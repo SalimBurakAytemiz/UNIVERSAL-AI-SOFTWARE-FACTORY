@@ -7,100 +7,125 @@ factory:
   branch: claude/ai-factory-baseline-v1-seawq7
   phase: P0_FACTORY_KERNEL
   pull_request: https://github.com/SalimBurakAytemiz/UNIVERSAL-AI-SOFTWARE-FACTORY/pull/1
+  p0_status: >
+    NOT complete. Explicit Founder instruction: do not move to P1 until the
+    P0 end-to-end flow is implemented, integration-tested and proof-verified.
+    This session made the foundation genuinely end-to-end (see below); it
+    has not been declared "done" by the Founder.
 
 completed_milestones:
-  - Existing public repository audited (was a single-commit, one-line-README
-    repo — no secrets, no history to preserve beyond that).
-  - Baseline V1 specification preserved verbatim at
-    specification/UNIVERSAL-AI-SOFTWARE-FACTORY-BASELINE-V1.md.
-  - specification/BASELINE.md and specification/CHANGELOG.md established.
-  - Annotated tag architecture-baseline-v1 pushed to GitHub (by the Human
-    Founder, verified against commit 8641c70).
+  - Existing public repository audited; Baseline V1 specification preserved
+    verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
+    and verified against commit 8641c70.
   - Baseline Requirement Registry for the P0 phase
     (specification/requirements/P0-factory-kernel.yml, 42 requirements),
-    schema-validated. ALL 42 now carry real evidence — no requirement is
-    left at a bare DEFINED status with zero implementation/test/proof refs.
-  - P0 Factory Kernel core implemented in TypeScript under runtime/: policy
-    engine + human approval workflow, model registry/gateway/MockProvider/
-    cheapest-capable-model router with premium-fallback blocking, cost
-    engine + budget ceilings, event bus with idle-by-default agents, cache
-    reuse layer, worker registry + smallest-sufficient-worker scheduler,
-    hash-chained audit log, secret-redacting structured logger.
-  - P0 foundation modules: Project OS scaffold, Project Genome
-    schema+validator, Discovery engine, Founder Decision Ledger, Assumption
-    Register (HIGH-impact assumptions need explicit Founder confirmation),
-    Technology Registry, Business Capability Registry, Organization
-    Composer, Capability Gateway, Sandbox, Project Isolation, Requirements
-    Traceability (detects unsupported status claims — proven against this
-    repo's own live registry), Artifact registry, Service/Integration
-    catalog (flags unowned services per section 127).
-  - CLI (runtime/cli): `doctor`, `baseline status`, `routing explain`,
-    `trace requirement`.
-  - proofs/ directory covering the named baseline proof scenarios for cost
-    optimization (A-I) and human approval.
-  - Public-repository secret scanner (scripts/secret-scan.mjs) with unit
-    tests, wired into CI.
-  - CI workflow (.github/workflows/ci.yml): lint, typecheck, build, test,
-    requirement-schema validation, CLI smoke test (incl. trace requirement),
-    secret scan.
-  - Governance docs: README.md, CLAUDE.md, AGENTS.md, SECURITY.md,
-    CONTRIBUTING.md, CODEOWNERS, docs/beginner/repository-map-tr.md.
-  - Branch pushed and PR #1 opened (via Claude Code UI) for
-    claude/ai-factory-baseline-v1-seawq7 -> main; kept up to date with
-    every subsequent commit.
-  - 126/126 tests passing; lint/typecheck/build/validate/secret-scan clean
-    as of the last push.
+    schema-validated, zero traceability issues (factory trace requirement).
+  - P0 Factory Kernel core (policy engine + approval workflow, model
+    registry/gateway/MockProvider/cheapest-capable-model router with
+    premium-fallback blocking, cost engine + budget ceilings, event bus,
+    cache, worker registry + scheduler, hash-chained audit log,
+    secret-redacting logger) plus foundation modules (Project OS, Project
+    Genome, Discovery engine, Decision Ledger, Assumption Register,
+    Technology/Business-Capability registries, Organization Composer,
+    Capability Gateway, Sandbox, Project Isolation, Requirements
+    Traceability, Artifact registry, Service catalog).
+  - THIS SESSION — made the foundation end-to-end, per explicit Founder
+    instruction that P0 was not yet complete:
+    - runtime/state/file-store.ts: a StateStore interface (baseline
+      section 275) with a JSON-file implementation. No longer "in-memory
+      only" — this is real, tested durability (a fresh store instance
+      reads back what a previous one wrote).
+    - runtime/decisions/decision-ledger.ts and
+      runtime/assumptions/assumption-register.ts: gained saveTo()/
+      loadFrom() persistence via FileStateStore.
+    - runtime/organization-composer/composer.ts: added
+      composeOrganizationFromGenome(), wiring a real, validated Project
+      Genome directly into team composition (project.family ->
+      base teams, business.capabilities -> capability-driven teams).
+    - runtime/project-lifecycle/orchestrator.ts (bootstrapProject): the
+      actual integrated pipeline — Requirements/Traceability (injected,
+      fail-closed) -> Project Genome validation (fail-closed) ->
+      Organization Composer -> Project OS scaffold (only runs inside a
+      Capability Gateway authorization — policy DENY/APPROVAL_REQUIRED
+      blocks it before any directory is created) -> cheapest-capable
+      model routing -> budget-tracked cost recording -> durable state
+      (genome, organization, and a bootstrap summary all written to disk
+      under the scaffolded project root).
+    - proofs/p0-integrated-flow/proof.test.ts: proof-level test running
+      the full chain against this repo's REAL requirement registry (not
+      mocked), asserting the composed organization, the scaffolded
+      directories on disk, the selected model/cost, and that every
+      persisted file is readable back from a fresh StateStore instance
+      (simulating a process restart).
+    - runtime/project-lifecycle/__tests__/orchestrator.test.ts: unit/
+      integration tests including two fail-closed proofs (default-deny
+      policy blocks scaffolding entirely; injected traceability issues
+      block bootstrap before the genome is even validated).
+  - CLI (`doctor`, `baseline status`, `routing explain`,
+    `trace requirement`); CI (lint/typecheck/build/test/validate/secret-
+    scan/CLI-smoke); governance docs (README, CLAUDE.md, AGENTS.md,
+    SECURITY.md, CONTRIBUTING.md, CODEOWNERS, Turkish repository map).
+  - 142/142 tests passing; lint/typecheck/build/validate-requirements/
+    secret-scan all clean as of the last push. Requirement registry:
+    16 PROOF_VERIFIED, 19 UNIT_TESTED, 6 IMPLEMENTATION_IN_PROGRESS,
+    1 IMPLEMENTED, 0 at bare DEFINED, 0 traceability issues.
 
 known_limitations:
-  - Only the P0 "Factory Kernel" phase (baseline section 304) has real
-    implementation. P1 (general business platform), P2 (games/3D/AI-ML/
-    data studios), and P3 (advanced/universal operations) are not started.
   - The requirement registry covers the P0 phase only (42 requirements);
-    the full 323-section baseline has not been decomposed into individually
-    tracked requirement IDs. See specification/requirements/README.md.
-  - All P0-listed items now have at least UNIT_TESTED-level evidence, but
-    most are "foundation" scope: in-memory only, not integrated with each
-    other end-to-end (e.g. Organization Composer doesn't yet consume a
-    real Project Genome; Project OS scaffold doesn't populate content).
-    This is a reasonable next increment, not a hidden gap — see exact_next
-    _action.
+    the full 323-section baseline decomposition is not done.
+  - Only ONE integrated pipeline exists (project bootstrap: Genome ->
+    Organization -> Project OS -> Policy -> Routing -> State). Other P0
+    modules (Discovery engine, Decision Ledger, Assumption Register,
+    Technology/Business-Capability registries, Sandbox, Artifact registry,
+    Service catalog, Worker Scheduler) are evidence-backed individually
+    but NOT yet wired into this same pipeline. That is real remaining P0
+    work, not a hidden gap — see exact_next_action.
+  - Persistence is JSON-file-based (runtime/state/file-store.ts), not
+    SQLite as baseline section 275 suggests as the initial candidate. The
+    StateStore interface is designed so a SQLite-backed implementation
+    could replace it without changing callers, but that implementation
+    does not exist yet.
   - No real model provider adapters (OpenAI/Anthropic/etc.) — only
-    MockProvider. Intentional at P0.
-  - CI pins GitHub Actions by version tag, not commit SHA.
-  - No automated dependency/SBOM/SCA scanning wired into CI yet.
-  - No LICENSE file — LICENSE_DECISION_REQUIRED (baseline section 206),
-    pending Human Founder decision.
+    MockProvider. Intentional at P0 (core tests must never require a paid
+    API), but a real gap beyond testing routing/budget logic itself.
+  - The integrated pipeline's "risk" parameter is caller-supplied with a
+    conservative default (1); there is no automated risk classification
+    engine yet deriving it from the Genome/requirements themselves.
+  - No LICENSE file — LICENSE_DECISION_REQUIRED (baseline section 206).
+  - CI pins GitHub Actions by version tag, not commit SHA. No automated
+    dependency/SBOM/SCA scanning wired into CI yet.
 
 blockers: []
 
 governance_decision_recorded: >
-  A request (received three times, with increasing detail, across this
-  session) to implement autonomous PR-merge authority into main — a
-  self-graded risk classifier letting an AI agent (or a second "independent
-  reviewer" AI session it also designs/controls) merge Risk 0-3 work with
-  no human in the loop — was declined. Rationale: a second AI session
-  instructed by the same author is not genuine independent review (same
-  model, same vendor, no adversarial stake); merging into a public repo's
-  main branch is a hard-to-reverse, trust-relevant action; and it would
-  contradict the very constitutional rules this codebase enforces in code
-  (runtime/policy-engine, runtime/capability-gateway: "implementation
-  author cannot be the final reviewer," "human final control"). This was
-  also put to the Founder directly via a multiple-choice question, which
-  was explicitly dismissed ("do not proceed, wait for next instruction").
-  Routine work (branches, commits, pushes, opening/updating PRs, fixing CI,
-  resolving ordinary conflicts) continues without asking each time, as
-  before — only the actual merge-into-main step and any GitHub branch-
-  protection/auto-merge configuration remain a human action. Do not
-  re-implement this without an explicit, freshly-stated Founder decision;
-  do not treat a rephrased version of the same request as new information.
+  A request (received three times, with increasing detail) to implement
+  autonomous PR-merge authority into main — including a variant using a
+  second "independent reviewer" AI session — was declined. Rationale: a
+  second AI session instructed by the same author is not genuine
+  independent review; merging into a public repo's main branch is a
+  human decision; it would contradict this codebase's own enforced rules
+  ("implementation author cannot be the final reviewer," "human final
+  control"). This was also put to the Founder via a direct question,
+  which was dismissed without selecting an option. Routine work (branches,
+  commits, pushes, opening/updating PRs, fixing CI, resolving ordinary
+  conflicts) continues without asking each time. Do not re-implement
+  autonomous merge authority without an explicit, freshly-stated Founder
+  decision; do not treat a rephrased repeat of the same request as new
+  information warranting a different answer.
 
 exact_next_action: >
-  1) Get an explicit Founder decision on whether the current P0 scope
-  (kernel + foundation modules, all evidence-backed) is sufficient to
-  declare P0 complete and move to P1, OR whether P0 should go deeper first
-  (wire the foundation modules together end-to-end: Project Genome ->
-  Organization Composer -> Project OS scaffold; add persistence beyond
-  in-memory; add integration tests). 2) Obtain a Founder licensing decision
-  (section 206). 3) Consider commit-SHA pinning for GitHub Actions. The
-  autonomous-merge governance question above is closed for this session —
-  do not re-raise it without new Founder-initiated context.
+  P0 is still open per explicit Founder instruction. Real remaining work,
+  in rough priority order: (1) wire the other evidence-backed foundation
+  modules (Discovery engine, Decision Ledger, Assumption Register,
+  Technology/Business-Capability registries) into the same bootstrap
+  pipeline so a Founder-provided idea can flow: raw input -> Discovery
+  classification -> Decision Ledger entries -> Genome -> Organization ->
+  Project OS, end to end; (2) add a second integrated pipeline exercising
+  Sandbox + Worker Scheduler + Artifact registry + Service catalog
+  together (e.g. "run a task for a bootstrapped project" rather than just
+  "bootstrap a project"); (3) consider a SQLite-backed StateStore
+  implementation alongside the JSON one; (4) get a Founder decision on
+  whether/when to consider P0 sufficient to move to P1; (5) obtain a
+  Founder licensing decision (section 206). The autonomous-merge
+  governance question is closed for this session — do not re-raise it
+  without new Founder-initiated context.

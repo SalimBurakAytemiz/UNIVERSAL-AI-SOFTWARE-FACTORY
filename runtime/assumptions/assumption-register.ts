@@ -4,6 +4,8 @@
 // olarak uygular (yüksek etkili bir varsayım, açık bir `confirmedBy`
 // olmadan ACCEPTED durumuna geçemez).
 
+import type { StateStore } from "../state/file-store.js";
+
 export type AssumptionImpact = "LOW" | "MEDIUM" | "HIGH";
 export type AssumptionStatus = "PROPOSED" | "ACCEPTED" | "REJECTED" | "VALIDATED" | "SUPERSEDED";
 
@@ -95,5 +97,20 @@ export class AssumptionRegister {
     const assumption = this.assumptions.get(id);
     if (!assumption) throw new AssumptionNotFoundError(id);
     return assumption;
+  }
+
+  /** Sadece bellekte tutmak yerine bir StateStore'a yazar (bölüm 275, 277). */
+  saveTo(store: StateStore, path: string): void {
+    store.write(path, [...this.assumptions.values()]);
+  }
+
+  /** Daha önce saveTo() ile kaydedilmiş bir varsayım kaydını geri yükler. */
+  static loadFrom(store: StateStore, path: string): AssumptionRegister {
+    const register = new AssumptionRegister();
+    const records = store.read<Assumption[]>(path) ?? [];
+    for (const record of records) {
+      register.assumptions.set(record.id, record);
+    }
+    return register;
   }
 }

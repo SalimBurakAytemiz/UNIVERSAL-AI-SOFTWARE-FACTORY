@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AssumptionRegister, FounderConfirmationRequiredError } from "../assumption-register.js";
+import { FileStateStore } from "../../state/file-store.js";
 
 describe("AssumptionRegister", () => {
   it("proposes an assumption as PROPOSED", () => {
@@ -42,5 +46,28 @@ describe("AssumptionRegister", () => {
     register.reject("a2");
     expect(register.allWithStatus("PROPOSED")).toHaveLength(1);
     expect(register.allWithStatus("REJECTED")).toHaveLength(1);
+  });
+
+  describe("persistence (durable, not just in-memory)", () => {
+    let tempRoot: string;
+
+    afterEach(() => {
+      if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    it("saveTo()/loadFrom() round-trips assumptions, including a HIGH-impact confirmation", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-assumptions-"));
+      const path = join(tempRoot, "assumptions.json");
+      const store = new FileStateStore();
+
+      const register = new AssumptionRegister();
+      register.propose({ id: "a1", description: "d", reason: "r", impact: "HIGH", source: "s" });
+      register.accept("a1", "founder@example.com");
+      register.saveTo(store, path);
+
+      const restored = AssumptionRegister.loadFrom(store, path);
+      expect(restored.get("a1")?.status).toBe("ACCEPTED");
+      expect(restored.get("a1")?.confirmedBy).toBe("founder@example.com");
+    });
   });
 });

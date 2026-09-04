@@ -119,14 +119,17 @@
   source_baseline: "BASELINE-V1 section 26"
   category: P0
   priority: MEDIUM
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/project-os/scaffold.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
   test_refs:
     - "runtime/project-os/__tests__/scaffold.test.ts"
-  proof_refs: []
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Scaffolds the section-26 directory structure idempotently; does not yet integrate with Project Genome or the Organization Composer to auto-populate content."
+  notes: "Now wired into the full pipeline via runtime/project-lifecycle/orchestrator.ts: scaffolding only happens inside a Capability Gateway authorization, and the Organization Composer's output is persisted into the scaffolded structure."
 
 - id: UASF-REQ-0008
   title: Project Genome schema
@@ -134,15 +137,18 @@
   source_baseline: "BASELINE-V1 section 27"
   category: P0
   priority: MEDIUM
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "schemas/project-genome.schema.json"
     - "runtime/project-genome/genome.ts"
   test_refs:
     - "runtime/project-genome/__tests__/genome.test.ts"
-  proof_refs: []
+    - "runtime/organization-composer/__tests__/composer.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Schema covers the shape from the baseline's own example; not every nested field of every future subsystem is modeled yet."
+  notes: "Schema covers the shape from the baseline's own example; not every nested field of every future subsystem is modeled yet. Now consumed directly by the Organization Composer and the full bootstrap pipeline."
 
 - id: UASF-REQ-0009
   title: Discovery & clarification engine (foundation)
@@ -174,7 +180,7 @@
     - "runtime/decisions/__tests__/decision-ledger.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "In-memory only; durable persistence (beyond project-state/current.yml-style files) is future work."
+  notes: "Now persists via runtime/state/file-store.ts (saveTo/loadFrom) — no longer in-memory only; a round-trip through a fresh store instance is tested."
 
 - id: UASF-REQ-0011
   title: Assumption register
@@ -189,7 +195,7 @@
     - "runtime/assumptions/__tests__/assumption-register.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "HIGH-impact assumptions cannot move to ACCEPTED without an explicit confirmedBy value (Founder confirmation gate), enforced in code."
+  notes: "HIGH-impact assumptions cannot move to ACCEPTED without an explicit confirmedBy value (Founder confirmation gate), enforced in code. Now persists via runtime/state/file-store.ts (saveTo/loadFrom), including the confirmedBy field, across a simulated process restart."
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -211,15 +217,16 @@
   source_baseline: "BASELINE-V1 section 49"
   category: P0
   priority: MEDIUM
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/requirements-traceability/traceability.ts"
     - "runtime/cli/commands/trace-requirement.ts"
   test_refs:
     - "runtime/requirements-traceability/__tests__/traceability.test.ts"
-  proof_refs: []
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Detects status claims with zero backing evidence over this repository's own requirement registry (`factory trace requirement`); does not yet trace the full business->product->story->AC->architecture->implementation->test->release chain described in section 49."
+  notes: "Detects status claims with zero backing evidence over this repository's own requirement registry (`factory trace requirement`); now the first, gating step of the integrated P0 pipeline (proofs/p0-integrated-flow). Does not yet trace the full business->product->story->AC->architecture->implementation->test->release chain described in section 49."
 
 - id: UASF-REQ-0014
   title: Technology registry (foundation)
@@ -257,14 +264,17 @@
   source_baseline: "BASELINE-V1 section 34"
   category: P0
   priority: LOW
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/organization-composer/composer.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
   test_refs:
     - "runtime/organization-composer/__tests__/composer.test.ts"
-  proof_refs: []
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Rule-based composition with a recorded rationale per activated team (tests assert unrelated teams are never added); does not yet consume a full Project Genome or budget input."
+  notes: "Rule-based composition with a recorded rationale per activated team (tests assert unrelated teams are never added). composeOrganizationFromGenome() now consumes a real, validated Project Genome directly; budget input is still not wired in."
 
 - id: UASF-REQ-0017
   title: Workflow engine (foundation)
@@ -290,14 +300,18 @@
   source_baseline: "BASELINE-V1 section 148, 241"
   category: P0
   priority: CRITICAL
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/policy-engine"
+    - "runtime/project-lifecycle/orchestrator.ts"
   test_refs:
     - "runtime/policy-engine/__tests__/policy-engine.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
   proof_refs:
     - "proofs/human-approval"
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
+  notes: "The integrated pipeline proof demonstrates default-deny in a realistic scenario: bootstrapProject() refuses to scaffold anything until an explicit policy rule allows it."
 
 - id: UASF-REQ-0019
   title: Capability gateway (foundation)
@@ -305,14 +319,17 @@
   source_baseline: "BASELINE-V1 section 147"
   category: P0
   priority: HIGH
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/capability-gateway/gateway.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
   test_refs:
     - "runtime/capability-gateway/__tests__/gateway.test.ts"
-  proof_refs: []
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Tests assert the wrapped execute() function is never called on DENY or APPROVAL_REQUIRED, only on ALLOW."
+  notes: "Tests assert the wrapped execute() function is never called on DENY or APPROVAL_REQUIRED, only on ALLOW. Now the real enforcement point in front of Project OS scaffolding in the integrated pipeline — not just a standalone demonstration."
 
 - id: UASF-REQ-0020
   title: Human approval workflow
@@ -342,12 +359,22 @@
   source_baseline: "BASELINE-V1 section 277"
   category: P0
   priority: HIGH
-  status: IMPLEMENTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "project-state/current.yml"
-  test_refs: []
-  proof_refs: []
+    - "runtime/state/file-store.ts"
+    - "runtime/decisions/decision-ledger.ts"
+    - "runtime/assumptions/assumption-register.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/state/__tests__/file-store.test.ts"
+    - "runtime/decisions/__tests__/decision-ledger.test.ts"
+    - "runtime/assumptions/__tests__/assumption-register.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
+  notes: "project-state/current.yml is the session-level durable record (Founder-facing prose+structure). runtime/state/file-store.ts is the code-level StateStore interface (baseline section 275) with a JSON-file implementation, used by the Decision Ledger, Assumption Register, and the P0 bootstrap pipeline; a real process-restart is simulated in tests via a fresh store instance reading the same path."
 
 - id: UASF-REQ-0022
   title: Audit (foundation)
@@ -438,6 +465,7 @@
     - "runtime/models/__tests__/router.test.ts"
   proof_refs:
     - "proofs/cheapest-capable-model/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
 
 - id: UASF-REQ-0028
@@ -463,12 +491,15 @@
   source_baseline: "BASELINE-V1 section 69"
   category: P0
   priority: CRITICAL
-  status: UNIT_TESTED
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/cost/cost-engine.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
   test_refs:
     - "runtime/cost/__tests__/cost-engine.test.ts"
-  proof_refs: []
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
 
 - id: UASF-REQ-0030
@@ -486,6 +517,7 @@
     - "runtime/budget/__tests__/budget.test.ts"
   proof_refs:
     - "proofs/budget-ceiling/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
 
 - id: UASF-REQ-0031
@@ -666,13 +698,23 @@
     A single test run demonstrating the P0 kernel invariants together:
     cheapest-capable routing, premium-fallback block, budget ceiling,
     event-driven activation, and cache reuse, in one coherent scenario.
+    Extended by proofs/p0-integrated-flow to also prove the foundation
+    modules are wired together, not just independently correct: real
+    requirement-registry traceability gates a validated Project Genome,
+    which drives the Organization Composer, which is persisted alongside
+    a Capability-Gateway-authorized Project OS scaffold, cheapest-capable
+    model routing, and durable state — all readable back after a
+    simulated process restart.
   source_baseline: "BASELINE-V1 section 304, 305, 306"
   category: P0
   priority: HIGH
   status: PROOF_VERIFIED
-  implementation_refs: []
+  implementation_refs:
+    - "runtime/project-lifecycle/orchestrator.ts"
   test_refs:
     - "proofs/e2e-p0-kernel/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
   proof_refs:
     - "proofs/e2e-p0-kernel/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []

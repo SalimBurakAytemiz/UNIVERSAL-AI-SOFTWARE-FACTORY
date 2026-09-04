@@ -51,6 +51,16 @@ completion.
   path-traversal confinement and a promise timeout helper.
 - **Project isolation**: a default-deny store so one project's data is
   never reachable from another project's code.
+- **An integrated P0 pipeline** (`runtime/project-lifecycle/orchestrator.ts`):
+  a real requirement-traceability check gates a validated Project Genome,
+  which drives the Organization Composer, whose output is persisted
+  alongside a Capability-Gateway-authorized Project OS scaffold, cheapest-
+  capable model routing, and durable state — all readable back after a
+  simulated process restart. See `proofs/p0-integrated-flow/`.
+- **Durable persistence**: a small `StateStore` interface
+  (`runtime/state/file-store.ts`) with a JSON-file implementation, used by
+  the Decision Ledger, Assumption Register, and the bootstrap pipeline —
+  data survives a process restart, not just in-memory.
 - **A public-repository secret scanner** with no external dependency,
   wired into CI (`scripts/secret-scan.mjs`).
 

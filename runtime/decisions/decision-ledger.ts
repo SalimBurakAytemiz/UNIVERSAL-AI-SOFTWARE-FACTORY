@@ -5,6 +5,8 @@
 // "neden değişti?" sorusu her zaman cevaplanabilir kalır (bölüm 255,
 // Decision Explainability).
 
+import type { StateStore } from "../state/file-store.js";
+
 export type FounderDecisionStatus = "ACTIVE" | "SUPERSEDED";
 
 export interface FounderDecision {
@@ -76,5 +78,23 @@ export class FounderDecisionLedger {
   /** Halihazırda ACTIVE bir karar var mı? — aynı soruyu tekrar tekrar sormamak için (bölüm 46). */
   hasActiveDecision(decisionId: string): boolean {
     return this.decisions.get(decisionId)?.status === "ACTIVE";
+  }
+
+  /**
+   * Sadece bellekte tutmak yerine bir StateStore'a yazar (bölüm 275, 277)
+   * — süreç yeniden başlasa bile karar geçmişi kaybolmaz.
+   */
+  saveTo(store: StateStore, path: string): void {
+    store.write(path, [...this.decisions.values()]);
+  }
+
+  /** Daha önce saveTo() ile kaydedilmiş bir karar defterini geri yükler. */
+  static loadFrom(store: StateStore, path: string): FounderDecisionLedger {
+    const ledger = new FounderDecisionLedger();
+    const records = store.read<FounderDecision[]>(path) ?? [];
+    for (const record of records) {
+      ledger.decisions.set(record.decisionId, record);
+    }
+    return ledger;
   }
 }

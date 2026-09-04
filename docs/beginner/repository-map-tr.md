@@ -144,6 +144,14 @@ sistem" talebini karşılayan kısımdır.
   çıktıların sınıflandırılmış kaydı.
 - **`runtime/service-catalog/`** — Servis/entegrasyon kaydı; sahibi
   olmayan (owner alanı boş) servisleri tespit eder (bölüm 127).
+- **`runtime/state/`** — Sadece bellekte değil, gerçekten diske yazan
+  kalıcı durum katmanı (`FileStateStore`). Karar defteri ve varsayım
+  kaydı artık bunu kullanarak süreç yeniden başlasa bile kaybolmuyor.
+- **`runtime/project-lifecycle/`** — P0'ın uçtan uca boru hattı:
+  Gereksinim İzlenebilirliği -> Project Genome -> Organization Composer ->
+  Project OS (Capability Gateway üzerinden) -> Maliyet/Model Yönlendirme
+  -> Kalıcı Durum. Ayrı ayrı test edilmiş parçaların GERÇEKTEN birlikte
+  çalıştığının kanıtı `proofs/p0-integrated-flow/` altındadır.
 
 **Yanlış değiştirilirse ne etkilenebilir?** `policy-engine` veya `budget`
 içindeki bir hata, gerçek bir dağıtımda maliyet kontrolünün veya insan

@@ -6,6 +6,8 @@
 // only what is needed"; bölüm 34, "record why every component was
 // activated").
 
+import type { ProjectGenome } from "../project-genome/genome.js";
+
 export interface OrganizationCompositionInput {
   readonly projectFamily: string;
   readonly requiredCapabilities: readonly string[];
@@ -67,4 +69,20 @@ export function composeOrganization(input: OrganizationCompositionInput): Organi
   }
 
   return { teams: [...teams], rationale };
+}
+
+/**
+ * Project Genome'u (bölüm 27) doğrudan Organization Composer'a bağlar.
+ * Genome'un `business.capabilities` alanı gerekli yetenekler olarak,
+ * `project.family` proje ailesi olarak kullanılır. `risk` Genome'un bir
+ * parçası değildir (şema bunu henüz modellemiyor) — çağıran taraf ayrı
+ * bir risk sınıflandırmasından (ör. Discovery/Policy) geçirebilir;
+ * verilmezse muhafazakar bir varsayılan (1) kullanılır.
+ */
+export function composeOrganizationFromGenome(genome: ProjectGenome, risk = 1): OrganizationComposition {
+  return composeOrganization({
+    projectFamily: genome.project.family,
+    requiredCapabilities: genome.business?.capabilities ?? [],
+    risk
+  });
 }
