@@ -113,6 +113,30 @@ sistem" talebini karşılayan kısımdır.
   alanları otomatik olarak gizler.
 - **`runtime/cli/`** — `factory` komut satırı aracının giriş noktası ve
   komutları (`doctor`, `baseline status`, `routing explain`).
+- **`runtime/capability-gateway/`** — Politika motorunu atlayan bir yol
+  bırakmayan tek geçiş noktası: `authorize()` çağrılmadan hiçbir eylemin
+  gerçek kodu (`execute`) çalıştırılmaz.
+- **`runtime/sandbox/`** — Yol sınırlama (`assertWithinRoot`, `../` ile
+  kaçışı engeller) ve zaman aşımı (`withTimeout`) koruması.
+- **`runtime/project-isolation/`** — Bir projenin başka bir projenin
+  verisine varsayılan olarak erişememesini sağlayan depo.
+- **`runtime/project-os/`** — Bir proje için izole dizin yapısını
+  (`project-definition/`, `requirements/`, `decisions/` vb.) oluşturan
+  betik.
+- **`runtime/project-genome/`** — Proje Genome nesnelerini
+  `schemas/project-genome.schema.json`'a göre doğrulayan yükleyici.
+- **`runtime/discovery/`** — Kurucu fikirlerini netleştirirken hangi
+  soruların sorulacağını (CRITICAL/IMPORTANT/OPTIONAL/DERIVABLE) belirler.
+- **`runtime/decisions/`** — Kurucu kararlarını, geçmişi silmeden
+  (SUPERSEDED işaretleyerek) izleyen karar defteri.
+- **`runtime/assumptions/`** — Varsayımları izler; YÜKSEK etkili bir
+  varsayım, açık bir Kurucu onayı olmadan kabul edilemez.
+- **`runtime/technology-registry/`** ve
+  **`runtime/business-capability-registry/`** — Teknoloji ve iş yeteneği
+  kayıt defterleri (FORBIDDEN/DEPRECATED teknolojiler asla önerilmez).
+- **`runtime/organization-composer/`** — Proje ailesine ve gerekli
+  yeteneklere göre minimum gerekli takımları, HER birinin neden
+  etkinleştirildiğini kaydederek oluşturur.
 
 **Yanlış değiştirilirse ne etkilenebilir?** `policy-engine` veya `budget`
 içindeki bir hata, gerçek bir dağıtımda maliyet kontrolünün veya insan

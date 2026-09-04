@@ -84,11 +84,15 @@
   implementation_refs:
     - "schemas/requirement.schema.json"
     - "schemas/model.schema.json"
+    - "schemas/project-genome.schema.json"
+    - "runtime/project-genome/genome.ts"
   test_refs:
     - "scripts/validate-requirements.mjs"
     - "runtime/models/__tests__/registry.test.ts"
+    - "runtime/project-genome/__tests__/genome.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Three schemas now demonstrate fail-closed validation (requirement, model, project-genome); still not every core entity listed in section 280 has one."
 
 - id: UASF-REQ-0006
   title: Factory CLI
@@ -115,12 +119,14 @@
   source_baseline: "BASELINE-V1 section 26"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/project-os/scaffold.ts"
+  test_refs:
+    - "runtime/project-os/__tests__/scaffold.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Not implemented this session; deferred to a follow-up P0 increment."
+  notes: "Scaffolds the section-26 directory structure idempotently; does not yet integrate with Project Genome or the Organization Composer to auto-populate content."
 
 - id: UASF-REQ-0008
   title: Project Genome schema
@@ -128,11 +134,15 @@
   source_baseline: "BASELINE-V1 section 27"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "schemas/project-genome.schema.json"
+    - "runtime/project-genome/genome.ts"
+  test_refs:
+    - "runtime/project-genome/__tests__/genome.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Schema covers the shape from the baseline's own example; not every nested field of every future subsystem is modeled yet."
 
 - id: UASF-REQ-0009
   title: Discovery & clarification engine (foundation)
@@ -142,11 +152,14 @@
   source_baseline: "BASELINE-V1 section 43, 44"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/discovery/discovery-engine.ts"
+  test_refs:
+    - "runtime/discovery/__tests__/discovery-engine.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Classification and question-selection logic only; no actual Founder-facing intake UI/CLI yet."
 
 - id: UASF-REQ-0010
   title: Founder decision ledger
@@ -154,11 +167,14 @@
   source_baseline: "BASELINE-V1 section 46"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/decisions/decision-ledger.ts"
+  test_refs:
+    - "runtime/decisions/__tests__/decision-ledger.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "In-memory only; durable persistence (beyond project-state/current.yml-style files) is future work."
 
 - id: UASF-REQ-0011
   title: Assumption register
@@ -166,11 +182,14 @@
   source_baseline: "BASELINE-V1 section 47"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/assumptions/assumption-register.ts"
+  test_refs:
+    - "runtime/assumptions/__tests__/assumption-register.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "HIGH-impact assumptions cannot move to ACCEPTED without an explicit confirmedBy value (Founder confirmation gate), enforced in code."
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -204,11 +223,14 @@
   source_baseline: "BASELINE-V1 section 53, 54"
   category: P0
   priority: LOW
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/technology-registry/registry.ts"
+  test_refs:
+    - "runtime/technology-registry/__tests__/registry.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "FORBIDDEN/DEPRECATED technologies are excluded from recommendable() at the data-model level; no seeded default registry or Technology Decision Engine yet."
 
 - id: UASF-REQ-0015
   title: Business capability registry (foundation)
@@ -216,11 +238,14 @@
   source_baseline: "BASELINE-V1 section 29"
   category: P0
   priority: LOW
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/business-capability-registry/registry.ts"
+  test_refs:
+    - "runtime/business-capability-registry/__tests__/registry.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Seeded with a representative subset (identity, payments, notifications, anti-cheat), not the full section-29 list."
 
 - id: UASF-REQ-0016
   title: Project organization composer (foundation)
@@ -228,11 +253,14 @@
   source_baseline: "BASELINE-V1 section 34"
   category: P0
   priority: LOW
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/organization-composer/composer.ts"
+  test_refs:
+    - "runtime/organization-composer/__tests__/composer.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Rule-based composition with a recorded rationale per activated team (tests assert unrelated teams are never added); does not yet consume a full Project Genome or budget input."
 
 - id: UASF-REQ-0017
   title: Workflow engine (foundation)
@@ -273,11 +301,14 @@
   source_baseline: "BASELINE-V1 section 147"
   category: P0
   priority: HIGH
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/capability-gateway/gateway.ts"
+  test_refs:
+    - "runtime/capability-gateway/__tests__/gateway.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Tests assert the wrapped execute() function is never called on DENY or APPROVAL_REQUIRED, only on ALLOW."
 
 - id: UASF-REQ-0020
   title: Human approval workflow
@@ -485,11 +516,14 @@
   source_baseline: "BASELINE-V1 section 87"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/sandbox/sandbox.ts"
+  test_refs:
+    - "runtime/sandbox/__tests__/sandbox.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Path-traversal confinement (assertWithinRoot) and a promise timeout wrapper (withTimeout) only; command controls, output limits, and environment filtering are not yet implemented."
 
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
@@ -497,11 +531,14 @@
   source_baseline: "BASELINE-V1 section 86"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/project-isolation/isolation.ts"
+  test_refs:
+    - "runtime/project-isolation/__tests__/isolation.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Default-deny keyed store proven for the data-access case; filesystem/worker-level isolation is not yet wired to this abstraction."
 
 - id: UASF-REQ-0035
   title: Event-driven agent activation
