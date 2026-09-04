@@ -1,0 +1,631 @@
+# Baseline Requirement Registry — P0 Factory Kernel batch.
+# Validated against schemas/requirement.schema.json (npm run validate:requirements).
+# See README.md in this directory for scope notes.
+
+- id: UASF-REQ-0001
+  title: Existing public repository audit
+  description: >
+    Audit the existing target repository's git state (branches, commits,
+    working tree) before any implementation work, without creating a new
+    repository.
+  source_baseline: "BASELINE-V1 section 318, 319"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs: []
+  test_refs: []
+  proof_refs:
+    - "Session audit: single 'Initial commit' with one-line README, working tree clean, no other branches/history."
+  security_refs: []
+  notes: "Performed manually at session start via git status/log; repository was effectively empty."
+
+- id: UASF-REQ-0002
+  title: Public secret / hygiene audit
+  description: >
+    Scan tracked files and git history for exposed secrets, credentials, and
+    sensitive data before major implementation.
+  source_baseline: "BASELINE-V1 section 2, 319, 307"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "scripts/secret-scan.mjs"
+  test_refs:
+    - "tests/secret-scan.test.mjs"
+  proof_refs:
+    - "CI job 'secret-scan' in .github/workflows/ci.yml"
+  security_refs:
+    - "SECURITY.md"
+
+- id: UASF-REQ-0003
+  title: Baseline specification preservation
+  description: >
+    Store the complete Founder-provided specification verbatim as the single
+    source of truth, plus BASELINE.md status and CHANGELOG.md.
+  source_baseline: "BASELINE-V1 section 292"
+  category: P0
+  priority: CRITICAL
+  status: IMPLEMENTED
+  implementation_refs:
+    - "specification/UNIVERSAL-AI-SOFTWARE-FACTORY-BASELINE-V1.md"
+    - "specification/BASELINE.md"
+    - "specification/CHANGELOG.md"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0004
+  title: Baseline requirement registry
+  description: >
+    Machine-readable, schema-validated requirement records with stable IDs
+    tracing to baseline sections.
+  source_baseline: "BASELINE-V1 section 293, 294"
+  category: P0
+  priority: CRITICAL
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "schemas/requirement.schema.json"
+    - "specification/requirements/P0-factory-kernel.yml"
+  test_refs:
+    - "scripts/validate-requirements.mjs"
+  proof_refs: []
+  security_refs: []
+  notes: "P0-scope batch only; full 323-section decomposition deferred (see requirements/README.md)."
+
+- id: UASF-REQ-0005
+  title: Strict schemas, fail closed
+  description: >
+    JSON Schema validation for core entities (requirements, model registry,
+    policy decisions), invalid configuration must fail closed.
+  source_baseline: "BASELINE-V1 section 280"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "schemas/requirement.schema.json"
+    - "schemas/model.schema.json"
+  test_refs:
+    - "scripts/validate-requirements.mjs"
+    - "runtime/models/__tests__/registry.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0006
+  title: Factory CLI
+  description: >
+    Minimum CLI surface starting with `factory doctor`, `factory status`,
+    `factory baseline status`, `factory routing explain`, `factory costs show`.
+  source_baseline: "BASELINE-V1 section 286"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "runtime/cli"
+  test_refs:
+    - "runtime/cli/__tests__"
+  proof_refs: []
+  security_refs: []
+  notes: "Only a subset of the full command list in section 286 is implemented; remaining commands are future work."
+
+- id: UASF-REQ-0007
+  title: Project Factory / Project OS foundation
+  description: >
+    Ability to scaffold an isolated per-project directory structure
+    (project-definition, requirements, decisions, assumptions, state, etc.).
+  source_baseline: "BASELINE-V1 section 26"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+  notes: "Not implemented this session; deferred to a follow-up P0 increment."
+
+- id: UASF-REQ-0008
+  title: Project Genome schema
+  description: Machine-readable Project Genome YAML schema and validator.
+  source_baseline: "BASELINE-V1 section 27"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0009
+  title: Discovery & clarification engine (foundation)
+  description: >
+    Founder-idea intake pipeline with CRITICAL/IMPORTANT/OPTIONAL/DERIVABLE
+    classification.
+  source_baseline: "BASELINE-V1 section 43, 44"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0010
+  title: Founder decision ledger
+  description: Persist Founder decisions with id/status/supersession tracking.
+  source_baseline: "BASELINE-V1 section 46"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0011
+  title: Assumption register
+  description: Track assumptions with PROPOSED/ACCEPTED/REJECTED/VALIDATED/SUPERSEDED lifecycle.
+  source_baseline: "BASELINE-V1 section 47"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0012
+  title: Requirements engine
+  description: Support BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL/... requirement types with stable IDs.
+  source_baseline: "BASELINE-V1 section 48"
+  category: P0
+  priority: MEDIUM
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "schemas/requirement.schema.json"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+  notes: "The Baseline Requirement Registry itself is the first instance of this engine's data model."
+
+- id: UASF-REQ-0013
+  title: Requirements traceability
+  description: Trace business requirement through to release, detect orphans.
+  source_baseline: "BASELINE-V1 section 49"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0014
+  title: Technology registry (foundation)
+  description: Track languages/frameworks/engines with EXPERIMENTAL..FORBIDDEN lifecycle.
+  source_baseline: "BASELINE-V1 section 53, 54"
+  category: P0
+  priority: LOW
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0015
+  title: Business capability registry (foundation)
+  description: Registry entries for CRM/ERP/OMS/... with delivery_options (BUILD/INTEGRATE/REUSE/BUY_OR_SAAS/DEFER/NOT_REQUIRED).
+  source_baseline: "BASELINE-V1 section 29"
+  category: P0
+  priority: LOW
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0016
+  title: Project organization composer (foundation)
+  description: Compose minimum justified project organization from Project Genome + requirements + risk + budget.
+  source_baseline: "BASELINE-V1 section 34"
+  category: P0
+  priority: LOW
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0017
+  title: Workflow engine (foundation)
+  description: Event-driven workflow execution substrate.
+  source_baseline: "BASELINE-V1 section 75"
+  category: P0
+  priority: MEDIUM
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "runtime/event-bus"
+  test_refs:
+    - "runtime/event-bus/__tests__"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0018
+  title: Policy engine — ALLOW/DENY/APPROVAL_REQUIRED
+  description: >
+    Central decision engine evaluating actions against policy, returning
+    ALLOW, DENY, or APPROVAL_REQUIRED, honoring the precedence order in
+    section 241 (safety/security/legal > production integrity > founder
+    policy > cost optimization > convenience).
+  source_baseline: "BASELINE-V1 section 148, 241"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/policy-engine"
+  test_refs:
+    - "runtime/policy-engine/__tests__/policy-engine.test.ts"
+  proof_refs:
+    - "proofs/human-approval"
+  security_refs: []
+
+- id: UASF-REQ-0019
+  title: Capability gateway (foundation)
+  description: Enforcement point routing actions through the policy engine before execution.
+  source_baseline: "BASELINE-V1 section 147"
+  category: P0
+  priority: HIGH
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0020
+  title: Human approval workflow
+  description: >
+    Risk-5 actions (production deploy, destructive DB ops, secret mutation,
+    premium-model escalation outside budget, etc.) require an explicit
+    APPROVE/REJECT/REQUEST_CHANGES decision and can never reach EXECUTED
+    without it.
+  source_baseline: "BASELINE-V1 section 145, 146"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/policy-engine/approval.ts"
+  test_refs:
+    - "runtime/policy-engine/__tests__/policy-engine.test.ts"
+  proof_refs:
+    - "proofs/human-approval"
+  security_refs: []
+
+- id: UASF-REQ-0021
+  title: Durable state / resume
+  description: >
+    Maintain project-state/current.yml recording phase, milestones, branch,
+    commit, blockers, and exact next action so interrupted work resumes
+    without repeating valid completed work.
+  source_baseline: "BASELINE-V1 section 277"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTED
+  implementation_refs:
+    - "project-state/current.yml"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0022
+  title: Audit (foundation)
+  description: Append-only audit log for policy/approval decisions.
+  source_baseline: "BASELINE-V1 section 242"
+  category: P0
+  priority: HIGH
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/audit"
+  test_refs:
+    - "runtime/audit/__tests__/audit-log.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0023
+  title: Artifact foundation
+  description: Minimal artifact classification/storage abstraction.
+  source_baseline: "BASELINE-V1 section 123"
+  category: P0
+  priority: LOW
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0024
+  title: Model gateway
+  description: Provider-abstraction interface so core tests never require paid APIs.
+  source_baseline: "BASELINE-V1 section 59"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/models/gateway.ts"
+  test_refs:
+    - "runtime/models/__tests__/gateway.test.ts"
+  proof_refs:
+    - "proofs/cheapest-capable-model"
+  security_refs: []
+
+- id: UASF-REQ-0025
+  title: Model registry
+  description: Registry of provider/model records with capabilities, cost_class, tier, status.
+  source_baseline: "BASELINE-V1 section 60, 61"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/models/registry.ts"
+    - "schemas/model.schema.json"
+  test_refs:
+    - "runtime/models/__tests__/registry.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0026
+  title: MockProvider
+  description: Deterministic, free, no-network model provider so the kernel's core tests are self-contained.
+  source_baseline: "BASELINE-V1 section 59"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/models/providers/mock-provider.ts"
+  test_refs:
+    - "runtime/models/__tests__/gateway.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0027
+  title: Cheapest-capable-model router
+  description: >
+    Classify task complexity/risk/required capabilities, select the
+    lowest-cost model in the registry that satisfies them; never select a
+    premium model for a trivial task.
+  source_baseline: "BASELINE-V1 section 62, 63, 306 (Proof A/B)"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/models/router.ts"
+  test_refs:
+    - "runtime/models/__tests__/router.test.ts"
+  proof_refs:
+    - "proofs/cheapest-capable-model/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0028
+  title: Premium fallback policy (default off, evidence-based escalation)
+  description: >
+    AUTO_PREMIUM_FALLBACK defaults to false; escalation beyond the cheapest
+    capable model requires validation failure plus policy/budget approval.
+  source_baseline: "BASELINE-V1 section 64, 306 (Proof C/D)"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/models/router.ts"
+  test_refs:
+    - "runtime/models/__tests__/router.test.ts"
+  proof_refs:
+    - "proofs/premium-fallback-block/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0029
+  title: Cost engine
+  description: Track cost per task/agent/model/provider call; no silent spending.
+  source_baseline: "BASELINE-V1 section 69"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/cost/cost-engine.ts"
+  test_refs:
+    - "runtime/cost/__tests__/cost-engine.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0030
+  title: Budget engine / cost ceilings
+  description: >
+    Task/run/project cost ceilings that stop or block execution before a
+    limit is exceeded, preventing runaway spend.
+  source_baseline: "BASELINE-V1 section 70, 71, 72, 306 (Proof E)"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/budget/budget.ts"
+  test_refs:
+    - "runtime/budget/__tests__/budget.test.ts"
+  proof_refs:
+    - "proofs/budget-ceiling/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0031
+  title: Worker registry (foundation)
+  description: Register worker classes (linux-general, gpu, macos, ...) with capability metadata; select smallest sufficient worker.
+  source_baseline: "BASELINE-V1 section 82, 83, 306 (Proof H)"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/workers/registry.ts"
+  test_refs:
+    - "runtime/workers/__tests__/registry.test.ts"
+  proof_refs:
+    - "proofs/smallest-sufficient-worker/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0032
+  title: Scheduler (foundation)
+  description: Resource-aware task-to-worker assignment favoring the smallest sufficient worker.
+  source_baseline: "BASELINE-V1 section 83"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/scheduler/scheduler.ts"
+  test_refs:
+    - "runtime/scheduler/__tests__/scheduler.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0033
+  title: Sandbox (foundation)
+  description: Path confinement / timeout / output-limit contract for executed actions.
+  source_baseline: "BASELINE-V1 section 87"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0034
+  title: Project isolation (foundation)
+  description: Cross-project default-deny isolation of filesystem/state/budget/artifacts.
+  source_baseline: "BASELINE-V1 section 86"
+  category: P0
+  priority: MEDIUM
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0035
+  title: Event-driven agent activation
+  description: >
+    Agents/workflows activate only on relevant events (not continuous
+    polling) and do not consume resources while idle.
+  source_baseline: "BASELINE-V1 section 41, 75, 306 (Proof F/I)"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/event-bus/event-bus.ts"
+  test_refs:
+    - "runtime/event-bus/__tests__/event-bus.test.ts"
+  proof_refs:
+    - "proofs/event-driven-activation/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0036
+  title: Cache / reuse layer
+  description: >
+    Before recomputation, check durable cache for still-valid prior results
+    and reuse them instead of recomputing.
+  source_baseline: "BASELINE-V1 section 77, 78, 306 (Proof G)"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/cache/cache.ts"
+  test_refs:
+    - "runtime/cache/__tests__/cache.test.ts"
+  proof_refs:
+    - "proofs/cache-reuse/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0037
+  title: Service / integration catalog foundation
+  description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
+  source_baseline: "BASELINE-V1 section 97, 126"
+  category: P0
+  priority: LOW
+  status: DEFINED
+  implementation_refs: []
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0038
+  title: Logging / telemetry foundation
+  description: >
+    Structured logging with the recommended field set, never logging
+    secrets or unnecessary PII.
+  source_baseline: "BASELINE-V1 section 124, 125"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/telemetry/logger.ts"
+  test_refs:
+    - "runtime/telemetry/__tests__/logger.test.ts"
+  proof_refs: []
+  security_refs:
+    - "SECURITY.md"
+
+- id: UASF-REQ-0039
+  title: Turkish source code explanation standard
+  description: >
+    Important classes/functions/security-sensitive logic carry concise
+    Turkish "why" comments, per the mandatory Turkish Source Code Explanation
+    Policy.
+  source_baseline: "BASELINE-V1 section 281, 285"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "runtime/policy-engine/policy-engine.ts"
+    - "runtime/models/router.ts"
+    - "runtime/budget/budget.ts"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+  notes: "Applied to P0 kernel modules implemented this session; broader repo-wide coverage is ongoing."
+
+- id: UASF-REQ-0040
+  title: Factory Doctor
+  description: "`factory doctor` checks Node/npm/Python/Git and reports READY/MISSING/OPTIONAL/BLOCKING/HUMAN_ACTION_REQUIRED per tool."
+  source_baseline: "BASELINE-V1 section 80"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/cli/commands/doctor.ts"
+  test_refs:
+    - "runtime/cli/__tests__/doctor.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0041
+  title: Baseline status command
+  description: "`factory baseline status` computes requirement counts by status from the requirement registry (not prose claims)."
+  source_baseline: "BASELINE-V1 section 296"
+  category: P0
+  priority: HIGH
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/cli/commands/baseline-status.ts"
+  test_refs:
+    - "runtime/cli/__tests__/baseline-status.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0042
+  title: P0 end-to-end proof
+  description: >
+    A single test run demonstrating the P0 kernel invariants together:
+    cheapest-capable routing, premium-fallback block, budget ceiling,
+    event-driven activation, and cache reuse, in one coherent scenario.
+  source_baseline: "BASELINE-V1 section 304, 305, 306"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs: []
+  test_refs:
+    - "proofs/e2e-p0-kernel/proof.test.ts"
+  proof_refs:
+    - "proofs/e2e-p0-kernel/proof.test.ts"
+  security_refs: []
