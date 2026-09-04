@@ -1,0 +1,71 @@
+# Durable session state (baseline section 277). This file lets a future
+# session resume without repeating already-completed, verified work. It
+# should be updated at the end of any session that changes the P0 kernel's
+# scope, and read at the start of the next one.
+
+factory:
+  branch: claude/ai-factory-baseline-v1-seawq7
+  phase: P0_FACTORY_KERNEL
+
+completed_milestones:
+  - Existing public repository audited (was a single-commit, one-line-README
+    repo — no secrets, no history to preserve beyond that).
+  - Baseline V1 specification preserved verbatim at
+    specification/UNIVERSAL-AI-SOFTWARE-FACTORY-BASELINE-V1.md.
+  - specification/BASELINE.md and specification/CHANGELOG.md established.
+  - Baseline Requirement Registry started for the P0 phase (42 requirements,
+    specification/requirements/P0-factory-kernel.yml), schema-validated via
+    schemas/requirement.schema.json and scripts/validate-requirements.mjs.
+  - P0 Factory Kernel implemented in TypeScript under runtime/: policy
+    engine + human approval workflow, model registry/gateway/MockProvider/
+    cheapest-capable-model router with premium-fallback blocking, cost
+    engine + budget ceilings, event bus with idle-by-default agents, cache
+    reuse layer, worker registry + smallest-sufficient-worker scheduler,
+    hash-chained audit log, secret-redacting structured logger.
+  - CLI (runtime/cli) with `doctor`, `baseline status`, `routing explain`.
+  - proofs/ directory covering the named baseline proof scenarios for cost
+    optimization (A, B, C, D, E, F, G, H, I) and human approval.
+  - Public-repository secret scanner (scripts/secret-scan.mjs, no external
+    dependency) with unit tests, wired into CI.
+  - CI workflow (.github/workflows/ci.yml): lint, typecheck, build, test,
+    requirement-schema validation, CLI smoke test, secret scan.
+  - Governance docs: README.md, CLAUDE.md, AGENTS.md, SECURITY.md,
+    CONTRIBUTING.md, CODEOWNERS, docs/beginner/repository-map-tr.md.
+
+known_limitations:
+  - Only the P0 "Factory Kernel" phase (baseline section 304) has real
+    implementation. P1 (general business platform), P2 (games/3D/AI-ML/
+    data studios), and P3 (advanced/universal operations) are not started.
+  - The requirement registry covers the P0 phase only; the full 323-section
+    baseline has not been decomposed into individually tracked requirement
+    IDs. See specification/requirements/README.md.
+  - No real model provider adapters (OpenAI/Anthropic/etc.) are implemented
+    yet — only MockProvider. This is intentional at P0 (core tests must
+    never require a paid API) but is a real gap for anything beyond testing
+    the routing/budget logic itself.
+  - Project OS / Project Genome / Discovery / Founder Decision Ledger /
+    Assumption Register / Business Capability Registry / Organization
+    Composer / Technology Registry are specified as P0 items in the
+    baseline but were NOT implemented this session — see
+    specification/requirements/P0-factory-kernel.yml (status: DEFINED for
+    these).
+  - CI pins GitHub Actions by version tag, not commit SHA (baseline section
+    287 prefers SHA pinning "where practical").
+  - No automated dependency/SBOM/SCA scanning wired into CI yet (only a
+    manual `npm audit` was run during development, which came back clean at
+    time of writing).
+  - No LICENSE file — licensing decision is explicitly
+    LICENSE_DECISION_REQUIRED (baseline section 206), pending Human Founder
+    decision.
+
+blockers: []
+
+exact_next_action: >
+  Decompose the remaining P0-listed-but-not-yet-implemented items (Project
+  OS foundation, Project Genome schema, Discovery engine, Founder Decision
+  Ledger, Assumption Register, Technology Registry, Business Capability
+  Registry, Organization Composer, Sandbox, Project Isolation) into working
+  code with tests, OR get an explicit Founder decision to treat the current
+  kernel slice as sufficient to close out P0 and move to P1. Also: obtain a
+  Founder licensing decision (baseline section 206) and consider commit-SHA
+  pinning for GitHub Actions.
