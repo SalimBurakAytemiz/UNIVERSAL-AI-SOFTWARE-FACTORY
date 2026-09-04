@@ -211,11 +211,15 @@
   source_baseline: "BASELINE-V1 section 49"
   category: P0
   priority: MEDIUM
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/requirements-traceability/traceability.ts"
+    - "runtime/cli/commands/trace-requirement.ts"
+  test_refs:
+    - "runtime/requirements-traceability/__tests__/traceability.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Detects status claims with zero backing evidence over this repository's own requirement registry (`factory trace requirement`); does not yet trace the full business->product->story->AC->architecture->implementation->test->release chain described in section 49."
 
 - id: UASF-REQ-0014
   title: Technology registry (foundation)
@@ -365,11 +369,14 @@
   source_baseline: "BASELINE-V1 section 123"
   category: P0
   priority: LOW
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/artifacts/artifact-registry.ts"
+  test_refs:
+    - "runtime/artifacts/__tests__/artifact-registry.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "In-memory registry with the section-123 artifact classes; no actual storage backend (filesystem/object store) yet."
 
 - id: UASF-REQ-0024
   title: Model gateway
@@ -580,11 +587,14 @@
   source_baseline: "BASELINE-V1 section 97, 126"
   category: P0
   priority: LOW
-  status: DEFINED
-  implementation_refs: []
-  test_refs: []
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/service-catalog/service-catalog.ts"
+  test_refs:
+    - "runtime/service-catalog/__tests__/service-catalog.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Includes findUnowned() enforcing baseline section 127 (every service should have a recorded owner); in-memory only, no real CMDB integration."
 
 - id: UASF-REQ-0038
   title: Logging / telemetry foundation

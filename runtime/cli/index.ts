@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { runDoctor } from "./commands/doctor.js";
 import { computeBaselineStatus } from "./commands/baseline-status.js";
+import { traceRequirements } from "./commands/trace-requirement.js";
 import { createDefaultModelRegistry } from "../models/registry.js";
 import { CheapestCapableModelRouter } from "../models/router.js";
 
@@ -84,18 +85,35 @@ function printRoutingExplain(): void {
   }
 }
 
+function printTraceRequirement(): void {
+  const requirementsDir = join(repoRoot, "specification", "requirements");
+  const issues = traceRequirements(requirementsDir);
+  console.log("factory trace requirement");
+  console.log("==========================");
+  if (issues.length === 0) {
+    console.log("No traceability issues found: every requirement's claimed status is backed by evidence.");
+    return;
+  }
+  for (const issue of issues) {
+    console.log(`${issue.requirementId.padEnd(16)} ${issue.status.padEnd(28)} ${issue.issue}`);
+  }
+  process.exitCode = 1;
+}
+
 function main(): void {
   const [command, subcommand] = process.argv.slice(2);
 
   if (command === "doctor") return printDoctor();
   if (command === "baseline" && subcommand === "status") return printBaselineStatus();
   if (command === "routing" && subcommand === "explain") return printRoutingExplain();
+  if (command === "trace" && subcommand === "requirement") return printTraceRequirement();
 
   console.log("Universal AI Technology Factory CLI (P0 kernel)");
   console.log("Usage:");
   console.log("  factory doctor");
   console.log("  factory baseline status");
   console.log("  factory routing explain");
+  console.log("  factory trace requirement");
   console.log("\nSee specification/requirements/README.md for what is and isn't implemented yet.");
   process.exitCode = command ? 1 : 0;
 }

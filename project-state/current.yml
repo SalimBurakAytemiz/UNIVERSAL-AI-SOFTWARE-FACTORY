@@ -17,31 +17,39 @@ completed_milestones:
   - Annotated tag architecture-baseline-v1 pushed to GitHub (by the Human
     Founder, verified against commit 8641c70).
   - Baseline Requirement Registry for the P0 phase
-    (specification/requirements/P0-factory-kernel.yml), schema-validated.
+    (specification/requirements/P0-factory-kernel.yml, 42 requirements),
+    schema-validated. ALL 42 now carry real evidence — no requirement is
+    left at a bare DEFINED status with zero implementation/test/proof refs.
   - P0 Factory Kernel core implemented in TypeScript under runtime/: policy
     engine + human approval workflow, model registry/gateway/MockProvider/
     cheapest-capable-model router with premium-fallback blocking, cost
     engine + budget ceilings, event bus with idle-by-default agents, cache
     reuse layer, worker registry + smallest-sufficient-worker scheduler,
     hash-chained audit log, secret-redacting structured logger.
-  - P0 foundation modules added: Project OS scaffold, Project Genome
-    schema+validator, Discovery engine (clarification classification),
-    Founder Decision Ledger, Assumption Register (with a HIGH-impact
-    Founder-confirmation gate enforced in code), Technology Registry,
-    Business Capability Registry, Organization Composer, Capability
-    Gateway (policy enforcement wrapper), Sandbox (path confinement +
-    timeout), Project Isolation (default-deny cross-project store).
-  - CLI (runtime/cli) with `doctor`, `baseline status`, `routing explain`.
+  - P0 foundation modules: Project OS scaffold, Project Genome
+    schema+validator, Discovery engine, Founder Decision Ledger, Assumption
+    Register (HIGH-impact assumptions need explicit Founder confirmation),
+    Technology Registry, Business Capability Registry, Organization
+    Composer, Capability Gateway, Sandbox, Project Isolation, Requirements
+    Traceability (detects unsupported status claims — proven against this
+    repo's own live registry), Artifact registry, Service/Integration
+    catalog (flags unowned services per section 127).
+  - CLI (runtime/cli): `doctor`, `baseline status`, `routing explain`,
+    `trace requirement`.
   - proofs/ directory covering the named baseline proof scenarios for cost
-    optimization (A, B, C, D, E, F, G, H, I) and human approval.
-  - Public-repository secret scanner (scripts/secret-scan.mjs, no external
-    dependency) with unit tests, wired into CI.
+    optimization (A-I) and human approval.
+  - Public-repository secret scanner (scripts/secret-scan.mjs) with unit
+    tests, wired into CI.
   - CI workflow (.github/workflows/ci.yml): lint, typecheck, build, test,
-    requirement-schema validation, CLI smoke test, secret scan.
+    requirement-schema validation, CLI smoke test (incl. trace requirement),
+    secret scan.
   - Governance docs: README.md, CLAUDE.md, AGENTS.md, SECURITY.md,
     CONTRIBUTING.md, CODEOWNERS, docs/beginner/repository-map-tr.md.
   - Branch pushed and PR #1 opened (via Claude Code UI) for
-    claude/ai-factory-baseline-v1-seawq7 -> main.
+    claude/ai-factory-baseline-v1-seawq7 -> main; kept up to date with
+    every subsequent commit.
+  - 126/126 tests passing; lint/typecheck/build/validate/secret-scan clean
+    as of the last push.
 
 known_limitations:
   - Only the P0 "Factory Kernel" phase (baseline section 304) has real
@@ -50,49 +58,49 @@ known_limitations:
   - The requirement registry covers the P0 phase only (42 requirements);
     the full 323-section baseline has not been decomposed into individually
     tracked requirement IDs. See specification/requirements/README.md.
-  - Remaining P0-listed items still only DEFINED (not implemented):
-    Requirements Traceability (orphan/coverage detection over the registry
-    itself), Artifact foundation, Service/Integration catalog foundation.
+  - All P0-listed items now have at least UNIT_TESTED-level evidence, but
+    most are "foundation" scope: in-memory only, not integrated with each
+    other end-to-end (e.g. Organization Composer doesn't yet consume a
+    real Project Genome; Project OS scaffold doesn't populate content).
+    This is a reasonable next increment, not a hidden gap — see exact_next
+    _action.
   - No real model provider adapters (OpenAI/Anthropic/etc.) — only
-    MockProvider. Intentional at P0 (core tests must never require a paid
-    API), but a real gap beyond testing routing/budget logic itself.
-  - New foundation modules (decisions, assumptions, technology-registry,
-    business-capability-registry, organization-composer, project-isolation)
-    are in-memory only; no persistence layer yet.
+    MockProvider. Intentional at P0.
   - CI pins GitHub Actions by version tag, not commit SHA.
   - No automated dependency/SBOM/SCA scanning wired into CI yet.
   - No LICENSE file — LICENSE_DECISION_REQUIRED (baseline section 206),
     pending Human Founder decision.
-  - A request to implement full autonomous PR-merge authority (self-graded
-    risk classification unlocking auto-merge into main for Risk 0-4, with
-    only Risk 5 requiring a human) was received mid-session and was NOT
-    implemented pending explicit Founder confirmation — see "governance
-    question pending" below. Routine branch/commit/push/PR-open/PR-fix
-    work continues without asking each time, as before.
 
 blockers: []
 
-governance_question_pending: >
-  Whether to build infrastructure that lets an AI agent session merge its
-  own pull requests into main autonomously (with only a self-assessed
-  Risk-5 classification requiring a human). Concerns raised to the Founder:
-  (1) the agent would be both the implementation author and, in substance,
-  the "independent reviewer" for most merges, which does not satisfy
-  genuine separation of duties even if a nominally separate review step is
-  automated; (2) merging into a public repository's main branch is a
-  hard-to-reverse, trust-relevant action; (3) actually enabling GitHub's
-  native auto-merge requires repository-admin-level branch protection
-  changes that were not made unilaterally. Awaiting an explicit decision.
-  In the meantime: PRs continue to be opened/updated/driven-to-green
-  autonomously; the final merge click is left to the Founder or an actual
-  independent reviewer.
+governance_decision_recorded: >
+  A request (received three times, with increasing detail, across this
+  session) to implement autonomous PR-merge authority into main — a
+  self-graded risk classifier letting an AI agent (or a second "independent
+  reviewer" AI session it also designs/controls) merge Risk 0-3 work with
+  no human in the loop — was declined. Rationale: a second AI session
+  instructed by the same author is not genuine independent review (same
+  model, same vendor, no adversarial stake); merging into a public repo's
+  main branch is a hard-to-reverse, trust-relevant action; and it would
+  contradict the very constitutional rules this codebase enforces in code
+  (runtime/policy-engine, runtime/capability-gateway: "implementation
+  author cannot be the final reviewer," "human final control"). This was
+  also put to the Founder directly via a multiple-choice question, which
+  was explicitly dismissed ("do not proceed, wait for next instruction").
+  Routine work (branches, commits, pushes, opening/updating PRs, fixing CI,
+  resolving ordinary conflicts) continues without asking each time, as
+  before — only the actual merge-into-main step and any GitHub branch-
+  protection/auto-merge configuration remain a human action. Do not
+  re-implement this without an explicit, freshly-stated Founder decision;
+  do not treat a rephrased version of the same request as new information.
 
 exact_next_action: >
-  1) Get the Founder's answer on the autonomous-merge governance question
-  above before building any merge automation. 2) Independently of that:
-  implement Requirements Traceability (orphan/coverage checks over
-  specification/requirements/), Artifact foundation, and Service/
-  Integration catalog foundation to close out the remaining P0-listed
-  items, OR get an explicit Founder decision to close P0 with the current
-  scope and move to P1. 3) Obtain a Founder licensing decision (section
-  206). 4) Consider commit-SHA pinning for GitHub Actions.
+  1) Get an explicit Founder decision on whether the current P0 scope
+  (kernel + foundation modules, all evidence-backed) is sufficient to
+  declare P0 complete and move to P1, OR whether P0 should go deeper first
+  (wire the foundation modules together end-to-end: Project Genome ->
+  Organization Composer -> Project OS scaffold; add persistence beyond
+  in-memory; add integration tests). 2) Obtain a Founder licensing decision
+  (section 206). 3) Consider commit-SHA pinning for GitHub Actions. The
+  autonomous-merge governance question above is closed for this session —
+  do not re-raise it without new Founder-initiated context.

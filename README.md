@@ -36,6 +36,21 @@ completion.
 - **A machine-readable requirement registry** validated against a JSON
   Schema, plus a CLI that computes baseline status from that data instead of
   asserting it in prose (`specification/requirements/`, `runtime/cli/`).
+- **Requirements traceability**: `factory trace requirement` flags any
+  requirement whose claimed status (e.g. "unit tested") has zero backing
+  evidence — checked against this repo's own registry in CI
+  (`runtime/requirements-traceability/`).
+- **Project foundations**: Project OS scaffolding, a schema-validated
+  Project Genome, a Founder Decision Ledger, an Assumption Register (a
+  HIGH-impact assumption can't be accepted without explicit Founder
+  confirmation), Technology and Business Capability registries, an
+  Organization Composer, an Artifact registry, and a Service/Integration
+  catalog (flags services with no recorded owner).
+- **A capability gateway and sandbox**: a single enforcement point that
+  never runs an action except on an ALLOW from the policy engine, plus
+  path-traversal confinement and a promise timeout helper.
+- **Project isolation**: a default-deny store so one project's data is
+  never reachable from another project's code.
 - **A public-repository secret scanner** with no external dependency,
   wired into CI (`scripts/secret-scan.mjs`).
 
@@ -49,7 +64,8 @@ yet.
 Run `npm run build && node dist/runtime/cli/index.js baseline status` for a
 live, computed answer. As of this writing:
 
-- 42 P0-scope requirements are tracked; see
+- 42 P0-scope requirements are tracked, all with real evidence (no bare
+  `DEFINED`-only items remain); see
   `specification/requirements/P0-factory-kernel.yml` for exact IDs and
   evidence (`implementation_refs` / `test_refs` / `proof_refs`).
 - The full 323-section baseline has **not** been decomposed into individual
@@ -64,6 +80,7 @@ npm run build
 node dist/runtime/cli/index.js doctor
 node dist/runtime/cli/index.js baseline status
 node dist/runtime/cli/index.js routing explain
+node dist/runtime/cli/index.js trace requirement
 ```
 
 ## Verifying it yourself

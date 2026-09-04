@@ -137,6 +137,13 @@ sistem" talebini karşılayan kısımdır.
 - **`runtime/organization-composer/`** — Proje ailesine ve gerekli
   yeteneklere göre minimum gerekli takımları, HER birinin neden
   etkinleştirildiğini kaydederek oluşturur.
+- **`runtime/requirements-traceability/`** — Gereksinim kayıt defterindeki
+  her kaydın iddia ettiği durumun (status) gerçek kanıtlarla desteklenip
+  desteklenmediğini denetler (`factory trace requirement`).
+- **`runtime/artifacts/`** — Kod, doküman, ekran görüntüsü gibi üretilen
+  çıktıların sınıflandırılmış kaydı.
+- **`runtime/service-catalog/`** — Servis/entegrasyon kaydı; sahibi
+  olmayan (owner alanı boş) servisleri tespit eder (bölüm 127).
 
 **Yanlış değiştirilirse ne etkilenebilir?** `policy-engine` veya `budget`
 içindeki bir hata, gerçek bir dağıtımda maliyet kontrolünün veya insan

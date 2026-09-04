@@ -60,6 +60,7 @@ jobs:
           node dist/runtime/cli/index.js doctor
           node dist/runtime/cli/index.js baseline status
           node dist/runtime/cli/index.js routing explain
+          node dist/runtime/cli/index.js trace requirement
 
   public-repository-security:
     name: Public repository secret hygiene
