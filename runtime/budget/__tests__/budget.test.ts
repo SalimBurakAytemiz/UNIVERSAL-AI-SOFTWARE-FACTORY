@@ -395,4 +395,76 @@ describe("BudgetGuard", () => {
       ); // would push monthly total (9 + 9 + 3 = 21) over 20
     });
   });
+
+  describe("P1 fix (5th independent review round): per-task budgets scope by projectId + taskId, not taskId alone", () => {
+    it("the SAME taskId used by two DIFFERENT projects gets independent per-task allowances", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+
+      // Project A spends its entire $1 allowance under taskId "shared-task".
+      guard.spend({ taskId: "shared-task", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 1 });
+
+      // Project B, using the SAME taskId, has its own unused $1 allowance —
+      // this must succeed, not be rejected by Project A's spend.
+      expect(() =>
+        guard.spend({ taskId: "shared-task", projectId: "project-b", provider: "mock", modelId: "m1", amountUsd: 1 })
+      ).not.toThrow();
+    });
+
+    it("spending in Project A does not consume Project B's allowance for the same taskId", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+
+      guard.spend({ taskId: "shared-task", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 0.9 });
+
+      expect(costEngine.totalFor({ taskId: "shared-task", projectId: "project-a" })).toBe(0.9);
+      expect(costEngine.totalFor({ taskId: "shared-task", projectId: "project-b" })).toBe(0);
+    });
+
+    it("the SAME project + SAME taskId still shares the intended single allowance", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+
+      guard.spend({ taskId: "t1", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+      expect(() =>
+        guard.spend({ taskId: "t1", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+      ).toThrow(BudgetExceededError); // 0.6 + 0.6 = 1.2 > 1, same project+task
+    });
+
+    it("a task budget WITHOUT projectId follows the documented global (project-agnostic) semantics", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+
+      // No projectId supplied at all — this is the intentionally-supported
+      // project-agnostic/global task budget case; it must still be
+      // enforced globally by taskId alone, exactly as before this fix.
+      guard.spend({ taskId: "global-task", provider: "mock", modelId: "m1", amountUsd: 0.7 });
+      expect(() => guard.spend({ taskId: "global-task", provider: "mock", modelId: "m1", amountUsd: 0.7 })).toThrow(
+        BudgetExceededError
+      );
+    });
+
+    it("daily/monthly/per-run budgets remain unaffected by the per-task scoping fix", () => {
+      const clock = makeClock("2026-06-01T00:00:00.000Z");
+      const costEngine = new CostEngine(clock.now);
+      const guard = new BudgetGuard(costEngine, { perRunUsd: 5, dailyUsd: 5, monthlyUsd: 10 }, clock.now);
+
+      // Two different projects, same taskId, both contribute to the SAME
+      // global perRunUsd/dailyUsd/monthlyUsd ceilings (those were never
+      // task-scoped and must stay that way).
+      guard.spend({ taskId: "shared-task", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 3 });
+      expect(() =>
+        guard.spend({ taskId: "shared-task", projectId: "project-b", provider: "mock", modelId: "m1", amountUsd: 3 })
+      ).toThrow(BudgetExceededError); // 3 + 3 = 6 > 5 perRunUsd, regardless of per-task scoping
+    });
+
+    it("invalid monetary inputs remain rejected regardless of project/task scoping", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+      expect(() =>
+        guard.spend({ taskId: "t1", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: NaN })
+      ).toThrow(InvalidMonetaryAmountError);
+      expect(costEngine.totalFor({ taskId: "t1", projectId: "project-a" })).toBe(0);
+    });
+  });
 });

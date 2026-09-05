@@ -3,7 +3,7 @@
 // (örn. `../../etc/passwd`) çıkarak dosya okuyup yazmasını veya bir işlemi
 // sonsuza kadar çalışır bırakmasını engelleyen minimum korumadır.
 
-import { existsSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve, sep } from "node:path";
 
 export class PathEscapeError extends Error {
@@ -37,31 +37,64 @@ export function assertWithinRoot(root: string, target: string): string {
 }
 
 /**
- * `path`'in en yakın VAR OLAN atasının GERÇEK (symlink'ler çözülmüş)
- * halini bulur ve henüz var olmayan kalan alt yolu (hiçbir zaman bir
- * symlink olamaz, çünkü henüz yaratılmadı) buna ekler. `path`'in kendisi
- * zaten varsa (bir symlink olsa bile), doğrudan onun gerçek karşılığını
- * döndürür — `realpathSync` sembolik bağ zincirlerini (iç içe olanlar
- * dahil) tam olarak çözer.
+ * `path`'in en yakın VAR OLAN atasının GERÇEK (symlink'ler çözülmüş) halini
+ * bulur ve henüz var olmayan kalan alt yolu (hiçbir zaman bir symlink
+ * olamaz, çünkü henüz yaratılmadı) buna ekler.
+ *
+ * P1 fix (5th independent review round, "final-destination / dangling
+ * symlink escape"): eskiden bu döngü `existsSync()` ile "bu seviyede bir
+ * şey var mı?" sorusunu soruyordu. `existsSync()`, bir symlink'i ÇÖZER —
+ * SARKAN (dangling, hedefi var olmayan) bir symlink için `existsSync`
+ * `false` döner, tıpkı orada HİÇBİR ŞEY yokmuş gibi. Bu, gerçek bir
+ * saldırı yüzeyiydi: `baseDir/proj` sarkan bir symlink ise (ör.
+ * `/nowhere/outside`'a işaret ediyorsa), eski kod bunu "henüz
+ * oluşturulmamış, güvenle yaratılabilir bir yol" sanıp üstüne atlıyor ve
+ * `baseDir` içindeymiş gibi GEÇERLİ sayıyordu — oysa `fs.writeFileSync`
+ * gibi bir işlem, sarkan bir symlink'in üzerine YAZARKEN o symlink'i
+ * TAKİP EDER ve dosyayı symlink'in GERÇEKTE işaret ettiği (dışarıdaki)
+ * konumda oluşturur. Artık her seviyede `lstatSync` kullanılır — bu,
+ * symlink'i ÇÖZMEZ, yalnızca "bu TAM yolda bir dosya sistemi girdisi
+ * (inode) var mı?" sorusuna cevap verir (var olsun ya da olmasın bir
+ * symlink dahil). Bir girdi VARSA (gerçek dosya/klasör YA DA bir symlink,
+ * sarkan olsun olmasın), `realpathSync` ile çözülmeye ÇALIŞILIR:
+ * başarılıysa gerçek hedef kullanılır (var olan davranış); BAŞARISIZ
+ * olursa (yalnızca sarkan bir symlink'te olur — lstat bir şey görüyor ama
+ * stat/realpath hedefi bulamıyor) bu asla "henüz yok" ile karıştırılmaz —
+ * doğrudan fail-closed (PathEscapeError) olunur.
  */
 function canonicalizeNearestExisting(path: string): string {
-  let ancestor = path;
+  let current = path;
   const pendingSuffix: string[] = [];
 
-  while (!existsSync(ancestor)) {
-    const parent = dirname(ancestor);
-    if (parent === ancestor) {
+  for (;;) {
+    let exists = true;
+    try {
+      lstatSync(current); // symlink'i ÇÖZMEZ — sadece bu tam yolda bir girdi olup olmadığını söyler
+    } catch {
+      exists = false;
+    }
+
+    if (exists) {
+      try {
+        const real = realpathSync(current); // gerçek dosya/klasör YA DA çözülebilen bir symlink
+        return pendingSuffix.length > 0 ? resolve(real, ...pendingSuffix) : real;
+      } catch {
+        // lstat bir girdi gördü ama realpath çözemedi -> SARKAN bir symlink.
+        // Bu, "henüz yok, güvenle oluşturulabilir" ile ASLA eşdeğer değildir.
+        throw new PathEscapeError(path, current);
+      }
+    }
+
+    const parent = dirname(current);
+    if (parent === current) {
       // Dosya sisteminin köküne kadar hiçbir şey bulunamadı — gerçek
       // (canonical) bir temel olmadan güvenli bir karşılaştırma
       // yapılamaz; fail closed.
       throw new PathEscapeError(path, path);
     }
-    pendingSuffix.unshift(basename(ancestor));
-    ancestor = parent;
+    pendingSuffix.unshift(basename(current));
+    current = parent;
   }
-
-  const realAncestor = realpathSync(ancestor);
-  return pendingSuffix.length > 0 ? resolve(realAncestor, ...pendingSuffix) : realAncestor;
 }
 
 /**
@@ -79,13 +112,22 @@ function canonicalizeNearestExisting(path: string): string {
  * yolu döndürür (çağıran, doğrulanmış olan bu yol altında güvenle
  * mkdir/write yapabilir).
  *
- * BİLİNEN SINIRLAMA (dürüstçe belgelenir): bu, "kontrol et sonra kullan"
- * (TOCTOU) desenidir — bu fonksiyonun döndüğü an ile çağıranın gerçek
- * dosya sistemi mutasyonunu yaptığı an arasında, teorik olarak bir
- * yarış-koşulu saldırganı bir symlink değiştirebilir. Node.js'in taşınabilir
- * (cross-platform) fs API'si atomik "sembolik bağları asla takip etme"
- * bayrakları (ör. Linux'a özgü openat2 RESOLVE_NO_SYMLINKS) sunmaz; P0
- * kapsamında bu kabul edilen bir kalıntı risktir, gizlenmemiştir.
+ * BİLİNEN SINIRLAMA (dürüstçe belgelenir — 5th independent review round'da
+ * netleştirildi): bu, "kontrol et sonra kullan" (TOCTOU) desenidir — bu
+ * fonksiyonun döndüğü an ile çağıranın gerçek dosya sistemi mutasyonunu
+ * yaptığı an arasında, bir yarış-koşulu bir symlink değiştirebilir. Node.js'in
+ * taşınabilir (cross-platform) fs API'si atomik "sembolik bağları asla takip
+ * etme" bayrakları (ör. Linux'a özgü openat2 RESOLVE_NO_SYMLINKS) sunmaz.
+ *
+ * Bu, YALNIZCA "kapsamı sınırlı, GÜVENİLİR (hostile olmayan) dosya sistemi
+ * yazıcılarına sahip bir P0 prototipi" için kabul edilebilir bir kalıntı
+ * risktir. Bu fonksiyon, DÜŞMANCA/EŞ ZAMANLI bir yazıcıya (ör. aynı ana
+ * makinede çalışan, kötü niyetli, sürekli symlink değiştiren başka bir
+ * süreç) karşı izolasyon SAĞLADIĞINI ASLA İDDİA ETMEZ — sağladığı garanti,
+ * kontrol anında mevcut olan (var olan veya SARKAN/dangling) her türlü
+ * symlink/junction yönlendirmesinin doğru şekilde tespit edilip
+ * reddedilmesidir (yarış koşulu olmaksızın tekrarlanabilir kaçışlar
+ * kapatılmıştır), atomik bir syscall garantisi değil.
  */
 export function assertFilesystemConfinement(root: string, target: string): string {
   const resolvedTarget = assertWithinRoot(root, target); // ucuz, sözdizimsel ön-kontrol (fail-fast)

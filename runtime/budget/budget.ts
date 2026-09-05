@@ -110,14 +110,34 @@ export class BudgetGuard {
     return freezeRecord({ ...this.limits });
   }
 
+  /**
+   * P1 fix (5th independent review round, "per-task budgets mix
+   * projects"): perTaskUsd eskiden yalnızca `taskId`'ye göre kapsamlanıyordu
+   * — Codex, aynı `taskId`'yi kullanan İKİ FARKLI projenin (ör. genel bir
+   * "bootstrap" görev şablonu) aynı $X tavanını PAYLAŞTIĞINI gösterdi:
+   * Proje A kendi $1'lık tavanını harcadığında, Proje B'nin kendi ayrı ve
+   * hiç kullanılmamış $1'lık tavanı da BOŞ YERE reddediliyordu.
+   *
+   * Kapsamlama semantiği (bölüm 70-72), artık AÇIKÇA şu şekilde
+   * tanımlanır: bir `projectId` VERİLMİŞSE, görev bütçesi anahtarı
+   * `projectId + taskId`'dir (aynı projedeki aynı görev tekrar tekrar
+   * kullanılabilir/paylaşılabilir, ama FARKLI projeler asla aynı tavanı
+   * paylaşmaz). `projectId` verilMEMİŞSE (ör. proje-bağımsız bir arka
+   * plan/altyapı görevi), tavan KASITLI OLARAK global kalır — yalnızca
+   * `taskId`'ye göre kapsamlanır — çünkü bu, mevcut sözleşmenin
+   * (`spend()` her zaman `projectId` geçmek ZORUNDA değildir) desteklediği
+   * meşru bir kullanım şeklidir.
+   */
   private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {
     const checks: CeilingCheck[] = [];
 
     if (this.limits.perTaskUsd !== undefined && scope.taskId !== undefined) {
+      const taskScope: CostScope =
+        scope.projectId !== undefined ? { taskId: scope.taskId, projectId: scope.projectId } : { taskId: scope.taskId };
       checks.push({
         ceiling: "perTaskUsd",
         limit: this.limits.perTaskUsd,
-        projected: this.costEngine.totalFor({ taskId: scope.taskId }) + projectedAmountUsd
+        projected: this.costEngine.totalFor(taskScope) + projectedAmountUsd
       });
     }
 

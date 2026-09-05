@@ -200,6 +200,46 @@
     RESOLVE_NO_SYMLINKS, so a symlink swapped in the narrow window between
     the check and the actual mkdirSync is a residual, accepted risk at P0.
 
+    P1 fix (5th independent review round, "final-destination / dangling
+    symlink escape"): Codex found two remaining, no-race-required gaps.
+    (1) The round-4 canonicalization walked ancestors using `existsSync()`,
+    which FOLLOWS symlinks — for a DANGLING symlink (target does not
+    exist), `existsSync()` returns false, indistinguishable from "nothing
+    here yet." The old code treated a dangling symlink exactly like an
+    empty, safely-creatable path, so it was never even inspected — but
+    `fs.writeFileSync` on a dangling symlink FOLLOWS it and creates the
+    file at the symlink's real (possibly outside-baseDir) target. Fixed in
+    canonicalizeNearestExisting() (runtime/sandbox/sandbox.ts, see
+    UASF-REQ-0033): every level is now checked with `lstatSync` (does NOT
+    follow symlinks — answers "is there literally an entry here," dangling
+    or not) before attempting `realpathSync`; if lstat finds something but
+    realpath cannot resolve it (only possible for a dangling symlink), this
+    now fails closed instead of being silently treated as "not yet
+    created." (2) orchestrator.ts's three stateStore.write() calls used
+    plain `join()` with NO confinement check on the final file path at all
+    — even a scaffold-confined project root could have its
+    genome.json/organization.json/bootstrap.json final filename replaced by
+    an attacker (or a stale artifact) with a real or dangling symlink
+    before the write. Fixed: each of those three paths is now resolved via
+    assertFilesystemConfinement(scaffold.projectRoot, ...) immediately
+    before the write. Regression tests using REAL temporary directories and
+    real (existing and dangling) symlinks prove: a dangling symlink at the
+    final destination is blocked, a dangling symlink used as an
+    intermediate/parent component is blocked, an existing final-FILE
+    symlink is blocked, a dangling final-FILE symlink is blocked, nothing
+    outside baseDir is created in any case, and a full end-to-end
+    bootstrapProject() test proves a dangling symlink planted at the exact
+    state-file path (replacing a real file from a prior legitimate
+    bootstrap) is rejected rather than followed on a second, idempotent
+    bootstrap call. Confirmed via git-stash that these tests fail against
+    the pre-fix (round-4) code — the pre-fix orchestrator.ts genuinely
+    resolved the bootstrapProject() promise instead of rejecting, meaning
+    it silently followed the dangling symlink. Codex's instruction is
+    followed exactly: the documented TOCTOU residual limitation is honest
+    and unchanged (this fix closes the reproducible, no-race escape; it
+    does not and cannot claim protection against a hostile, concurrently
+    racing filesystem writer, which is out of scope for this P0 prototype).
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -277,6 +317,31 @@
     prove a mutation attempt on a returned decision throws (frozen) and never
     changes what get() subsequently returns. Confirmed via git-stash that
     these tests fail against the pre-fix code.
+
+    P1 fix (5th independent review round, "repeated supersession corrupts
+    decision history"): supersede() never checked that `oldDecisionId`'s
+    CURRENT status was ACTIVE before transitioning it. Codex reproduced
+    `A -> B` followed by `A -> C`: the second call created a brand-new C
+    record (status ACTIVE, via record()) and silently overwrote A's
+    `supersededBy` from B to C — leaving BOTH B and C simultaneously
+    ACTIVE, each implicitly claiming to be "the" current replacement for A,
+    corrupting the "exactly one current decision" invariant. Fixed:
+    supersede() now throws a new DecisionAlreadySupersededError (naming the
+    decision's actual current status and existing supersededBy) BEFORE any
+    mutation or new record is created, unless `oldDecisionId` is currently
+    ACTIVE. A decision can only evolve by superseding its CURRENT active
+    replacement (A -> B -> C), never by re-replacing an already-superseded
+    decision (A -> B and A -> C, branching) — the spec does not define
+    branching, so this is never silently allowed. Regression tests prove:
+    A -> B works, a second A -> C is rejected, the original A -> B link
+    survives the rejected attempt unchanged, B remains the sole ACTIVE
+    decision throughout, B -> C (evolving the current decision) works,
+    the resulting A -> B -> C chain has exactly one ACTIVE decision (C),
+    the rejected supersession creates no partial record (id "c" is never
+    recorded at all when the first attempt used that id), and the error
+    message reports the decision's real current state. Confirmed via
+    git-stash that 5 of these tests fail against the pre-fix code with
+    exactly the branching corruption Codex described.
 
 - id: UASF-REQ-0011
   title: Assumption register
@@ -910,6 +975,27 @@
     enforcement still works end-to-end after the fix. Confirmed via
     git-stash that these tests fail on the pre-fix code.
 
+    P1 fix (5th independent review round, "per-task budgets mix
+    projects"): buildCeilingChecks()'s perTaskUsd check scoped ONLY by
+    `taskId` — Codex reproduced two DIFFERENT projects using the same
+    `taskId` (e.g. a shared "bootstrap" task template) sharing a single
+    perTaskUsd ceiling: Project A spending its full allowance caused
+    Project B's own, separate, unused allowance to be wrongly rejected.
+    Scoping semantics are now explicit and documented in code: when
+    `projectId` is present on the scope, the task-budget key is
+    `projectId + taskId` (matching bölüm 70-72's per-project/per-task
+    ceilings); when `projectId` is absent, the ceiling remains
+    intentionally GLOBAL by `taskId` alone, preserving the existing,
+    legitimate project-agnostic task-budget use case. Regression tests
+    prove: the same taskId in two different projects gets independent
+    allowances, spending in Project A does not consume Project B's
+    allowance, the same project+taskId still shares one allowance,
+    project-less task budgets keep their documented global semantics,
+    daily/monthly/per-run budgets (never task-scoped) are unaffected, and
+    invalid monetary inputs are still rejected regardless of scoping.
+    Confirmed via git-stash that the "independent allowances" test fails
+    against the pre-fix code with the exact reproduction Codex described.
+
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
   description: Register worker classes (linux-general, gpu, macos, ...) with capability metadata; select smallest sufficient worker.
@@ -1004,6 +1090,33 @@
     ALONE is fooled by a symlink that assertFilesystemConfinement()
     correctly catches. See UASF-REQ-0007 for the TOCTOU limitation this
     honestly documents rather than hides.
+
+    P1 fix (5th independent review round, "final-destination / dangling
+    symlink escape"): the round-4 canonicalizeNearestExisting() helper used
+    `existsSync()` to decide whether a path component existed —
+    `existsSync()` FOLLOWS symlinks and returns false for a DANGLING one
+    (target does not exist), so a dangling symlink was silently treated as
+    "not created yet, safe to write through," exactly the case
+    `fs.writeFileSync` actually follows and creates a new file at. Fixed:
+    every level is now checked with `lstatSync` (never follows symlinks —
+    detects the presence of an entry regardless of whether it's dangling)
+    before `realpathSync` is attempted; if lstat finds an entry but
+    realpath cannot resolve it (the defining signature of a dangling
+    symlink), this now fails closed (PathEscapeError) instead of being
+    treated as absent. Also strengthened the doc comment on
+    assertFilesystemConfinement() per explicit review instruction: it now
+    states plainly that the documented TOCTOU residual risk is acceptable
+    ONLY for a scoped P0 prototype with trusted filesystem writers, and
+    does NOT claim protection against a hostile, concurrently-racing
+    writer. Regression tests using real temporary directories and real
+    (existing and dangling) symlinks prove: a dangling symlink at the final
+    destination is blocked, a dangling symlink as an intermediate/parent
+    component is blocked, an existing final-FILE symlink is blocked, a
+    dangling final-FILE symlink is blocked (with the outside target
+    confirmed never created), no partial/unsafe state is left behind on
+    rejection, and normal (non-symlink) project creation still succeeds.
+    Confirmed via git-stash that these tests fail against the pre-fix
+    (existsSync-based) code.
 
 - id: UASF-REQ-0034
   title: Project isolation (foundation)

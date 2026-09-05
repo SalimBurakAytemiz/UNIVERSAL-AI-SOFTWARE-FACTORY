@@ -10,7 +10,7 @@ factory:
   p0_status: >
     NOT complete. Explicit Founder instruction: do not move to P1, do not
     mark P0 complete, until an independent review finds no blocking P0
-    finding. Four independent Codex review rounds so far: round 1 found 4
+    finding. Five independent Codex review rounds so far: round 1 found 4
     blocking findings (all fixed, confirmed fixed by round 2); round 2 found
     4 NEW findings — 1 BLOCKER, 3 P2 (all fixed, confirmed fixed by round 3);
     round 3 found 3 NEW P1 findings, all in the same "internal mutable state
@@ -19,10 +19,16 @@ factory:
     8); round 4 found the SAME vulnerability class was not yet fully closed
     in 3 more specific ways (limits ownership, symlink-based filesystem
     escape, audit payload deep-mutability), plus asked for one more targeted
-    ownership audit. All 3 named findings, PLUS 4 more instances found during
-    that audit, are fixed in this session (see below), fully verified, and
-    pushed for a fifth re-review. P0 remains open until that re-review comes
-    back clean.
+    ownership audit that found 4 more instances (all 7 fixed, confirmed
+    fixed by round 5); round 5 confirmed all prior fixes but found 3 NEW
+    blocking issues in 3 DIFFERENT bug classes (a dangling/final-destination
+    symlink gap the round-4 fix missed, a budget scope collision across
+    projects sharing a taskId, and a decision-ledger repeated-supersession
+    history corruption), plus a narrow targeted audit for those same 3
+    classes. All 3 named findings are fixed in this session (see below), no
+    further instances of those 3 exact classes were found elsewhere, fully
+    verified, and pushed for a sixth re-review. P0 remains open until that
+    re-review comes back clean.
 
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
@@ -397,6 +403,111 @@ completed_milestones:
     orchestrator/scaffold + audit-log) confirmed via git-stash to have
     failing regression tests against its pre-fix code, then passing again
     with the fix restored.
+  - |-
+    THIS SESSION (round 5) — a fifth independent Codex review confirmed all
+    prior fixes (ownership, budget-limit, audit-payload, registry, policy,
+    cache, approval, existing-directory symlink), then found 3 NEW blocking
+    issues, each in a DIFFERENT bug class from the "mutable state" theme of
+    rounds 3-4:
+    - [BLOCKER] "Final-destination / dangling symlink escape": the round-4
+      symlink-confinement fix (canonicalizeNearestExisting) used
+      `existsSync()` to walk path ancestors — `existsSync()` FOLLOWS
+      symlinks and returns false for a DANGLING one (target does not
+      exist), so a dangling symlink was silently treated as "nothing here
+      yet, safe to write through." But `fs.writeFileSync` on a dangling
+      symlink FOLLOWS it and creates the file at the symlink's real
+      (possibly outside-baseDir) target — no race required, fully
+      reproducible. Separately, orchestrator.ts's three
+      stateStore.write() calls (genome.json, organization.json,
+      bootstrap.json) used plain `join()` with NO confinement check on the
+      final file path at all, even though scaffoldProjectOs() confined the
+      directories around them. Fixed: canonicalizeNearestExisting() now
+      uses `lstatSync` (never follows symlinks) to detect an entry's mere
+      presence at each level, then attempts `realpathSync`; if lstat finds
+      something but realpath cannot resolve it (only possible for a
+      dangling symlink), this now fails closed instead of being treated as
+      absent. orchestrator.ts's three file writes are now each individually
+      confined via assertFilesystemConfinement() immediately before the
+      write. Regression tests use real temporary directories and real
+      (existing and dangling) symlinks: dangling symlink at the final
+      destination blocked, dangling symlink as an intermediate/parent
+      component blocked, existing final-FILE symlink blocked, dangling
+      final-FILE symlink blocked (outside target confirmed never created),
+      no partial state left on rejection, normal creation still works, and
+      a full bootstrapProject() end-to-end test proves a dangling symlink
+      planted at the exact state-file path (replacing a real file from a
+      prior legitimate bootstrap) is rejected on a second, idempotent
+      bootstrap rather than followed. Confirmed via git-stash that these
+      tests fail against the pre-fix code — the pre-fix orchestrator.ts
+      genuinely resolved (did not reject) the bootstrapProject() promise,
+      meaning it silently followed the dangling symlink. Per Codex's
+      explicit instruction, the documented TOCTOU residual-risk language
+      was strengthened to state plainly that this fix closes the
+      reproducible no-race escape only, and does NOT claim protection
+      against a hostile, concurrently-racing filesystem writer.
+    - [P1] "Per-task budgets mix projects": BudgetGuard's perTaskUsd check
+      scoped only by `taskId` — two DIFFERENT projects reusing the same
+      taskId (e.g. a shared "bootstrap" task template) shared a single
+      ceiling: Project A spending its full $1 allowance caused Project B's
+      own, separate, unused $1 allowance to be wrongly rejected. Fixed and
+      explicitly documented in code: when `projectId` is present, the
+      task-budget key is `projectId + taskId`; when absent, the ceiling
+      remains intentionally global by `taskId` alone (a legitimate,
+      already-supported project-agnostic use case that must not break).
+      Regression tests prove independent per-project allowances for a
+      shared taskId, no cross-project consumption, same-project+task
+      sharing still works, project-less global semantics are preserved,
+      daily/monthly/per-run budgets are unaffected, and invalid monetary
+      inputs are still rejected. Confirmed via git-stash with the exact
+      reproduction Codex described.
+    - [P1] "Repeated supersession corrupts decision history": supersede()
+      never checked that the decision being superseded was currently
+      ACTIVE. `A -> B` then `A -> C` created a new C record (ACTIVE) and
+      silently overwrote A's supersededBy from B to C, leaving BOTH B and
+      C simultaneously ACTIVE — corrupting "exactly one current decision"
+      history integrity. Fixed: supersede() now throws a new
+      DecisionAlreadySupersededError (naming the actual current status and
+      existing supersededBy) before any mutation or new record is created,
+      unless the decision being superseded is ACTIVE; evolution must go
+      through the current active decision (A -> B -> C), never branch
+      (A -> B and A -> C). Regression tests prove A -> B works, a second
+      A -> C is rejected, the A -> B link survives unchanged, B stays the
+      sole ACTIVE decision, B -> C works, the resulting A -> B -> C chain
+      has exactly one ACTIVE decision, the rejected attempt creates no
+      partial record, and the error reports the real current state.
+      Confirmed via git-stash (5 tests failed on pre-fix code).
+    - Targeted audit (as explicitly requested, narrow — only these 3
+      classes): reviewed service-catalog.ts's updateStatus() (open-ended
+      health toggling, no terminal/ordering invariant — not applicable),
+      workers/registry.ts (no status-update method exists at all — not
+      applicable), assumption-register.ts's accept()/reject()/validate()
+      (no current-status guard exists, but unlike decision-ledger there is
+      no explicit baseline-documented "never overwrite, only supersede"
+      invariant governing assumption transitions, and no branching/
+      multiple-simultaneous-terminal-state risk since these methods flip
+      one record's status rather than creating replacement records —
+      deliberately left unchanged rather than inventing an unspecified
+      lifecycle-ordering rule), and confirmed the file-writing surface is
+      exactly 4 files (sandbox.ts, scaffold.ts, orchestrator.ts,
+      file-store.ts), all of which route through the now-fixed
+      confinement primitive except FileStateStore itself (intentionally
+      root-agnostic/generic; every current caller confines its own paths
+      before calling it). No further genuine instance of these 3 exact
+      classes was found. This scoping decision is recorded here so a
+      future session does not re-litigate it without new evidence.
+  - >-
+    Requirement registry updated a fifth time from this round's real
+    evidence: UASF-REQ-0007 (orchestrator — dangling-symlink final-file
+    confinement), UASF-REQ-0033 (Sandbox — lstat/realpath dangling-symlink
+    fix), UASF-REQ-0030 (Budget — per-task projectId+taskId scoping),
+    UASF-REQ-0010 (Decision ledger — supersession-from-ACTIVE-only guard).
+    No status raised beyond what a real test/proof supports.
+  - 306/306 tests passing (up from 285 before this round, +21 net new
+    across 4 fixed files); lint/typecheck/build/validate-requirements/
+    secret-scan (history-aware) all clean; every one of the 3 fixes (plus
+    the orchestrator integration-level dangling-symlink test) confirmed via
+    git-stash to have failing regression tests against its pre-fix code,
+    then passing again with the fix restored.
 
 known_limitations:
   - >-
@@ -424,17 +535,17 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting a FIFTH independent (Codex) re-review of the pushed fixes
-    (round 4's 3 new P1 findings — budget limits ownership, symlink
-    filesystem escape, audit payload deep-mutability — plus 4 more
-    instances of the same vulnerability class found during the requested
-    targeted follow-up ownership audit, are now fixed, tested, and
-    verified per the full required sequence: lint, typecheck, build,
-    285/285 tests, validate:requirements, history-aware secret-scan, all
-    P0 proofs). Per explicit instruction: "stop at the independent-review
-    boundary" — do not push further P0 feature work, and do not declare
-    P0 complete, until that re-review confirms no blocking finding
-    remains.
+    Awaiting a SIXTH independent (Codex) re-review of the pushed fixes
+    (round 5's 3 new findings — a dangling/final-destination symlink gap,
+    a per-task budget scope collision across projects, and a
+    decision-ledger repeated-supersession history corruption — are now
+    fixed, tested, and verified per the full required sequence: lint,
+    typecheck, build, 306/306 tests, validate:requirements, history-aware
+    secret-scan, all P0 proofs; a narrow targeted audit for those same 3
+    bug classes found no further instances elsewhere). Per explicit
+    instruction: "stop at the independent-review boundary" — do not push
+    further P0 feature work, and do not declare P0 complete, until that
+    re-review confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -453,22 +564,24 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 4's 3 P1 Codex findings (budget/limits ownership,
-  symlink-based filesystem escape, audit payload deep-mutability), plus 4
-  more instances of the same vulnerability class found during the
-  requested targeted follow-up ownership audit (models/registry.ts,
-  technology-registry, business-capability-registry, artifact-registry),
-  are implemented, tested, and pushed, with the full required verification
-  sequence run clean (lint, typecheck, build, 285/285 tests,
-  validate:requirements, history-aware secret-scan, all P0 proofs). Every
-  fix was individually confirmed via git-stash to have failing regression
-  tests against its pre-fix code. Do not proceed to further P0 feature work
-  or declare P0 complete until an independent (Codex) re-review of this
-  diff confirms no blocking P0 finding remains. If/when that comes back
-  clean, resume from the prior exact_next_action: wire the remaining
-  foundation modules (Discovery, Decisions, Assumptions,
-  Technology/Business-Capability registries) into the same integrated
-  pipeline, consider a SQLite-backed
-  StateStore, get a Founder decision on P0-sufficiency and licensing
-  (section 206). The autonomous-merge governance question stays closed
-  absent new Founder-initiated context.
+  fixes for round 5's 3 findings (dangling/final-destination symlink escape
+  via lstat/realpath in canonicalizeNearestExisting plus per-file
+  confinement in orchestrator.ts's stateStore.write() calls; per-task
+  budget scoping by projectId+taskId; decision-ledger supersede()
+  requiring the old decision to be ACTIVE) are implemented, tested, and
+  pushed, with the full required verification sequence run clean (lint,
+  typecheck, build, 306/306 tests, validate:requirements, history-aware
+  secret-scan, all P0 proofs). A narrow targeted audit for those same 3 bug
+  classes (not a broad refactor) found no further genuine instances
+  elsewhere — see completed_milestones for exactly what was reviewed and
+  why each was left unchanged. Every fix was individually confirmed via
+  git-stash to have failing regression tests against its pre-fix code. Do
+  not proceed to further P0 feature work or declare P0 complete until an
+  independent (Codex) re-review of this diff confirms no blocking P0
+  finding remains. If/when that comes back clean, resume from the prior
+  exact_next_action: wire the remaining foundation modules (Discovery,
+  Decisions, Assumptions, Technology/Business-Capability registries) into
+  the same integrated pipeline, consider a SQLite-backed StateStore, get a
+  Founder decision on P0-sufficiency and licensing (section 206). The
+  autonomous-merge governance question stays closed absent new
+  Founder-initiated context.

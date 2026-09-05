@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { bootstrapProject, PreflightTraceabilityFailedError } from "../orchestrator.js";
@@ -303,6 +303,53 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       ).rejects.toThrow(PathEscapeError);
 
       expect(readdirSync(outside)).toHaveLength(0); // nothing was scaffolded into the real target
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    it("P1 fix (5th independent review round): a pre-planted dangling symlink at the final state-file destination is blocked, not followed", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const outside = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-outside-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      // First, a completely legitimate bootstrap — this is what creates the
+      // real "state" directory that a later attacker could target.
+      const first = await bootstrapProject({
+        genomeCandidate: validGenome("reused-project"),
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+
+      // Attacker (or a prior compromised run) now REPLACES the real file
+      // the first bootstrap just wrote with a DANGLING symlink at that
+      // exact path, pointing at a location outside baseDir that has never
+      // been created.
+      const outsideNeverCreated = join(outside, "exfiltrated-state.json");
+      unlinkSync(first.statePath); // remove the real file so the symlink can take its place
+      let symlinkSupported = true;
+      try {
+        symlinkSync(outsideNeverCreated, first.statePath);
+      } catch {
+        symlinkSupported = false;
+      }
+      if (!symlinkSupported) {
+        rmSync(outside, { recursive: true, force: true });
+        return;
+      }
+
+      // A second, idempotent bootstrap of the SAME project must not follow
+      // that dangling symlink and write outside baseDir.
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("reused-project"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(PathEscapeError);
+
+      expect(existsSync(outsideNeverCreated)).toBe(false); // never followed/created
       rmSync(outside, { recursive: true, force: true });
     });
   });

@@ -115,11 +115,27 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     amountUsd: modelDecision.model.costPerCall
   });
 
+  // P1 fix (5th independent review round, "final-destination / dangling
+  // symlink escape"): eskiden bu dosya yolları düz `join()` ile
+  // oluşturuluyordu — scaffoldProjectOs() klasörleri onaylasa bile, bu
+  // klasörlerin İÇİNDEKİ NİHAİ dosya adı (ör. "genome.json") daha önce
+  // (veya scaffold ile yazma arasında) saldırgan tarafından dışarıya
+  // işaret eden bir symlink (sarkan/dangling olsun olmasın) olarak
+  // yerleştirilmiş olabilirdi — `writeFileSync` böyle bir symlink'i takip
+  // eder ve dosyayı GERÇEKTEN symlink'in işaret ettiği (baseDir dışı)
+  // konumda oluşturur. Artık her nihai dosya yolu, gerçek yazmadan HEMEN
+  // önce assertFilesystemConfinement() ile ayrıca doğrulanır.
   const stateStore = input.stateStore ?? new FileStateStore();
-  stateStore.write(join(scaffold.projectRoot, "project-genome", "genome.json"), genome);
-  stateStore.write(join(scaffold.projectRoot, "organization", "organization.json"), organization);
+  stateStore.write(
+    assertFilesystemConfinement(scaffold.projectRoot, join("project-genome", "genome.json")),
+    genome
+  );
+  stateStore.write(
+    assertFilesystemConfinement(scaffold.projectRoot, join("organization", "organization.json")),
+    organization
+  );
 
-  const statePath = join(scaffold.projectRoot, "state", "bootstrap.json");
+  const statePath = assertFilesystemConfinement(scaffold.projectRoot, join("state", "bootstrap.json"));
   const totalCostUsd = costEngine.totalFor({ projectId: genome.project.id });
   stateStore.write(statePath, {
     bootstrappedAt: new Date().toISOString(),

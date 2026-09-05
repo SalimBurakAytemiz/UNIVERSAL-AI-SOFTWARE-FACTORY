@@ -37,6 +37,18 @@ export class DecisionNotFoundError extends Error {
   }
 }
 
+export class DecisionAlreadySupersededError extends Error {
+  constructor(decisionId: string, currentStatus: FounderDecisionStatus, supersededBy: string | undefined) {
+    super(
+      `Cannot supersede decision '${decisionId}': its current status is ${currentStatus}` +
+        (supersededBy ? ` (already superseded by '${supersededBy}')` : "") +
+        `. A decision may only be superseded once, from ACTIVE. Evolve the CURRENT active ` +
+        `replacement instead (A -> B -> C), never re-replace A directly (A -> B and A -> C).`
+    );
+    this.name = "DecisionAlreadySupersededError";
+  }
+}
+
 export class FounderDecisionLedger {
   private readonly decisions = new Map<string, MutableFounderDecision>();
 
@@ -73,10 +85,29 @@ export class FounderDecisionLedger {
    * Eski kararı SUPERSEDED yapar (asla silmez) ve yeni kararı kaydeder.
    * Bu, "changed decisions trigger impact analysis" gereksinimi için geçmiş
    * karar zincirinin her zaman izlenebilir kalmasını sağlar.
+   *
+   * P1 fix (5th independent review round, "repeated supersession corrupts
+   * decision history"): eskiden bu, `oldDecisionId`'nin GEÇERLİ durumunu
+   * hiç kontrol etmiyordu — `A -> B` çağrısından sonra tekrar `A -> C`
+   * çağrılırsa, `record()` YENİ bir C kaydı (status: ACTIVE) oluşturuyor
+   * ve `old.supersededBy`'yi B'den C'ye SESSİZCE ÜZERİNE YAZIYORDU; B
+   * kaydı ise hâlâ ACTIVE kalıyordu (hiç dokunulmamıştı) — sonuçta hem B
+   * hem C "A'nın aktif yerine geçeni" iddiasında bulunan, ikisi de ACTIVE
+   * durumda iki kayıt oluşuyordu. Bu, "hangi karar şu an yürürlükte?"
+   * sorusunun asla iki farklı cevabı olamayacağı değişmezini bozar. Artık:
+   * `oldDecisionId`'nin durumu ACTIVE DEĞİLSE (zaten SUPERSEDED ise),
+   * HİÇBİR mutasyon yapılmadan (yeni kayıt oluşturulmadan ÖNCE)
+   * DecisionAlreadySupersededError ile fail-closed olunur. Bir kararın
+   * evrimi yalnızca `A -> B -> C` şeklinde (B'yi supersede ederek) mümkündür
+   * — `A -> B` ve `A -> C` (dallanma) şeklinde DEĞİL; bu şema, dallanmayı
+   * açıkça TANIMLAMADIĞI sürece asla sessizce buna izin vermez.
    */
   supersede(oldDecisionId: string, newDecisionId: string, decision: string, source: string): FounderDecision {
     const old = this.decisions.get(oldDecisionId);
     if (!old) throw new DecisionNotFoundError(oldDecisionId);
+    if (old.status !== "ACTIVE") {
+      throw new DecisionAlreadySupersededError(oldDecisionId, old.status, old.supersededBy);
+    }
 
     const replacement = this.record(newDecisionId, old.project, decision, source);
     old.status = "SUPERSEDED";

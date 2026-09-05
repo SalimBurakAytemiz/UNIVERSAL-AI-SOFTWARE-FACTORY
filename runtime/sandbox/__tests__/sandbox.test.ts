@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -215,7 +215,97 @@ describe("assertFilesystemConfinement (P1 fix: real filesystem-aware confinement
 
     rmSync(outside, { recursive: true, force: true });
   });
+
+  describe("P1 fix (5th independent review round): dangling and final-destination symlinks", () => {
+    it("blocks a DANGLING symlink (target does not exist) planted at the final destination", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-fsconfine-dangling-"));
+      const nonexistentOutsideTarget = join(tmpdir(), `uasf-fsconfine-never-created-${process.pid}-${Date.now()}`);
+      const linkPath = join(tempRoot, "evil-project");
+
+      if (!trySymlink(nonexistentOutsideTarget, linkPath)) return;
+
+      // Sanity: the symlink target genuinely does not exist (this is what
+      // made the old existsSync()-based check treat it as "not there yet").
+      expect(existsSyncFollows(nonexistentOutsideTarget)).toBe(false);
+
+      expect(() => assertFilesystemConfinement(tempRoot, "evil-project")).toThrow(PathEscapeError);
+      expect(existsSyncFollows(nonexistentOutsideTarget)).toBe(false); // still never created
+    });
+
+    it("blocks a DANGLING symlink used as an intermediate (parent) path component", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-fsconfine-dangling-"));
+      const nonexistentOutsideTarget = join(tmpdir(), `uasf-fsconfine-never-created-parent-${process.pid}-${Date.now()}`);
+      const linkedParent = join(tempRoot, "dangling-parent");
+
+      if (!trySymlink(nonexistentOutsideTarget, linkedParent)) return;
+
+      expect(() => assertFilesystemConfinement(tempRoot, join("dangling-parent", "new-file.json"))).toThrow(
+        PathEscapeError
+      );
+    });
+
+    it("blocks a final-FILE symlink (not a directory) pointing outside baseDir, existing and non-dangling", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-fsconfine-finalfile-"));
+      const outside = mkdtempSync(join(tmpdir(), "uasf-fsconfine-finalfile-outside-"));
+      writeFileSync(join(outside, "real-target.json"), "{}");
+      const linkPath = join(tempRoot, "state.json");
+
+      if (!trySymlink(join(outside, "real-target.json"), linkPath)) {
+        rmSync(outside, { recursive: true, force: true });
+        return;
+      }
+
+      expect(() => assertFilesystemConfinement(tempRoot, "state.json")).toThrow(PathEscapeError);
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    it("blocks a DANGLING final-FILE symlink pointing outside baseDir", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-fsconfine-finalfile-dangling-"));
+      const outside = mkdtempSync(join(tmpdir(), "uasf-fsconfine-finalfile-dangling-outside-"));
+      const outsideTargetNeverCreated = join(outside, "would-be-written-here.json");
+      const linkPath = join(tempRoot, "state.json");
+
+      if (!trySymlink(outsideTargetNeverCreated, linkPath)) {
+        rmSync(outside, { recursive: true, force: true });
+        return;
+      }
+
+      expect(() => assertFilesystemConfinement(tempRoot, "state.json")).toThrow(PathEscapeError);
+
+      // The whole point: a real writeFileSync would have followed this
+      // dangling symlink and CREATED the file at the outside location.
+      // Confirm confinement rejected it before any such write happened.
+      expect(existsSyncFollows(outsideTargetNeverCreated)).toBe(false);
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    it("leaves no partial/unsafe state anywhere when a dangling-symlink attempt is rejected", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-fsconfine-partial-"));
+      const outsideTargetNeverCreated = join(tmpdir(), `uasf-fsconfine-partial-outside-${process.pid}-${Date.now()}`);
+      const linkPath = join(tempRoot, "evil");
+
+      if (!trySymlink(outsideTargetNeverCreated, linkPath)) return;
+
+      expect(() => assertFilesystemConfinement(tempRoot, "evil")).toThrow(PathEscapeError);
+
+      // Nothing new appeared in tempRoot beyond the attacker's own
+      // pre-planted symlink (we created nothing further while rejecting).
+      expect(readdirSync(tempRoot)).toEqual(["evil"]);
+      expect(existsSyncFollows(outsideTargetNeverCreated)).toBe(false);
+    });
+
+    it("normal (non-symlink) project creation still succeeds after this fix", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-fsconfine-normal-"));
+      const resolved = assertFilesystemConfinement(tempRoot, "normal-project");
+      expect(resolved).toBe(join(tempRoot, "normal-project"));
+    });
+  });
 });
+
+/** `fs.existsSync` follows symlinks — used here purely to assert a target was never actually created. */
+function existsSyncFollows(path: string): boolean {
+  return existsSync(path);
+}
 
 describe("withTimeout", () => {
   it("resolves normally when the operation finishes before the timeout", async () => {

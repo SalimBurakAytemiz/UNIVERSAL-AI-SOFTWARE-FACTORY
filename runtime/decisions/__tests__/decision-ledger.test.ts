@@ -2,7 +2,12 @@ import { describe, expect, it, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DecisionNotFoundError, DuplicateDecisionError, FounderDecisionLedger } from "../decision-ledger.js";
+import {
+  DecisionAlreadySupersededError,
+  DecisionNotFoundError,
+  DuplicateDecisionError,
+  FounderDecisionLedger
+} from "../decision-ledger.js";
 import { FileStateStore } from "../../state/file-store.js";
 
 describe("FounderDecisionLedger", () => {
@@ -114,6 +119,105 @@ describe("FounderDecisionLedger", () => {
       const got = ledger.get("dec-1")!;
       expect(returned).not.toBe(got);
       expect(returned).toEqual(got);
+    });
+  });
+
+  describe("P1 fix (5th independent review round): repeated supersession cannot corrupt decision history", () => {
+    it("A -> B works", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      const b = ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+      expect(b.status).toBe("ACTIVE");
+      expect(ledger.get("a")!.status).toBe("SUPERSEDED");
+      expect(ledger.get("a")!.supersededBy).toBe("b");
+    });
+
+    it("A -> B then A -> C (re-superseding an already-superseded decision) is rejected", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+
+      expect(() => ledger.supersede("a", "c", "Use MongoDB", "founder chat 3")).toThrow(
+        DecisionAlreadySupersededError
+      );
+    });
+
+    it("history still records A -> B after a rejected A -> C attempt", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+
+      expect(() => ledger.supersede("a", "c", "Use MongoDB", "founder chat 3")).toThrow();
+
+      expect(ledger.get("a")!.status).toBe("SUPERSEDED");
+      expect(ledger.get("a")!.supersededBy).toBe("b"); // NOT overwritten to "c"
+    });
+
+    it("B remains the authoritative current ACTIVE replacement after a rejected re-supersession of A", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+
+      expect(() => ledger.supersede("a", "c", "Use MongoDB", "founder chat 3")).toThrow();
+
+      expect(ledger.get("b")!.status).toBe("ACTIVE");
+      expect(ledger.hasActiveDecision("b")).toBe(true);
+    });
+
+    it("B -> C works (evolving the CURRENT active decision, not re-replacing A)", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+      const c = ledger.supersede("b", "c", "Use MongoDB", "founder chat 3");
+
+      expect(c.status).toBe("ACTIVE");
+      expect(ledger.get("b")!.status).toBe("SUPERSEDED");
+      expect(ledger.get("b")!.supersededBy).toBe("c");
+    });
+
+    it("the resulting history is A -> B -> C, with exactly one ACTIVE decision (no multiple active replacements)", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+      ledger.supersede("b", "c", "Use MongoDB", "founder chat 3");
+
+      const all = ledger.allFor("proj-a");
+      expect(all.map((d) => d.decisionId).sort()).toEqual(["a", "b", "c"]);
+
+      const activeOnes = all.filter((d) => d.status === "ACTIVE");
+      expect(activeOnes).toHaveLength(1);
+      expect(activeOnes[0]!.decisionId).toBe("c");
+
+      expect(ledger.get("a")!.status).toBe("SUPERSEDED");
+      expect(ledger.get("a")!.supersededBy).toBe("b");
+      expect(ledger.get("b")!.status).toBe("SUPERSEDED");
+      expect(ledger.get("b")!.supersededBy).toBe("c");
+    });
+
+    it("a failed repeated supersession performs no partial mutation (the rejected replacement id is never created)", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+
+      expect(() => ledger.supersede("a", "c", "Use MongoDB", "founder chat 3")).toThrow();
+
+      expect(ledger.get("c")).toBeUndefined(); // "c" was never recorded at all
+      expect(ledger.allFor("proj-a")).toHaveLength(2); // still just a and b
+    });
+
+    it("attempting to supersede an ALREADY-SUPERSEDED decision a second time reports its actual current status", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("a", "proj-a", "Use PostgreSQL", "founder chat");
+      ledger.supersede("a", "b", "Use MySQL", "founder chat 2");
+
+      try {
+        ledger.supersede("a", "c", "Use MongoDB", "founder chat 3");
+        throw new Error("expected supersede() to throw");
+      } catch (err) {
+        expect(err).toBeInstanceOf(DecisionAlreadySupersededError);
+        expect((err as Error).message).toContain("SUPERSEDED");
+        expect((err as Error).message).toContain("b");
+      }
     });
   });
 });
