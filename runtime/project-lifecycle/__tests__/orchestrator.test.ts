@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { bootstrapProject, PreflightTraceabilityFailedError } from "../orchestrator.js";
@@ -274,6 +274,36 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       rmSync(escapedPath, { recursive: true, force: true }); // defensive pre-clean, see above
       expect(() => scaffoldProjectOs(tempRoot, "../outside")).toThrow(InvalidProjectIdError);
       expect(existsSync(escapedPath)).toBe(false);
+    });
+
+    it("the full bootstrap pipeline refuses a symlink-based escape (project id passes format validation, the destination itself is a symlink)", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const outside = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-outside-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      let symlinkSupported = true;
+      try {
+        symlinkSync(outside, join(tempRoot, "sneaky"));
+      } catch {
+        symlinkSupported = false;
+      }
+      if (!symlinkSupported) {
+        rmSync(outside, { recursive: true, force: true });
+        return;
+      }
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("sneaky"), // valid format, but resolves through a symlink
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(PathEscapeError);
+
+      expect(readdirSync(outside)).toHaveLength(0); // nothing was scaffolded into the real target
+      rmSync(outside, { recursive: true, force: true });
     });
   });
 

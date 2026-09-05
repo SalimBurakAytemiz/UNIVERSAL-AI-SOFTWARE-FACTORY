@@ -176,6 +176,30 @@
     (observed writing to /tmp/outside and /tmp/escape-attempt on the real
     filesystem) and that the fix closes this.
 
+    P1 fix (4th independent review round, "symlink filesystem escape still
+    exists"): the round-3 fix above was purely LEXICAL (path.resolve +
+    startsWith) — it never checked whether a path component was actually a
+    symlink pointing outside baseDir. Fixed: added
+    assertFilesystemConfinement() (runtime/sandbox/sandbox.ts, see
+    UASF-REQ-0033) which canonicalizes the nearest existing ancestor of
+    both root and target via realpathSync (resolving any symlink chain,
+    including nested ones) before checking containment, and scaffoldProjectOs()
+    / orchestrator.ts now call it instead of the lexical-only check, before
+    any filesystem mutation or policy check. Regression tests using REAL
+    temporary directories and real symlinks (not mocks) prove: a normal
+    project still works, a symlink planted inside baseDir pointing outside
+    is blocked (both at the project-root level and at a subdirectory
+    level), a symlinked parent directory pointing outside is blocked, a
+    nested symlink chain is blocked, nothing outside baseDir is modified
+    when confinement is rejected, and — the clearest before/after evidence
+    — assertWithinRoot() ALONE is shown to be fooled by the exact same
+    symlink that assertFilesystemConfinement() correctly rejects. Known,
+    honestly-documented limitation: this is a check-then-use (TOCTOU)
+    pattern, not an atomic syscall-level guarantee; Node's portable fs API
+    has no cross-platform equivalent of Linux's openat2
+    RESOLVE_NO_SYMLINKS, so a symlink swapped in the narrow window between
+    the check and the actual mkdirSync is a residual, accepted risk at P0.
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -327,7 +351,22 @@
     - "runtime/technology-registry/__tests__/registry.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "FORBIDDEN/DEPRECATED technologies are excluded from recommendable() at the data-model level; no seeded default registry or Technology Decision Engine yet."
+  notes: >
+    FORBIDDEN/DEPRECATED technologies are excluded from recommendable() at
+    the data-model level; no seeded default registry or Technology
+    Decision Engine yet.
+
+    P1 fix (4th independent review round, targeted follow-up ownership
+    audit): register() stored the caller's object reference and all()
+    returned internal Map values directly — a caller could mutate a
+    registered (or returned) technology's `lifecycle` field from
+    FORBIDDEN/DEPRECATED to something recommendable, bypassing bölüm
+    53-54's "never auto-recommended" rule without going through any
+    controlled transition. Fixed: register() stores an independent, frozen
+    copy; all() returns frozen, detached snapshots. Regression tests prove
+    mutating the object passed into register(), or a record returned by
+    all(), cannot un-forbid a technology. Confirmed via git-stash that
+    these tests fail on the pre-fix code.
 
 - id: UASF-REQ-0015
   title: Business capability registry (foundation)
@@ -342,7 +381,18 @@
     - "runtime/business-capability-registry/__tests__/registry.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Seeded with a representative subset (identity, payments, notifications, anti-cheat), not the full section-29 list."
+  notes: >
+    Seeded with a representative subset (identity, payments, notifications,
+    anti-cheat), not the full section-29 list.
+
+    P1 fix (4th independent review round, targeted follow-up ownership
+    audit): register()/get()/all() stored and returned the caller's own
+    object references directly (same pattern as the other registries fixed
+    this round). Fixed: register() stores an independent, frozen copy;
+    get()/all() return frozen, detached snapshots. Regression tests prove
+    mutating the object passed into register(), or a record returned by
+    get(), cannot affect findApplicable()'s results. Confirmed via
+    git-stash that these tests fail on the pre-fix code.
 
 - id: UASF-REQ-0016
   title: Project organization composer (foundation)
@@ -534,17 +584,38 @@
     neither of which verifyIntegrity() would ever catch (it only walks
     whatever the array currently contains). This directly undermined the
     "append-only, tamper-evident" guarantee this module exists to provide.
-    Fixed: append()/all() now return frozen, detached copies
-    (runtime/util/immutable.ts) — array-level injection/deletion via a
-    returned reference is no longer possible, and a top-level field
-    reassignment throws instead of silently succeeding. Nested payload
-    mutation remains detectable (not preventable) via hash mismatch, which
-    matches the module's documented "tamper-evident" (not "tamper-proof")
-    promise and is covered by the pre-existing "detects tampering with a
-    historical record" test. New regression tests prove push()/splice() on a
-    returned array cannot inject or remove records, and a returned record's
-    fields are frozen. Confirmed via git-stash that these tests fail against
-    the pre-fix code.
+    Fixed (round 3): append()/all() returned frozen, detached SHALLOW copies
+    (runtime/util/immutable.ts freezeRecord) — array-level injection/deletion
+    via a returned reference was no longer possible, and a top-level field
+    reassignment threw instead of silently succeeding. At that point, nested
+    payload mutation was still only detectable (not preventable) via hash
+    mismatch on verifyIntegrity(), which was believed to match the module's
+    "tamper-evident" (not "tamper-proof") promise.
+
+    P1 fix (4th independent review round, "audit payload mutability leak
+    remains"): Codex correctly identified that shallow freezing is
+    insufficient for a `payload: Record<string, unknown>` field that can
+    hold arbitrary nesting — `record.payload.detail.amount = 9999` was
+    still possible on a returned snapshot, AND (more severely) the ORIGINAL
+    event object passed into append() was never detached from the caller
+    at all (only a shallow `{...event}` copy was stored), so a caller
+    mutating their own original payload object AFTER calling append() could
+    corrupt the "already written" authoritative record directly, with no
+    detection needed to bypass — no mutation of a returned value was even
+    required. Fixed: added deepFreezeClone() (runtime/util/immutable.ts,
+    using `structuredClone` + a recursive `deepFreeze`) and append() now
+    detaches the incoming event via `structuredClone` BEFORE storing it,
+    while append()/all() return full deep clones, deeply frozen. Regression
+    tests prove: mutating the original payload (including nested
+    objects/arrays) after append() does not change the stored record,
+    mutating append()'s or all()'s return value (including a deeply nested
+    field) throws instead of silently succeeding, previously written
+    evidence remains structurally identical across reads, ordering/
+    sequence/timestamps are unaffected, and a non-serializable payload
+    (e.g. a function) now fails closed via `structuredClone` rather than
+    being silently dropped by JSON.stringify inside hashOf(). Confirmed via
+    git-stash that these tests fail against the round-3 (shallow-freeze)
+    code.
 
 - id: UASF-REQ-0023
   title: Artifact foundation
@@ -559,7 +630,22 @@
     - "runtime/artifacts/__tests__/artifact-registry.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "In-memory registry with the section-123 artifact classes; no actual storage backend (filesystem/object store) yet."
+  notes: >
+    In-memory registry with the section-123 artifact classes; no actual
+    storage backend (filesystem/object store) yet.
+
+    P1 fix (4th independent review round, targeted follow-up ownership
+    audit): get()/allFor()/findByClass() returned the internal
+    ArtifactRecord objects directly. Mutating a returned record's `path`
+    or `checksum` after the fact would silently swap what evidence a proof
+    reference actually points to, without a new register() event —
+    directly undermining "no claim without evidence" (bölüm 303: the
+    record backing a claim must be exactly what was registered). Fixed:
+    every read now returns a frozen, detached snapshot
+    (runtime/util/immutable.ts). Regression tests prove mutating the
+    return value of register()/get()/allFor()/findByClass() throws and
+    never changes the recorded evidence. Confirmed via git-stash that
+    these tests fail on the pre-fix code.
 
 - id: UASF-REQ-0024
   title: Model gateway
@@ -590,6 +676,21 @@
     - "runtime/models/__tests__/registry.test.ts"
   proof_refs: []
   security_refs: []
+  notes: >
+    P1 fix (4th independent review round, targeted follow-up ownership
+    audit): register() stored the caller's object reference directly, and
+    all()/findCapable() returned the internal array UNCHANGED (no copy, no
+    freeze at all — the most severe form of this bug found in the audit).
+    A caller holding a reference to a registered (or returned) model
+    record could mutate `costPerCall` downward to bias cheapest-capable
+    routing, flip `status` from DEPRECATED/RETIRED to ACTIVE to bypass the
+    "never auto-selected" rule, or add a `capabilities` entry the model
+    doesn't actually support (bölüm 60-64, cost/routing integrity). Fixed:
+    register() now stores an independent, frozen copy; all()/findCapable()
+    return frozen, detached snapshots. Regression tests prove mutating the
+    object passed into register() (or a returned record's costPerCall/
+    capabilities) cannot affect subsequent routing decisions. Confirmed
+    via git-stash that these tests fail on the pre-fix code.
 
 - id: UASF-REQ-0026
   title: MockProvider
@@ -790,6 +891,25 @@
     test, and an audit-log assertion that a rejected invalid amount is
     recorded as BUDGET_INVALID_AMOUNT_REJECTED.
 
+    P1 fix (4th independent review round, "limits ownership is still
+    unsafe"): the constructor stored the CALLER's `limits` object by
+    reference (`this.limits = limits`); validating it at construction time
+    did not protect against the caller mutating that SAME object
+    afterward (e.g. `originalLimits.dailyUsd = -1`), which would corrupt
+    the authoritative ceilings post-validation. Fixed: the constructor now
+    validates, then copies the limits into a frozen internal object
+    (`freezeRecord({...limits})`) — the caller's own reference is never
+    retained. Also added `getLimits()`, returning a frozen, detached
+    snapshot (there was previously no way to read back configured limits
+    at all). Regression tests prove: mutating the original limits object
+    after construction does not change enforcement, mutating it to
+    NaN/Infinity/negative afterward does not corrupt enforcement (still
+    blocks correctly, and all totals remain finite/non-negative),
+    `getLimits()` returns a snapshot that cannot mutate internal state and
+    is never the same object reference twice, and daily/monthly
+    enforcement still works end-to-end after the fix. Confirmed via
+    git-stash that these tests fail on the pre-fix code.
+
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
   description: Register worker classes (linux-general, gpu, macos, ...) with capability metadata; select smallest sufficient worker.
@@ -864,6 +984,26 @@
     case; a new prefix-confusion test also confirms assertWithinRoot()
     itself (the second, independent confinement layer) rejects a sibling
     path that merely shares a string prefix with the root.
+
+    P1 fix (4th independent review round, "symlink filesystem escape still
+    exists"): added assertFilesystemConfinement(), a filesystem-aware
+    confinement check on top of assertWithinRoot(). It canonicalizes the
+    nearest EXISTING ancestor of both `root` and `target` via
+    `fs.realpathSync` (which resolves symlink chains, including nested
+    ones, and transparently handles a target that does not exist yet by
+    resolving only its existing ancestor and appending the not-yet-created
+    suffix, which by definition cannot itself be a symlink) before
+    verifying containment. Regression tests use REAL temporary directories
+    and real `fs.symlinkSync` calls (skipped gracefully, not failed, on a
+    platform that cannot create symlinks — an honestly documented
+    limitation): a normal directory works, lexical `../` and absolute
+    escapes are still blocked, a symlink inside baseDir pointing outside is
+    blocked, a symlinked parent directory pointing outside is blocked, a
+    nested symlink chain is blocked, nothing outside baseDir is modified on
+    rejection, and a direct before/after test proves assertWithinRoot()
+    ALONE is fooled by a symlink that assertFilesystemConfinement()
+    correctly catches. See UASF-REQ-0007 for the TOCTOU limitation this
+    honestly documents rather than hides.
 
 - id: UASF-REQ-0034
   title: Project isolation (foundation)

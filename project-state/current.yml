@@ -10,15 +10,19 @@ factory:
   p0_status: >
     NOT complete. Explicit Founder instruction: do not move to P1, do not
     mark P0 complete, until an independent review finds no blocking P0
-    finding. Three independent Codex review rounds so far: round 1 found 4
+    finding. Four independent Codex review rounds so far: round 1 found 4
     blocking findings (all fixed, confirmed fixed by round 2); round 2 found
     4 NEW findings — 1 BLOCKER, 3 P2 (all fixed, confirmed fixed by round 3);
     round 3 found 3 NEW P1 findings, all in the same "internal mutable state
-    leaked to callers" vulnerability class, plus asked for a cross-cutting
-    audit. All 3 named findings, PLUS 5 more instances of the same class
-    found during the audit, are fixed in this session (see below), fully
-    verified, and pushed for a fourth re-review. P0 remains open until that
-    re-review comes back clean.
+    leaked to callers" vulnerability class, plus a cross-cutting audit that
+    found 5 more instances (all fixed, confirmed fixed by round 4 for those
+    8); round 4 found the SAME vulnerability class was not yet fully closed
+    in 3 more specific ways (limits ownership, symlink-based filesystem
+    escape, audit payload deep-mutability), plus asked for one more targeted
+    ownership audit. All 3 named findings, PLUS 4 more instances found during
+    that audit, are fixed in this session (see below), fully verified, and
+    pushed for a fifth re-review. P0 remains open until that re-review comes
+    back clean.
 
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
@@ -282,6 +286,117 @@ completed_milestones:
     (history-aware) all clean; every one of the 8 fixes individually
     confirmed via git-stash to have failing regression tests against its
     pre-fix code, then passing again with the fix restored.
+  - |-
+    THIS SESSION (round 4) — a fourth independent Codex review confirmed
+    the round-3 fixes, then found the SAME vulnerability class ("internal
+    mutable state" / "caller-owned input leaking into authoritative state")
+    was not yet fully closed in 3 more specific ways, plus asked for one
+    more targeted ownership audit. All 3 named findings are fixed:
+    - [P1] "Budget/limit ownership is still unsafe": BudgetGuard's
+      constructor validated the caller's `limits` object but then stored
+      that SAME object by reference (`this.limits = limits`) — a caller
+      mutating their own limits object AFTER construction (e.g.
+      `originalLimits.dailyUsd = -1`) directly corrupted the authoritative
+      ceilings, since validation only ran once, at construction, before the
+      mutation. Fixed: the constructor now validates, then copies the
+      limits into a frozen internal object; the caller's reference is never
+      retained. Also added getLimits(), returning a frozen, detached
+      snapshot (there was no way to read back configured limits before).
+      Regression tests prove: mutating the original limits object after
+      construction (including to NaN/Infinity/negative) does not corrupt
+      enforcement, getLimits() cannot mutate internal state and is never
+      the same reference twice, and daily/monthly enforcement still works.
+    - [P1] "Symlink filesystem escape still exists": the round-3 path-escape
+      fix (assertWithinRoot) was purely lexical — path.resolve/startsWith
+      have no concept of symlinks, so a symlink planted inside baseDir
+      pointing outside it sailed through unnoticed. Fixed: added
+      assertFilesystemConfinement() (runtime/sandbox/sandbox.ts), which
+      canonicalizes the nearest EXISTING ancestor of both root and target
+      via fs.realpathSync (resolving symlink chains, including nested
+      ones) before checking containment; scaffoldProjectOs() and
+      orchestrator.ts now call this instead of the lexical-only check.
+      Regression tests use REAL temporary directories and real symlinks
+      (not mocks): a normal project works, a symlink inside baseDir
+      pointing outside is blocked (at both the project-root and
+      subdirectory level), a symlinked parent directory pointing outside
+      is blocked, a nested symlink chain is blocked, nothing outside
+      baseDir is modified on rejection, and a direct before/after test
+      shows assertWithinRoot() ALONE is fooled by the exact symlink that
+      assertFilesystemConfinement() correctly rejects. Honestly documented
+      residual limitation: this is a check-then-use (TOCTOU) pattern, not
+      an atomic syscall-level guarantee — Node's portable fs API has no
+      cross-platform equivalent of Linux's openat2 RESOLVE_NO_SYMLINKS.
+    - [P1] "Audit payload mutability leak remains": the round-3 audit-log
+      fix used a SHALLOW freeze (freezeRecord) — sufficient for the
+      top-level record and array-level injection/deletion, but
+      `payload: Record<string, unknown>` can hold arbitrary nesting, and a
+      nested field on a returned record could still be mutated
+      (`record.payload.detail.amount = 9999`). Worse: the ORIGINAL event
+      object passed into append() was never detached at all (only a
+      shallow `{...event}` copy was stored), so a caller mutating their
+      own original payload object AFTER calling append() corrupted the
+      "already written" record directly — no mutation of a *returned*
+      value was even required. Fixed: added deepFreezeClone() (using
+      `structuredClone` + a recursive deepFreeze) in
+      runtime/util/immutable.ts; append() now detaches the incoming event
+      via structuredClone before storing it, and append()/all() return
+      full deep clones, deeply frozen. Regression tests prove: mutating
+      the original payload (incl. nested objects/arrays) after append()
+      does not change the stored record, mutating a returned value's
+      nested field throws instead of silently succeeding, previously
+      written evidence stays structurally identical across reads,
+      ordering/sequence/timestamps are unaffected, and a non-serializable
+      payload (e.g. a function) now fails closed via structuredClone
+      instead of being silently dropped by JSON.stringify inside hashOf().
+    - Targeted follow-up ownership audit (as explicitly requested): grepped
+      every constructor/register()/all()/get() across runtime/ for the
+      "caller-owned input -> internal state" and "internal state ->
+      returned snapshot" shapes specifically. Found and fixed 4 more
+      genuine instances, each confirmed via git-stash to fail on its
+      pre-fix code:
+      - runtime/models/registry.ts: register() stored the caller's
+        reference AND all()/findCapable() returned the internal array
+        completely unchanged (no copy, no freeze at all — the most severe
+        instance found). A leaked/mutated reference could bias
+        cheapest-capable-model routing (lower costPerCall), bypass the
+        DEPRECATED/RETIRED exclusion rule, or forge a capability.
+      - runtime/technology-registry/registry.ts: same pattern; a leaked
+        reference could flip a FORBIDDEN/DEPRECATED technology's lifecycle
+        to bypass recommendable()'s exclusion rule (bölüm 53-54).
+      - runtime/business-capability-registry/registry.ts: same pattern,
+        fixed for consistency (informational catalog, no bypass of a named
+        invariant, but the same unsafe ownership shape).
+      - runtime/artifacts/artifact-registry.ts: get()/allFor()/
+        findByClass() returned live internal objects — a leaked reference
+        could swap a registered artifact's path/checksum after the fact,
+        undermining "no claim without evidence" (bölüm 303).
+      Reviewed but NOT changed (no genuine leak of this class found):
+      runtime/models/providers/mock-provider.ts (stores options by
+      reference, but it is a test-only fixture with no security invariant
+      tied to it), runtime/scheduler/scheduler.ts and
+      runtime/event-bus/event-bus.ts (per-call parameters, not retained
+      cross-call authoritative state), runtime/cache/*.ts and
+      runtime/state/file-store.ts (already StateStore-backed, no live
+      caller-object retention). This scoping decision is recorded here so
+      a future session does not re-litigate it without new evidence.
+  - >-
+    Requirement registry updated a fourth time from this round's real
+    evidence: UASF-REQ-0007 (orchestrator/scaffold — symlink confinement),
+    UASF-REQ-0033 (Sandbox — assertFilesystemConfinement),
+    UASF-REQ-0030 (Budget — limits ownership + getLimits()),
+    UASF-REQ-0022 (Audit — corrected the round-3 note's now-inaccurate
+    "nested payload mutation is only detectable" claim and documented the
+    deep-ownership fix), UASF-REQ-0025 (Model registry), UASF-REQ-0014
+    (Technology registry), UASF-REQ-0015 (Business capability registry),
+    UASF-REQ-0023 (Artifact foundation). No status raised beyond what a
+    real test/proof supports.
+  - 285/285 tests passing (up from 251 before this round, +34 net new
+    across the 9 fixed files); lint/typecheck/build/validate-requirements/
+    secret-scan (history-aware) all clean; every one of the 12 individual
+    fixes (3 named + 4 audit-found registries + budget + sandbox +
+    orchestrator/scaffold + audit-log) confirmed via git-stash to have
+    failing regression tests against its pre-fix code, then passing again
+    with the fix restored.
 
 known_limitations:
   - >-
@@ -309,15 +424,17 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting a FOURTH independent (Codex) re-review of the pushed fixes
-    (round 3's 3 new P1 findings, plus 5 more instances of the same
-    vulnerability class found during the requested cross-cutting audit,
-    are now fixed, tested, and verified per the full required sequence:
-    lint, typecheck, build, 251/251 tests, validate:requirements,
-    history-aware secret-scan, all P0 proofs). Per explicit instruction:
-    "stop at the independent-review boundary" — do not push further P0
-    feature work, and do not declare P0 complete, until that re-review
-    confirms no blocking finding remains.
+    Awaiting a FIFTH independent (Codex) re-review of the pushed fixes
+    (round 4's 3 new P1 findings — budget limits ownership, symlink
+    filesystem escape, audit payload deep-mutability — plus 4 more
+    instances of the same vulnerability class found during the requested
+    targeted follow-up ownership audit, are now fixed, tested, and
+    verified per the full required sequence: lint, typecheck, build,
+    285/285 tests, validate:requirements, history-aware secret-scan, all
+    P0 proofs). Per explicit instruction: "stop at the independent-review
+    boundary" — do not push further P0 feature work, and do not declare
+    P0 complete, until that re-review confirms no blocking finding
+    remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -336,20 +453,22 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 3's 3 P1 Codex findings, plus 5 more instances of the
-  same "internal mutable state leaked to callers" class found during the
-  requested cross-cutting audit (audit-log, decision-ledger,
-  service-catalog, assumption-register, worker-registry), are implemented,
-  tested, and pushed, with the full required verification sequence run
-  clean (lint, typecheck, build, 251/251 tests, validate:requirements,
-  history-aware secret-scan, all P0 proofs). Every fix was individually
-  confirmed via git-stash to have failing regression tests against its
-  pre-fix code. Do not proceed to further P0 feature work or declare P0
-  complete until an independent (Codex) re-review of this diff confirms no
-  blocking P0 finding remains. If/when that comes back clean, resume from
-  the prior exact_next_action: wire the remaining foundation modules
-  (Discovery, Decisions, Assumptions, Technology/Business-Capability
-  registries) into the same integrated pipeline, consider a SQLite-backed
+  fixes for round 4's 3 P1 Codex findings (budget/limits ownership,
+  symlink-based filesystem escape, audit payload deep-mutability), plus 4
+  more instances of the same vulnerability class found during the
+  requested targeted follow-up ownership audit (models/registry.ts,
+  technology-registry, business-capability-registry, artifact-registry),
+  are implemented, tested, and pushed, with the full required verification
+  sequence run clean (lint, typecheck, build, 285/285 tests,
+  validate:requirements, history-aware secret-scan, all P0 proofs). Every
+  fix was individually confirmed via git-stash to have failing regression
+  tests against its pre-fix code. Do not proceed to further P0 feature work
+  or declare P0 complete until an independent (Codex) re-review of this
+  diff confirms no blocking P0 finding remains. If/when that comes back
+  clean, resume from the prior exact_next_action: wire the remaining
+  foundation modules (Discovery, Decisions, Assumptions,
+  Technology/Business-Capability registries) into the same integrated
+  pipeline, consider a SQLite-backed
   StateStore, get a Founder decision on P0-sufficiency and licensing
   (section 206). The autonomous-merge governance question stays closed
   absent new Founder-initiated context.

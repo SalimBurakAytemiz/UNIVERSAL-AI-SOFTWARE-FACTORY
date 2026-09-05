@@ -20,16 +20,23 @@ describe("AuditLog", () => {
     expect(log.verifyIntegrity()).toBe(true);
   });
 
-  it("detects tampering with a historical record", () => {
+  it("a returned record's nested payload can no longer be tampered with at all (deep-freeze fix supersedes hash-only detection)", () => {
+    // Historically this test mutated a returned record's nested payload
+    // in place and asserted verifyIntegrity() caught it AFTER THE FACT.
+    // Since the round-4 deep-ownership fix, that mutation attempt is
+    // prevented OUTRIGHT (TypeError), which is a strictly stronger
+    // guarantee — see the "audit payload deep-ownership" describe block
+    // below for the full regression suite.
     const log = new AuditLog();
     log.append({ type: "A", actor: "x", payload: { amount: 1 }, timestamp: new Date().toISOString() });
     log.append({ type: "B", actor: "x", payload: {}, timestamp: new Date().toISOString() });
 
     const records = log.all() as unknown as { payload: Record<string, unknown> }[];
-    // Simulate tampering: mutate a historical payload in place.
-    records[0]!.payload.amount = 9999;
+    expect(() => {
+      records[0]!.payload.amount = 9999;
+    }).toThrow(TypeError);
 
-    expect(log.verifyIntegrity()).toBe(false);
+    expect(log.verifyIntegrity()).toBe(true); // nothing was actually tampered with
   });
 
   describe("P1 cross-cutting fix: all() cannot be used to inject or silently remove records", () => {
@@ -84,6 +91,129 @@ describe("AuditLog", () => {
       expect(first).not.toBe(second);
       expect(first[0]).not.toBe(second[0]);
       expect(first).toEqual(second);
+    });
+  });
+
+  describe("P1 fix (4th independent review round): audit payload deep-ownership (nested mutation cannot reach authoritative state)", () => {
+    it("mutating the ORIGINAL payload object after append() does not change the stored audit record", () => {
+      const log = new AuditLog();
+      const originalPayload: { amount: number } = { amount: 1 };
+      log.append({ type: "SPEND", actor: "x", payload: originalPayload, timestamp: new Date().toISOString() });
+
+      originalPayload.amount = 9999; // caller mutates the object they originally passed in
+
+      expect(log.all()[0]!.payload).toEqual({ amount: 1 });
+    });
+
+    it("mutating a NESTED object inside the original payload after append() does not change the stored record", () => {
+      const log = new AuditLog();
+      const originalPayload: { detail: { amount: number } } = { detail: { amount: 1 } };
+      log.append({ type: "SPEND", actor: "x", payload: originalPayload, timestamp: new Date().toISOString() });
+
+      originalPayload.detail.amount = 9999;
+
+      expect(log.all()[0]!.payload).toEqual({ detail: { amount: 1 } });
+    });
+
+    it("mutating an ARRAY inside the original payload after append() does not change the stored record", () => {
+      const log = new AuditLog();
+      const originalPayload: { items: number[] } = { items: [1, 2, 3] };
+      log.append({ type: "BATCH", actor: "x", payload: originalPayload, timestamp: new Date().toISOString() });
+
+      originalPayload.items.push(999);
+      originalPayload.items[0] = -1;
+
+      expect(log.all()[0]!.payload).toEqual({ items: [1, 2, 3] });
+    });
+
+    it("mutating the RETURN VALUE of append() (including nested payload) throws and never changes stored state", () => {
+      const log = new AuditLog();
+      const record = log.append({
+        type: "SPEND",
+        actor: "x",
+        payload: { detail: { amount: 1 }, items: [1, 2] },
+        timestamp: new Date().toISOString()
+      });
+
+      expect(() => {
+        (record.payload as { detail: { amount: number } }).detail.amount = 9999;
+      }).toThrow(TypeError);
+      expect(() => {
+        (record.payload as { items: number[] }).items.push(999);
+      }).toThrow(TypeError);
+
+      expect(log.all()[0]!.payload).toEqual({ detail: { amount: 1 }, items: [1, 2] });
+    });
+
+    it("mutating a get()/all() result (including nested payload) throws and never changes stored state", () => {
+      const log = new AuditLog();
+      log.append({
+        type: "SPEND",
+        actor: "x",
+        payload: { detail: { amount: 1 }, items: [1, 2] },
+        timestamp: new Date().toISOString()
+      });
+
+      const [record] = log.all();
+      expect(() => {
+        (record!.payload as { detail: { amount: number } }).detail.amount = 9999;
+      }).toThrow(TypeError);
+      expect(() => {
+        (record!.payload as { items: number[] }).items.push(999);
+      }).toThrow(TypeError);
+
+      expect(log.all()[0]!.payload).toEqual({ detail: { amount: 1 }, items: [1, 2] });
+    });
+
+    it("mutating a nested object obtained by reading INTO a returned payload throws (deep, not shallow, freeze)", () => {
+      const log = new AuditLog();
+      log.append({
+        type: "SPEND",
+        actor: "x",
+        payload: { detail: { nested: { deep: { amount: 1 } } } },
+        timestamp: new Date().toISOString()
+      });
+
+      const [record] = log.all();
+      const deepRef = (record!.payload as { detail: { nested: { deep: { amount: number } } } }).detail.nested.deep;
+      expect(() => {
+        deepRef.amount = 9999;
+      }).toThrow(TypeError);
+    });
+
+    it("previously written audit evidence remains structurally equivalent across many reads", () => {
+      const log = new AuditLog();
+      const appended = log.append({
+        type: "SPEND",
+        actor: "x",
+        payload: { detail: { amount: 1 }, items: [1, 2, 3] },
+        timestamp: "2026-01-01T00:00:00.000Z"
+      });
+
+      const readBack = log.all()[0]!;
+      expect(readBack).toEqual(appended);
+      expect(readBack.sequence).toBe(appended.sequence);
+      expect(readBack.hash).toBe(appended.hash);
+    });
+
+    it("audit ordering, sequence numbers, and timestamps are unaffected by the ownership fix", () => {
+      const log = new AuditLog();
+      const a = log.append({ type: "A", actor: "x", payload: {}, timestamp: "2026-01-01T00:00:00.000Z" });
+      const b = log.append({ type: "B", actor: "x", payload: {}, timestamp: "2026-01-01T00:00:01.000Z" });
+
+      expect(a.sequence).toBe(0);
+      expect(b.sequence).toBe(1);
+      expect(b.previousHash).toBe(a.hash);
+      expect(log.all().map((r) => r.type)).toEqual(["A", "B"]);
+    });
+
+    it("a non-serializable payload value (e.g. a function) fails closed rather than silently dropping data", () => {
+      const log = new AuditLog();
+      const unsupportedPayload = { handler: () => {} } as unknown as Record<string, unknown>;
+      expect(() =>
+        log.append({ type: "BAD", actor: "x", payload: unsupportedPayload, timestamp: new Date().toISOString() })
+      ).toThrow();
+      expect(log.all()).toHaveLength(0); // nothing was partially recorded
     });
   });
 });

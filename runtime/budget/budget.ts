@@ -13,6 +13,7 @@
 import { assertValidMonetaryAmount } from "../cost/cost-engine.js";
 import type { CostEngine, CostScope } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export type BudgetCeilingName = "perTaskUsd" | "perRunUsd" | "dailyUsd" | "monthlyUsd";
 
@@ -71,9 +72,23 @@ function startOfUtcMonth(date: Date): string {
 }
 
 export class BudgetGuard {
+  /**
+   * P1 fix (4th independent review round): eskiden constructor,
+   * ÇAĞIRANIN geçtiği `limits` nesnesinin REFERANSINI doğrudan saklıyordu.
+   * TypeScript'in `readonly` işaretleyicisi yalnızca derleme zamanında
+   * uyarır — çağıran, kaydettikten SONRA aynı nesneyi
+   * (`limits.dailyUsd = -1` gibi) mutasyona uğratırsa, bu doğrudan
+   * yetkili (authoritative) tavanları da bozardı; kurulum anındaki
+   * doğrulama bunu YAKALAYAMAZ çünkü mutasyon doğrulamadan SONRA olur.
+   * Artık: doğrula, SONRA çağıranın nesnesinden BAĞIMSIZ, donmuş bir iç
+   * kopya oluştur — orijinal nesneye yapılan hiçbir sonraki mutasyon iç
+   * durumu etkileyemez.
+   */
+  private readonly limits: Readonly<BudgetLimits>;
+
   constructor(
     private readonly costEngine: CostEngine,
-    private readonly limits: BudgetLimits,
+    limits: BudgetLimits,
     private readonly now: () => Date = () => new Date(),
     private readonly auditLog?: AuditLog
   ) {
@@ -83,6 +98,16 @@ export class BudgetGuard {
     assertValidLimit("perRunUsd", limits.perRunUsd);
     assertValidLimit("dailyUsd", limits.dailyUsd);
     assertValidLimit("monthlyUsd", limits.monthlyUsd);
+    this.limits = freezeRecord({ ...limits });
+  }
+
+  /**
+   * Yapılandırılmış tavanların salt-okunur, ayrık bir anlık görüntüsü.
+   * Döndürülen nesne üzerindeki hiçbir mutasyon iç `this.limits`'i
+   * etkilemez (donmuş + kopya).
+   */
+  getLimits(): Readonly<BudgetLimits> {
+    return freezeRecord({ ...this.limits });
   }
 
   private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {

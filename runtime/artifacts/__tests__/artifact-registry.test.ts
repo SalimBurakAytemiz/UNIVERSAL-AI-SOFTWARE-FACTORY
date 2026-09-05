@@ -29,4 +29,31 @@ describe("ArtifactRegistry", () => {
     registry.register({ id: "a2", artifactClass: "code", path: "x.ts", projectId: "proj-1" });
     expect(registry.findByClass("screenshots")).toHaveLength(1);
   });
+
+  describe("P1 fix (targeted ownership audit): registered evidence cannot be swapped via a leaked reference", () => {
+    it("mutating the object returned by register() cannot change the recorded path/checksum", () => {
+      const registry = new ArtifactRegistry();
+      const record = registry.register({ id: "a1", artifactClass: "tests", path: "coverage/report.html", projectId: "proj-1" });
+
+      expect(() => {
+        (record as { path: string }).path = "coverage/forged.html";
+      }).toThrow(TypeError);
+
+      expect(registry.get("a1")!.path).toBe("coverage/report.html");
+    });
+
+    it("mutating a record returned by get()/allFor()/findByClass() cannot change the recorded evidence", () => {
+      const registry = new ArtifactRegistry();
+      registry.register({ id: "a1", artifactClass: "tests", path: "coverage/report.html", projectId: "proj-1", checksum: "abc123" });
+
+      const got = registry.get("a1")!;
+      expect(() => {
+        (got as { checksum: string }).checksum = "forged";
+      }).toThrow(TypeError);
+
+      expect(registry.get("a1")!.checksum).toBe("abc123");
+      expect(registry.allFor("proj-1")[0]!.checksum).toBe("abc123");
+      expect(registry.findByClass("tests")[0]!.checksum).toBe("abc123");
+    });
+  });
 });

@@ -4,7 +4,7 @@
 // aynı proje için tekrar tekrar çağrılması güvenlidir.
 
 import { mkdirSync } from "node:fs";
-import { assertValidProjectId, assertWithinRoot } from "../sandbox/sandbox.js";
+import { assertFilesystemConfinement, assertValidProjectId } from "../sandbox/sandbox.js";
 
 export const PROJECT_OS_SUBDIRECTORIES = [
   "project-definition",
@@ -46,18 +46,22 @@ export interface ScaffoldResult {
  * (veya üst katmandaki doğrulamayı atlayan bir yol) `projectId = "../outside"`
  * verirse, sonuç `baseDir` dışına çıkabiliyordu. Artık bu fonksiyon KENDİSİ
  * de savunma katmanı olarak: (1) projectId'nin güvenli bir tanımlayıcı
- * biçiminde olduğunu doğrular, (2) nihai hedefi GÜVENİLİR bir yol API'siyle
- * (`assertWithinRoot`) çözüp `baseDir` içinde kaldığını doğrular — HİÇBİR
- * dosya sistemi mutasyonundan (mkdirSync) ÖNCE. Bu, yalnızca üst katmanın
- * (bootstrapProject) doğru doğrulama yapmasına güvenmek yerine, bu
- * fonksiyonu doğrudan çağıran herhangi bir kod için de aynı garantiyi verir
- * (fail closed, bölüm 87).
+ * biçiminde olduğunu doğrular, (2) nihai hedefi doğrular — HİÇBİR dosya
+ * sistemi mutasyonundan (mkdirSync) ÖNCE.
+ *
+ * P1 fix (4th independent review round): (2)'deki doğrulama artık salt
+ * sözdizimsel (assertWithinRoot) DEĞİL — assertFilesystemConfinement()
+ * kullanılır, bu da `baseDir` içine yerleştirilmiş, `baseDir` dışına işaret
+ * eden bir symlink/junction ile yapılan bir kaçışı da yakalar (bölüm 87).
+ * Bu, yalnızca üst katmanın (bootstrapProject) doğru doğrulama yapmasına
+ * güvenmek yerine, bu fonksiyonu doğrudan çağıran herhangi bir kod için de
+ * aynı garantiyi verir (fail closed).
  */
 export function scaffoldProjectOs(baseDir: string, projectId: string): ScaffoldResult {
   assertValidProjectId(projectId);
-  const projectRoot = assertWithinRoot(baseDir, projectId);
+  const projectRoot = assertFilesystemConfinement(baseDir, projectId);
   const createdDirectories = PROJECT_OS_SUBDIRECTORIES.map((sub) => {
-    const dir = assertWithinRoot(projectRoot, sub);
+    const dir = assertFilesystemConfinement(projectRoot, sub);
     mkdirSync(dir, { recursive: true });
     return dir;
   });

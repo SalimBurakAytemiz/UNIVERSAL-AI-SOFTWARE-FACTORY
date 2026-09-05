@@ -26,7 +26,7 @@ import { parseProjectGenome, type ProjectGenome } from "../project-genome/genome
 import { composeOrganizationFromGenome, type OrganizationComposition } from "../organization-composer/composer.js";
 import { scaffoldProjectOs, type ScaffoldResult } from "../project-os/scaffold.js";
 import { CapabilityGateway } from "../capability-gateway/gateway.js";
-import { assertWithinRoot } from "../sandbox/sandbox.js";
+import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
 import type { ModelRegistry } from "../models/registry.js";
 import { CheapestCapableModelRouter, type RoutingDecision } from "../models/router.js";
@@ -79,8 +79,12 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // THEN FILESYSTEM MUTATION (bölüm 87). Bu doğrulama, Capability
   // Gateway/Policy Engine'e ulaşmadan ÖNCE yapılır — bir path-escape
   // girişimi, hiçbir politika kararı gerektirmeden en baştan reddedilir.
+  // assertFilesystemConfinement (sözdizimsel DEĞİL, gerçek dosya sistemi
+  // farkındalıklı) kullanılır çünkü `baseDir` içine yerleştirilmiş,
+  // `baseDir` dışına işaret eden bir symlink de aynı şekilde reddedilmelidir
+  // (4th independent review round fix).
   const genome = parseProjectGenome(input.genomeCandidate);
-  assertWithinRoot(input.baseDir, genome.project.id);
+  assertFilesystemConfinement(input.baseDir, genome.project.id);
   const risk = input.risk ?? 1;
   const organization = composeOrganizationFromGenome(genome, risk);
 

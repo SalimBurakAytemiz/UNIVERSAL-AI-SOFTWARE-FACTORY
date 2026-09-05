@@ -26,4 +26,39 @@ describe("BusinessCapabilityRegistry", () => {
     });
     expect(registry.get("loyalty")?.deliveryOptions).toEqual(["DEFER"]);
   });
+
+  describe("P1 fix (targeted ownership audit): registered/returned capabilities cannot be mutated via a leaked reference", () => {
+    it("mutating the object passed into register() after registration does not affect internal state", () => {
+      const registry = new BusinessCapabilityRegistry();
+      const capability: { id: string; purpose: string; projectFamilies: string[]; dependencies: string[]; deliveryOptions: ("DEFER" | "BUILD")[] } = {
+        id: "loyalty",
+        purpose: "Customer loyalty points",
+        projectFamilies: ["ecommerce"],
+        dependencies: [],
+        deliveryOptions: ["DEFER"]
+      };
+      registry.register(capability);
+      capability.projectFamilies.push("game");
+
+      expect(registry.findApplicable("game")).toHaveLength(0);
+    });
+
+    it("mutating a record returned by get()/all() throws and does not affect internal state", () => {
+      const registry = new BusinessCapabilityRegistry();
+      registry.register({
+        id: "loyalty",
+        purpose: "Customer loyalty points",
+        projectFamilies: ["ecommerce"],
+        dependencies: [],
+        deliveryOptions: ["DEFER"]
+      });
+
+      const got = registry.get("loyalty")!;
+      expect(() => {
+        (got.projectFamilies as string[]).push("game");
+      }).toThrow(TypeError);
+
+      expect(registry.findApplicable("game")).toHaveLength(0);
+    });
+  });
 });

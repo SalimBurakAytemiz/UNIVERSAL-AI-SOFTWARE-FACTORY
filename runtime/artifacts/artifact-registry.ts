@@ -4,6 +4,8 @@
 // bir dayanağıdır — bir kanıt (proof/test sonucu) iddiaya bağlanacaksa,
 // önce bir Artifact kaydı olarak var olmalıdır.
 
+import { freezeRecord } from "../util/immutable.js";
+
 export type ArtifactClass =
   | "code"
   | "docs"
@@ -44,6 +46,16 @@ export interface RegisterArtifactInput {
   readonly checksum?: string;
 }
 
+/**
+ * P1 fix (4th independent review round, targeted follow-up ownership
+ * audit): get()/allFor()/findByClass() previously returned the internal
+ * ArtifactRecord objects directly — mutating a returned record's `path`
+ * or `checksum` after the fact would silently swap what evidence a proof
+ * reference actually points to, without a new register() event, directly
+ * undermining "no claim without evidence" (bölüm 303: the record backing
+ * a claim must be exactly what was registered). Every read now returns a
+ * frozen, detached snapshot.
+ */
 export class ArtifactRegistry {
   private readonly artifacts = new Map<string, ArtifactRecord>();
 
@@ -54,18 +66,19 @@ export class ArtifactRegistry {
     }
     const record: ArtifactRecord = { ...input, createdAt: new Date().toISOString() };
     this.artifacts.set(input.id, record);
-    return record;
+    return freezeRecord(record);
   }
 
   get(id: string): ArtifactRecord | undefined {
-    return this.artifacts.get(id);
+    const record = this.artifacts.get(id);
+    return record ? freezeRecord(record) : undefined;
   }
 
   allFor(projectId: string): readonly ArtifactRecord[] {
-    return [...this.artifacts.values()].filter((a) => a.projectId === projectId);
+    return [...this.artifacts.values()].filter((a) => a.projectId === projectId).map((a) => freezeRecord(a));
   }
 
   findByClass(artifactClass: ArtifactClass): readonly ArtifactRecord[] {
-    return [...this.artifacts.values()].filter((a) => a.artifactClass === artifactClass);
+    return [...this.artifacts.values()].filter((a) => a.artifactClass === artifactClass).map((a) => freezeRecord(a));
   }
 }

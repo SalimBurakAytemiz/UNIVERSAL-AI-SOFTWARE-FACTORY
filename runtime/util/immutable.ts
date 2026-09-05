@@ -32,3 +32,37 @@ export function freezeRecord<T extends object>(value: T): Readonly<T> {
 export function freezeRecords<T extends object>(values: readonly T[]): readonly Readonly<T>[] {
   return values.map((v) => freezeRecord(v));
 }
+
+/**
+ * `freezeRecord`, yalnızca BİR seviye (üst nesne + doğrudan dizi alanları)
+ * dondurur — güvenlik kanıtı (audit) gibi, içinde rastgele derinlikte iç
+ * içe nesne/dizi barındırabilen (`payload: Record<string, unknown>` gibi)
+ * kayıtlar için bu YETERSİZDİR: `record.payload.detay.altAlan = "..."`
+ * gibi bir mutasyon hâlâ mümkün kalır. `deepFreeze`, bir nesne grafiğinin
+ * HER seviyesini (nesneler ve diziler dahil) özyinelemeli olarak dondurur.
+ */
+export function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const key of Object.getOwnPropertyNames(value)) {
+    deepFreeze((value as Record<string, unknown>)[key]);
+  }
+  return value;
+}
+
+/**
+ * `structuredClone` ile TAM bir derin kopya alır (çağıranın orijinal nesne
+ * grafiğinden tamamen kopuk — hiçbir iç içe nesne/dizi referansı
+ * paylaşılmaz) ve sonucu `deepFreeze` ile dondurur. Audit kayıtları gibi
+ * "bu asla, hiçbir yoldan, sonradan mutasyona uğratılamamalı" güvenlik
+ * kanıtı verileri için kullanılır (bölüm 242). `structuredClone`
+ * fonksiyon/sembol gibi seri hale getirilemeyen değerler için doğal olarak
+ * fırlatır (fail closed) — bu, audit payload'unun her zaman JSON-uyumlu,
+ * seri hale getirilebilir veri olması gerektiği kuralıyla tutarlıdır
+ * (hashOf zaten JSON.stringify kullanır).
+ */
+export function deepFreezeClone<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
+}

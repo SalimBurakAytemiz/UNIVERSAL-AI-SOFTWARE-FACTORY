@@ -5,7 +5,7 @@
 // aradan bir kayıt silinip/değiştirilirse zincir bozulur ve tespit edilebilir.
 
 import { createHash } from "node:crypto";
-import { freezeRecord } from "../util/immutable.js";
+import { deepFreezeClone } from "../util/immutable.js";
 
 export interface AuditEvent {
   readonly type: string;
@@ -35,33 +35,55 @@ export class AuditLog {
   private readonly records: AuditRecord[] = [];
   private static readonly GENESIS_HASH = "0".repeat(64);
 
+  /**
+   * P1 fix (4th independent review round, "audit payload mutability leak"):
+   * eskiden `event` (ve özellikle `event.payload`, rastgele derinlikte iç
+   * içe nesne/dizi içerebilir) SIĞ bir kopyayla (`{...event}`) saklanıyordu
+   * — bu yalnızca ÜST DÜZEYİ ayırır; `event.payload` iç Map'e giden
+   * kayıtla AYNI nesne referansıydı. Bir çağıran, append()'e verdiği
+   * ORİJİNAL payload nesnesini SONRADAN mutasyona uğratırsa (ör.
+   * `myPayload.detail.amount = 9999`), bu doğrudan yetkili (authoritative)
+   * audit geçmişini de bozardı — hash zaten hesaplanmış olduğundan
+   * verifyIntegrity() bunu yakalardı ama kayıt İÇERİĞİ zaten sessizce
+   * değişmiş olurdu. Artık `event` önce TAM bir derin kopyayla
+   * (`structuredClone`) çağıranın nesne grafiğinden koparılır; ondan
+   * SONRA hash hesaplanır ve iç diziye eklenir — orijinal girdi nesnesi
+   * üzerindeki hiçbir sonraki mutasyon, artık depolanmış olan kaydı
+   * ETKİLEYEMEZ.
+   */
   append(event: AuditEvent): AuditRecord {
+    const detachedEvent = structuredClone(event);
     const previousHash = this.records.length > 0
       ? this.records[this.records.length - 1]!.hash
       : AuditLog.GENESIS_HASH;
 
     const base = {
-      ...event,
+      ...detachedEvent,
       sequence: this.records.length,
       previousHash
     };
     const record: AuditRecord = { ...base, hash: hashOf(base) };
     this.records.push(record);
-    return freezeRecord(record);
+    return deepFreezeClone(record);
   }
 
   /**
-   * P1 audit fix (cross-cutting review): eskiden bu, İÇ `records` dizisinin
+   * P1 cross-cutting fix (round 3): eskiden bu, İÇ `records` dizisinin
    * KENDİSİNİ döndürüyordu — `auditLog.all().push(sahteKayit)` veya
    * `.splice(...)` ile bir çağıran, hash zincirinden hiç geçmeden kayıt
    * ekleyebilir veya (özellikle SON kaydı) hash zincirini bozmadan
    * silebilirdi; bu, `verifyIntegrity()`'nin asla yakalayamayacağı bir
-   * "sessiz silme" yoluydu. Artık her çağrı, iç diziden BAĞIMSIZ, taze bir
-   * kopya döndürür — döndürülen dizi üzerindeki hiçbir mutasyon iç durumu
-   * etkilemez.
+   * "sessiz silme" yoluydu.
+   *
+   * P1 fix (round 4): sığ `freezeRecord` yerine artık `deepFreezeClone`
+   * kullanılır — döndürülen kaydın `payload` alanı DAHİL, tüm nesne
+   * grafiği hem iç durumdan ayrık (derin kopya) hem de tamamen donmuştur.
+   * Böylece `auditLog.all()[0].payload.detay.altAlan = "x"` gibi iç içe
+   * bir mutasyon girişimi de artık iç durumu ETKİLEMEZ (ve zaten donmuş
+   * olduğundan TypeError fırlatır).
    */
   all(): readonly AuditRecord[] {
-    return this.records.map((r) => freezeRecord(r));
+    return this.records.map((r) => deepFreezeClone(r));
   }
 
   /**

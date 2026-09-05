@@ -319,4 +319,80 @@ describe("BudgetGuard", () => {
       expect(auditLog.verifyIntegrity()).toBe(true);
     });
   });
+
+  describe("P1 fix: limits ownership (caller-owned config object cannot mutate authoritative ceilings)", () => {
+    it("mutating the ORIGINAL limits object after construction does not change internal ceilings", () => {
+      const costEngine = new CostEngine();
+      const originalLimits: { perTaskUsd: number } = { perTaskUsd: 1 };
+      const guard = new BudgetGuard(costEngine, originalLimits);
+
+      // Caller mutates the very object they passed in, after the fact.
+      originalLimits.perTaskUsd = 1000;
+
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1.5 })).toThrow(
+        BudgetExceededError
+      );
+    });
+
+    it("mutating the original limits object to NaN/Infinity/negative after construction does not corrupt enforcement", () => {
+      const costEngine = new CostEngine();
+      const originalLimits: { perTaskUsd: number; dailyUsd: number } = { perTaskUsd: 1, dailyUsd: 5 };
+      const guard = new BudgetGuard(costEngine, originalLimits);
+
+      originalLimits.perTaskUsd = NaN;
+      originalLimits.dailyUsd = -Infinity;
+
+      // Internal ceilings remain the original, valid values — the guard
+      // still blocks over-ceiling spend rather than silently allowing it
+      // (which is what would happen if NaN/-Infinity leaked in: `x > NaN`
+      // and `x > -Infinity` comparisons never block appropriately).
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1.5 })).toThrow(
+        BudgetExceededError
+      );
+      expect(Number.isFinite(costEngine.total())).toBe(true);
+      expect(costEngine.total()).toBeGreaterThanOrEqual(0);
+    });
+
+    it("getLimits() returns a frozen, detached snapshot that cannot mutate internal state", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 2 });
+
+      const snapshot = guard.getLimits();
+      expect(() => {
+        (snapshot as { perTaskUsd: number }).perTaskUsd = 9999;
+      }).toThrow(TypeError);
+
+      // Internal ceiling is unaffected regardless.
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 3 })).toThrow(
+        BudgetExceededError
+      );
+      expect(guard.getLimits().perTaskUsd).toBe(2);
+    });
+
+    it("getLimits() never returns the same object reference on repeated calls", () => {
+      const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 2 });
+      const a = guard.getLimits();
+      const b = guard.getLimits();
+      expect(a).not.toBe(b);
+      expect(a).toEqual(b);
+    });
+
+    it("daily/monthly enforcement still works after the ownership fix (regression guard)", () => {
+      const clock = makeClock("2026-05-01T00:00:00.000Z");
+      const costEngine = new CostEngine(clock.now);
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 10, monthlyUsd: 20 }, clock.now);
+
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 9 });
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: 2 })).toThrow(
+        BudgetExceededError
+      );
+
+      // A new UTC day resets the daily ceiling but not the monthly one.
+      clock.advanceTo("2026-05-02T00:00:01.000Z");
+      guard.spend({ taskId: "t3", provider: "mock", modelId: "m1", amountUsd: 9 });
+      expect(() => guard.spend({ taskId: "t4", provider: "mock", modelId: "m1", amountUsd: 3 })).toThrow(
+        BudgetExceededError
+      ); // would push monthly total (9 + 9 + 3 = 21) over 20
+    });
+  });
 });

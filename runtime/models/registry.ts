@@ -3,6 +3,8 @@
 // kod içine gömülmez (bölüm 60). Yeni model eklemek kod değişikliği
 // gerektirmemelidir.
 
+import { freezeRecord } from "../util/immutable.js";
+
 export type ModelTier =
   | "MOCK"
   | "LOCAL_FREE"
@@ -44,15 +46,28 @@ export interface ModelRecord {
 
 const USABLE_STATUSES: readonly ModelStatus[] = ["APPROVED", "ACTIVE", "MONITORED"];
 
+/**
+ * P1 fix (4th independent review round, targeted follow-up ownership
+ * audit): register() eskiden ÇAĞIRANIN geçtiği nesnenin REFERANSINI
+ * saklıyordu ve all()/findCapable() İÇ diziyi doğrudan döndürüyordu (en
+ * kötü hali — hiçbir kopya, hiçbir dondurma). Bir çağıran, kaydettiği
+ * (veya `all()`'dan döndürülen) bir model kaydını sonradan mutasyona
+ * uğratarak `costPerCall`'ı düşürüp en-ucuz-yeterli-model yönlendirmesini
+ * yanıltabilir, `status`'u DEPRECATED/RETIRED'dan APPROVED'a çevirip bu
+ * modelin asla otomatik seçilmeme kuralını atlatabilir, veya
+ * `capabilities`'e sahip olmadığı bir yetenek ekleyebilirdi (bölüm 60-64,
+ * maliyet/yönlendirme bütünlüğü). Artık register() bağımsız bir kopya
+ * saklar; all()/findCapable() donmuş, ayrık anlık görüntüler döndürür.
+ */
 export class ModelRegistry {
   private readonly models: ModelRecord[] = [];
 
   register(model: ModelRecord): void {
-    this.models.push(model);
+    this.models.push(freezeRecord({ ...model }));
   }
 
   all(): readonly ModelRecord[] {
-    return this.models;
+    return this.models.map((m) => freezeRecord(m));
   }
 
   /**
@@ -61,11 +76,9 @@ export class ModelRegistry {
    * modeller asla otomatik yönlendirmeye dahil edilmez.
    */
   findCapable(requiredCapabilities: readonly string[]): ModelRecord[] {
-    return this.models.filter(
-      (m) =>
-        USABLE_STATUSES.includes(m.status) &&
-        requiredCapabilities.every((cap) => m.capabilities.includes(cap))
-    );
+    return this.models
+      .filter((m) => USABLE_STATUSES.includes(m.status) && requiredCapabilities.every((cap) => m.capabilities.includes(cap)))
+      .map((m) => freezeRecord(m));
   }
 }
 

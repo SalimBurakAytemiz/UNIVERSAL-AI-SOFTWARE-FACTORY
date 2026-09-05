@@ -4,6 +4,8 @@
 // NOT_REQUIRED) kaydeder. Bu, "her şeyi sıfırdan inşa etme" eğilimine
 // karşı bir denge noktasıdır (bölüm 30, Build vs Buy vs Integrate Engine).
 
+import { freezeRecord } from "../util/immutable.js";
+
 export type DeliveryOption = "BUILD" | "INTEGRATE" | "REUSE" | "BUY_OR_SAAS" | "DEFER" | "NOT_REQUIRED";
 
 export interface BusinessCapabilityRecord {
@@ -14,19 +16,27 @@ export interface BusinessCapabilityRecord {
   readonly deliveryOptions: readonly DeliveryOption[];
 }
 
+/**
+ * P1 fix (4th independent review round, targeted follow-up ownership
+ * audit): register()/get()/all() previously stored and returned the
+ * caller's own object references directly. Now register() stores an
+ * independent copy and every read returns a frozen, detached snapshot
+ * (runtime/util/immutable.ts), consistent with every other P0 registry.
+ */
 export class BusinessCapabilityRegistry {
   private readonly capabilities = new Map<string, BusinessCapabilityRecord>();
 
   register(capability: BusinessCapabilityRecord): void {
-    this.capabilities.set(capability.id, capability);
+    this.capabilities.set(capability.id, freezeRecord({ ...capability }));
   }
 
   all(): readonly BusinessCapabilityRecord[] {
-    return [...this.capabilities.values()];
+    return [...this.capabilities.values()].map((c) => freezeRecord(c));
   }
 
   get(id: string): BusinessCapabilityRecord | undefined {
-    return this.capabilities.get(id);
+    const capability = this.capabilities.get(id);
+    return capability ? freezeRecord(capability) : undefined;
   }
 
   /** Belirli bir proje ailesi için geçerli olan iş yeteneklerini döndürür. */
