@@ -48,6 +48,39 @@ export interface ModelRecord {
 const USABLE_STATUSES: readonly ModelStatus[] = ["APPROVED", "ACTIVE", "MONITORED"];
 
 /**
+ * P2 targeted-audit fix (9th independent review round, same class as
+ * "duplicate worker identities break authoritative status" —
+ * workers/registry.ts): register() eskiden bir `modelId` çakışmasını hiç
+ * kontrol etmiyordu — aynı `modelId` ile ikinci bir register() çağrısı,
+ * ilk kaydı SİLMEDEN dizinin sonuna YENİ bir kayıt daha ekliyordu.
+ * findCapable() yalnızca `status`'a göre filtreler; bir model önce ACTIVE
+ * kaydedilip sonra AYNI id ile DEPRECATED/RETIRED olarak "yeniden
+ * kaydedilirse", BAYAT ACTIVE kayıt dizide kalır ve router hâlâ onu
+ * seçebilir — "bir model id TEK bir yetkili kimliği temsil eder" ilkesini
+ * (bölüm 60/61) ihlal eder. Fixed: register() artık aynı id ile ikinci
+ * bir kayda İZİN VERMEZ; mevcut bir modelin durumunu değiştirmek için
+ * AÇIK bir updateStatus() metodu kullanılmalıdır — bu, YETKİLİ kaydı
+ * YERİNDE değiştirir, asla ikinci bir kayıt OLUŞTURMAZ.
+ */
+export class DuplicateModelIdError extends Error {
+  constructor(modelId: string) {
+    super(
+      `Model id '${modelId}' already exists. A model id is a permanent, unique authoritative ` +
+        `identity — register() never creates a second record for an existing id; use ` +
+        `updateStatus() to transition an existing model's status.`
+    );
+    this.name = "DuplicateModelIdError";
+  }
+}
+
+export class ModelNotFoundError extends Error {
+  constructor(modelId: string) {
+    super(`No model registered with id '${modelId}'.`);
+    this.name = "ModelNotFoundError";
+  }
+}
+
+/**
  * P1 fix (4th independent review round, targeted follow-up ownership
  * audit): register() eskiden ÇAĞIRANIN geçtiği nesnenin REFERANSINI
  * saklıyordu ve all()/findCapable() İÇ diziyi doğrudan döndürüyordu (en
@@ -74,6 +107,11 @@ export class ModelRegistry {
     // ayrı/farklı bir kural icat edilmez — ve reddedilen bir kayıt asla
     // `this.models` dizisine ULAŞMAZ (fail closed, mutasyondan önce kontrol).
     assertValidMonetaryAmount(model.costPerCall, `ModelRegistry.register(modelId=${model.modelId})`);
+    // P2 targeted-audit fix (9th independent review round): reject an id
+    // collision BEFORE any mutation — see DuplicateModelIdError above.
+    if (this.models.some((m) => m.modelId === model.modelId)) {
+      throw new DuplicateModelIdError(model.modelId);
+    }
     this.models.push(freezeRecord({ ...model }));
   }
 
@@ -90,6 +128,21 @@ export class ModelRegistry {
     return this.models
       .filter((m) => USABLE_STATUSES.includes(m.status) && requiredCapabilities.every((cap) => m.capabilities.includes(cap)))
       .map((m) => freezeRecord(m));
+  }
+
+  /**
+   * Var olan bir modelin durumunu değiştirmenin TEK yolu — register()'ı
+   * TEKRAR çağırmak DEĞİL. YETKİLİ kaydı YERİNDE (aynı dizi konumunda)
+   * değiştirir, asla ikinci bir kayıt oluşturmaz.
+   */
+  updateStatus(modelId: string, status: ModelStatus): ModelRecord {
+    const index = this.models.findIndex((m) => m.modelId === modelId);
+    if (index === -1) {
+      throw new ModelNotFoundError(modelId);
+    }
+    const updated = freezeRecord({ ...this.models[index]!, status });
+    this.models[index] = updated;
+    return freezeRecord(updated);
   }
 }
 

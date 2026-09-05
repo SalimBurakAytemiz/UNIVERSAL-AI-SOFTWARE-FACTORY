@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { WorkerRegistry } from "../registry.js";
+import { WorkerRegistry, DuplicateWorkerIdError, WorkerNotFoundError } from "../registry.js";
 import { InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
+import { ResourceAwareScheduler, NoSufficientWorkerError } from "../../scheduler/scheduler.js";
 
 describe("WorkerRegistry", () => {
   it("excludes quarantined workers from capable candidates", () => {
@@ -106,6 +107,109 @@ describe("WorkerRegistry", () => {
       const capable = registry.findCapable(["gpu"]);
       expect(capable).toHaveLength(1);
       expect(capable[0]!.id).toBe("genuinely-cheap");
+    });
+  });
+
+  describe("P2 fix (9th independent review round, 'duplicate worker identities break authoritative status')", () => {
+    it("first registration of a worker id succeeds", () => {
+      const registry = new WorkerRegistry();
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" })
+      ).not.toThrow();
+      expect(registry.all()).toHaveLength(1);
+    });
+
+    it("a duplicate worker id registration is rejected", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.02, status: "QUARANTINED" })
+      ).toThrow(DuplicateWorkerIdError);
+    });
+
+    it("the original record remains completely unchanged after a rejected duplicate registration", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "gpu", capabilities: ["gpu"], costPerMinuteUsd: 99, status: "QUARANTINED" })
+      ).toThrow(DuplicateWorkerIdError);
+
+      const [worker] = registry.all();
+      expect(worker!.status).toBe("IDLE");
+      expect(worker!.workerClass).toBe("linux-general");
+      expect(worker!.costPerMinuteUsd).toBe(0.01);
+      expect(registry.all()).toHaveLength(1); // no stale/duplicate record was created
+    });
+
+    it("an explicit status transition IDLE -> QUARANTINED works via updateStatus()", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      const updated = registry.updateStatus("w1", "QUARANTINED");
+      expect(updated.status).toBe("QUARANTINED");
+      expect(registry.all()).toHaveLength(1); // still exactly one authoritative record
+    });
+
+    it("BLOCKER regression: a quarantined worker (via updateStatus) is never returned by findCapable() — no stale IDLE record survives", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      registry.updateStatus("w1", "QUARANTINED");
+
+      expect(registry.findCapable(["cpu"])).toHaveLength(0);
+      expect(registry.all()).toHaveLength(1);
+    });
+
+    it("BLOCKER regression: the scheduler never selects a worker quarantined via updateStatus()", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      registry.updateStatus("w1", "QUARANTINED");
+      const scheduler = new ResourceAwareScheduler(registry);
+
+      expect(() => scheduler.selectWorker({ taskId: "t1", requiredCapabilities: ["cpu"] })).toThrow(
+        NoSufficientWorkerError
+      );
+    });
+
+    it("a BUSY worker is excluded from scheduler selection per the existing IDLE-only contract", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      registry.updateStatus("w1", "BUSY");
+      const scheduler = new ResourceAwareScheduler(registry);
+
+      expect(() => scheduler.selectWorker({ taskId: "t1", requiredCapabilities: ["cpu"] })).toThrow(
+        NoSufficientWorkerError
+      );
+      // findCapable() itself still lists it (only QUARANTINED is excluded there) — the
+      // IDLE-only restriction is the scheduler's own, separate contract.
+      expect(registry.findCapable(["cpu"])).toHaveLength(1);
+    });
+
+    it("a worker returns to an allowed (IDLE) state only through an explicit updateStatus() transition, and is then selectable again", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      registry.updateStatus("w1", "QUARANTINED");
+      expect(registry.findCapable(["cpu"])).toHaveLength(0);
+
+      registry.updateStatus("w1", "IDLE");
+      const scheduler = new ResourceAwareScheduler(registry);
+      expect(scheduler.selectWorker({ taskId: "t1", requiredCapabilities: ["cpu"] }).id).toBe("w1");
+      expect(registry.all()).toHaveLength(1); // still exactly one record throughout
+    });
+
+    it("updateStatus() on an unregistered id fails closed instead of silently creating a record", () => {
+      const registry = new WorkerRegistry();
+      expect(() => registry.updateStatus("never-registered", "QUARANTINED")).toThrow(WorkerNotFoundError);
+      expect(registry.all()).toHaveLength(0);
+    });
+
+    it("no stale duplicate worker record remains after repeated register/reject/updateStatus cycles", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" })
+      ).toThrow(DuplicateWorkerIdError);
+      registry.updateStatus("w1", "BUSY");
+      registry.updateStatus("w1", "IDLE");
+      expect(registry.all()).toHaveLength(1);
     });
   });
 });

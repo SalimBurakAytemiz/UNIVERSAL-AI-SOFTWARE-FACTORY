@@ -62,8 +62,22 @@ factory:
     narrow targeted audit for those same 5 classes that found and fixed
     one more genuine instance (runtime/cli/commands/baseline-status.ts's
     summarizeRequirements() had the identical prototype-key counting bug
-    for req.status/req.category). All findings are fixed in this session
-    (see below), fully verified, and pushed for a ninth re-review. P0
+    for req.status/req.category); round 9 confirmed all prior fixes but
+    reproduced 3 NEW findings on d19ee90 (routeAndExecute() invoked EVERY
+    model candidate — initial and every escalation/fallback step — via a
+    direct provider call with NO PolicyEngine/BudgetGuard consultation and
+    no cost recorded for a candidate that later failed validation, meaning
+    allowPremiumFallback was being treated as an authorization rather than
+    a routing permission flag; WorkerRegistry.register() allowed a
+    duplicate worker id to leave a STALE record in the array after a
+    same-id re-registration, so a quarantined duplicate never actually
+    removed the original IDLE record from scheduler eligibility; and
+    package.json's engines.node ('>=20') silently contradicted the locked
+    Vitest 5 dependency's own required range), plus a narrow targeted
+    audit for those same 3 classes that found and fixed one more genuine
+    instance (models/registry.ts had the identical duplicate-id/stale-
+    record bug as WorkerRegistry). All findings are fixed in this session
+    (see below), fully verified, and pushed for a tenth re-review. P0
     remains open until that re-review comes back clean.
 
 completed_milestones:
@@ -964,6 +978,137 @@ completed_milestones:
     secret-scan (history-aware)/all 9 P0 proofs all clean; every fix
     confirmed via git-stash to have failing regression tests against its
     pre-fix code, then passing again with the fix restored.
+  - |-
+    THIS SESSION (round 9) — a ninth independent Codex review confirmed
+    the round-8 fixes (toJSON redaction bypass, genome ownership race,
+    non-atomic state writes, prototype-name crash, float budget precision,
+    plus every earlier ownership/policy/approval/cache fix), then
+    reproduced 3 NEW findings on commit d19ee90, plus asked for a narrow
+    targeted audit for those same 3 classes. All findings fixed:
+    - [P1] "Fallback execution bypasses policy and budget enforcement":
+      Codex reproduced routeAndExecute() invoking EVERY candidate — the
+      initial one AND every escalation/fallback step — via a DIRECT
+      `gateway.invoke()` call, with NO PolicyEngine or BudgetGuard
+      consultation anywhere, and no cost recorded for a candidate whose
+      invocation succeeded but whose output later failed validate().
+      `allowPremiumFallback` is a routing-level permission flag, never an
+      authorization substitute for the same policy/budget gate every
+      other risky Factory action passes through (bölüm 147). Fixed in
+      runtime/models/router.ts: routeAndExecute() now takes REQUIRED
+      `policy`/`budget` parameters; every candidate invocation — initial
+      and every escalation — goes through a new private
+      invokeAuthorized() helper wrapping a CapabilityGateway/PolicyEngine
+      check (DENY/APPROVAL_REQUIRED throw, provider never called), a
+      pre-invocation BudgetGuard.assertWithinBudget() check against the
+      estimated cost (blocks BEFORE any provider call), and a
+      post-invocation BudgetGuard.spend() recording the ACTUAL cost
+      BEFORE validate() runs (so a failed-validation candidate's real
+      spend is still accounted for). All existing router/proof tests were
+      updated to supply the now-required policy/budget arguments (all
+      continue to pass, confirming no behavioral regression). Six new
+      regression tests prove: a policy-DENYed fallback candidate is never
+      invoked, a fallback requiring approval is not invoked without one,
+      insufficient budget blocks a fallback BEFORE any provider call, a
+      fallback's cost is recorded even though its output later fails
+      validation, multiple failed fallback attempts cannot silently
+      exceed the budget ceiling, and allowPremiumFallback=true is not
+      itself an authorization (a default-deny policy blocks even the
+      INITIAL candidate, proving the initial invocation is gated too, not
+      just fallbacks). Because the fix changes routeAndExecute()'s
+      signature (2 new required parameters), a plain git-stash of the
+      whole file would misleadingly shift argument positions rather than
+      isolate the security property; verified instead by temporarily
+      bypassing ONLY the authorization wrapper's body (keeping the new
+      signature) and confirming all 6 new tests fail with exactly the
+      bypass Codex described, then restoring the real fix.
+    - [P2] "Duplicate worker identities break authoritative status": Codex
+      reproduced worker id X registered IDLE, then the SAME id X
+      registered again as QUARANTINED — register() never checked for an
+      id collision, so BOTH records remained in the array; findCapable()
+      only filters out QUARANTINED, leaving the stale IDLE record
+      selectable by ResourceAwareScheduler. Fixed in
+      runtime/workers/registry.ts: register() now rejects an id collision
+      (new DuplicateWorkerIdError) before any mutation, and a new
+      updateStatus() method is the ONLY way to transition an existing
+      worker's status — it mutates the authoritative record in place,
+      never creating a second record. Regression tests prove: first
+      registration succeeds, a duplicate id is rejected with the original
+      record completely unchanged, an explicit IDLE->QUARANTINED
+      transition works via updateStatus(), a quarantined worker is never
+      returned by findCapable() or selected by the scheduler, a BUSY
+      worker is excluded from scheduler selection per the existing
+      IDLE-only contract, a worker returns to IDLE only through an
+      explicit updateStatus() call, updateStatus() on an unregistered id
+      fails closed, and no stale duplicate record survives repeated
+      register/reject/updateStatus cycles. Confirmed via git-stash that 8
+      of these tests fail against the pre-fix code with exactly the
+      stale-record reproduction Codex described.
+    - [P2] "Declared Node support conflicts with Vitest 5": package.json's
+      `engines.node` (">=20") silently contradicted the locked
+      `vitest@^5.0.0` dependency's own required range (`^22.12.0 ||
+      ^24.0.0 || >=26.0.0`) — the Factory advertised support for a
+      runtime its own required test toolchain does not support. Fixed:
+      `engines.node` now matches Vitest 5's range exactly (CI already
+      targeted Node 22, needing no change). To ensure a FUTURE dependency
+      upgrade can never silently widen this gap again, `factory doctor`'s
+      Node.js check (runtime/cli/commands/doctor.ts) was upgraded from
+      "is `node` merely present" to genuinely validating the running
+      version against the declared `engines.node` range (new
+      `satisfiesEngineRange()`, reading package.json by walking up from
+      doctor.ts's own directory — correct from both source `tsx` execution
+      and the compiled `dist/` CLI). Regression tests prove: the real
+      environment's Node.js check is READY only because it genuinely
+      satisfies the declared range, the range-matching logic is correct
+      at exact boundaries (v22.11.0 fails, v22.12.0 passes, v25.0.0 fails
+      in the gap between ^24 and >=26, etc.), and — reading Vitest's OWN
+      engines.node directly from node_modules — every version the
+      Factory's range accepts is also accepted by Vitest's. Confirmed via
+      a temporary revert of package.json's engines.node back to '>=20'
+      (keeping the new doctor.ts logic) that both the boundary test and
+      the no-silent-contradiction test correctly fail, reproducing the
+      exact historical inconsistency; restored afterward.
+    - Targeted follow-up audit (as explicitly requested, narrow — only
+      these 3 classes): found and fixed ONE more genuine instance.
+      models/registry.ts's register() had the IDENTICAL duplicate-id/
+      stale-record bug as WorkerRegistry — a model re-registered under
+      the same id (e.g. attempting to "deprecate via re-registration")
+      left the original ACTIVE record routable alongside the new one.
+      Fixed with the same pattern (new DuplicateModelIdError,
+      updateStatus() as the only transition path); confirmed via
+      git-stash that 5 regression tests fail against the pre-fix code.
+      Reviewed and found NOT applicable: orchestrator.ts never calls
+      `gateway.invoke()` directly (routeAndExecute is the only call
+      site), so no other invocation-bypass path exists; audit-log.ts and
+      cost-engine.ts's internal arrays are append-only historical event
+      logs, not mutable-status identity registries, so the duplicate-
+      identity class does not apply to them; policy-engine.ts's rules are
+      not identity-keyed; business-capability-registry.ts and
+      technology-registry.ts use Map-keyed storage, which is structurally
+      immune to this bug class (a second `.set()` under the same key
+      overwrites rather than coexisting); no .nvmrc, Dockerfile, or other
+      documentation declares a Node version, and @types/node's version is
+      already consistent with the corrected baseline. This scoping
+      decision is recorded here so a future session does not re-litigate
+      it without new evidence.
+  - >-
+    Requirement registry updated a ninth time from this round's real
+    evidence: UASF-REQ-0027/UASF-REQ-0028 (Cheapest-capable-model router /
+    Premium fallback policy — routeAndExecute() policy+budget
+    authorization gate), UASF-REQ-0025 (Model registry — duplicate-id
+    rejection + updateStatus(), audit-found), UASF-REQ-0031 (Worker
+    registry — duplicate-id rejection + updateStatus()), UASF-REQ-0040
+    (Factory Doctor — genuine engines.node range validation). No status
+    raised beyond what a real test/proof supports; UASF-REQ-0027/0028
+    remain PROOF_VERIFIED on the strength of the NEW evidence, with the
+    prior gap (policy/budget enforcement claimed but not implemented)
+    recorded honestly in their notes rather than silently closed.
+  - 462/462 tests passing (up from 434 before this round, +28 net new
+    across 5 fixed files); lint/typecheck/build/validate-requirements/
+    secret-scan (history-aware)/all 9 P0 proofs all clean; every fix
+    confirmed via git-stash (or, for router.ts's signature-changing fix, a
+    temporary in-place bypass of only the new gating logic) to have
+    failing regression tests against its pre-fix behavior, then passing
+    again with the fix restored.
 
 known_limitations:
   - >-
@@ -991,26 +1136,25 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting a NINTH independent (Codex) re-review of the pushed fixes
-    (round 8's 5 new findings — a logger serialization hook (toJSON) that
-    could reintroduce unredacted credentials after the redaction boundary,
-    a caller-owned mutable Project Genome retained across
-    bootstrapProject()'s async boundary letting a post-call mutation drift
-    authoritative project identity, a non-atomic FileStateStore.write()
-    that could destroy the last known-good durable state on a real write
-    failure, prototype-named project families crashing the Organization
-    Composer via a plain-object dictionary lookup, and binary
-    floating-point accumulation causing exact-ceiling budget spends to be
-    incorrectly rejected across all four cumulative ceilings — are now
-    fixed, tested, and verified per the full required sequence: lint,
-    typecheck, build, 434/434 tests, validate:requirements, history-aware
-    secret-scan, all 9 P0 proofs; a narrow targeted audit for those same 5
-    bug classes found and fixed one more genuine instance, the identical
-    prototype-key counting bug in
-    runtime/cli/commands/baseline-status.ts's summarizeRequirements()).
-    Per explicit instruction: "stop at the independent-review boundary" —
-    do not push further P0 feature work, and do not declare P0 complete,
-    until that re-review confirms no blocking finding remains.
+    Awaiting a TENTH independent (Codex) re-review of the pushed fixes
+    (round 9's 3 new findings — routeAndExecute() invoking every model
+    candidate, initial and every escalation/fallback step, via a direct
+    provider call with NO PolicyEngine/BudgetGuard consultation and no
+    cost recorded for a candidate that later failed validation;
+    WorkerRegistry.register() allowing a duplicate worker id to leave a
+    stale record in the array after a same-id re-registration, so a
+    quarantined duplicate never removed the original IDLE record from
+    scheduler eligibility; and package.json's engines.node ('>=20')
+    silently contradicting the locked Vitest 5 dependency's own required
+    range — are now fixed, tested, and verified per the full required
+    sequence: lint, typecheck, build, 462/462 tests, validate:requirements,
+    history-aware secret-scan, all 9 P0 proofs; a narrow targeted audit
+    for those same 3 bug classes found and fixed one more genuine
+    instance, the identical duplicate-id/stale-record bug in
+    models/registry.ts). Per explicit instruction: "stop at the
+    independent-review boundary" — do not push further P0 feature work,
+    and do not declare P0 complete, until that re-review confirms no
+    blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -1029,48 +1173,51 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 8's 5 findings (redact() in runtime/telemetry/logger.ts
-  now strips every function-valued property, including a caller-supplied
-  toJSON(), so no serialization hook can reintroduce unredacted data after
-  the redaction boundary; parseProjectGenome() now deep-detaches and
-  freezes the candidate via deepFreezeClone() BEFORE validation, so no
-  downstream step of bootstrapProject() can ever observe a caller's later
-  mutation of the original object; FileStateStore.write() now writes to a
-  temporary sibling file and only renameSync's it over the destination on
-  full success, so a failed write can never truncate/destroy the previous
-  valid state; organization-composer's BASE_TEAMS_BY_FAMILY is now a Map
-  (never reads the JS prototype chain), so prototype-named project
-  families fall back correctly instead of crashing; and a new centralized
-  exceedsMonetaryAmount() (runtime/cost/cost-engine.ts, integer
-  micro-dollar comparison) now backs every budget ceiling check, so an
-  exact-ceiling spend is correctly accepted instead of rejected by binary
-  floating-point noise), plus one more genuine instance found during the
-  requested targeted audit (runtime/cli/commands/baseline-status.ts's
-  summarizeRequirements() needed the identical Map-based fix as the
-  composer, to protect its own status/category counts from the same
-  prototype-key corruption), are implemented, tested, and pushed, with the
-  full required verification sequence run clean (lint, typecheck, build,
-  434/434 tests, validate:requirements, history-aware secret-scan, all 9
-  P0 proofs). Every fix was individually confirmed via git-stash to have
-  failing regression tests against its pre-fix code, including the exact
-  reproductions Codex described (a toJSON() hook reintroducing a
-  credential after redaction, a mid-bootstrap project-id mutation drifting
-  authoritative identity, a truncated-JSON durable-state corruption, a
-  TypeError crash on a "constructor"-named project family, and an
-  incorrectly-rejected exact-ceiling budget spend). One collateral,
-  correctness-preserving test update was also required: Proof E's
-  runaway-loop assertion in proofs/budget-ceiling/proof.test.ts, which
-  only ever passed because the OLD budget bug's incorrect rejections
-  happened to also keep the raw float sum under the ceiling — now updated
-  to assert correctness at the Factory's own documented monetary
-  precision rather than bitwise-exact float equality, with the proof's
-  actual claim (a runaway loop is stopped by the ceiling) unchanged and
-  still verified. Do not proceed to further P0 feature work or declare P0
-  complete until an independent (Codex) re-review of this diff confirms no
-  blocking P0 finding remains. If/when that comes back clean, resume from
-  the prior exact_next_action: wire the remaining foundation modules
-  (Discovery, Decisions, Assumptions, Technology/Business-Capability
-  registries) into the same integrated pipeline, consider a SQLite-backed
-  StateStore, get a Founder decision on P0-sufficiency and licensing
-  (section 206). The autonomous-merge governance question stays closed
-  absent new Founder-initiated context.
+  fixes for round 9's 3 findings (routeAndExecute() in
+  runtime/models/router.ts now takes REQUIRED policy/budget parameters and
+  routes every candidate invocation — initial and every escalation step —
+  through a new invokeAuthorized() helper that checks CapabilityGateway/
+  PolicyEngine (DENY/APPROVAL_REQUIRED block the provider call entirely),
+  pre-checks BudgetGuard against the estimated cost before invoking, and
+  records the ACTUAL cost via BudgetGuard.spend() immediately after
+  invocation regardless of later validation outcome; WorkerRegistry in
+  runtime/workers/registry.ts now rejects a duplicate worker id at
+  register() (new DuplicateWorkerIdError) and requires an explicit
+  updateStatus() call — which mutates the authoritative record in place —
+  for any status transition, so no stale duplicate record can ever
+  coexist with a fresh one; package.json's engines.node now matches
+  Vitest 5's own required range exactly, and factory doctor's Node.js
+  check now genuinely validates the running version against that
+  declared range instead of merely checking `node` is present, so a
+  future dependency upgrade widening the required range can never
+  silently go undetected), plus one more genuine instance found during
+  the requested targeted audit (models/registry.ts needed the identical
+  duplicate-id-rejection + updateStatus() fix as WorkerRegistry, to
+  prevent a stale ACTIVE model record surviving a rejected "deprecation
+  via re-registration" attempt), are implemented, tested, and pushed,
+  with the full required verification sequence run clean (lint,
+  typecheck, build, 462/462 tests, validate:requirements, history-aware
+  secret-scan, all 9 P0 proofs). Every fix was individually verified to
+  have failing regression tests against its pre-fix behavior: for
+  workers/registry.ts and models/registry.ts, via the standard git-stash
+  pattern; for router.ts, whose fix changes the function's own signature
+  (making a naive git-stash of the whole file misleading, since old code
+  would silently misassign the new positional arguments), via a temporary
+  in-place bypass of only the new authorization-wrapper body while
+  keeping the new signature, confirming all 6 new tests fail with exactly
+  the policy/budget-bypass Codex described, then restoring the real fix;
+  for package.json/doctor.ts, via a temporary revert of engines.node back
+  to '>=20' (keeping the new doctor.ts validation logic), confirming the
+  new range-boundary and no-silent-contradiction tests correctly fail,
+  reproducing the exact historical inconsistency, then restoring the
+  corrected value. Do not proceed to further P0 feature work or declare
+  P0 complete until an independent (Codex) re-review of this diff
+  confirms no blocking P0 finding remains. If/when that comes back clean,
+  resume from the prior exact_next_action: wire the remaining foundation
+  modules (Discovery, Decisions, Assumptions, Technology/
+  Business-Capability registries) into the same integrated pipeline
+  (including, per this round's finding, ACTUALLY invoking models via
+  routeAndExecute() rather than only selecting them), consider a
+  SQLite-backed StateStore, get a Founder decision on P0-sufficiency and
+  licensing (section 206). The autonomous-merge governance question stays
+  closed absent new Founder-initiated context.

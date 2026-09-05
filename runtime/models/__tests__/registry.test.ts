@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ModelRegistry, createDefaultModelRegistry, tierRank } from "../registry.js";
+import { ModelRegistry, createDefaultModelRegistry, tierRank, DuplicateModelIdError, ModelNotFoundError } from "../registry.js";
 import { InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
 
 function baseModel(overrides: Partial<Parameters<ModelRegistry["register"]>[0]> = {}) {
@@ -165,6 +165,69 @@ describe("ModelRegistry", () => {
         expect(err).toBeInstanceOf(InvalidMonetaryAmountError);
         expect((err as Error).message).toContain("bad-model");
       }
+    });
+  });
+
+  describe("P2 targeted-audit fix (9th independent review round, same class as 'duplicate worker identities break authoritative status')", () => {
+    it("first registration of a model id succeeds", () => {
+      const registry = new ModelRegistry();
+      expect(() => registry.register(baseModel({ modelId: "m1" }))).not.toThrow();
+      expect(registry.all()).toHaveLength(1);
+    });
+
+    it("a duplicate model id registration is rejected", () => {
+      const registry = new ModelRegistry();
+      registry.register(baseModel({ modelId: "m1", status: "ACTIVE" }));
+      expect(() => registry.register(baseModel({ modelId: "m1", status: "DEPRECATED" }))).toThrow(
+        DuplicateModelIdError
+      );
+    });
+
+    it("BLOCKER regression: no stale ACTIVE record survives a rejected duplicate 'deprecation' registration attempt", () => {
+      const registry = new ModelRegistry();
+      registry.register(baseModel({ modelId: "m1", status: "ACTIVE", capabilities: ["classification"] }));
+      expect(() =>
+        registry.register(baseModel({ modelId: "m1", status: "DEPRECATED", capabilities: ["classification"] }))
+      ).toThrow(DuplicateModelIdError);
+
+      // Only ONE record exists, and it is still the original ACTIVE one — the
+      // caller's attempt to "deprecate via re-registration" never silently
+      // left a stale, still-routable ACTIVE duplicate alongside a new one.
+      expect(registry.all()).toHaveLength(1);
+      expect(registry.all()[0]!.status).toBe("ACTIVE");
+    });
+
+    it("an explicit status transition ACTIVE -> DEPRECATED works via updateStatus()", () => {
+      const registry = new ModelRegistry();
+      registry.register(baseModel({ modelId: "m1", status: "ACTIVE" }));
+      const updated = registry.updateStatus("m1", "DEPRECATED");
+      expect(updated.status).toBe("DEPRECATED");
+      expect(registry.all()).toHaveLength(1);
+    });
+
+    it("a model deprecated via updateStatus() is never returned by findCapable()", () => {
+      const registry = new ModelRegistry();
+      registry.register(baseModel({ modelId: "m1", status: "ACTIVE", capabilities: ["classification"] }));
+      registry.updateStatus("m1", "DEPRECATED");
+      expect(registry.findCapable(["classification"])).toHaveLength(0);
+      expect(registry.all()).toHaveLength(1);
+    });
+
+    it("updateStatus() on an unregistered id fails closed instead of silently creating a record", () => {
+      const registry = new ModelRegistry();
+      expect(() => registry.updateStatus("never-registered", "DEPRECATED")).toThrow(ModelNotFoundError);
+      expect(registry.all()).toHaveLength(0);
+    });
+
+    it("a model returns to a usable state only through an explicit updateStatus() transition, with exactly one record throughout", () => {
+      const registry = new ModelRegistry();
+      registry.register(baseModel({ modelId: "m1", status: "ACTIVE", capabilities: ["classification"] }));
+      registry.updateStatus("m1", "DEPRECATED");
+      expect(registry.findCapable(["classification"])).toHaveLength(0);
+
+      registry.updateStatus("m1", "ACTIVE");
+      expect(registry.findCapable(["classification"])).toHaveLength(1);
+      expect(registry.all()).toHaveLength(1);
     });
   });
 });

@@ -8,6 +8,9 @@
 
 import { ModelGateway, type ModelInvocationRequest, type ModelInvocationResponse } from "./gateway.js";
 import { ModelRegistry, TIER_ORDER, tierRank, type ModelRecord, type ModelTier } from "./registry.js";
+import { CapabilityGateway } from "../capability-gateway/gateway.js";
+import type { PolicyEngine } from "../policy-engine/policy-engine.js";
+import type { BudgetGuard } from "../budget/budget.js";
 
 export interface RoutingRequest {
   readonly taskId: string;
@@ -104,6 +107,65 @@ export class CheapestCapableModelRouter {
   }
 
   /**
+   * P1 fix (9th independent review round, "fallback execution bypasses
+   * policy and budget enforcement"): Codex reproduced routeAndExecute()
+   * invoking every candidate — initial AND every escalation/fallback
+   * step — via a DIRECT `gateway.invoke()` call, with NO PolicyEngine or
+   * BudgetGuard consultation anywhere in the loop, and no cost recorded
+   * for a candidate whose invocation succeeded but whose OUTPUT later
+   * failed `validate()`. `allowPremiumFallback` is a routing-level
+   * PERMISSION FLAG ("fallback may be considered at all"), never an
+   * AUTHORIZATION — it must never substitute for the same policy/budget
+   * gate every other risky Factory action passes through (bölüm 147,
+   * "capability gateway'in policy engine'i atlayan bir yolu olmamalı").
+   * Fixed: every candidate invocation — the initial one and each
+   * escalation step — now goes through `invokeAuthorized()` below, which
+   * (1) evaluates the SAME `CapabilityGateway`/`PolicyEngine` used
+   * elsewhere in the Factory (ALLOW required; DENY/APPROVAL_REQUIRED
+   * throw and the provider is never called), (2) checks the projected
+   * cost against `BudgetGuard` BEFORE invoking (insufficient budget
+   * blocks the call, no provider invocation occurs), and (3) records the
+   * ACTUAL incurred cost via `BudgetGuard.spend()` immediately after a
+   * successful invocation — BEFORE `validate()` runs — so a candidate
+   * whose output later fails validation is still correctly accounted for
+   * (bölüm 147, "sessiz harcama yok" applies even to failed attempts).
+   */
+  private async invokeAuthorized(
+    decision: RoutingDecision,
+    request: RoutingRequest,
+    gateway: ModelGateway,
+    invocationRequest: ModelInvocationRequest,
+    capabilityGateway: CapabilityGateway,
+    budget: BudgetGuard
+  ): Promise<ModelInvocationResponse> {
+    return capabilityGateway.authorize(
+      {
+        actionType: "model.invoke",
+        risk: request.risk,
+        description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`,
+        costUsd: decision.model.costPerCall
+      },
+      async () => {
+        // Sağlayıcı ÇAĞRILMADAN ÖNCE, tahmini maliyet (costPerCall) tavana
+        // karşı kontrol edilir — yetersiz bütçe, hiçbir provider çağrısı
+        // yapılmadan reddeder.
+        budget.assertWithinBudget({ taskId: request.taskId }, decision.model.costPerCall);
+        const response = await gateway.invoke(decision.model, invocationRequest);
+        // Gerçek maliyet, validate() çağrılmadan ÖNCE kaydedilir — bir
+        // çıktının sonradan geçersiz sayılması, zaten gerçekleşmiş
+        // harcamanın kayıtlardan düşmesine ASLA yol açmaz.
+        budget.spend({
+          taskId: request.taskId,
+          provider: response.provider,
+          modelId: response.modelId,
+          amountUsd: response.costUsd
+        });
+        return response;
+      }
+    );
+  }
+
+  /**
    * Seç + çalıştır + doğrula akışı. Doğrulama başarısız olursa ve premium
    * fallback açıkça izinliyse, bir üst kalite seviyesine yükselir. KRİTİK:
    * yükseltilen (fallback) yanıt da AYNI `validate` fonksiyonundan geçirilir
@@ -115,16 +177,24 @@ export class CheapestCapableModelRouter {
    * (EscalationExhaustedError) — asla doğrulanmamış bir çıktı sessizce
    * döndürülmez. Seviye sayısı sonlu (6 kademe) olduğundan bu döngü
    * doğası gereği sınırlıdır; sonsuz bir yeniden deneme riski yoktur.
+   *
+   * `policy`/`budget` artık ZORUNLU parametrelerdir — HER aday (ilk seçim
+   * dahil), invokeAuthorized() üzerinden aynı yetkilendirme kapısından
+   * geçer (bkz. yukarıdaki fix notu).
    */
   async routeAndExecute(
     request: RoutingRequest,
     gateway: ModelGateway,
     invocationRequest: ModelInvocationRequest,
     validate: (response: ModelInvocationResponse) => boolean,
+    policy: PolicyEngine,
+    budget: BudgetGuard,
     options: RouteAndExecuteOptions = {}
   ): Promise<RouteAndExecuteResult> {
+    const capabilityGateway = new CapabilityGateway(policy);
+
     let decision = this.selectModel(request);
-    let response = await gateway.invoke(decision.model, invocationRequest);
+    let response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, capabilityGateway, budget);
 
     if (validate(response)) {
       return { response, decision };
@@ -148,7 +218,7 @@ export class CheapestCapableModelRouter {
       }
 
       decision = this.selectModel(request, nextTier);
-      response = await gateway.invoke(decision.model, invocationRequest);
+      response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, capabilityGateway, budget);
 
       if (validate(response)) {
         return { response, decision };

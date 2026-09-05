@@ -9,13 +9,32 @@ import {
   PremiumFallbackBlockedError
 } from "../router.js";
 import type { ModelInvocationResponse } from "../gateway.js";
+import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
+import { CapabilityDeniedError, CapabilityApprovalRequiredError } from "../../capability-gateway/gateway.js";
+import { CostEngine } from "../../cost/cost-engine.js";
+import { BudgetGuard, BudgetExceededError } from "../../budget/budget.js";
+
+/** A permissive policy that ALLOWs everything up to risk 5 — the default for tests not exercising the policy gate itself. */
+function permissivePolicy(): PolicyEngine {
+  const policy = new PolicyEngine();
+  policy.addRule(lowRiskAllowRule(5));
+  return policy;
+}
+
+/** A budget with generous ceilings — the default for tests not exercising the budget gate itself. */
+function permissiveBudget(costEngine: CostEngine = new CostEngine()): BudgetGuard {
+  return new BudgetGuard(costEngine, { perRunUsd: 1000, perTaskUsd: 1000 });
+}
 
 function setup() {
   const registry = createDefaultModelRegistry();
   const gateway = new ModelGateway();
   gateway.registerProvider(new MockProvider());
   const router = new CheapestCapableModelRouter(registry);
-  return { registry, gateway, router };
+  const policy = permissivePolicy();
+  const costEngine = new CostEngine();
+  const budget = permissiveBudget(costEngine);
+  return { registry, gateway, router, policy, budget, costEngine };
 }
 
 describe("CheapestCapableModelRouter", () => {
@@ -48,38 +67,44 @@ describe("CheapestCapableModelRouter", () => {
   });
 
   it("Proof B: a valid cheap-model result does not escalate", async () => {
-    const { router, gateway } = setup();
+    const { router, gateway, policy, budget } = setup();
     const result = await router.routeAndExecute(
       { taskId: "tagging-ok", risk: 0, requiredCapabilities: ["tagging"] },
       gateway,
       { prompt: "tag this" },
-      () => true // validation always passes
+      () => true, // validation always passes
+      policy,
+      budget
     );
     expect(result.decision.escalated).toBe(false);
     expect(result.decision.model.tier).toBe("MOCK");
   });
 
   it("Proof D: premium fallback is blocked by default when validation fails", async () => {
-    const { router, gateway } = setup();
+    const { router, gateway, policy, budget } = setup();
     await expect(
       router.routeAndExecute(
         { taskId: "tagging-fails", risk: 0, requiredCapabilities: ["tagging"] },
         gateway,
         { prompt: "tag this" },
-        () => false // validation always fails
+        () => false, // validation always fails
+        policy,
+        budget
         // allowPremiumFallback intentionally omitted -> defaults to false
       )
     ).rejects.toThrow(PremiumFallbackBlockedError);
   });
 
   it("Proof C: a failed low-cost model can escalate when explicitly authorized, and the escalated response is itself validated", async () => {
-    const { router, gateway } = setup();
+    const { router, gateway, policy, budget } = setup();
     const validate = vi.fn((response) => response.modelId === "mock-premium-architect");
     const result = await router.routeAndExecute(
       { taskId: "implementation-needs-escalation", risk: 3, requiredCapabilities: ["implementation"] },
       gateway,
       { prompt: "implement this" },
       validate,
+      policy,
+      budget,
       { allowPremiumFallback: true }
     );
     expect(result.decision.escalated).toBe(true);
@@ -122,7 +147,9 @@ function setupCapabilityDrivenPromotionScenario() {
   const gateway = new ModelGateway();
   gateway.registerProvider(new MockProvider());
   const router = new CheapestCapableModelRouter(registry);
-  return { registry, gateway, router };
+  const policy = permissivePolicy();
+  const budget = permissiveBudget();
+  return { registry, gateway, router, policy, budget };
 }
 
 describe("CheapestCapableModelRouter escalation (capability-driven initial promotion)", () => {
@@ -141,13 +168,15 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
   });
 
   it("escalates to the tier ABOVE the actually-selected model, not a same-or-lower tier reselection", async () => {
-    const { router, gateway } = setupCapabilityDrivenPromotionScenario();
+    const { router, gateway, policy, budget } = setupCapabilityDrivenPromotionScenario();
     const validate = vi.fn((response) => response.modelId === "niche-premium");
     const result = await router.routeAndExecute(
       { taskId: "niche-task", risk: 0, requiredCapabilities: ["niche-capability"] },
       gateway,
       { prompt: "do the niche thing" },
       validate,
+      policy,
+      budget,
       { allowPremiumFallback: true }
     );
 
@@ -160,13 +189,15 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
   });
 
   it("premium fallback policy remains enforced in the capability-driven-promotion scenario", async () => {
-    const { router, gateway } = setupCapabilityDrivenPromotionScenario();
+    const { router, gateway, policy, budget } = setupCapabilityDrivenPromotionScenario();
     await expect(
       router.routeAndExecute(
         { taskId: "niche-task", risk: 0, requiredCapabilities: ["niche-capability"] },
         gateway,
         { prompt: "do the niche thing" },
-        () => false
+        () => false,
+        policy,
+        budget
         // allowPremiumFallback intentionally omitted -> defaults to false
       )
     ).rejects.toThrow(PremiumFallbackBlockedError);
@@ -185,6 +216,8 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
     const gateway = new ModelGateway();
     gateway.registerProvider(new MockProvider());
     const router = new CheapestCapableModelRouter(registry);
+    const policy = permissivePolicy();
+    const budget = permissiveBudget();
 
     await expect(
       router.routeAndExecute(
@@ -192,6 +225,8 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
         gateway,
         { prompt: "x" },
         () => false,
+        policy,
+        budget,
         { allowPremiumFallback: true }
       )
     ).rejects.toThrow(EscalationExhaustedError);
@@ -235,12 +270,14 @@ function setupThreeTierEscalationScenario() {
   const gateway = new ModelGateway();
   gateway.registerProvider(new MockProvider());
   const router = new CheapestCapableModelRouter(registry);
-  return { registry, gateway, router };
+  const policy = permissivePolicy();
+  const budget = permissiveBudget();
+  return { registry, gateway, router, policy, budget };
 }
 
 describe("CheapestCapableModelRouter fallback output validation", () => {
   it("primary fails, fallback (first escalation) passes -> returns the validated fallback response", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
     const validate = vi.fn((response) => response.modelId === "tier-premium");
 
     const result = await router.routeAndExecute(
@@ -248,6 +285,8 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
       gateway,
       { prompt: "x" },
       validate,
+      policy,
+      budget,
       { allowPremiumFallback: true }
     );
 
@@ -256,7 +295,7 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
   });
 
   it("primary fails, fallback also fails -> continues escalating, validating every candidate, and fails closed once exhausted", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
     const validate = vi.fn((_response: ModelInvocationResponse) => false); // nothing ever validates
 
     await expect(
@@ -265,6 +304,8 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
         gateway,
         { prompt: "x" },
         validate,
+        policy,
+        budget,
         { allowPremiumFallback: true }
       )
     ).rejects.toThrow(EscalationExhaustedError);
@@ -280,7 +321,7 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
   });
 
   it("an invalid premium fallback response cannot bypass validation merely because it is a pricier model", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
     // The premium response fails validation; only the top (critical) tier would pass.
     const validate = vi.fn((response) => response.modelId === "tier-critical");
 
@@ -289,6 +330,8 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
       gateway,
       { prompt: "x" },
       validate,
+      policy,
+      budget,
       { allowPremiumFallback: true }
     );
 
@@ -298,7 +341,7 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
   });
 
   it("retry/escalation limits still apply: at most one attempt per tier, never an unbounded retry loop", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
     const validate = vi.fn(() => false);
 
     await expect(
@@ -307,6 +350,8 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
         gateway,
         { prompt: "x" },
         validate,
+        policy,
+        budget,
         { allowPremiumFallback: true }
       )
     ).rejects.toThrow(EscalationExhaustedError);
@@ -316,7 +361,7 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
   });
 
   it("premium fallback policy is still enforced before any escalation is attempted in this scenario", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
     const validate = vi.fn(() => false);
 
     await expect(
@@ -324,12 +369,172 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
         { taskId: "t5", risk: 0, requiredCapabilities: ["escalation-capability"] },
         gateway,
         { prompt: "x" },
-        validate
+        validate,
+        policy,
+        budget
         // allowPremiumFallback intentionally omitted -> defaults to false
       )
     ).rejects.toThrow(PremiumFallbackBlockedError);
 
     // Blocked immediately after the primary attempt — no escalation happened at all.
     expect(validate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent review round: 'fallback execution bypasses policy and budget enforcement')", () => {
+  it("a fallback candidate that policy DENYs is never invoked — the provider is never called for it", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const policy = new PolicyEngine();
+    policy.addRule(lowRiskAllowRule(5)); // would otherwise allow everything
+    policy.addRule({
+      name: "deny-tier-premium",
+      priority: 1,
+      evaluate: (action) => (action.description.includes("tier-premium") ? "DENY" : null)
+    });
+    const budget = permissiveBudget();
+    const invokeSpy = vi.spyOn(gateway, "invoke");
+    const validate = vi.fn(() => false); // primary fails -> triggers an escalation attempt
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "deny-fallback", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        policy,
+        budget,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(CapabilityDeniedError);
+
+    // tier-mock (initial, allowed) WAS invoked; tier-premium (denied) was NEVER invoked.
+    expect(invokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+  });
+
+  it("a fallback candidate requiring approval is not invoked without a valid approval", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const policy = new PolicyEngine();
+    policy.addRule(lowRiskAllowRule(5));
+    // Higher priority than the catch-all ALLOW above: both are non-DENY, so
+    // whichever is evaluated first among non-DENY matches wins — this must
+    // be considered before the catch-all ALLOW for the assertion below to
+    // reflect this rule's decision rather than being shadowed by it.
+    policy.addRule({
+      name: "approval-required-for-premium",
+      priority: 10,
+      evaluate: (action) => (action.description.includes("tier-premium") ? "APPROVAL_REQUIRED" : null)
+    });
+    const budget = permissiveBudget();
+    const invokeSpy = vi.spyOn(gateway, "invoke");
+    const validate = vi.fn(() => false);
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "approval-fallback", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        policy,
+        budget,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(CapabilityApprovalRequiredError);
+
+    expect(invokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+  });
+
+  it("insufficient budget blocks a fallback candidate BEFORE any provider call occurs", async () => {
+    const { router, gateway, policy } = setupThreeTierEscalationScenario();
+    const costEngine = new CostEngine();
+    // Enough for the free initial (tier-mock, $0) but not the $0.5 premium fallback.
+    const budget = new BudgetGuard(costEngine, { perRunUsd: 0.1 });
+    const invokeSpy = vi.spyOn(gateway, "invoke");
+    const validate = vi.fn(() => false);
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "budget-fallback", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        policy,
+        budget,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(BudgetExceededError);
+
+    // tier-mock (free, within budget) WAS invoked; tier-premium ($0.5, over budget) was NEVER invoked.
+    expect(invokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+    expect(costEngine.total()).toBe(0);
+  });
+
+  it("the cost of a fallback invocation is recorded even though its output later fails validation", async () => {
+    const { router, gateway, policy } = setupThreeTierEscalationScenario();
+    const costEngine = new CostEngine();
+    const budget = new BudgetGuard(costEngine, { perRunUsd: 100 });
+    const validate = vi.fn(() => false); // nothing ever validates -> escalates through every tier
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "cost-accounting", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        policy,
+        budget,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(EscalationExhaustedError);
+
+    // tier-mock ($0) + tier-premium ($0.5) + tier-critical ($2) were all actually invoked
+    // and their real cost recorded, even though EVERY one of them failed validate().
+    expect(costEngine.total()).toBeCloseTo(2.5);
+  });
+
+  it("multiple failed fallback attempts cannot silently exceed the budget ceiling", async () => {
+    const { router, gateway, policy } = setupThreeTierEscalationScenario();
+    const costEngine = new CostEngine();
+    // Enough for tier-mock ($0) + tier-premium ($0.5) but not also tier-critical ($2).
+    const budget = new BudgetGuard(costEngine, { perRunUsd: 0.5 });
+    const validate = vi.fn(() => false);
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "multi-fallback-budget", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        policy,
+        budget,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(BudgetExceededError);
+
+    // tier-critical's $2 invocation never happened once it would push cumulative
+    // spend past the $0.5 ceiling — the ceiling was never silently exceeded.
+    expect(costEngine.total()).toBeCloseTo(0.5);
+  });
+
+  it("allowPremiumFallback=true is not itself an authorization — a default-deny policy blocks even the initial candidate", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const policy = new PolicyEngine(); // no rules at all -> default deny
+    const budget = permissiveBudget();
+    const invokeSpy = vi.spyOn(gateway, "invoke");
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "no-policy-rules", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        () => false,
+        policy,
+        budget,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(CapabilityDeniedError);
+
+    // Not even the INITIAL candidate was invoked — routing permission
+    // (allowPremiumFallback) is never a substitute for policy authorization.
+    expect(invokeSpy).not.toHaveBeenCalled();
   });
 });

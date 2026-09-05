@@ -5,7 +5,7 @@
   "description": "Universal AI Technology Factory — P0 Factory Kernel (Architecture Baseline V1)",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

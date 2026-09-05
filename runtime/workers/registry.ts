@@ -31,6 +31,39 @@ interface MutableWorkerRecord {
 export type WorkerRecord = Readonly<MutableWorkerRecord>;
 
 /**
+ * P2 fix (9th independent review round, "duplicate worker identities break
+ * authoritative status"): register() eskiden bir `id` çakışmasını hiç
+ * kontrol etmiyordu — aynı `id` ile İKİNCİ bir register() çağrısı, ilk
+ * kaydı SİLMEDEN dizinin sonuna YENİ bir kayıt daha ekliyordu. Codex,
+ * worker X'in önce IDLE, sonra AYNI id ile QUARANTINED olarak kaydedildiği
+ * bir senaryo gösterdi: findCapable() yalnızca QUARANTINED kaydı filtreler,
+ * ama BAYAT (stale) IDLE kaydı dizide KALIR ve ResourceAwareScheduler
+ * bunu hâlâ seçebilir — "bir worker id TEK bir yetkili kimliği temsil
+ * eder" ilkesini (bölüm 82/85) ihlal eder. Fixed: register() artık aynı
+ * id ile ikinci bir kayda İZİN VERMEZ (fail closed); mevcut bir worker'ın
+ * durumunu değiştirmek için AÇIK bir updateStatus() metodu kullanılmalıdır
+ * — bu, YETKİLİ kaydı YERİNDE (in place) değiştirir, asla ikinci bir kayıt
+ * OLUŞTURMAZ, dolayısıyla bayat bir ikinci kayıt hiçbir zaman var olamaz.
+ */
+export class DuplicateWorkerIdError extends Error {
+  constructor(id: string) {
+    super(
+      `Worker id '${id}' already exists. A worker id is a permanent, unique authoritative ` +
+        `identity — register() never creates a second record for an existing id; use ` +
+        `updateStatus() to transition an existing worker's status.`
+    );
+    this.name = "DuplicateWorkerIdError";
+  }
+}
+
+export class WorkerNotFoundError extends Error {
+  constructor(id: string) {
+    super(`No worker registered with id '${id}'.`);
+    this.name = "WorkerNotFoundError";
+  }
+}
+
+/**
  * P1 cross-cutting fix: `status`/`capabilities` eskiden all()/findCapable()
  * üzerinden İÇ nesnenin kendisi olarak sızıyordu — bir çağıran
  * `all()[0].status = "IDLE"` yaparak QUARANTINED bir işçiyi (bölüm 85,
@@ -53,6 +86,12 @@ export class WorkerRegistry {
     // `costPerCall` corrupted model routing — the SAME centralized
     // validator is reused here, not a divergent rule.
     assertValidMonetaryAmount(worker.costPerMinuteUsd, `WorkerRegistry.register(id=${worker.id})`);
+    // P2 fix (9th independent review round, "duplicate worker identities
+    // break authoritative status"): reject an id collision BEFORE any
+    // mutation — see DuplicateWorkerIdError above.
+    if (this.workers.some((w) => w.id === worker.id)) {
+      throw new DuplicateWorkerIdError(worker.id);
+    }
     this.workers.push({ ...worker, capabilities: [...worker.capabilities] });
   }
 
@@ -68,5 +107,20 @@ export class WorkerRegistry {
     return this.workers
       .filter((w) => w.status !== "QUARANTINED" && requiredCapabilities.every((c) => w.capabilities.includes(c)))
       .map((w) => freezeRecord(w));
+  }
+
+  /**
+   * Var olan bir worker'ın durumunu değiştirmenin TEK yolu — register()'ı
+   * TEKRAR çağırmak DEĞİL. YETKİLİ kaydı YERİNDE (in place) günceller,
+   * asla ikinci bir kayıt oluşturmaz; bu yüzden bayat/çakışan bir kayıt
+   * hiçbir zaman ortaya çıkamaz (bkz. DuplicateWorkerIdError yukarıda).
+   */
+  updateStatus(id: string, status: WorkerStatus): WorkerRecord {
+    const worker = this.workers.find((w) => w.id === id);
+    if (!worker) {
+      throw new WorkerNotFoundError(id);
+    }
+    worker.status = status;
+    return freezeRecord(worker);
   }
 }

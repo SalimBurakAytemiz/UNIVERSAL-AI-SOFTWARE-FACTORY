@@ -992,6 +992,27 @@
     and the error message identifies the offending model. Confirmed via
     git-stash that 7 of these tests fail against the pre-fix code.
 
+    P2 targeted-audit fix (9th independent review round, found while
+    auditing for the same class as workers/registry.ts's "duplicate
+    worker identities break authoritative status"): register() never
+    checked for a `modelId` collision — a second register() call with the
+    SAME id (e.g. attempting to "deprecate via re-registration") left the
+    original ACTIVE record in the array alongside the new one; findCapable()
+    only filters by status, so the stale ACTIVE record remained routable.
+    Fixed with the identical pattern: register() now rejects an id
+    collision (new DuplicateModelIdError) before any mutation, and a new
+    updateStatus() method is the only way to transition an existing
+    model's status — it mutates the authoritative record's array slot in
+    place rather than ever creating a second record. Regression tests
+    prove: first registration succeeds, a duplicate id is rejected, no
+    stale ACTIVE record survives a rejected duplicate "deprecation"
+    attempt, updateStatus() correctly transitions status, a deprecated
+    model is never returned by findCapable(), updateStatus() on an
+    unregistered id fails closed, and a model can return to a usable
+    state only through updateStatus() with exactly one record throughout.
+    Confirmed via git-stash that 5 of these tests fail against the
+    pre-fix code.
+
 - id: UASF-REQ-0026
   title: MockProvider
   description: Deterministic, free, no-network model provider so the kernel's core tests are self-contained.
@@ -1057,6 +1078,42 @@
     attempted (PremiumFallbackBlockedError after exactly one validate call).
     Confirmed via git-stash that these tests fail against the pre-fix code.
 
+    P1 fix (9th independent review round, "fallback execution bypasses
+    policy and budget enforcement"): Codex reproduced routeAndExecute()
+    invoking EVERY candidate — the initial one AND every escalation/
+    fallback step — via a direct gateway.invoke() call, with NO
+    PolicyEngine or BudgetGuard consultation anywhere, and no cost
+    recorded for a candidate whose invocation succeeded but whose output
+    later failed validate(). `allowPremiumFallback` is a routing-level
+    permission flag ("fallback may be considered"), never an authorization
+    substitute for the same policy/budget gate every other risky Factory
+    action passes through (bölüm 147). Fixed: routeAndExecute() now takes
+    REQUIRED `policy: PolicyEngine` and `budget: BudgetGuard` parameters;
+    every candidate invocation goes through a new private
+    invokeAuthorized() helper that (1) evaluates the SAME
+    CapabilityGateway/PolicyEngine used elsewhere in the Factory (DENY/
+    APPROVAL_REQUIRED throw and the provider is never called), (2) checks
+    the projected cost against BudgetGuard BEFORE invoking (insufficient
+    budget blocks the call with zero provider invocations), and (3)
+    records the ACTUAL incurred cost via BudgetGuard.spend() immediately
+    after a successful invocation — BEFORE validate() runs — so a
+    candidate whose output later fails validation is still correctly
+    accounted for. Regression tests prove: a policy-DENYed fallback
+    candidate is never invoked, a fallback candidate requiring approval is
+    not invoked without one, insufficient budget blocks a fallback BEFORE
+    any provider call, the cost of a fallback invocation is recorded even
+    though its output later fails validation, multiple failed fallback
+    attempts cannot silently exceed the budget ceiling, and
+    allowPremiumFallback=true is not itself an authorization (a
+    default-deny policy blocks even the INITIAL candidate). All prior
+    escalation/validation/cheapest-routing regression tests continue to
+    pass unchanged (updated only to supply the now-required policy/budget
+    arguments). Confirmed via a temporary bypass of the new authorization
+    wrapper (keeping the new signature, since the OLD 5-argument signature
+    cannot be meaningfully git-stashed against calls now using 7
+    arguments) that all 6 new tests fail with exactly the bypass Codex
+    described, then restored.
+
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
   description: >
@@ -1080,6 +1137,19 @@
     directly to this requirement's "escalation requires validation failure"
     guarantee — a fallback response is never trusted merely for being from
     a pricier model.
+
+    P1 fix (9th independent review round, "fallback execution bypasses
+    policy and budget enforcement"): see UASF-REQ-0027's matching note for
+    full detail. This requirement's own description — "escalation ...
+    requires validation failure PLUS POLICY/BUDGET APPROVAL" — was not
+    actually enforced in code prior to this round: `allowPremiumFallback`
+    was the ONLY gate, and it is a routing permission flag, not a policy/
+    budget authorization. PROOF_VERIFIED is retained here (not
+    downgraded) because the underlying code is NOW fixed and the
+    regression tests genuinely prove policy/budget enforcement on every
+    escalation step, per baseline section 294 ("no unsupported upgrades"
+    also implies no unsupported non-corrections once real evidence exists)
+    — but this gap is recorded honestly rather than silently closed.
 
 - id: UASF-REQ-0029
   title: Cost engine
@@ -1329,6 +1399,31 @@
     registered first can no longer corrupt findCapable() results since it
     never enters the registry. Confirmed via git-stash that 4 of these
     tests fail against the pre-fix code.
+
+    P2 fix (9th independent review round, "duplicate worker identities
+    break authoritative status"): Codex reproduced worker id X registered
+    IDLE, then the SAME id X registered again as QUARANTINED — register()
+    never checked for an id collision, so BOTH records remained in the
+    array; findCapable() only filters out QUARANTINED, so the stale IDLE
+    record was still selectable by ResourceAwareScheduler. Fixed: register()
+    now rejects an id collision (new DuplicateWorkerIdError) before any
+    mutation — a worker id represents exactly one authoritative identity —
+    and a new updateStatus() method is the ONLY way to transition an
+    existing worker's status, mutating the authoritative record in place
+    rather than ever creating a second record. Regression tests prove:
+    first registration succeeds, a duplicate id is rejected with the
+    original record completely unchanged, an explicit IDLE->QUARANTINED
+    transition works via updateStatus(), a quarantined worker (via
+    updateStatus) is never returned by findCapable() OR selected by the
+    scheduler, a BUSY worker is excluded from scheduler selection per the
+    existing IDLE-only contract (while still appearing in findCapable(),
+    which only excludes QUARANTINED), a worker returns to IDLE only
+    through an explicit updateStatus() call and is then selectable again,
+    updateStatus() on an unregistered id fails closed, and no stale
+    duplicate record survives repeated register/reject/updateStatus
+    cycles. Confirmed via git-stash that 8 of these tests fail against the
+    pre-fix code with exactly the stale-record reproduction Codex
+    described.
 
 - id: UASF-REQ-0032
   title: Scheduler (foundation)
@@ -1732,6 +1827,42 @@
     - "runtime/cli/__tests__/doctor.test.ts"
   proof_refs: []
   security_refs: []
+  notes: >
+    P2 fix (9th independent review round, "declared Node support
+    conflicts with Vitest 5"): package.json's `engines.node` (previously
+    ">=20") silently contradicted the locked `vitest@^5.0.0` dependency's
+    own required range (`^22.12.0 || ^24.0.0 || >=26.0.0`) — the Factory
+    advertised support for a runtime its own required test toolchain does
+    not support. Fixed by setting `engines.node` to match Vitest 5's
+    range exactly (the single source of truth for what the toolchain
+    genuinely requires); CI already targeted Node 22 and needed no
+    change. The Node.js check previously only
+    confirmed `node --version` succeeded (presence), never that the
+    RUNNING version actually satisfied `package.json`'s declared
+    `engines.node` range — so `factory doctor` could report READY on a
+    Node version the locked Vitest 5 test toolchain would itself refuse
+    to run under, and a future dependency upgrade widening that gap would
+    go completely undetected. Fixed: a new `satisfiesEngineRange()`
+    (caret/`>=`/exact clause matching, OR-joined) checks the actual `node
+    --version` output against `engines.node` (read from the nearest
+    package.json found by walking UP from doctor.ts's own directory —
+    correct whether running from source via `tsx` or from the compiled
+    `dist/` CLI, where the file sits one directory level deeper). A
+    version outside the declared range now reports BLOCKING with a
+    message naming the declared range. Regression tests prove: the real
+    environment's Node.js check is READY only because it genuinely
+    satisfies the declared range (asserted via the same package.json read
+    independently in the test), satisfiesEngineRange() correctly evaluates
+    caret and >= clauses in isolation and against the actual declared
+    range's boundaries (v22.11.0 fails just below ^22.12.0, v25.0.0 fails
+    in the gap between ^24.0.0 and >=26.0.0, etc.), and — reading Vitest's
+    OWN engines.node directly from node_modules — every Node version the
+    Factory's declared range accepts is also accepted by Vitest's,
+    proving no silent contradiction remains. Confirmed via a temporary
+    revert of package.json's engines.node back to the old '>=20' value
+    (keeping the new doctor.ts logic) that both the range-boundary test
+    and the no-silent-contradiction test correctly fail, reproducing the
+    exact historical inconsistency Codex found; restored afterward.
 
 - id: UASF-REQ-0041
   title: Baseline status command
