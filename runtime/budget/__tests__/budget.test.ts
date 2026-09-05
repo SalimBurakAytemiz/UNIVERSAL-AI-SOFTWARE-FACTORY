@@ -467,4 +467,108 @@ describe("BudgetGuard", () => {
       expect(costEngine.totalFor({ taskId: "t1", projectId: "project-a" })).toBe(0);
     });
   });
+
+  describe("P2 fix (8th independent review round, 'floating-point comparisons reject exact budget spend')", () => {
+    it("0.10 + 0.20 landing exactly on a 0.30 per-task ceiling is accepted, not rejected by float noise", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 0.3 });
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 });
+      // Native `0.1 + 0.2 > 0.3` is `true` in JS — this must not leak into rejection.
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.2 })).not.toThrow();
+      expect(costEngine.totalFor({ taskId: "t1" })).toBeCloseTo(0.3);
+    });
+
+    it("spending one precision unit ($0.000001) above the ceiling is still correctly rejected", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 0.3 });
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 });
+      expect(() =>
+        guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.200001 })
+      ).toThrow(BudgetExceededError);
+    });
+
+    it("repeated small decimal spends accumulate correctly across many calls without spurious rejection", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+      // Ten spends of $0.10 should land exactly on a $1.00 ceiling.
+      for (let i = 0; i < 10; i++) {
+        expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 })).not.toThrow();
+      }
+      expect(costEngine.totalFor({ taskId: "t1" })).toBeCloseTo(1.0);
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.000001 })).toThrow(
+        BudgetExceededError
+      );
+    });
+
+    it("the same exact-ceiling precision fix applies identically to the perRunUsd ceiling", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perRunUsd: 0.3 });
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 });
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: 0.2 })).not.toThrow();
+    });
+
+    it("the same exact-ceiling precision fix applies identically to the dailyUsd ceiling", () => {
+      const clock = makeClock("2026-06-15T00:00:00.000Z");
+      const costEngine = new CostEngine(clock.now);
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 0.3 }, clock.now);
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 });
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: 0.2 })).not.toThrow();
+    });
+
+    it("the same exact-ceiling precision fix applies identically to the monthlyUsd ceiling", () => {
+      const clock = makeClock("2026-06-15T00:00:00.000Z");
+      const costEngine = new CostEngine(clock.now);
+      const guard = new BudgetGuard(costEngine, { monthlyUsd: 0.3 }, clock.now);
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 });
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: 0.2 })).not.toThrow();
+    });
+
+    it("project/task scoping remains correct alongside the precision fix", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 0.3 });
+      guard.spend({ taskId: "shared", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 0.2 });
+      guard.spend({ taskId: "shared", projectId: "project-b", provider: "mock", modelId: "m1", amountUsd: 0.1 });
+      // Each project has its own independent $0.30 allowance; landing exactly
+      // on it for BOTH must be accepted for both, not confused by float noise.
+      expect(() =>
+        guard.spend({ taskId: "shared", projectId: "project-a", provider: "mock", modelId: "m1", amountUsd: 0.1 })
+      ).not.toThrow();
+      expect(() =>
+        guard.spend({ taskId: "shared", projectId: "project-b", provider: "mock", modelId: "m1", amountUsd: 0.2 })
+      ).not.toThrow();
+    });
+
+    it("daily/monthly rollover enforcement remains correct alongside the precision fix", () => {
+      const clock = makeClock("2026-06-30T23:00:00.000Z");
+      const costEngine = new CostEngine(clock.now);
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 0.3 }, clock.now);
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.3 });
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: 0.01 })).toThrow(
+        BudgetExceededError
+      );
+
+      clock.advanceTo("2026-07-01T00:00:00.001Z"); // new UTC day -> resets
+      expect(() => guard.spend({ taskId: "t3", provider: "mock", modelId: "m1", amountUsd: 0.3 })).not.toThrow();
+    });
+
+    it("a free/zero monetary spend remains valid alongside the precision fix", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 0 });
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0 })).not.toThrow();
+    });
+
+    it("NaN/Infinity/negative monetary values remain rejected by the precision fix's comparison path", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: Infinity })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: -0.01 })).toThrow(
+        InvalidMonetaryAmountError
+      );
+    });
+  });
 });

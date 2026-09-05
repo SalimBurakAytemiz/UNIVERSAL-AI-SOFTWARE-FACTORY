@@ -10,6 +10,7 @@
 import { Ajv, type ValidateFunction } from "ajv";
 import schema from "../../schemas/project-genome.schema.json" with { type: "json" };
 import { assertValidProjectId } from "../sandbox/sandbox.js";
+import { deepFreezeClone } from "../util/immutable.js";
 
 export interface ProjectGenome {
   readonly project: {
@@ -64,13 +65,33 @@ export class InvalidProjectGenomeError extends Error {
  * scaffolding/dosya sistemi adımına, güvenli bir tanımlayıcı biçimini
  * doğrulamadan ulaşamaz (fail closed, PROJECT ID -> VALIDATE akışının
  * ilk adımı).
+ *
+ * P1 fix (8th independent review round, "caller mutation changes project
+ * identity during bootstrap"): eskiden `candidate as ProjectGenome` ile
+ * ÇAĞIRANIN KENDİ nesne referansı (iç içe `project` nesnesi dahil)
+ * doğrudan döndürülüyordu. Codex, `bootstrapProject()` için bir
+ * `genomeCandidate` verilip henüz asenkron işlem tamamlanmadan ÇAĞIRANIN
+ * `genomeCandidate.project.id`'yi A'dan B'ye DEĞİŞTİRDİĞİ bir senaryo
+ * gösterdi: yetkilendirme/kök seçimi ZATEN A için yapılmıştı, ama kalıcı
+ * hale getirilen projectId ve maliyet ilişkilendirmesi sonradan B'ye
+ * kayıyordu — "bir kez Factory güven sınırına giren Genome, o işlemin
+ * TAMAMI için TEK, ayrık, doğrulanmış bir anlık görüntü olmalıdır" ilkesini
+ * ihlal ediyordu. `readonly` yalnızca derleme-zamanı bir uyarıdır;
+ * çalışma zamanında çağıranın paylaşılan nesnesini korumaz. Fixed: giren
+ * `candidate`, doğrulamadan ÖNCE `deepFreezeClone()` (structuredClone +
+ * özyinelemeli Object.freeze, runtime/util/immutable.ts) ile TAMAMEN
+ * AYRIK, donmuş bir kopyaya dönüştürülür; şema doğrulaması VE
+ * assertValidProjectId bu kopya üzerinde çalışır, ve döndürülen (dolayısıyla
+ * bootstrap'in geri kalanının kullandığı TEK) genome hep bu kopyadır —
+ * çağıranın orijinal nesnesine yapılan HİÇBİR sonraki mutasyon (iç içe
+ * `project.id` dahil) artık hiçbir şeyi etkileyemez.
  */
 export function parseProjectGenome(candidate: unknown): ProjectGenome {
-  const result = validateProjectGenome(candidate);
+  const detached = deepFreezeClone(candidate) as ProjectGenome;
+  const result = validateProjectGenome(detached);
   if (!result.valid) {
     throw new InvalidProjectGenomeError(result.errors);
   }
-  const genome = candidate as ProjectGenome;
-  assertValidProjectId(genome.project.id);
-  return genome;
+  assertValidProjectId(detached.project.id);
+  return detached;
 }

@@ -324,6 +324,34 @@
     earliest possible point (fail closed) before any downstream consumer
     (Organization Composer, Project OS scaffold) ever sees it.
 
+    P1 fix (8th independent review round, "caller mutation changes project
+    identity during bootstrap"): parseProjectGenome() used to validate,
+    then return `candidate as ProjectGenome` — the SAME object reference
+    the caller supplied, including its nested `project` object. Codex
+    reproduced bootstrapProject() starting for project A while the caller
+    still held (and later mutated) `genomeCandidate.project.id` from A to
+    B before the async pipeline finished; because the returned genome was
+    never detached, later steps that read `genome.project.id` after an
+    `await` boundary could observe the caller's later mutation, drifting
+    authoritative project identity mid-operation. Fixed: parseProjectGenome()
+    now calls `deepFreezeClone()` (structuredClone + recursive
+    Object.freeze, runtime/util/immutable.ts) on the candidate BEFORE
+    validation, validates and applies assertValidProjectId() to that
+    detached copy, and returns ONLY the detached, frozen clone — no
+    downstream code path (authorization, filesystem root, cost
+    attribution, persistence) ever sees a reference the caller can still
+    reach. Regression tests prove: mutating the original candidate's
+    nested project.id/family/business.capabilities after parseProjectGenome()
+    never changes the returned genome, the returned genome is a genuinely
+    distinct, deeply frozen object, an invalid genome still fails closed
+    before any detachment side effect, and — at the full bootstrapProject()
+    level — a caller mutating `genomeCandidate.project.id` from A to B
+    while the async pipeline is still in flight never changes which
+    project's directory is scaffolded, which genome is persisted, or which
+    project cost is attributed to. Confirmed via git-stash that 7 of these
+    tests (including the full end-to-end orchestrator reproduction) fail
+    against the pre-fix code.
+
 - id: UASF-REQ-0009
   title: Discovery & clarification engine (foundation)
   description: >
@@ -548,7 +576,34 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Rule-based composition with a recorded rationale per activated team (tests assert unrelated teams are never added). composeOrganizationFromGenome() now consumes a real, validated Project Genome directly; budget input is still not wired in."
+  notes: >
+    Rule-based composition with a recorded rationale per activated team
+    (tests assert unrelated teams are never added). composeOrganizationFromGenome()
+    now consumes a real, validated Project Genome directly; budget input is
+    still not wired in.
+
+    P2 fix (8th independent review round, "prototype names crash
+    schema-valid project families"): `BASE_TEAMS_BY_FAMILY` was a plain
+    object (`Record<string, readonly string[]>`) accessed via
+    `BASE_TEAMS_BY_FAMILY[input.projectFamily]`. Since the Project Genome
+    schema only requires `project.family` to be ANY string,
+    schema-valid-but-prototype-named values ("constructor", "toString",
+    "__proto__") read an INHERITED Object.prototype value instead of
+    `undefined` — truthy, so `?? DEFAULT_BASE_TEAMS` never caught it — and
+    `new Set(inheritedFunctionOrObject)` (not iterable) threw a TypeError,
+    crashing bootstrap. Fixed: the lookup table is now a `Map`, whose
+    `.get()`/`.has()` never read the JS prototype chain, so any string key
+    (including prototype names) correctly falls back to
+    `DEFAULT_BASE_TEAMS` when undefined. Regression tests prove:
+    "constructor", "toString", "__proto__", and "hasOwnProperty" families
+    all resolve to the fallback teams without crashing, known families
+    still resolve their correct specific teams (no regression), a
+    prototype-named family combined with a capability requirement still
+    adds the required team via the documented rule, no prototype pollution
+    occurs, and a full composeOrganizationFromGenome()/parseProjectGenome()
+    bootstrap with a "constructor" family completes per the fallback
+    contract. Confirmed via git-stash that 7 of these tests fail against
+    the pre-fix code with exactly the TypeError Codex described.
 
 - id: UASF-REQ-0017
   title: Workflow engine (foundation)
@@ -741,7 +796,45 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "project-state/current.yml is the session-level durable record (Founder-facing prose+structure). runtime/state/file-store.ts is the code-level StateStore interface (baseline section 275) with a JSON-file implementation, used by the Decision Ledger, Assumption Register, and the P0 bootstrap pipeline; a real process-restart is simulated in tests via a fresh store instance reading the same path."
+  notes: >
+    project-state/current.yml is the session-level durable record
+    (Founder-facing prose+structure). runtime/state/file-store.ts is the
+    code-level StateStore interface (baseline section 275) with a
+    JSON-file implementation, used by the Decision Ledger, Assumption
+    Register, and the P0 bootstrap pipeline; a real process-restart is
+    simulated in tests via a fresh store instance reading the same path.
+
+    P2 fix (8th independent review round, "failed state writes destroy
+    previous recoverable state"): FileStateStore.write() used to call
+    `writeFileSync(path, ...)` DIRECTLY against the destination. Codex
+    reproduced a real write failure (ör. EFBIG/disk-full): if a valid
+    state file already existed and the write was interrupted partway
+    through, the previous valid file was overwritten with TRUNCATED,
+    invalid JSON — a subsequent read() threw a SyntaxError and the state
+    was completely unrecoverable, directly violating "kalıcı durum" (bölüm
+    277)'s core promise that a failed write must never destroy the last
+    known-good durable state. Fixed with the standard atomic-write
+    pattern: the full content is written to a temporary SIBLING file in
+    the SAME directory first (so `renameSync` is guaranteed atomic — no
+    cross-filesystem rename assumption), and the destination is only
+    replaced via `renameSync` after that write fully succeeds; if the
+    temp write fails, the destination is never touched and the temp file
+    is best-effort cleaned up (a cleanup failure never masks the original
+    write error). Regression tests, using a spy that wraps the REAL
+    `node:fs.writeFileSync`/`unlinkSync` (so both this test file's and the
+    module-under-test's imports resolve to the same mocked module record)
+    and simulates a genuine PARTIAL write (some bytes reach disk before
+    the injected failure, faithfully matching a real EFBIG/disk-full
+    scenario rather than merely intercepting the call before any disk I/O
+    happens), prove: a simulated write failure leaves the previous valid
+    state byte-identical, a fresh store instance still recovers the prior
+    state afterward, a successful write atomically replaces old content,
+    no partially-written temp file remains after success OR after a
+    cleanup-succeeded failure, a cleanup failure never masks the original
+    write error, and existing FileCache/durable-state users continue to
+    work unchanged. Confirmed via git-stash that 3 of these tests fail
+    against the pre-fix code with exactly the truncated-JSON/SyntaxError
+    corruption Codex described.
 
 - id: UASF-REQ-0022
   title: Audit (foundation)
@@ -1039,6 +1132,19 @@
     non-negative after every mutation attempt. Confirmed via git-stash that
     these tests fail against the pre-fix code.
 
+    P2 addition (8th independent review round, "floating-point comparisons
+    reject exact budget spend" — see UASF-REQ-0030 for the full finding):
+    added `exceedsMonetaryAmount(a, b)` alongside `assertValidMonetaryAmount`
+    as this module's second centralized monetary primitive — a single,
+    documented precision policy (integer micro-dollar units,
+    `MONETARY_PRECISION_SCALE = 1_000_000`) for "does a exceed b" cumulative
+    comparisons, used by every ceiling check in runtime/budget/budget.ts so
+    no comparison site invents its own epsilon/tolerance. Direct unit tests
+    prove 0.1+0.2 does not exceed 0.3 at this precision (despite native
+    `0.1 + 0.2 > 0.3 === true`), a genuine one-unit excess is still
+    detected, equal and smaller amounts never register as exceeding, and
+    repeated decimal accumulation lands exactly on a whole-dollar ceiling.
+
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
   description: >
@@ -1137,6 +1243,44 @@
     invalid monetary inputs are still rejected regardless of scoping.
     Confirmed via git-stash that the "independent allowances" test fails
     against the pre-fix code with the exact reproduction Codex described.
+
+    P2 fix (8th independent review round, "floating-point comparisons
+    reject exact budget spend"): assertWithinBudget()'s ceiling check used
+    a bare `check.projected > check.limit` comparison. Codex reproduced
+    spending $0.10 then $0.20 against a $0.30 ceiling: binary
+    floating-point addition produces `0.30000000000000004`, which the bare
+    `>` comparison correctly (per IEEE-754) but WRONGLY-for-intent judged
+    as exceeding the $0.30 ceiling — a spend landing EXACTLY on the
+    configured limit was incorrectly blocked, across all four cumulative
+    ceilings (perTaskUsd, perRunUsd, dailyUsd, monthlyUsd). Fixed with a
+    single, deliberate, documented precision policy — NOT a scattered
+    magic epsilon: a new `exceedsMonetaryAmount()` (runtime/cost/
+    cost-engine.ts) scales both operands to integer micro-dollar units
+    ($0.000001, `MONETARY_PRECISION_SCALE = 1_000_000`) via `Math.round`
+    and compares the resulting INTEGERS — a comparison structurally immune
+    to binary floating-point accumulation noise. All four ceiling checks
+    in buildCeilingChecks()/assertWithinBudget() now route through this
+    one shared function. Regression tests prove: 0.10+0.20 landing exactly
+    on a 0.30 ceiling is accepted (for all four ceiling types
+    individually), one precision unit ($0.000001) above the ceiling is
+    still correctly rejected, ten repeated $0.10 spends land exactly on a
+    $1.00 ceiling without spurious rejection, project/task scoping and
+    daily/monthly rollover remain correct alongside the fix, zero/free
+    spends remain valid, and NaN/Infinity/negative amounts remain
+    rejected. Direct unit tests of `exceedsMonetaryAmount()` itself (see
+    UASF-REQ-0029) prove the underlying comparison semantics. Confirmed
+    via git-stash that 5 of the budget-level tests fail against the
+    pre-fix bare-`>` code with exactly the incorrect-rejection Codex
+    described. Collateral, correctness-preserving update: Proof E's
+    runaway-loop test (proofs/budget-ceiling/proof.test.ts) previously
+    asserted the accumulated spend was `<= 5` using RAW float equality —
+    that assertion only ever passed because the OLD bug's incorrect
+    rejections happened to also keep the raw sum under 5; now that an
+    exact-ceiling spend is correctly accepted (raw sum
+    `5.000000000000002`), the assertion was updated to `toBeCloseTo(5, 6)`
+    (correct at the Factory's own documented precision) — the proof's
+    actual claim (a runaway loop is stopped by the ceiling) is unchanged
+    and still verified.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -1524,6 +1668,38 @@
     prototype pollution occurs; confirmed via git-stash that this test
     fails against the pre-fix (plain-object) code.
 
+    P1 fix (8th independent review round, "logger serialization hooks
+    bypass credential redaction"): Codex reproduced a redaction bypass
+    using an enumerable `toJSON()` method — redact() preserved function
+    VALUES unchanged (only key names were checked for sensitivity), so a
+    nested object's own `toJSON()` method survived redaction intact in the
+    rebuilt tree; `log()`'s final `JSON.stringify()` call then invoked that
+    `toJSON()` (JSON.stringify calls any object's toJSON, own or
+    inherited, enumerable or not, completely ignoring whatever redact()
+    already produced) and used its freshly-returned, NEVER-redacted
+    content — reintroducing plaintext Authorization/Cookie/session
+    credentials AFTER the redaction boundary had already "completed".
+    Fixed: redact() now strips every function-valued property entirely
+    (replacing it with the string `"[FUNCTION_REMOVED]"`) rather than
+    passing it through — since the rebuilt redacted tree is always
+    composed of fresh `Object.create(null)` objects containing ONLY
+    copied-over own-enumerable entries, once no function value survives
+    that copy, nothing in the final tree can carry an executable
+    serialization hook for JSON.stringify to invoke; redaction is
+    therefore applied to (and enforced on) the FINAL emitted
+    representation, not bypassable by a later hook. Regression tests
+    prove: a nested enumerable toJSON() cannot reintroduce Authorization,
+    toJSON() cannot reintroduce Cookie/session credentials, a hook buried
+    deep inside nested structure cannot bypass recursive redaction, arrays
+    containing objects with toJSON() remain safe, the caller's original
+    payload (including the toJSON function itself) is never mutated,
+    plaintext fixture credentials from a toJSON() hook never reach the
+    sink, normal non-sensitive logging and the round-6 prototype-key fix
+    both remain unaffected, and no prototype pollution is introduced by
+    the function-stripping itself. Confirmed via git-stash that 4 of these
+    tests fail against the pre-fix code with exactly the bypass Codex
+    described.
+
 - id: UASF-REQ-0039
   title: Turkish source code explanation standard
   description: >
@@ -1570,6 +1746,34 @@
     - "runtime/cli/__tests__/baseline-status.test.ts"
   proof_refs: []
   security_refs: []
+  notes: >
+    P2 targeted-audit fix (8th independent review round, found while
+    auditing for the same class as organization-composer's "prototype
+    names crash schema-valid project families"): `summarizeRequirements()`
+    counted requirements via plain-object dictionaries
+    (`byStatus[req.status] = (byStatus[req.status] ?? 0) + 1`, same for
+    byCategory). `RequirementRecord.status`/`.category` are typed as plain
+    `string` in this function's own signature — the closed schema enum is
+    enforced by a DIFFERENT layer (scripts/validate-requirements.mjs), not
+    here — so a status/category value of "constructor" reads the inherited
+    `Object.prototype.constructor` function (truthy, never caught by `??`)
+    and `function + 1` silently becomes STRING CONCATENATION instead of
+    numeric addition, corrupting the count with no error raised — directly
+    undermining the "no claim without evidence" purpose of this exact
+    tool (a wrong count is itself unsupported evidence). Fixed: counts are
+    now accumulated in a `Map<string, number>` (never reads the prototype
+    chain) and converted to the public `Record<string, number>` return
+    shape only at the end via `Object.fromEntries()`, which uses
+    `[[DefineOwnProperty]]` (not `[[Set]]`) and therefore creates a
+    genuine own property for any key — including "__proto__" — without
+    ever invoking an accessor. Regression tests prove: a status of
+    "constructor" counts correctly as a number (not a string), a category
+    of "__proto__" counts correctly with no prototype pollution, "toString"
+    counts correctly across multiple records, prototype-named and
+    ordinary values are counted independently in the same call, and no
+    prototype pollution occurs from processing any of these. Confirmed
+    via git-stash that all 4 of these tests fail against the pre-fix code
+    with exactly the corrupted-count (string-concatenation) symptom.
 
 - id: UASF-REQ-0042
   title: P0 end-to-end proof

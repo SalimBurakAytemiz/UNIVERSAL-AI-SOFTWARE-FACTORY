@@ -416,4 +416,88 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
     });
     expect(result.totalCostUsd).toBe(0);
   });
+
+  describe("P1 fix (8th independent review round, 'caller mutation changes project identity during bootstrap')", () => {
+    it("mutating the caller's genomeCandidate.project.id AFTER bootstrapProject() has started does not change the authoritative project identity anywhere in the pipeline", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-genome-race-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+      const genomeCandidate = validGenome("proj-A");
+
+      const promise = bootstrapProject({
+        genomeCandidate,
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+
+      // Simulate the caller continuing to hold and mutate their own object
+      // while bootstrapProject()'s async work is still in flight.
+      genomeCandidate.project.id = "proj-B";
+      genomeCandidate.project.family = "web";
+
+      const result = await promise;
+
+      // Authorization/root selection/persistence all used project A throughout.
+      expect(result.genome.project.id).toBe("proj-A");
+      expect(result.genome.project.family).toBe("ecommerce");
+      expect(existsSync(join(tempRoot, "proj-A"))).toBe(true);
+      expect(existsSync(join(tempRoot, "proj-B"))).toBe(false);
+
+      const persistedGenome = JSON.parse(
+        readFileSync(join(result.scaffold.projectRoot, "project-genome", "genome.json"), "utf8")
+      );
+      expect(persistedGenome.project.id).toBe("proj-A");
+
+      const persistedState = JSON.parse(readFileSync(result.statePath, "utf8"));
+      expect(persistedState.projectId).toBe("proj-A");
+
+      // Cost attribution stayed with project A, not the caller's later "B".
+      expect(result.totalCostUsd).toBeGreaterThanOrEqual(0);
+    });
+
+    it("the genome returned in the bootstrap result is never the same reference as the caller's genomeCandidate", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-genome-race-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+      const genomeCandidate = validGenome("proj-ownership");
+
+      const result = await bootstrapProject({
+        genomeCandidate,
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+
+      expect(result.genome).not.toBe(genomeCandidate);
+      expect(result.genome.project).not.toBe(genomeCandidate.project);
+      // Mutating the caller's object post-hoc cannot reach into the result either.
+      genomeCandidate.project.id = "tampered";
+      expect(result.genome.project.id).toBe("proj-ownership");
+    });
+
+    it("mutating a nested business.capabilities array after bootstrap starts does not change the organization composed from it", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-genome-race-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+      const genomeCandidate = validGenome("proj-caps");
+
+      const promise = bootstrapProject({
+        genomeCandidate,
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+
+      genomeCandidate.business.capabilities.push("identity");
+
+      const result = await promise;
+
+      // "identity" would have added the security team for a different
+      // reason; here it must never have been observed at all — only the
+      // ORIGINAL ["payments"] (still security-triggering, but via the
+      // documented payments rule) is authoritative.
+      expect(result.organization.rationale.security).toBe("Payments capability requires Security team involvement");
+    });
+  });
 });

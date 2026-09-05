@@ -73,7 +73,32 @@ function isSensitiveKey(key: string): boolean {
  * every key (including `__proto__`, `constructor`, `prototype`) becomes
  * an ordinary own data property.
  */
+/**
+ * P1 fix (8th independent review round, "logger serialization hooks
+ * bypass credential redaction"): eskiden bir DEĞER fonksiyon ise (ör. bir
+ * nesnenin kendi `toJSON()` metodu, own-enumerable bir alan olarak)
+ * redact() bunu OLDUĞU GİBİ (dokunmadan) sonuca kopyalıyordu — "hassas bir
+ * ANAHTAR değil" diye. Ancak `log()`, son adımda `JSON.stringify()`
+ * çağırır; JSON.stringify, serileştirdiği HERHANGİ bir nesnede bir
+ * `toJSON` metodu bulursa (own veya inherited, enumerable olsun olmasın —
+ * hiç fark etmez), o metodu ÇAĞIRIR ve dönen değeri kullanır — redact()'in
+ * ÇOKTAN üretmiş olduğu güvenli, redakte edilmiş temsili TAMAMEN görmezden
+ * gelerek. Codex, `toJSON()`'ın taze, hiç redakte edilmemiş
+ * `Authorization`/`Cookie` içeriği DÖNDÜRDÜĞÜNÜ ve bunun sink'e ulaştığını
+ * gösterdi — redaksiyon SINIRI tamamlandıktan SONRA çalışan bir kanca
+ * (hook), gizli veriyi yeniden ORTAYA ÇIKARABİLİYORDU. Fix: redact() artık
+ * HER fonksiyon değerini (adı ne olursa olsun — `toJSON`, `toString`
+ * override'ı vb.) tamamen ÇIKARIR, sonuca hiç kopyalamaz. Bu, redakte
+ * edilmiş ağacın (ve onun her seviyesinin, çünkü her seviye burada
+ * yeniden inşa edilir) ASLA çalıştırılabilir bir serileştirme kancası
+ * TAŞIMAMASINI garanti eder — `JSON.stringify()`'ın sonradan çağıracağı
+ * hiçbir şey kalmaz, redaksiyon NİHAİ yayılan temsilin kendisine uygulanmış
+ * olur.
+ */
 function redact(value: unknown): unknown {
+  if (typeof value === "function") {
+    return "[FUNCTION_REMOVED]";
+  }
   if (Array.isArray(value)) {
     return value.map(redact);
   }

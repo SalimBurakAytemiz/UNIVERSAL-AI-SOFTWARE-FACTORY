@@ -19,20 +19,39 @@ export interface OrganizationComposition {
   readonly rationale: Readonly<Record<string, string>>;
 }
 
-const BASE_TEAMS_BY_FAMILY: Readonly<Record<string, readonly string[]>> = {
-  web: ["web", "backend", "qa"],
-  backend: ["backend", "qa"],
-  api: ["backend", "qa"],
-  saas: ["web", "backend", "qa"],
-  ecommerce: ["web", "backend", "qa"],
-  mobile: ["mobile", "backend", "qa"],
-  desktop: ["desktop", "qa"],
-  game: ["game", "qa"],
-  multiplayer_game: ["game", "backend", "qa"],
-  mmorpg: ["game", "backend", "qa"],
-  cli: ["backend", "qa"],
-  library: ["backend", "qa"]
-};
+// P2 fix (8th independent review round, "prototype names crash schema-valid
+// project families"): eskiden bu bir DÜZ nesne (`Record<string, ...>`) idi
+// ve `BASE_TEAMS_BY_FAMILY[input.projectFamily]` ile erişiliyordu. Şema,
+// `project.family`'nin herhangi bir string OLMASINI sağlar — "constructor",
+// "toString", "__proto__" gibi Object.prototype üzerinde ZATEN VAR OLAN
+// isimler de şema-geçerli değerlerdir. Codex, `BASE_TEAMS_BY_FAMILY
+// ["constructor"]`'ın (bu anahtar hiç TANIMLANMAMIŞ olsa bile) MİRAS ALINAN
+// `Object` fonksiyonunu DÖNDÜRDÜĞÜNÜ, bunun `?? DEFAULT_BASE_TEAMS` ile asla
+// yakalanmadığını (çünkü truthy bir değerdir, `undefined`/`null` değil) ve
+// `new Set(inheritedFunctionValue)`'nin (fonksiyonlar yinelenebilir/
+// iterable DEĞİLDİR) bootstrap sırasında bir TypeError ile ÇÖKTÜĞÜNÜ
+// gösterdi — aynı sınıf "__proto__" (Object.prototype'ın kendisi, yine
+// iterable değil) ve "toString" için de geçerlidir. Fixed: arama artık bir
+// `Map` üzerinden yapılır — `Map.get()`/`.has()` YALNIZCA kendi dahili
+// hash tablosuna bakar, ASLA JavaScript prototip zincirinden okumaz; bu
+// yüzden "constructor"/"toString"/"__proto__"/"prototype" dahil HERHANGİ
+// bir string anahtar, tanımlı değilse her zaman `undefined` döner (ve
+// dokümante edilmiş yedek davranış — DEFAULT_BASE_TEAMS — devreye girer),
+// asla mirasa özgü bir değer değil.
+const BASE_TEAMS_BY_FAMILY: ReadonlyMap<string, readonly string[]> = new Map([
+  ["web", ["web", "backend", "qa"]],
+  ["backend", ["backend", "qa"]],
+  ["api", ["backend", "qa"]],
+  ["saas", ["web", "backend", "qa"]],
+  ["ecommerce", ["web", "backend", "qa"]],
+  ["mobile", ["mobile", "backend", "qa"]],
+  ["desktop", ["desktop", "qa"]],
+  ["game", ["game", "qa"]],
+  ["multiplayer_game", ["game", "backend", "qa"]],
+  ["mmorpg", ["game", "backend", "qa"]],
+  ["cli", ["backend", "qa"]],
+  ["library", ["backend", "qa"]]
+]);
 
 const DEFAULT_BASE_TEAMS: readonly string[] = ["backend", "qa"];
 
@@ -46,7 +65,7 @@ const CAPABILITY_REQUIRES_TEAM: ReadonlyArray<{ capability: string; team: string
 ];
 
 export function composeOrganization(input: OrganizationCompositionInput): OrganizationComposition {
-  const teams = new Set<string>(BASE_TEAMS_BY_FAMILY[input.projectFamily] ?? DEFAULT_BASE_TEAMS);
+  const teams = new Set<string>(BASE_TEAMS_BY_FAMILY.get(input.projectFamily) ?? DEFAULT_BASE_TEAMS);
   const rationale: Record<string, string> = {};
 
   for (const team of teams) {

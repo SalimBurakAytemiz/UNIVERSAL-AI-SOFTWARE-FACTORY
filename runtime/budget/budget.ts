@@ -10,7 +10,7 @@
 // `now` enjekte edilebilir bir saat fonksiyonudur; testler bunu ilerleterek
 // gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
-import { assertValidMonetaryAmount } from "../cost/cost-engine.js";
+import { assertValidMonetaryAmount, exceedsMonetaryAmount } from "../cost/cost-engine.js";
 import type { CostEngine, CostScope } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
@@ -199,8 +199,16 @@ export class BudgetGuard {
 
     const checks = this.buildCeilingChecks(scope, projectedAmountUsd);
 
+    // P2 fix (8th independent review round, "floating-point comparisons
+    // reject exact budget spend"): eskiden burada ÇIPLAK `>` operatörü
+    // kullanılıyordu — `0.10` + `0.20` gibi ikili kayan noktalı toplamalar
+    // `0.30000000000000004` ürettiğinde, TAM tavan harcaması (`0.30`)
+    // yanlışlıkla reddediliyordu. `exceedsMonetaryAmount()` (runtime/cost/
+    // cost-engine.ts), TÜM dört tavan türü için AYNI, merkezi, belgelenen
+    // hassasiyet politikasını (mikro-dolar tam sayı birimleri) kullanır —
+    // dağınık/rastgele bir epsilon değil.
     for (const check of checks) {
-      if (check.projected > check.limit) {
+      if (exceedsMonetaryAmount(check.projected, check.limit)) {
         this.auditLog?.append({
           type: "BUDGET_BLOCKED",
           actor: "budget-guard",

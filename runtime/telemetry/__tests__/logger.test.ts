@@ -230,4 +230,161 @@ describe("Logger", () => {
       expect(typeof parsed.timestamp).toBe("string");
     });
   });
+
+  describe("P1 fix (8th independent review round): serialization hooks (toJSON) cannot bypass redaction", () => {
+    it("a nested enumerable toJSON() cannot reintroduce a redacted Authorization value", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({
+        eventType: "http.request",
+        headers: {
+          Authorization: "Bearer fake-token-should-stay-redacted", // secret-scan:allow (fake fixture value)
+          toJSON() {
+            return { Authorization: "fixture-serialization-credential" }; // secret-scan:allow (fake fixture value)
+          }
+        }
+      } as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      expect(line).not.toContain("fake-token-should-stay-redacted");
+      expect(line).not.toContain("fixture-serialization-credential");
+      expect(line).toContain("[REDACTED]");
+    });
+
+    it("toJSON() cannot reintroduce Cookie/session credentials", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({
+        eventType: "http.response",
+        session: {
+          sessionId: "fake-session-should-stay-redacted", // secret-scan:allow (fake fixture value)
+          toJSON() {
+            return { Cookie: "fixture-cookie-from-serialization-hook" }; // secret-scan:allow (fake fixture value)
+          }
+        }
+      } as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      expect(line).not.toContain("fake-session-should-stay-redacted");
+      expect(line).not.toContain("fixture-cookie-from-serialization-hook");
+    });
+
+    it("a serialization hook buried deep inside nested structure cannot bypass recursive redaction", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({
+        eventType: "deep.nesting",
+        level1: {
+          level2: {
+            level3: {
+              apiKey: "fake-deep-key-should-stay-redacted", // secret-scan:allow (fake fixture value)
+              toJSON() {
+                return { apiKey: "fixture-deep-serialization-key" }; // secret-scan:allow (fake fixture value)
+              }
+            }
+          }
+        }
+      } as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      expect(line).not.toContain("fake-deep-key-should-stay-redacted");
+      expect(line).not.toContain("fixture-deep-serialization-key");
+    });
+
+    it("arrays containing objects with toJSON() remain safe", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({
+        eventType: "batch.requests",
+        requests: [
+          {
+            url: "https://a.example.com",
+            headers: { Authorization: "Bearer fake-array-token" }, // secret-scan:allow
+            toJSON() {
+              return { headers: { Authorization: "fixture-array-serialization-token" } }; // secret-scan:allow
+            }
+          }
+        ]
+      } as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      expect(line).not.toContain("fake-array-token");
+      expect(line).not.toContain("fixture-array-serialization-token");
+      expect(line).toContain("https://a.example.com");
+    });
+
+    it("does not mutate the caller's original payload, including the toJSON function itself", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      const toJsonFn = function toJSON() {
+        return { Authorization: "fixture-untouched" }; // secret-scan:allow
+      };
+      const original = {
+        eventType: "http.request",
+        headers: { Authorization: "Bearer fake-should-remain-in-original", toJSON: toJsonFn } // secret-scan:allow
+      };
+
+      logger.log(original as never);
+
+      expect(original.headers.Authorization).toBe("Bearer fake-should-remain-in-original");
+      expect(original.headers.toJSON).toBe(toJsonFn);
+    });
+
+    it("plaintext fixture credentials from a toJSON() hook never reach the sink verbatim", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({
+        eventType: "auth.check",
+        credentials: {
+          toJSON() {
+            return { password: "should-never-appear-anywhere" }; // secret-scan:allow (fake fixture value)
+          }
+        }
+      } as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      expect(line).not.toContain("should-never-appear-anywhere");
+    });
+
+    it("normal non-sensitive logging is unaffected by the function-stripping fix", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({ eventType: "task.completed", taskId: "t1", result: "success", duration: 12 });
+
+      const line = sink.mock.calls[0]![0] as string;
+      expect(line).toContain("task.completed");
+      expect(line).toContain("t1");
+      expect(line).not.toContain("[REDACTED]");
+    });
+
+    it("prototype-key preservation (round 6 fix) still works alongside the toJSON fix", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      const payload = JSON.parse('{"eventType":"raw.payload","__proto__":"not-a-secret-value"}');
+      logger.log(payload as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      const parsed = JSON.parse(line);
+      expect(parsed.__proto__).toBe("not-a-secret-value");
+      expect(Object.getPrototypeOf(parsed)).toBe(Object.prototype);
+    });
+
+    it("stripping a toJSON function does not introduce prototype pollution", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      logger.log({
+        eventType: "http.request",
+        headers: {
+          toJSON() {
+            return {};
+          }
+        }
+      } as never);
+
+      const line = sink.mock.calls[0]![0] as string;
+      const parsed = JSON.parse(line);
+      expect(Object.getPrototypeOf(parsed)).toBe(Object.prototype);
+      expect(parsed.headers.toJSON).toBe("[FUNCTION_REMOVED]");
+    });
+  });
 });

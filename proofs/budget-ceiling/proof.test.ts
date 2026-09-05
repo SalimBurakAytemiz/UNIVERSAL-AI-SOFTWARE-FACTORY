@@ -23,6 +23,16 @@ describe("Proof: Budget ceilings stop runaway execution", () => {
 
     expect(stoppedByBudget).toBe(true);
     expect(callsMade).toBeLessThan(100); // stopped almost immediately, not after 100,000 iterations
-    expect(costEngine.total()).toBeLessThanOrEqual(5);
+    // P2 fix (8th independent review round, "floating-point comparisons
+    // reject exact budget spend"): 25 spends of $0.20 land EXACTLY on the
+    // $5 ceiling in intent, but binary floating-point accumulation produces
+    // a raw sum like 5.000000000000002 — a strict `toBeLessThanOrEqual(5)`
+    // would fail on that harmless representational noise even though the
+    // fixed monetary-precision comparison (runtime/cost/cost-engine.ts,
+    // exceedsMonetaryAmount) correctly treats it as "at the ceiling, not
+    // over it" and accepted it (this is the whole point of the fix — see
+    // budget.test.ts). `toBeCloseTo` asserts the total is correct at the
+    // Factory's own documented precision, not bitwise-exact float equality.
+    expect(costEngine.total()).toBeCloseTo(5, 6);
   });
 });

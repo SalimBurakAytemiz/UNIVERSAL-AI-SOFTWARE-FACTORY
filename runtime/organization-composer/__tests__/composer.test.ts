@@ -38,6 +38,65 @@ describe("composeOrganization", () => {
       expect(composition.rationale[team]).toBeTruthy();
     }
   });
+
+  describe("P2 fix (8th independent review round, 'prototype names crash schema-valid project families')", () => {
+    it("a projectFamily of 'constructor' does not crash and uses the fallback teams", () => {
+      const composition = composeOrganization({ projectFamily: "constructor", requiredCapabilities: [], risk: 1 });
+      expect([...composition.teams].sort()).toEqual(["backend", "qa"]);
+    });
+
+    it("a projectFamily of 'toString' does not crash and uses the fallback teams", () => {
+      const composition = composeOrganization({ projectFamily: "toString", requiredCapabilities: [], risk: 1 });
+      expect([...composition.teams].sort()).toEqual(["backend", "qa"]);
+    });
+
+    it("a projectFamily of '__proto__' does not crash and uses the fallback teams", () => {
+      const composition = composeOrganization({ projectFamily: "__proto__", requiredCapabilities: [], risk: 1 });
+      expect([...composition.teams].sort()).toEqual(["backend", "qa"]);
+    });
+
+    it("a projectFamily of 'hasOwnProperty' does not crash and uses the fallback teams", () => {
+      const composition = composeOrganization({ projectFamily: "hasOwnProperty", requiredCapabilities: [], risk: 1 });
+      expect([...composition.teams].sort()).toEqual(["backend", "qa"]);
+    });
+
+    it("an unrecognized ordinary family string still gets the documented fallback teams", () => {
+      const composition = composeOrganization({ projectFamily: "totally-unknown-family", requiredCapabilities: [], risk: 1 });
+      expect([...composition.teams].sort()).toEqual(["backend", "qa"]);
+    });
+
+    it("known families still resolve their correct, specific teams (no regression from the Map conversion)", () => {
+      expect([...composeOrganization({ projectFamily: "web", requiredCapabilities: [], risk: 0 }).teams].sort()).toEqual(
+        ["backend", "qa", "web"]
+      );
+      expect([...composeOrganization({ projectFamily: "mobile", requiredCapabilities: [], risk: 0 }).teams].sort()).toEqual(
+        ["backend", "mobile", "qa"]
+      );
+      expect([...composeOrganization({ projectFamily: "mmorpg", requiredCapabilities: [], risk: 0 }).teams].sort()).toEqual(
+        ["backend", "game", "qa"]
+      );
+    });
+
+    it("no prototype pollution occurs from processing a prototype-named family (a fresh object is unaffected)", () => {
+      composeOrganization({ projectFamily: "__proto__", requiredCapabilities: [], risk: 1 });
+      composeOrganization({ projectFamily: "constructor", requiredCapabilities: [], risk: 1 });
+      const fresh: Record<string, unknown> = {};
+      expect(Object.getPrototypeOf(fresh)).toBe(Object.prototype);
+      expect((fresh as { polluted?: unknown }).polluted).toBeUndefined();
+    });
+
+    it("a prototype-named family combined with a capability requirement still adds the required team via the documented rule", () => {
+      const composition = composeOrganization({ projectFamily: "constructor", requiredCapabilities: ["payments"], risk: 1 });
+      expect(composition.teams).toContain("security");
+      expect(composition.rationale.security).toContain("Payments");
+    });
+
+    it("bootstrap via composeOrganizationFromGenome completes according to the fallback contract for a prototype-named family", () => {
+      const genome = parseProjectGenome({ project: { id: "proj-1", name: "Test", family: "constructor" } });
+      const composition = composeOrganizationFromGenome(genome);
+      expect([...composition.teams].sort()).toEqual(["backend", "qa"]);
+    });
+  });
 });
 
 describe("composeOrganizationFromGenome (Project Genome -> Organization Composer wiring)", () => {

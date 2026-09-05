@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CostEngine, InvalidMonetaryAmountError, assertValidMonetaryAmount } from "../cost-engine.js";
+import { CostEngine, InvalidMonetaryAmountError, assertValidMonetaryAmount, exceedsMonetaryAmount } from "../cost-engine.js";
 
 describe("CostEngine", () => {
   it("accumulates cost entries and reports totals scoped by task", () => {
@@ -149,6 +149,32 @@ describe("CostEngine", () => {
       const [b] = engine.all();
       expect(a).not.toBe(b); // fresh snapshot every call — no shared mutable identity to leak
       expect(a).toEqual(b);
+    });
+  });
+
+  describe("exceedsMonetaryAmount (P2 fix, 8th independent review round: 'floating-point comparisons reject exact budget spend')", () => {
+    it("0.1 + 0.2 does not exceed 0.3 at the Factory's fixed monetary precision, despite native float noise", () => {
+      expect(0.1 + 0.2 > 0.3).toBe(true); // sanity: confirms the native bug this utility fixes
+      expect(exceedsMonetaryAmount(0.1 + 0.2, 0.3)).toBe(false);
+    });
+
+    it("a genuine excess (one precision unit above) is still reported as exceeding", () => {
+      expect(exceedsMonetaryAmount(0.300001, 0.3)).toBe(true);
+    });
+
+    it("equal amounts never exceed each other", () => {
+      expect(exceedsMonetaryAmount(5, 5)).toBe(false);
+      expect(exceedsMonetaryAmount(0, 0)).toBe(false);
+    });
+
+    it("a genuinely smaller amount never exceeds a larger one", () => {
+      expect(exceedsMonetaryAmount(1, 2)).toBe(false);
+    });
+
+    it("repeated decimal accumulation lands exactly on a whole-dollar ceiling", () => {
+      let total = 0;
+      for (let i = 0; i < 10; i++) total += 0.1;
+      expect(exceedsMonetaryAmount(total, 1)).toBe(false);
     });
   });
 });

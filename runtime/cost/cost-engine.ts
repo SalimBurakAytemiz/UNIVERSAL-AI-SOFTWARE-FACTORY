@@ -30,6 +30,43 @@ export function assertValidMonetaryAmount(amount: number, context: string): void
   }
 }
 
+/**
+ * P2 fix (8th independent review round, "floating-point comparisons reject
+ * exact budget spend"): Codex, `0.10` sonra `0.20` harcanıp $0.30'luk bir
+ * tavana karşı kontrol edildiğinde, JavaScript'in ikili kayan noktalı
+ * toplamasının `0.30000000000000004` ÜRETTİĞİNİ ve bu değerin `0.3`'ten
+ * BÜYÜK olduğu için (`projected > limit`) TAM TAVAN harcamasının YANLIŞLIKLA
+ * REDDEDİLDİĞİNİ gösterdi — bu, dört bütçe tavanının (perTaskUsd, perRunUsd,
+ * dailyUsd, monthlyUsd) TAMAMINDA tekrarlanan aynı hatadır (runtime/budget/
+ * budget.ts). Fix, RASGELE/dağınık bir epsilon DEĞİL — TEK, merkezi,
+ * belgelenen bir hassasiyet POLİTİKASI kullanır: her tutar, karşılaştırmadan
+ * ÖNCE `MONETARY_PRECISION_SCALE` (mikro-dolar, $0.000001 — hem sıradan
+ * sent-düzeyi harcamayı GÜVENLE kapsar hem de token-başına milyonda birkaç
+ * dolarlık model fiyatlandırması gibi daha ince taneli P0 fiyatlarını
+ * bozmaz) ile TAM SAYI birimlere yuvarlanır (`Math.round`), ve karşılaştırma
+ * bu İKİ TAM SAYI üzerinde yapılır — tam sayı karşılaştırması, kayan
+ * noktalı birikim gürültüsünden (`0.1 + 0.2 !== 0.3` sınıfı) yapısal olarak
+ * ETKİLENMEZ. Bu fonksiyon, dört bütçe tavanının HEPSİ için (ve gelecekte
+ * eklenecek her kümülatif parasal karşılaştırma için) TEK kaynak olarak
+ * kullanılmalıdır — her karşılaştırma noktasında ayrı ayrı icat edilen bir
+ * epsilon/tolerans DEĞİL.
+ */
+export const MONETARY_PRECISION_SCALE = 1_000_000;
+
+function toMonetaryUnits(amountUsd: number): number {
+  return Math.round(amountUsd * MONETARY_PRECISION_SCALE);
+}
+
+/**
+ * `a`'nın, Factory'nin sabit parasal hassasiyetinde (bkz.
+ * `MONETARY_PRECISION_SCALE`) `b`'yi GERÇEKTEN aşıp aşmadığını döndürür —
+ * TAM tavan harcaması (`a === b` niyetiyle) ikili kayan nokta gürültüsü
+ * yüzünden asla yanlışlıkla `true` dönmez.
+ */
+export function exceedsMonetaryAmount(a: number, b: number): boolean {
+  return toMonetaryUnits(a) > toMonetaryUnits(b);
+}
+
 export interface CostEntry {
   readonly taskId: string;
   readonly agentId?: string;

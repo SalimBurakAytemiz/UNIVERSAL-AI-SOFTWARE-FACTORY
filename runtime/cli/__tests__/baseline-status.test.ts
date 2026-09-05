@@ -19,6 +19,49 @@ describe("summarizeRequirements (pure logic)", () => {
     expect(summary.byCategory.P0).toBe(2);
     expect(summary.byCategory.P1).toBe(1);
   });
+
+  describe("P2 targeted-audit fix (8th independent review round, same class as 'prototype names crash schema-valid project families')", () => {
+    it("a status of 'constructor' does not crash and counts correctly", () => {
+      const summary = summarizeRequirements([{ id: "A", category: "P0", status: "constructor" }]);
+      expect(summary.byStatus.constructor).toBe(1);
+      expect(typeof summary.byStatus.constructor).toBe("number");
+    });
+
+    it("a category of '__proto__' does not crash and counts correctly", () => {
+      const summary = summarizeRequirements([{ id: "A", category: "__proto__", status: "DEFINED" }]);
+      expect(summary.byCategory.__proto__).toBe(1);
+      expect(Object.getPrototypeOf(summary.byCategory)).toBe(Object.prototype); // no pollution
+    });
+
+    it("a status of 'toString' does not crash and counts correctly", () => {
+      const summary = summarizeRequirements([
+        { id: "A", category: "P0", status: "toString" },
+        { id: "B", category: "P0", status: "toString" }
+      ]);
+      expect(summary.byStatus.toString).toBe(2);
+    });
+
+    it("mixing prototype-named and ordinary statuses/categories counts each independently", () => {
+      const summary = summarizeRequirements([
+        { id: "A", category: "P0", status: "DEFINED" },
+        { id: "B", category: "P0", status: "constructor" },
+        { id: "C", category: "P0", status: "DEFINED" }
+      ]);
+      expect(summary.byStatus.DEFINED).toBe(2);
+      expect(summary.byStatus.constructor).toBe(1);
+      expect(summary.total).toBe(3);
+    });
+
+    it("no prototype pollution occurs from processing prototype-named statuses/categories", () => {
+      summarizeRequirements([
+        { id: "A", category: "__proto__", status: "constructor" },
+        { id: "B", category: "hasOwnProperty", status: "toString" }
+      ]);
+      const fresh: Record<string, unknown> = {};
+      expect(Object.getPrototypeOf(fresh)).toBe(Object.prototype);
+      expect((fresh as { polluted?: unknown }).polluted).toBeUndefined();
+    });
+  });
 });
 
 describe("computeBaselineStatus (real repository data)", () => {

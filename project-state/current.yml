@@ -43,10 +43,28 @@ factory:
     found and fixed two more genuine instances (assumption-register.ts had
     the identical duplicate-id history-erasure bug bypassing its
     Founder-confirmation gate; workers/registry.ts had the identical
-    unvalidated-price bug feeding scheduler.ts's cheapest-worker reduce).
-    All findings are fixed in this session (see below), fully verified, and
-    pushed for an eighth re-review. P0 remains open until that re-review
-    comes back clean.
+    unvalidated-price bug feeding scheduler.ts's cheapest-worker reduce);
+    round 8 confirmed all prior fixes (DENY precedence, duplicate approval
+    ID, invalid model price, filesystem alias, credential redaction,
+    durable cache, budget isolation, CostEngine ownership, decision
+    supersession, fallback validation, escalation) but reproduced 5 NEW
+    findings on b50ecf5 (a logger serialization hook (toJSON) that could
+    reintroduce unredacted credentials after the redaction boundary; a
+    caller-owned, mutable Project Genome object retained across
+    bootstrapProject()'s async boundary so a post-call mutation of
+    project.id could drift authoritative project identity; a non-atomic
+    FileStateStore.write() that could destroy the last known-good durable
+    state on a real write failure; prototype-named project families
+    ("constructor"/"toString"/"__proto__") crashing the Organization
+    Composer via a plain-object dictionary lookup; and binary
+    floating-point accumulation causing exact-ceiling budget spends to be
+    incorrectly rejected across all four cumulative ceilings), plus a
+    narrow targeted audit for those same 5 classes that found and fixed
+    one more genuine instance (runtime/cli/commands/baseline-status.ts's
+    summarizeRequirements() had the identical prototype-key counting bug
+    for req.status/req.category). All findings are fixed in this session
+    (see below), fully verified, and pushed for a ninth re-review. P0
+    remains open until that re-review comes back clean.
 
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
@@ -778,6 +796,174 @@ completed_milestones:
     secret-scan (history-aware)/all 9 P0 proofs all clean; every fix
     confirmed via git-stash to have failing regression tests against its
     pre-fix code, then passing again with the fix restored.
+  - |-
+    THIS SESSION (round 8) — an eighth independent Codex review confirmed
+    the round-7 fixes (hard-link alias, DENY precedence, duplicate
+    approval ID, invalid model price, plus every earlier ownership/policy/
+    approval/budget/cache fix), then reproduced 5 NEW findings on commit
+    b50ecf5, plus asked for a narrow targeted audit for those same 5
+    classes. All findings fixed:
+    - [P1] "Logger serialization hooks bypass credential redaction": Codex
+      reproduced a nested enumerable `toJSON()` method surviving redact()
+      unchanged (only key NAMES were checked for sensitivity, not value
+      types), so `log()`'s final `JSON.stringify()` call invoked that
+      `toJSON()` and used its freshly-returned, NEVER-redacted content —
+      reintroducing plaintext Authorization/Cookie/session credentials
+      AFTER the redaction boundary had already run. Fixed in
+      runtime/telemetry/logger.ts: redact() now strips every
+      function-valued property entirely (replaced with the string
+      "[FUNCTION_REMOVED]") instead of passing it through, so the rebuilt
+      redacted tree (composed only of fresh Object.create(null) objects)
+      can never carry an executable serialization hook for
+      JSON.stringify to invoke. Regression tests prove a nested toJSON()
+      cannot reintroduce Authorization/Cookie/session credentials, a hook
+      buried deep inside nested structure or inside an array cannot bypass
+      recursive redaction, the caller's original payload (including the
+      toJSON function itself) is never mutated, normal logging and the
+      round-6 prototype-key fix remain unaffected, and no prototype
+      pollution is introduced by the function-stripping. Confirmed via
+      git-stash that 4 of these tests fail against the pre-fix code with
+      exactly the bypass Codex described.
+    - [P1] "Caller mutation changes project identity during bootstrap":
+      Codex reproduced bootstrapProject() starting for project A while the
+      caller still held (and later mutated) `genomeCandidate.project.id`
+      from A to B before the async pipeline finished; parseProjectGenome()
+      used to return the SAME object reference the caller supplied
+      (`candidate as ProjectGenome`), so a mutation reachable across an
+      `await` boundary could drift authoritative project identity mid-
+      operation. Fixed in runtime/project-genome/genome.ts:
+      parseProjectGenome() now calls `deepFreezeClone()` on the candidate
+      BEFORE validation, validates and applies assertValidProjectId() to
+      that detached copy, and returns ONLY the frozen clone — no
+      downstream step (authorization, filesystem root, cost attribution,
+      persistence) ever sees a reference the caller can still reach.
+      Regression tests prove mutating the original candidate's nested
+      project.id/family/capabilities after parseProjectGenome() never
+      changes the returned genome, the returned genome is deeply frozen
+      and never the same reference, an invalid genome still fails closed,
+      and — at the full bootstrapProject() level — a caller mutating
+      genomeCandidate.project.id from A to B mid-flight never changes
+      which project's directory is scaffolded, genome is persisted, or
+      cost is attributed. Confirmed via git-stash that 7 of these tests
+      (including the full end-to-end orchestrator reproduction) fail
+      against the pre-fix code.
+    - [P2] "Failed state writes destroy previous recoverable state": Codex
+      reproduced a real write failure (EFBIG/disk-full-style): with a
+      valid state file already on disk, a write interrupted partway
+      through overwrote it with TRUNCATED, invalid JSON — a subsequent
+      read() threw a SyntaxError and the state was completely
+      unrecoverable. Fixed in runtime/state/file-store.ts:
+      FileStateStore.write() now uses the standard atomic-write pattern —
+      write the full content to a temporary SIBLING file in the same
+      directory first, then `renameSync` it over the destination only
+      after that write fully succeeds (a failed temp write never touches
+      the destination; a leftover temp file is best-effort cleaned up
+      without masking the original error). Regression tests, using a spy
+      that wraps the REAL fs.writeFileSync/unlinkSync and simulates a
+      genuine PARTIAL write (some bytes reach disk before the injected
+      failure, faithfully matching a real EFBIG scenario rather than
+      merely intercepting the call before any I/O), prove a simulated
+      write failure leaves the previous valid state byte-identical, a
+      fresh store instance still recovers it, a successful write
+      atomically replaces old content, no partial temp file remains after
+      success or a cleanup-succeeded failure, a cleanup failure never
+      masks the original write error, and existing FileCache/durable-state
+      users keep working. Confirmed via git-stash that 3 of these tests
+      fail against the pre-fix code with exactly the truncated-JSON
+      corruption Codex described.
+    - [P2] "Prototype names crash schema-valid project families": Codex
+      reproduced project families "constructor"/"toString"/"__proto__" —
+      all schema-valid strings — reading an INHERITED Object.prototype
+      value instead of `undefined` from the plain-object
+      `BASE_TEAMS_BY_FAMILY[input.projectFamily]` lookup (never caught by
+      `?? DEFAULT_BASE_TEAMS` since the inherited value is truthy), and
+      `new Set(inheritedValue)` (not iterable) crashing bootstrap with a
+      TypeError. Fixed in runtime/organization-composer/composer.ts: the
+      lookup table is now a `Map`, whose `.get()` never reads the
+      prototype chain, so any unrecognized string (prototype-named or
+      not) correctly falls back to DEFAULT_BASE_TEAMS. Regression tests
+      prove "constructor"/"toString"/"__proto__"/"hasOwnProperty" families
+      all resolve to fallback teams without crashing, known families still
+      resolve correctly (no regression), a prototype-named family
+      combined with a capability requirement still adds the required team,
+      no prototype pollution occurs, and a full genome-to-composer
+      bootstrap with a "constructor" family completes per the fallback
+      contract. Confirmed via git-stash that 7 of these tests fail against
+      the pre-fix code with exactly the TypeError Codex described.
+    - [P2] "Floating-point comparisons reject exact budget spend": Codex
+      reproduced spending $0.10 then $0.20 against a $0.30 ceiling —
+      binary floating-point addition produces `0.30000000000000004`, which
+      the bare `>` comparison in assertWithinBudget() judged as exceeding
+      the ceiling, incorrectly blocking an exact-ceiling spend across all
+      four cumulative ceilings (perTaskUsd/perRunUsd/dailyUsd/monthlyUsd).
+      Fixed with ONE centralized, documented precision policy (not a
+      scattered epsilon): a new `exceedsMonetaryAmount()` (runtime/cost/
+      cost-engine.ts) scales both operands to integer micro-dollar units
+      (`MONETARY_PRECISION_SCALE = 1_000_000`) via Math.round and compares
+      the resulting integers; every ceiling check in runtime/budget/
+      budget.ts now routes through this one function. Regression tests
+      prove 0.10+0.20 landing exactly on 0.30 is accepted for all four
+      ceiling types, one precision unit above the ceiling is still
+      rejected, ten repeated $0.10 spends land exactly on $1.00 without
+      spurious rejection, project/task scoping and daily/monthly rollover
+      remain correct, and zero/NaN/Infinity/negative handling is
+      unaffected, plus direct unit tests of exceedsMonetaryAmount() itself.
+      Confirmed via git-stash that 5 of these tests fail against the
+      pre-fix bare-`>` code. Collateral fix: Proof E's runaway-loop test
+      (proofs/budget-ceiling/proof.test.ts) asserted the accumulated spend
+      was `<= 5` using raw float equality — this only ever passed because
+      the OLD bug's incorrect rejections happened to also keep the raw sum
+      under 5; now that an exact-ceiling spend is correctly accepted (raw
+      sum 5.000000000000002), the assertion was updated to
+      `toBeCloseTo(5, 6)` — the proof's actual claim is unchanged and
+      still verified.
+    - Targeted follow-up audit (as explicitly requested, narrow — only
+      these 5 classes): found and fixed ONE more genuine instance.
+      runtime/cli/commands/baseline-status.ts's summarizeRequirements() had
+      the IDENTICAL prototype-key counting bug as composer.ts:
+      `byStatus[req.status] = (byStatus[req.status] ?? 0) + 1` on a status
+      of "constructor" reads the inherited function (never caught by `??`)
+      and silently corrupts the count via string concatenation instead of
+      numeric addition — undermining the exact "no claim without evidence"
+      purpose of this tool. Fixed with the same Map-based pattern,
+      converted to the public Record shape via `Object.fromEntries()`
+      (which uses [[DefineOwnProperty]], never [[Set]], so "__proto__" as
+      a key is always a genuine own property). Confirmed via git-stash
+      that all 4 new regression tests fail against the pre-fix code with
+      exactly the corrupted-count symptom. Reviewed and found NOT
+      applicable: file-store.ts's JSON.stringify has no redaction contract
+      (class 1 is specifically about bypassing REDACTION, not generic
+      serialization); audit-log.ts already fails closed via
+      structuredClone (throws on function values) before ever reaching
+      JSON.stringify; router.ts's RoutingRequest is retained across await
+      points in its escalation loop (same async-boundary shape as class 2)
+      but the round's own audit instruction scoped class 2 explicitly to
+      "Project Genome input paths only," so it was left unchanged with
+      this reasoning recorded; no other direct destination-overwriting
+      fs.writeFileSync call site exists besides file-store.ts; no other
+      Record<string,...> dictionary is keyed by an externally-controlled
+      arbitrary string; router.ts/scheduler.ts's cheapest-candidate `<`
+      comparisons are a different concern (single-value selection, not a
+      cumulative-sum-vs-ceiling boundary) and were left unchanged. This
+      scoping decision is recorded here so a future session does not
+      re-litigate it without new evidence.
+  - >-
+    Requirement registry updated an eighth time from this round's real
+    evidence: UASF-REQ-0038 (Logging — serialization-hook redaction fix),
+    UASF-REQ-0008 (Project Genome — deep-detach-before-validate fix),
+    UASF-REQ-0021 (Durable state — atomic temp-then-rename write),
+    UASF-REQ-0016 (Organization composer — Map-based family lookup),
+    UASF-REQ-0029/UASF-REQ-0030 (Cost engine / Budget — centralized
+    exceedsMonetaryAmount precision utility), UASF-REQ-0041 (Baseline
+    status command — Map-based status/category counting, audit-found). No
+    status raised beyond what a real test/proof supports.
+  - 434/434 tests passing (up from 378 before this round, +56 net new
+    across 8 fixed files, plus one collateral proof-assertion correction
+    in proofs/budget-ceiling/proof.test.ts made necessary by the budget
+    precision fix itself); lint/typecheck/build/validate-requirements/
+    secret-scan (history-aware)/all 9 P0 proofs all clean; every fix
+    confirmed via git-stash to have failing regression tests against its
+    pre-fix code, then passing again with the fix restored.
 
 known_limitations:
   - >-
@@ -805,23 +991,26 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting an EIGHTH independent (Codex) re-review of the pushed fixes
-    (round 7's 4 new findings — a static hard-link filesystem alias the
-    round-6 symlink-only confinement check structurally cannot detect, a
-    policy-engine early-break letting a higher-priority ALLOW skip a
-    matching lower-priority DENY, duplicate approval IDs silently
-    replacing authoritative EXECUTED history, and unvalidated model
-    registry prices letting a NaN-priced candidate corrupt cheapest-
-    capable routing — are now fixed, tested, and verified per the full
-    required sequence: lint, typecheck, build, 378/378 tests,
-    validate:requirements, history-aware secret-scan, all 9 P0 proofs; a
-    narrow targeted audit for those same 4 bug classes found and fixed two
-    more genuine instances, the identical duplicate-id gap in
-    assumption-register.ts and the identical unvalidated-price gap in
-    workers/registry.ts). Per explicit instruction: "stop at the
-    independent-review boundary" — do not push further P0 feature work,
-    and do not declare P0 complete, until that re-review confirms no
-    blocking finding remains.
+    Awaiting a NINTH independent (Codex) re-review of the pushed fixes
+    (round 8's 5 new findings — a logger serialization hook (toJSON) that
+    could reintroduce unredacted credentials after the redaction boundary,
+    a caller-owned mutable Project Genome retained across
+    bootstrapProject()'s async boundary letting a post-call mutation drift
+    authoritative project identity, a non-atomic FileStateStore.write()
+    that could destroy the last known-good durable state on a real write
+    failure, prototype-named project families crashing the Organization
+    Composer via a plain-object dictionary lookup, and binary
+    floating-point accumulation causing exact-ceiling budget spends to be
+    incorrectly rejected across all four cumulative ceilings — are now
+    fixed, tested, and verified per the full required sequence: lint,
+    typecheck, build, 434/434 tests, validate:requirements, history-aware
+    secret-scan, all 9 P0 proofs; a narrow targeted audit for those same 5
+    bug classes found and fixed one more genuine instance, the identical
+    prototype-key counting bug in
+    runtime/cli/commands/baseline-status.ts's summarizeRequirements()).
+    Per explicit instruction: "stop at the independent-review boundary" —
+    do not push further P0 feature work, and do not declare P0 complete,
+    until that re-review confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -840,35 +1029,48 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 7's 4 findings (a new assertNoHardLinkAlias() check in
-  assertFilesystemConfinement rejecting already-existing, multiply-linked
-  (nlink > 1) destination files; PolicyEngine.evaluate() no longer
-  break-ing at the first matching rule, so a DENY at any priority always
-  wins over a non-DENY match; a new DuplicateApprovalIdError in
-  ApprovalWorkflow.request() rejecting any id collision before mutation,
-  regardless of the existing record's status; ModelRegistry.register() now
-  calling the existing assertValidMonetaryAmount() validator on
-  costPerCall before insertion), plus two more genuine instances found
-  during the requested targeted audit (assumption-register.ts's propose()
-  needed the identical duplicate-id guard as approval.ts, to protect its
-  Founder-confirmation gate; workers/registry.ts's register() needed the
-  identical monetary validation as the model registry, to protect
-  scheduler.ts's cheapest-worker selection), are implemented, tested, and
-  pushed, with the full required verification sequence run clean (lint,
-  typecheck, build, 378/378 tests, validate:requirements, history-aware
-  secret-scan, all 9 P0 proofs). Every fix was individually confirmed via
-  git-stash to have failing regression tests against its pre-fix code,
-  including the exact reproductions Codex described (a hard-linked
-  cross-project file overwrite, a priority-10 ALLOW shadowing a
-  priority-1 DENY, an EXECUTED approval's provenance silently erased by a
-  same-id request(), and a NaN-priced premium model beating a genuinely
-  cheaper free one). Do not proceed to further P0 feature work or declare
-  P0 complete until an independent (Codex) re-review of this diff
-  confirms no blocking P0 finding remains. If/when that comes back clean,
-  resume from the prior exact_next_action: wire the remaining foundation
-  modules (Discovery, Decisions, Assumptions, Technology/
-  Business-Capability registries) into the same integrated pipeline,
-  consider a SQLite-backed StateStore, get a Founder decision on
-  P0-sufficiency and licensing (section 206). The
-  autonomous-merge governance question stays closed absent new
-  Founder-initiated context.
+  fixes for round 8's 5 findings (redact() in runtime/telemetry/logger.ts
+  now strips every function-valued property, including a caller-supplied
+  toJSON(), so no serialization hook can reintroduce unredacted data after
+  the redaction boundary; parseProjectGenome() now deep-detaches and
+  freezes the candidate via deepFreezeClone() BEFORE validation, so no
+  downstream step of bootstrapProject() can ever observe a caller's later
+  mutation of the original object; FileStateStore.write() now writes to a
+  temporary sibling file and only renameSync's it over the destination on
+  full success, so a failed write can never truncate/destroy the previous
+  valid state; organization-composer's BASE_TEAMS_BY_FAMILY is now a Map
+  (never reads the JS prototype chain), so prototype-named project
+  families fall back correctly instead of crashing; and a new centralized
+  exceedsMonetaryAmount() (runtime/cost/cost-engine.ts, integer
+  micro-dollar comparison) now backs every budget ceiling check, so an
+  exact-ceiling spend is correctly accepted instead of rejected by binary
+  floating-point noise), plus one more genuine instance found during the
+  requested targeted audit (runtime/cli/commands/baseline-status.ts's
+  summarizeRequirements() needed the identical Map-based fix as the
+  composer, to protect its own status/category counts from the same
+  prototype-key corruption), are implemented, tested, and pushed, with the
+  full required verification sequence run clean (lint, typecheck, build,
+  434/434 tests, validate:requirements, history-aware secret-scan, all 9
+  P0 proofs). Every fix was individually confirmed via git-stash to have
+  failing regression tests against its pre-fix code, including the exact
+  reproductions Codex described (a toJSON() hook reintroducing a
+  credential after redaction, a mid-bootstrap project-id mutation drifting
+  authoritative identity, a truncated-JSON durable-state corruption, a
+  TypeError crash on a "constructor"-named project family, and an
+  incorrectly-rejected exact-ceiling budget spend). One collateral,
+  correctness-preserving test update was also required: Proof E's
+  runaway-loop assertion in proofs/budget-ceiling/proof.test.ts, which
+  only ever passed because the OLD budget bug's incorrect rejections
+  happened to also keep the raw float sum under the ceiling — now updated
+  to assert correctness at the Factory's own documented monetary
+  precision rather than bitwise-exact float equality, with the proof's
+  actual claim (a runaway loop is stopped by the ceiling) unchanged and
+  still verified. Do not proceed to further P0 feature work or declare P0
+  complete until an independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains. If/when that comes back clean, resume from
+  the prior exact_next_action: wire the remaining foundation modules
+  (Discovery, Decisions, Assumptions, Technology/Business-Capability
+  registries) into the same integrated pipeline, consider a SQLite-backed
+  StateStore, get a Founder decision on P0-sufficiency and licensing
+  (section 206). The autonomous-merge governance question stays closed
+  absent new Founder-initiated context.
