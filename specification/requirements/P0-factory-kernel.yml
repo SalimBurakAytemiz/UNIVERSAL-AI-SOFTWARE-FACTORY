@@ -240,6 +240,35 @@
     does not and cannot claim protection against a hostile, concurrently
     racing filesystem writer, which is out of scope for this P0 prototype).
 
+    P1 fix (6th independent review round, "project-root alias permits
+    cross-project writes"): Codex reproduced `baseDir/A` as a PRE-EXISTING
+    symlink to `baseDir/B` (both inside baseDir, no race required).
+    assertFilesystemConfinement()'s round-5 check only verified that the
+    REAL (resolved) target stayed somewhere INSIDE baseDir (a prefix
+    test) — since B is also inside baseDir, that check passed, and
+    bootstrapping project A silently scaffolded/wrote into project B's
+    real directory, overwriting B's genome with A's data. Fixed in
+    runtime/sandbox/sandbox.ts (see UASF-REQ-0033): the confinement check
+    now compares the RELATIVE path from root to target LEXICALLY against
+    the RELATIVE path from the resolved root to the resolved target — any
+    symlink indirection that changes WHICH entry a path resolves to (not
+    just whether it stays inside the root) is now rejected, closing the
+    alias/identity-reuse case while remaining a strict superset of the
+    prior containment check (every previously-blocked "escape outside
+    baseDir" case is still blocked). Regression tests prove: normal
+    project A creation still succeeds, baseDir/A -> baseDir/B is rejected
+    at the sandbox layer AND at the full bootstrapProject() level, a
+    second bootstrap of colliding project A cannot overwrite project B's
+    genome/organization/state files (confirmed byte-identical before and
+    after the rejected attempt), the rejection happens before any file is
+    touched, a nested alias variant (a subdirectory inside a real project
+    root aliasing a sibling subdirectory) is also rejected, and all
+    previously-fixed dangling/final/parent symlink escapes remain blocked
+    under the stricter check. Confirmed via git-stash that these tests
+    (including the full end-to-end bootstrapProject() test showing the
+    pre-fix code's resolved projectRoot was silently the alias target)
+    fail against the pre-fix (round-5) code.
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -1118,6 +1147,32 @@
     Confirmed via git-stash that these tests fail against the pre-fix
     (existsSync-based) code.
 
+    P1 fix (6th independent review round, "project-root alias permits
+    cross-project writes"): assertFilesystemConfinement()'s containment
+    test (`realTarget.startsWith(realRoot + sep)`) only verified the
+    resolved target stayed somewhere INSIDE root — it did not verify the
+    target resolved to its OWN canonical location. `baseDir/A` as a
+    pre-existing symlink to `baseDir/B` passed this prefix test (B is also
+    inside baseDir), silently redirecting anything written to "A" into
+    B's real directory — a cross-project identity alias, no race
+    required. Fixed: the check now compares the LEXICAL relative path
+    (root to target, unresolved) against the REAL relative path (resolved
+    root to resolved target) and requires exact equality — only the ROOT
+    itself may differ between its lexical and real form (harmless OS-level
+    normalization, e.g. /tmp -> /private/tmp); the caller-supplied SUFFIX
+    (project id, subdirectory, filename) must resolve to the identical
+    relative location, with zero symlink-induced redirection anywhere in
+    that suffix. This is a strict superset of the old containment check
+    (equal relative paths always imply containment), so no previously
+    blocked "escape outside root" case is weakened. Regression tests
+    (here and at the scaffold/orchestrator level, see UASF-REQ-0007)
+    prove: baseDir/A -> baseDir/B is rejected, a not-yet-existing project
+    root is never treated as an alias, a nested subdirectory-level alias
+    within an established project root is rejected, and every previously
+    fixed dangling/final/parent/nested symlink escape remains blocked.
+    Confirmed via git-stash that the alias-specific tests fail against
+    the pre-fix (round-5, prefix-only) code.
+
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
   description: Cross-project default-deny isolation of filesystem/state/budget/artifacts.
@@ -1194,6 +1249,32 @@
     cross-process durability (e.g. the cache-reuse proof's original
     same-process test).
 
+    P2 fix (6th independent review round, "durable cache loses __proto__
+    keys"): FileCache persisted entries as a plain JS object
+    (`Record<string, CacheEntry<T>>`) and accessed them via bracket
+    assignment/lookup (`all[key] = ...`, `all[key]`). Since the cache API
+    accepts arbitrary string keys, `set("__proto__", value)` never created
+    a real own property — `Object.prototype`'s `__proto__` accessor
+    intercepted the assignment instead, so the persisted representation
+    stayed silently `{}` and `get("__proto__")` always returned undefined.
+    Fixed: the persisted representation is now an array of `[key, entry]`
+    tuples, and the in-memory structure is a `Map<string, CacheEntry<T>>`
+    — neither an array nor a Map ever routes a key through JS object
+    property/accessor semantics, so `__proto__`, `constructor`, and
+    `prototype` all behave as ordinary keys with no special case needed.
+    Regression tests prove: `set("__proto__", ...)` persists and an
+    immediate get() returns it, a new FileCache instance (same path)
+    recovers it, a genuinely separate FileCache+FileStateStore instance
+    (simulated separate process) recovers it, the persisted representation
+    is never silently empty, no prototype pollution occurs (a fresh,
+    unrelated plain object is unaffected), `constructor`/`prototype` also
+    behave as ordinary keys, normal and reserved-name keys coexist
+    correctly with size() reflecting all of them, and the pre-existing
+    durable cross-process cache proof (proofs/cache-reuse/proof.test.ts)
+    still passes unchanged. Confirmed via git-stash that 5 of the new
+    tests fail against the pre-fix (plain-object) representation with
+    exactly the `{}`-stays-empty symptom Codex described.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
@@ -1237,6 +1318,43 @@
   proof_refs: []
   security_refs:
     - "SECURITY.md"
+  notes: >
+    P1 fix (6th independent review round, "authentication headers leak
+    through logging"): the sensitive-key fragment list only covered
+    application-secret field names (apiKey, accessToken, ...), not
+    standard HTTP/session credential-bearing names — Codex reproduced
+    Authorization, Proxy-Authorization, and Cookie/session values reaching
+    the sink in plaintext. Fixed: added fragments for "authorization"
+    (also matches Proxy-Authorization via substring), "cookie" (also
+    matches Set-Cookie), "session" (also matches sessionId/sessionid),
+    "bearer", and hyphenated variants of api-key/access-token/
+    refresh-token/private-key (the existing fragments only covered the
+    no-separator and underscore forms; "api_key" and "api-key" are
+    different substrings and both need their own entry). Regression tests
+    prove: Authorization Bearer values, Proxy-Authorization, Cookie/
+    Set-Cookie, nested headers inside a request-metadata object,
+    mixed-case header names (AUTHORIZATION, X-Api-Key), and arrays of
+    credential-bearing objects are all redacted; non-sensitive values stay
+    readable; the caller's original payload object graph is never
+    mutated; and all pre-existing logging behavior (recommended fields,
+    timestamp) is unaffected. Confirmed via git-stash that 8 of these
+    tests fail against the pre-fix fragment list with the exact leakage
+    Codex described.
+
+    Cross-cutting audit fix (same finding's targeted follow-up, "prototype-
+    sensitive dictionary keys" — the same class as the FileCache
+    `__proto__` finding, see UASF-REQ-0036): `redact()`'s internal
+    dictionary-building loop used a plain `{}` object and bracket
+    assignment (`result[key] = ...`), which for a field literally named
+    `__proto__` (e.g. logging a raw JSON.parse'd payload) invoked
+    `Object.prototype`'s accessor instead of creating an ordinary own
+    property, silently dropping that field. Fixed by building `result` via
+    `Object.create(null)` (no inherited accessors at all), so every key —
+    including `__proto__`, `constructor`, `prototype` — becomes an
+    ordinary own data property. Regression test proves a `__proto__`-named
+    field now survives redaction/serialization unchanged and no
+    prototype pollution occurs; confirmed via git-stash that this test
+    fails against the pre-fix (plain-object) code.
 
 - id: UASF-REQ-0039
   title: Turkish source code explanation standard

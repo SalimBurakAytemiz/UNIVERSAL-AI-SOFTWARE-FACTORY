@@ -10,7 +10,7 @@ factory:
   p0_status: >
     NOT complete. Explicit Founder instruction: do not move to P1, do not
     mark P0 complete, until an independent review finds no blocking P0
-    finding. Five independent Codex review rounds so far: round 1 found 4
+    finding. Six independent Codex review rounds so far: round 1 found 4
     blocking findings (all fixed, confirmed fixed by round 2); round 2 found
     4 NEW findings — 1 BLOCKER, 3 P2 (all fixed, confirmed fixed by round 3);
     round 3 found 3 NEW P1 findings, all in the same "internal mutable state
@@ -25,10 +25,16 @@ factory:
     symlink gap the round-4 fix missed, a budget scope collision across
     projects sharing a taskId, and a decision-ledger repeated-supersession
     history corruption), plus a narrow targeted audit for those same 3
-    classes. All 3 named findings are fixed in this session (see below), no
-    further instances of those 3 exact classes were found elsewhere, fully
-    verified, and pushed for a sixth re-review. P0 remains open until that
-    re-review comes back clean.
+    classes (all fixed, confirmed fixed by round 6); round 6 confirmed all
+    prior fixes but reproduced 3 NEW findings on 8626b15 (a project-root
+    symlink-alias gap the round-5 confinement fix missed, incomplete
+    credential-key redaction in the logger, and a prototype-unsafe cache
+    key implementation), plus a narrow targeted audit for those same 3
+    classes that found and fixed one more genuine instance (the logger's
+    own dictionary-building loop had the same prototype-key issue). All
+    findings are fixed in this session (see below), fully verified, and
+    pushed for a seventh re-review. P0 remains open until that re-review
+    comes back clean.
 
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
@@ -508,6 +514,118 @@ completed_milestones:
     the orchestrator integration-level dangling-symlink test) confirmed via
     git-stash to have failing regression tests against its pre-fix code,
     then passing again with the fix restored.
+  - |-
+    THIS SESSION (round 6) — a sixth independent Codex review confirmed
+    the round-5 fixes (dangling-symlink, budget scope, decision
+    supersession, plus every earlier ownership/policy/approval/cache fix),
+    then reproduced 3 NEW findings on commit 8626b15, plus asked for a
+    narrow targeted audit for those same 3 classes. All findings fixed:
+    - [P1] "Project-root alias permits cross-project writes": Codex
+      reproduced `baseDir/A` as a PRE-EXISTING symlink to `baseDir/B`
+      (both inside baseDir, no race). assertFilesystemConfinement()'s
+      round-5 check only verified the resolved target stayed somewhere
+      INSIDE baseDir (a prefix test) — since B is also inside baseDir,
+      that check passed, and bootstrapping project A silently
+      scaffolded/wrote into project B's real directory, overwriting B's
+      genome with A's data (Codex confirmed the overwrite directly).
+      Fixed in runtime/sandbox/sandbox.ts: the check now compares the
+      LEXICAL relative path (root to target, unresolved) against the REAL
+      relative path (resolved root to resolved target) and requires exact
+      equality, not mere containment — only the root itself may differ
+      between lexical and real form (harmless OS normalization), never
+      the caller-supplied suffix. This is a strict superset of the prior
+      containment check (equal relative paths always imply containment),
+      so no previously-blocked escape is weakened. Regression tests prove:
+      normal project A creation still succeeds, baseDir/A -> baseDir/B is
+      rejected at both the sandbox layer and the full bootstrapProject()
+      level, a full end-to-end test proves project A's bootstrap cannot
+      overwrite project B's genome/organization/state files (confirmed
+      byte-identical before/after the rejected attempt), rejection occurs
+      before any mutation, a nested subdirectory-level alias variant is
+      rejected, and every previously-fixed dangling/final/parent/nested
+      symlink escape remains blocked. Confirmed via git-stash — the
+      pre-fix orchestrator.ts's resolved projectRoot was observably the
+      alias target (project-a resolving into project-b's directory).
+    - [P1] "Authentication headers leak through logging": the logger's
+      sensitive-key fragment list only covered application-secret field
+      names (apiKey, accessToken, ...), not standard HTTP/session
+      credential names. Codex reproduced Authorization,
+      Proxy-Authorization, and Cookie/session values reaching the sink in
+      plaintext using fake credentials. Fixed in
+      runtime/telemetry/logger.ts: added fragments for "authorization"
+      (also matches Proxy-Authorization), "cookie" (also matches
+      Set-Cookie), "session" (also matches sessionId), "bearer", and the
+      missing hyphenated separator variants of api-key/access-token/
+      refresh-token/private-key (each separator style — no-separator,
+      underscore, hyphen — needs its own fragment since none contain each
+      other as substrings). Regression tests prove: Authorization Bearer
+      values, Proxy-Authorization, Cookie/Set-Cookie, nested headers
+      inside a request-metadata object, mixed-case header names, and
+      arrays of credential-bearing objects are all redacted; non-sensitive
+      values stay readable; the caller's original payload is never
+      mutated; and pre-existing logging behavior is unaffected. Confirmed
+      via git-stash that 8 of these tests fail against the pre-fix
+      fragment list with the exact leakage Codex described.
+    - [P2] "Durable cache loses __proto__ keys": FileCache persisted
+      entries as a plain JS object accessed via bracket assignment
+      (`all[key] = ...`). Since the cache API accepts arbitrary string
+      keys, `set("__proto__", value)` never created a real own property —
+      `Object.prototype`'s accessor intercepted it instead, so the
+      persisted representation stayed silently `{}` and
+      `get("__proto__")` always returned undefined, exactly as Codex
+      reproduced. Fixed in runtime/cache/file-cache.ts: the persisted
+      representation is now an array of `[key, entry]` tuples, and the
+      in-memory structure is a `Map<string, CacheEntry<T>>` — neither
+      routes a key through JS object property/accessor semantics, so
+      `__proto__`, `constructor`, and `prototype` behave as ordinary keys.
+      Regression tests prove: `set`/immediate `get` round-trips
+      `"__proto__"`, a new same-path instance recovers it, a genuinely
+      separate instance (simulated separate process) recovers it, the
+      persisted representation is never silently empty, no prototype
+      pollution occurs, `constructor`/`prototype` also work, normal and
+      reserved-name keys coexist with correct size(), and the pre-existing
+      durable cross-process cache proof still passes unchanged. Confirmed
+      via git-stash that 5 of these tests fail against the pre-fix
+      (plain-object) representation.
+    - Targeted follow-up audit (as explicitly requested, narrow — only
+      these 3 classes): found and fixed ONE more genuine instance of the
+      "prototype-sensitive dictionary key" class — the logger's own
+      `redact()` function built its recursive result object as a plain
+      `{}` with bracket assignment, so a field literally named
+      `__proto__` (e.g. logging a raw JSON.parse'd payload) was silently
+      dropped the same way FileCache's keys were. Fixed by building that
+      result object via `Object.create(null)` instead (no inherited
+      accessors at all). Regression test added and confirmed via
+      git-stash to fail on the pre-fix code. Reviewed and found NOT
+      applicable: the file-writing surface for cross-project aliasing is
+      still exactly the same 4 files already centralized behind the one
+      fixed confinement primitive (no other project-root resolution logic
+      exists); AuditLog's payload fields are all internally-authored
+      literal key names (scope, projectedAmountUsd, decision, ...), never
+      externally-controlled key NAMES, so it is not a genuine instance of
+      credential-key leakage today (values can be attacker-influenced,
+      but no code path currently puts a credential-shaped VALUE into an
+      audit payload; recorded here rather than fixed pre-emptively);
+      other `Record<string, ...>` dictionaries in the codebase
+      (baseline-status.ts, organization-composer.ts) are keyed only by
+      fixed, internally-defined identifiers (status/category/team-family
+      names), never by externally-controlled strings, so prototype-key
+      safety does not apply to them. This scoping decision is recorded
+      here so a future session does not re-litigate it without new
+      evidence.
+  - >-
+    Requirement registry updated a sixth time from this round's real
+    evidence: UASF-REQ-0007 (orchestrator/scaffold — project-root alias
+    rejection), UASF-REQ-0033 (Sandbox — lexical-vs-real relative-path
+    equality check), UASF-REQ-0038 (Logging — expanded credential-key
+    redaction plus the Object.create(null) prototype-safety fix),
+    UASF-REQ-0036 (Cache — Map/array-based prototype-safe persistence).
+    No status raised beyond what a real test/proof supports.
+  - 332/332 tests passing (up from 306 before this round, +26 net new
+    across 4 fixed files); lint/typecheck/build/validate-requirements/
+    secret-scan (history-aware) all clean; every fix confirmed via
+    git-stash to have failing regression tests against its pre-fix code,
+    then passing again with the fix restored.
 
 known_limitations:
   - >-
@@ -535,17 +653,18 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting a SIXTH independent (Codex) re-review of the pushed fixes
-    (round 5's 3 new findings — a dangling/final-destination symlink gap,
-    a per-task budget scope collision across projects, and a
-    decision-ledger repeated-supersession history corruption — are now
-    fixed, tested, and verified per the full required sequence: lint,
-    typecheck, build, 306/306 tests, validate:requirements, history-aware
-    secret-scan, all P0 proofs; a narrow targeted audit for those same 3
-    bug classes found no further instances elsewhere). Per explicit
-    instruction: "stop at the independent-review boundary" — do not push
-    further P0 feature work, and do not declare P0 complete, until that
-    re-review confirms no blocking finding remains.
+    Awaiting a SEVENTH independent (Codex) re-review of the pushed fixes
+    (round 6's 3 new findings — a project-root symlink-alias gap the
+    round-5 confinement fix missed, incomplete credential-key redaction in
+    the logger, and a prototype-unsafe durable-cache key implementation —
+    are now fixed, tested, and verified per the full required sequence:
+    lint, typecheck, build, 332/332 tests, validate:requirements,
+    history-aware secret-scan, all P0 proofs; a narrow targeted audit for
+    those same 3 bug classes found and fixed one more genuine instance,
+    the same prototype-key issue in the logger's own redact() function).
+    Per explicit instruction: "stop at the independent-review boundary" —
+    do not push further P0 feature work, and do not declare P0 complete,
+    until that re-review confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -564,24 +683,29 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 5's 3 findings (dangling/final-destination symlink escape
-  via lstat/realpath in canonicalizeNearestExisting plus per-file
-  confinement in orchestrator.ts's stateStore.write() calls; per-task
-  budget scoping by projectId+taskId; decision-ledger supersede()
-  requiring the old decision to be ACTIVE) are implemented, tested, and
-  pushed, with the full required verification sequence run clean (lint,
-  typecheck, build, 306/306 tests, validate:requirements, history-aware
-  secret-scan, all P0 proofs). A narrow targeted audit for those same 3 bug
-  classes (not a broad refactor) found no further genuine instances
-  elsewhere — see completed_milestones for exactly what was reviewed and
-  why each was left unchanged. Every fix was individually confirmed via
-  git-stash to have failing regression tests against its pre-fix code. Do
-  not proceed to further P0 feature work or declare P0 complete until an
-  independent (Codex) re-review of this diff confirms no blocking P0
-  finding remains. If/when that comes back clean, resume from the prior
-  exact_next_action: wire the remaining foundation modules (Discovery,
-  Decisions, Assumptions, Technology/Business-Capability registries) into
-  the same integrated pipeline, consider a SQLite-backed StateStore, get a
-  Founder decision on P0-sufficiency and licensing (section 206). The
+  fixes for round 6's 3 findings (project-root symlink-alias rejection via
+  a lexical-vs-real relative-path equality check in
+  assertFilesystemConfinement; expanded credential-key redaction in the
+  logger covering Authorization/Proxy-Authorization/Cookie/Set-Cookie/
+  session/bearer and hyphenated api-key/access-token/refresh-token
+  variants; a prototype-safe Map/array-based FileCache representation),
+  plus one more genuine instance found during the requested targeted
+  audit (the logger's own redact() dictionary-building loop needed the
+  same Object.create(null) prototype-safety fix as FileCache), are
+  implemented, tested, and pushed, with the full required verification
+  sequence run clean (lint, typecheck, build, 332/332 tests,
+  validate:requirements, history-aware secret-scan, all P0 proofs). Every
+  fix was individually confirmed via git-stash to have failing regression
+  tests against its pre-fix code, including a full end-to-end
+  bootstrapProject() test proving the project-root alias exploit was real
+  (Codex's reproduction: project A's bootstrap silently wrote into project
+  B's real directory). Do not proceed to further P0 feature work or
+  declare P0 complete until an independent (Codex) re-review of this diff
+  confirms no blocking P0 finding remains. If/when that comes back clean,
+  resume from the prior exact_next_action: wire the remaining foundation
+  modules (Discovery, Decisions, Assumptions, Technology/
+  Business-Capability registries) into the same integrated pipeline,
+  consider a SQLite-backed StateStore, get a Founder decision on
+  P0-sufficiency and licensing (section 206). The
   autonomous-merge governance question stays closed absent new
   Founder-initiated context.

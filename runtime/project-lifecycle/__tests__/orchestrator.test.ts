@@ -352,6 +352,53 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       expect(existsSync(outsideNeverCreated)).toBe(false); // never followed/created
       rmSync(outside, { recursive: true, force: true });
     });
+
+    it("P1 fix (6th independent review round): a pre-existing project-root alias (baseDir/A -> baseDir/B) cannot overwrite project B's persisted state", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-alias-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      // Bootstrap a completely legitimate project B first.
+      const b = await bootstrapProject({
+        genomeCandidate: validGenome("project-b"),
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+      const bGenomeBefore = readFileSync(join(b.scaffold.projectRoot, "project-genome", "genome.json"), "utf8");
+      const bStateBefore = readFileSync(b.statePath, "utf8");
+
+      // An attacker (or a stale artifact) makes baseDir/project-a an ALIAS
+      // of baseDir/project-b — a pre-existing symlink, no race required.
+      let symlinkSupported = true;
+      try {
+        symlinkSync(b.scaffold.projectRoot, join(tempRoot, "project-a"));
+      } catch {
+        symlinkSupported = false;
+      }
+      if (!symlinkSupported) return;
+
+      // Bootstrapping project A must be rejected outright, not silently
+      // redirected into writing/overwriting project B's real directory.
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("project-a"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(PathEscapeError);
+
+      // Project B's genome, organization, and state files must be
+      // byte-identical to before the rejected project-A bootstrap attempt
+      // — no partial mutation occurred, and B's project id was never
+      // overwritten with A's.
+      expect(readFileSync(join(b.scaffold.projectRoot, "project-genome", "genome.json"), "utf8")).toBe(
+        bGenomeBefore
+      );
+      expect(readFileSync(b.statePath, "utf8")).toBe(bStateBefore);
+      expect(JSON.parse(readFileSync(b.statePath, "utf8")).projectId).toBe("project-b");
+    });
   });
 
   it("enforces a budget ceiling across the model-routing step of the pipeline", async () => {

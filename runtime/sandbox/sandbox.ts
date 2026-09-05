@@ -4,11 +4,15 @@
 // sonsuza kadar çalışır bırakmasını engelleyen minimum korumadır.
 
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, resolve, sep } from "node:path";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 
 export class PathEscapeError extends Error {
   constructor(root: string, target: string) {
-    super(`Path '${target}' resolves outside sandbox root '${root}'`);
+    super(
+      `Path '${target}' does not resolve to its own canonical, non-aliased location inside ` +
+        `sandbox root '${root}' (either it escapes the root entirely, or a symlink/junction ` +
+        `redirects it to a different location that merely happens to still be inside the root).`
+    );
     this.name = "PathEscapeError";
   }
 }
@@ -128,14 +132,36 @@ function canonicalizeNearestExisting(path: string): string {
  * symlink/junction yönlendirmesinin doğru şekilde tespit edilip
  * reddedilmesidir (yarış koşulu olmaksızın tekrarlanabilir kaçışlar
  * kapatılmıştır), atomik bir syscall garantisi değil.
+ *
+ * P1 fix (6th independent review round, "project-root alias permits
+ * cross-project writes"): eskiden yalnızca "gerçek (resolved) hedef, hâlâ
+ * root'un İÇİNDE mi?" kontrol ediliyordu (bir ÖN EK/prefix testi). Bu,
+ * `baseDir/A` önceden VAR OLAN bir symlink olarak `baseDir/B`'ye işaret
+ * ediyorsa YAKALAYAMAZDI — çünkü B de `baseDir` içinde olduğundan önek
+ * testi geçerdi, ama proje A aslında proje B'nin GERÇEK dizinine
+ * YAZIYORDU (kimlik takma adı / alias — hiçbir yarış koşulu gerekmeden,
+ * kaçış "dışarı" değil "içeride başka bir yere" olduğu için). Artık
+ * kontrol çok daha KATI: `root`'tan `target`'a olan GÖRECELİ yol
+ * (sözdizimsel) ile `realRoot`'tan `realTarget`'a olan GÖRECELİ yol
+ * (symlink'ler çözülmüş) TAM OLARAK AYNI olmalıdır. Yalnızca `root`'un
+ * kendisinin (ör. `/tmp` -> `/private/tmp` gibi işletim sistemi düzeyinde,
+ * zararsız) çözülmesine izin verilir — çağıranın EKLEDİĞİ alt yol
+ * (projectId, alt klasör adı, dosya adı) symlink çözümlemesi sırasında
+ * HİÇBİR ŞEKİLDE değişemez/yönlendirilemez. Bu, eski önek-tabanlı kontrolü
+ * KATI BİR ÜST KÜMESİDİR (eşitlik sağlanıyorsa önek testi de otomatik
+ * sağlanır), bu yüzden önceki tüm "dışarı kaçış" korumaları korunur.
  */
 export function assertFilesystemConfinement(root: string, target: string): string {
+  const resolvedRoot = resolve(root);
   const resolvedTarget = assertWithinRoot(root, target); // ucuz, sözdizimsel ön-kontrol (fail-fast)
 
-  const realRoot = canonicalizeNearestExisting(resolve(root));
+  const realRoot = canonicalizeNearestExisting(resolvedRoot);
   const realTarget = canonicalizeNearestExisting(resolvedTarget);
 
-  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
+  const lexicalRelative = relative(resolvedRoot, resolvedTarget);
+  const realRelative = relative(realRoot, realTarget);
+
+  if (lexicalRelative !== realRelative) {
     throw new PathEscapeError(realRoot, target);
   }
 

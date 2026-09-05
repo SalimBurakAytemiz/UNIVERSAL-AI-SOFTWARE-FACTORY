@@ -300,6 +300,47 @@ describe("assertFilesystemConfinement (P1 fix: real filesystem-aware confinement
       expect(resolved).toBe(join(tempRoot, "normal-project"));
     });
   });
+
+  describe("P1 fix (6th independent review round): project-root alias (in-baseDir symlink to a DIFFERENT location) is rejected", () => {
+    it("blocks baseDir/A -> baseDir/B: an alias that stays inside baseDir but redirects to a different entry", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-alias-"));
+      mkdirSync(join(tempRoot, "B"));
+      if (!trySymlink(join(tempRoot, "B"), join(tempRoot, "A"))) return;
+
+      // The old prefix-only check would have allowed this: realpath(A) =
+      // tempRoot/B, which IS still inside tempRoot. The new check compares
+      // the RELATIVE path, catching that "A" resolves to "B", not "A".
+      expect(() => assertFilesystemConfinement(tempRoot, "A")).toThrow(PathEscapeError);
+    });
+
+    it("a project root that does not exist yet is never an alias (guaranteed unique, no rejection)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-alias-"));
+      expect(() => assertFilesystemConfinement(tempRoot, "brand-new-project")).not.toThrow();
+    });
+
+    it("blocks a nested alias variant: a subdirectory inside a real project root aliasing a sibling subdirectory", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-alias-nested-"));
+      const projectRoot = join(tempRoot, "proj");
+      mkdirSync(join(projectRoot, "organization"), { recursive: true });
+      if (!trySymlink(join(projectRoot, "organization"), join(projectRoot, "project-genome"))) return;
+
+      expect(() => assertFilesystemConfinement(projectRoot, "project-genome")).toThrow(PathEscapeError);
+    });
+
+    it("previously fixed dangling-symlink and outside-pointing-symlink escapes remain blocked after this stricter check", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-alias-regress-"));
+      const outside = mkdtempSync(join(tmpdir(), "uasf-alias-regress-outside-"));
+      const danglingTarget = join(tmpdir(), `uasf-alias-regress-dangling-${process.pid}-${Date.now()}`);
+
+      if (trySymlink(outside, join(tempRoot, "outside-link"))) {
+        expect(() => assertFilesystemConfinement(tempRoot, "outside-link")).toThrow(PathEscapeError);
+      }
+      if (trySymlink(danglingTarget, join(tempRoot, "dangling-link"))) {
+        expect(() => assertFilesystemConfinement(tempRoot, "dangling-link")).toThrow(PathEscapeError);
+      }
+      rmSync(outside, { recursive: true, force: true });
+    });
+  });
 });
 
 /** `fs.existsSync` follows symlinks — used here purely to assert a target was never actually created. */

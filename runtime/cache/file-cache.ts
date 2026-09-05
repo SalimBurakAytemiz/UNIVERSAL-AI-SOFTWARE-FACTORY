@@ -9,7 +9,27 @@
 import type { StateStore } from "../state/file-store.js";
 import type { CacheEntry } from "./cache.js";
 
-type PersistedEntries<T> = Record<string, CacheEntry<T>>;
+/**
+ * P2 fix (6th independent review round, "durable cache loses __proto__
+ * keys"): eskiden bu, kalıcı hale (disk) `Record<string, CacheEntry<T>>`
+ * — yani düz bir JavaScript nesnesi — olarak yazılıyor ve `all[key] = ...`
+ * / `all[key]` şeklinde ERİŞİLİYORDU. Cache API'si RASTGELE string
+ * anahtarları kabul ettiğinden, `key = "__proto__"` verildiğinde bu asla
+ * sıradan bir "own property" OLUŞTURMAZ — `Object.prototype.__proto__`
+ * bir accessor (getter/setter) olduğundan, `all["__proto__"] = entry`
+ * yazması nesnenin PROTOTİPİNİ değiştirmeye ÇALIŞIR (prototype pollution
+ * riski) ve kaydı asla gerçek bir "own" alan olarak SAKLAMAZ — bu yüzden
+ * `get("__proto__")` her zaman `undefined` dönerdi ve kalıcı gösterim
+ * sessizce `{}` olarak kalırdı. Artık kalıcı gösterim bir DİZİ
+ * (`[key, entry]` çiftlerinden oluşan) ve bellek-içi yapı bir `Map`'tir —
+ * ikisi de anahtar adının HİÇBİR ÖZEL anlamı olmadığı, salt veri
+ * yapılarıdır; `"__proto__"`, `"constructor"`, `"prototype"` dahil HER
+ * string, sıradan bir anahtar olarak davranır (Map.set/get, nesne
+ * özelliği erişimi/ataması KULLANMAZ, dolayısıyla prototip zincirine asla
+ * dokunmaz).
+ */
+type PersistedEntry<T> = readonly [key: string, entry: CacheEntry<T>];
+type PersistedEntries<T> = readonly PersistedEntry<T>[];
 
 export class FileCache<T = unknown> {
   constructor(
@@ -17,18 +37,26 @@ export class FileCache<T = unknown> {
     private readonly path: string
   ) {}
 
-  private loadAll(): PersistedEntries<T> {
-    return this.stateStore.read<PersistedEntries<T>>(this.path) ?? {};
+  private loadAll(): Map<string, CacheEntry<T>> {
+    const persisted = this.stateStore.read<PersistedEntries<T>>(this.path) ?? [];
+    return new Map(persisted);
+  }
+
+  private saveAll(all: Map<string, CacheEntry<T>>): void {
+    // Her set() çağrısında TÜM harita diske yazılır — kalıcılığın
+    // yalnızca bu sürecin belleğine değil, dosyaya bağlı olması için
+    // (bir sonraki process'in aynı in-memory nesneyi paylaşmasına gerek yok).
+    this.stateStore.write(this.path, [...all.entries()]);
   }
 
   get(key: string): T | undefined {
     const all = this.loadAll();
-    const entry = all[key];
+    const entry = all.get(key);
     if (!entry) return undefined;
     if (entry.expiresAt !== undefined && entry.expiresAt < Date.now()) {
       // Süresi dolmuş girdi diskte de asla sessizce yeniden kullanılmaz.
-      delete all[key];
-      this.stateStore.write(this.path, all);
+      all.delete(key);
+      this.saveAll(all);
       return undefined;
     }
     return entry.value;
@@ -36,15 +64,12 @@ export class FileCache<T = unknown> {
 
   set(key: string, value: T, ttlMs?: number): void {
     const all = this.loadAll();
-    all[key] = {
+    all.set(key, {
       value,
       computedAt: Date.now(),
       expiresAt: ttlMs !== undefined ? Date.now() + ttlMs : undefined
-    };
-    // Her set() çağrısında TÜM harita diske yazılır — kalıcılığın
-    // yalnızca bu sürecin belleğine değil, dosyaya bağlı olması için
-    // (bir sonraki process'in aynı in-memory nesneyi paylaşmasına gerek yok).
-    this.stateStore.write(this.path, all);
+    });
+    this.saveAll(all);
   }
 
   has(key: string): boolean {
@@ -52,7 +77,7 @@ export class FileCache<T = unknown> {
   }
 
   size(): number {
-    return Object.keys(this.loadAll()).length;
+    return this.loadAll().size;
   }
 }
 

@@ -101,4 +101,106 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       expect(processB.has("stale")).toBe(false);
     });
   });
+
+  describe("P2 fix (6th independent review round): prototype-sensitive keys are ordinary cache keys", () => {
+    it("set('__proto__', value) persists correctly and an immediate get() returns it", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-"));
+      const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+
+      cache.set("__proto__", "expected");
+      expect(cache.get("__proto__")).toBe("expected");
+    });
+
+    it("a NEW FileCache instance (same path) recovers a value stored under '__proto__'", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-"));
+      const path = join(tempRoot, "cache.json");
+      new FileCache<string>(new FileStateStore(), path).set("__proto__", "expected");
+
+      const fresh = new FileCache<string>(new FileStateStore(), path);
+      expect(fresh.get("__proto__")).toBe("expected");
+    });
+
+    it("a SEPARATE FileCache+FileStateStore instance (simulated separate process) recovers '__proto__'", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-restart-"));
+      const path = join(tempRoot, "cache.json");
+      const computeOnce = vi.fn(async () => "computed-value");
+
+      { // "process A"
+        const processA = new FileCache<string>(new FileStateStore(), path);
+        const result = await computeWithFileCache(processA, "__proto__", computeOnce);
+        expect(result.cached).toBe(false);
+      }
+
+      const processB = new FileCache<string>(new FileStateStore(), path);
+      expect(processB.get("__proto__")).toBe("computed-value");
+    });
+
+    it("the persisted representation is not silently empty after storing '__proto__'", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-"));
+      const path = join(tempRoot, "cache.json");
+      const store = new FileStateStore();
+      new FileCache<string>(store, path).set("__proto__", "expected");
+
+      const persisted = store.read<unknown>(path);
+      expect(persisted).not.toEqual({});
+      expect(store.exists(path)).toBe(true);
+    });
+
+    it("storing '__proto__' does not pollute Object.prototype or the internal Map's own prototype", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-"));
+      const cache = new FileCache<{ polluted?: boolean }>(new FileStateStore(), join(tempRoot, "cache.json"));
+
+      cache.set("__proto__", { polluted: true });
+      cache.get("__proto__");
+
+      // A brand-new, unrelated plain object must NOT have inherited
+      // anything from this — proving no global prototype pollution occurred.
+      const innocentObject: Record<string, unknown> = {};
+      expect((innocentObject as { polluted?: boolean }).polluted).toBeUndefined();
+      expect(Object.getPrototypeOf(innocentObject)).toBe(Object.prototype);
+    });
+
+    it("'constructor' and 'prototype' behave as ordinary cache keys too", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-"));
+      const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+
+      cache.set("constructor", "value-for-constructor-key");
+      cache.set("prototype", "value-for-prototype-key");
+
+      expect(cache.get("constructor")).toBe("value-for-constructor-key");
+      expect(cache.get("prototype")).toBe("value-for-prototype-key");
+    });
+
+    it("normal cache keys and reserved-name keys coexist correctly, with size() reflecting all of them", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-"));
+      const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+
+      cache.set("normal-key", "normal-value");
+      cache.set("__proto__", "proto-value");
+      cache.set("constructor", "constructor-value");
+
+      expect(cache.size()).toBe(3);
+      expect(cache.get("normal-key")).toBe("normal-value");
+      expect(cache.get("__proto__")).toBe("proto-value");
+      expect(cache.get("constructor")).toBe("constructor-value");
+    });
+
+    it("the pre-existing durable cross-process cache proof still passes (regression guard, non-reserved key)", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-proto-cross-"));
+      const path = join(tempRoot, "cache.json");
+      const computeOnce = vi.fn(async () => "computed-by-process-a");
+
+      {
+        const processA = new FileCache<string>(new FileStateStore(), path);
+        const result = await computeWithFileCache(processA, "shared-key", computeOnce);
+        expect(result.cached).toBe(false);
+      }
+
+      const processB = new FileCache<string>(new FileStateStore(), path);
+      const resultB = await computeWithFileCache(processB, "shared-key", computeOnce);
+      expect(resultB.cached).toBe(true);
+      expect(resultB.value).toBe("computed-by-process-a");
+      expect(computeOnce).toHaveBeenCalledTimes(1);
+    });
+  });
 });
