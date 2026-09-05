@@ -5,6 +5,7 @@
 // aradan bir kayıt silinip/değiştirilirse zincir bozulur ve tespit edilebilir.
 
 import { createHash } from "node:crypto";
+import { freezeRecord } from "../util/immutable.js";
 
 export interface AuditEvent {
   readonly type: string;
@@ -46,11 +47,21 @@ export class AuditLog {
     };
     const record: AuditRecord = { ...base, hash: hashOf(base) };
     this.records.push(record);
-    return record;
+    return freezeRecord(record);
   }
 
+  /**
+   * P1 audit fix (cross-cutting review): eskiden bu, İÇ `records` dizisinin
+   * KENDİSİNİ döndürüyordu — `auditLog.all().push(sahteKayit)` veya
+   * `.splice(...)` ile bir çağıran, hash zincirinden hiç geçmeden kayıt
+   * ekleyebilir veya (özellikle SON kaydı) hash zincirini bozmadan
+   * silebilirdi; bu, `verifyIntegrity()`'nin asla yakalayamayacağı bir
+   * "sessiz silme" yoluydu. Artık her çağrı, iç diziden BAĞIMSIZ, taze bir
+   * kopya döndürür — döndürülen dizi üzerindeki hiçbir mutasyon iç durumu
+   * etkilemez.
+   */
   all(): readonly AuditRecord[] {
-    return this.records;
+    return this.records.map((r) => freezeRecord(r));
   }
 
   /**

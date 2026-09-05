@@ -5,21 +5,25 @@
 // olmadan ACCEPTED durumuna geçemez).
 
 import type { StateStore } from "../state/file-store.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export type AssumptionImpact = "LOW" | "MEDIUM" | "HIGH";
 export type AssumptionStatus = "PROPOSED" | "ACCEPTED" | "REJECTED" | "VALIDATED" | "SUPERSEDED";
 
-export interface Assumption {
-  readonly id: string;
-  readonly description: string;
-  readonly reason: string;
-  readonly impact: AssumptionImpact;
-  readonly source: string;
+interface MutableAssumption {
+  id: string;
+  description: string;
+  reason: string;
+  impact: AssumptionImpact;
+  source: string;
   status: AssumptionStatus;
-  readonly createdAt: string;
+  createdAt: string;
   confirmedAt?: string;
   confirmedBy?: string;
 }
+
+/** Dışa döndürülen her varsayım bunun donmuş, ayrık bir kopyasıdır. */
+export type Assumption = Readonly<MutableAssumption>;
 
 export class AssumptionNotFoundError extends Error {
   constructor(id: string) {
@@ -46,17 +50,27 @@ export interface ProposeAssumptionInput {
   readonly source: string;
 }
 
+/**
+ * P1 cross-cutting fix: `status`/`confirmedBy` alanları eskiden mutable
+ * idi ve get()/allWithStatus() iç nesnenin kendisini döndürüyordu — bir
+ * çağıran, HIGH etkili bir varsayımı `confirmedBy` OLMADAN
+ * `assumption.status = "ACCEPTED"` yaparak, accept()'in Founder onayı
+ * kontrolünü tamamen atlayabilirdi. Artık her okuma donmuş, ayrık bir
+ * kopya döndürür; durum geçişleri YALNIZCA accept()/reject()/validate()
+ * üzerinden gerçekleşir.
+ */
 export class AssumptionRegister {
-  private readonly assumptions = new Map<string, Assumption>();
+  private readonly assumptions = new Map<string, MutableAssumption>();
 
   propose(input: ProposeAssumptionInput): Assumption {
-    const assumption: Assumption = { ...input, status: "PROPOSED", createdAt: new Date().toISOString() };
+    const assumption: MutableAssumption = { ...input, status: "PROPOSED", createdAt: new Date().toISOString() };
     this.assumptions.set(input.id, assumption);
-    return assumption;
+    return freezeRecord(assumption);
   }
 
   get(id: string): Assumption | undefined {
-    return this.assumptions.get(id);
+    const assumption = this.assumptions.get(id);
+    return assumption ? freezeRecord(assumption) : undefined;
   }
 
   /**
@@ -73,27 +87,27 @@ export class AssumptionRegister {
     assumption.status = "ACCEPTED";
     assumption.confirmedAt = new Date().toISOString();
     assumption.confirmedBy = confirmedBy;
-    return assumption;
+    return freezeRecord(assumption);
   }
 
   reject(id: string): Assumption {
     const assumption = this.mustGet(id);
     assumption.status = "REJECTED";
-    return assumption;
+    return freezeRecord(assumption);
   }
 
   validate(id: string): Assumption {
     const assumption = this.mustGet(id);
     assumption.status = "VALIDATED";
     assumption.confirmedAt = new Date().toISOString();
-    return assumption;
+    return freezeRecord(assumption);
   }
 
   allWithStatus(status: AssumptionStatus): readonly Assumption[] {
-    return [...this.assumptions.values()].filter((a) => a.status === status);
+    return [...this.assumptions.values()].filter((a) => a.status === status).map((a) => freezeRecord(a));
   }
 
-  private mustGet(id: string): Assumption {
+  private mustGet(id: string): MutableAssumption {
     const assumption = this.assumptions.get(id);
     if (!assumption) throw new AssumptionNotFoundError(id);
     return assumption;
@@ -107,7 +121,7 @@ export class AssumptionRegister {
   /** Daha önce saveTo() ile kaydedilmiş bir varsayım kaydını geri yükler. */
   static loadFrom(store: StateStore, path: string): AssumptionRegister {
     const register = new AssumptionRegister();
-    const records = store.read<Assumption[]>(path) ?? [];
+    const records = store.read<MutableAssumption[]>(path) ?? [];
     for (const record of records) {
       register.assumptions.set(record.id, record);
     }

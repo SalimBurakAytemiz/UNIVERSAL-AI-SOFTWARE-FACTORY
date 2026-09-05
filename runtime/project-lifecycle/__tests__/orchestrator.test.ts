@@ -1,13 +1,15 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { bootstrapProject, PreflightTraceabilityFailedError } from "../orchestrator.js";
+import { scaffoldProjectOs } from "../../project-os/scaffold.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
 import { CapabilityDeniedError } from "../../capability-gateway/gateway.js";
 import { createDefaultModelRegistry } from "../../models/registry.js";
 import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
 import { FileStateStore } from "../../state/file-store.js";
+import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
 import type { TraceabilityIssue } from "../../requirements-traceability/traceability.js";
 
 function validGenome(id: string) {
@@ -119,6 +121,160 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
     const persistedState = freshStore.read<{ projectId: string; policyDecision: string }>(result.statePath);
     expect(persistedState?.projectId).toBe("shop-1");
     expect(persistedState?.policyDecision).toBe("ALLOW");
+  });
+
+  describe("P1 fix: project bootstrap can never escape its authorized base directory", () => {
+    it("a normal project id still works end-to-end", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      const result = await bootstrapProject({
+        genomeCandidate: validGenome("legit-project"),
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+      expect(existsSync(result.scaffold.projectRoot)).toBe(true);
+    });
+
+    it("rejects '../outside' before any filesystem mutation", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+      // Defensive pre-clean: `../outside` resolves to a fixed path in the
+      // shared OS temp dir, so a prior (e.g. manually-reverted) run must
+      // not be able to leave a stale directory that masks this assertion.
+      const escapedPath = join(tempRoot, "..", "outside");
+      rmSync(escapedPath, { recursive: true, force: true });
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("../outside"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(InvalidProjectIdError);
+
+      expect(existsSync(escapedPath)).toBe(false);
+    });
+
+    it("rejects '../../outside'", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("../../outside"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(InvalidProjectIdError);
+    });
+
+    it("rejects an absolute path as project id", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("/etc/passwd"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(InvalidProjectIdError);
+    });
+
+    it("rejects slash and backslash traversal variants", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("a/../../outside"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(InvalidProjectIdError);
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("a\\..\\outside"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow(InvalidProjectIdError);
+    });
+
+    it("scaffolding a legitimate project never touches a sibling directory outside baseDir (sibling-overwrite non-interference)", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+
+      // A sibling directory that sits right next to baseDir, sharing a
+      // string prefix with it — the exact shape a prefix-confusion escape
+      // would target. It must remain completely untouched.
+      const siblingRoot = `${tempRoot}-sibling-project`;
+      mkdirSync(siblingRoot, { recursive: true });
+      writeFileSync(join(siblingRoot, "marker.txt"), "untouched");
+
+      await bootstrapProject({
+        genomeCandidate: validGenome("shop"),
+        baseDir: tempRoot,
+        policy,
+        modelRegistry: createDefaultModelRegistry()
+      });
+
+      expect(readFileSync(join(siblingRoot, "marker.txt"), "utf8")).toBe("untouched");
+      rmSync(siblingRoot, { recursive: true, force: true });
+    });
+
+    it("blocks a prefix-confusion sibling escape at the confinement layer directly (assertWithinRoot)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      // Once a project id passes format validation it cannot contain '/'
+      // or '..' at all, so this attack is only reachable by calling the
+      // lower-level confinement primitive directly — proving the SECOND,
+      // independent layer (not just the regex) also fails closed.
+      expect(() => assertWithinRoot(tempRoot, `../${basename(tempRoot)}-evil`)).toThrow(PathEscapeError);
+    });
+
+    it("does not create any directory when project-id validation fails", async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
+      const before = readdirSync(tempRoot);
+      const escapedPath = join(tempRoot, "..", "escape-attempt");
+      rmSync(escapedPath, { recursive: true, force: true }); // defensive pre-clean, see above
+
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("../escape-attempt"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        })
+      ).rejects.toThrow();
+
+      const after = readdirSync(tempRoot);
+      expect(after).toEqual(before);
+      expect(existsSync(escapedPath)).toBe(false);
+    });
+
+    it("scaffoldProjectOs itself refuses to escape even if called directly with an unsafe id", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+      const escapedPath = join(tempRoot, "..", "outside");
+      rmSync(escapedPath, { recursive: true, force: true }); // defensive pre-clean, see above
+      expect(() => scaffoldProjectOs(tempRoot, "../outside")).toThrow(InvalidProjectIdError);
+      expect(existsSync(escapedPath)).toBe(false);
+    });
   });
 
   it("enforces a budget ceiling across the model-routing step of the pipeline", async () => {

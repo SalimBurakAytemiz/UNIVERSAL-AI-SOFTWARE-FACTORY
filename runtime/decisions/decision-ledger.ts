@@ -6,18 +6,22 @@
 // Decision Explainability).
 
 import type { StateStore } from "../state/file-store.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export type FounderDecisionStatus = "ACTIVE" | "SUPERSEDED";
 
-export interface FounderDecision {
-  readonly decisionId: string;
-  readonly project: string;
-  readonly decision: string;
-  readonly source: string;
+interface MutableFounderDecision {
+  decisionId: string;
+  project: string;
+  decision: string;
+  source: string;
   status: FounderDecisionStatus;
-  readonly createdAt: string;
+  createdAt: string;
   supersededBy?: string;
 }
+
+/** Dışa döndürülen her karar bunun donmuş, ayrık bir kopyasıdır. */
+export type FounderDecision = Readonly<MutableFounderDecision>;
 
 export class DuplicateDecisionError extends Error {
   constructor(decisionId: string) {
@@ -34,13 +38,21 @@ export class DecisionNotFoundError extends Error {
 }
 
 export class FounderDecisionLedger {
-  private readonly decisions = new Map<string, FounderDecision>();
+  private readonly decisions = new Map<string, MutableFounderDecision>();
 
+  /**
+   * P1 cross-cutting fix: eskiden bu (ve get()/allFor()) İÇ nesnenin
+   * kendisini döndürüyordu — `ledger.get(id).status = "SUPERSEDED"` gibi bir
+   * çağıran, `supersede()`'i hiç çağırmadan "asla silme, sadece SUPERSEDED
+   * yap" değişmezini atlatabilirdi. Artık her okuma, donmuş bir kopya
+   * döndürür; durum geçişleri YALNIZCA supersede() üzerinden, iç yetkili
+   * nesne üzerinde gerçekleşir.
+   */
   record(decisionId: string, project: string, decision: string, source: string): FounderDecision {
     if (this.decisions.has(decisionId)) {
       throw new DuplicateDecisionError(decisionId);
     }
-    const record: FounderDecision = {
+    const record: MutableFounderDecision = {
       decisionId,
       project,
       decision,
@@ -49,11 +61,12 @@ export class FounderDecisionLedger {
       createdAt: new Date().toISOString()
     };
     this.decisions.set(decisionId, record);
-    return record;
+    return freezeRecord(record);
   }
 
   get(decisionId: string): FounderDecision | undefined {
-    return this.decisions.get(decisionId);
+    const record = this.decisions.get(decisionId);
+    return record ? freezeRecord(record) : undefined;
   }
 
   /**
@@ -72,7 +85,7 @@ export class FounderDecisionLedger {
   }
 
   allFor(project: string): readonly FounderDecision[] {
-    return [...this.decisions.values()].filter((d) => d.project === project);
+    return [...this.decisions.values()].filter((d) => d.project === project).map((d) => freezeRecord(d));
   }
 
   /** Halihazırda ACTIVE bir karar var mı? — aynı soruyu tekrar tekrar sormamak için (bölüm 46). */
@@ -91,7 +104,7 @@ export class FounderDecisionLedger {
   /** Daha önce saveTo() ile kaydedilmiş bir karar defterini geri yükler. */
   static loadFrom(store: StateStore, path: string): FounderDecisionLedger {
     const ledger = new FounderDecisionLedger();
-    const records = store.read<FounderDecision[]>(path) ?? [];
+    const records = store.read<MutableFounderDecision[]>(path) ?? [];
     for (const record of records) {
       ledger.decisions.set(record.decisionId, record);
     }

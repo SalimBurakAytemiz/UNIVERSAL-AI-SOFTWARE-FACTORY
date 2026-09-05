@@ -70,4 +70,41 @@ describe("AssumptionRegister", () => {
       expect(restored.get("a1")?.confirmedBy).toBe("founder@example.com");
     });
   });
+
+  describe("P1 cross-cutting fix: HIGH-impact confirmation cannot be bypassed via a leaked mutable reference", () => {
+    it("mutating an object returned by propose()/get() cannot ACCEPT a HIGH-impact assumption without confirmedBy", () => {
+      const register = new AssumptionRegister();
+      const proposed = register.propose({
+        id: "a1",
+        description: "Store card numbers in plaintext for speed",
+        reason: "r",
+        impact: "HIGH",
+        source: "s"
+      });
+
+      expect(() => {
+        (proposed as { status: string }).status = "ACCEPTED";
+      }).toThrow(TypeError);
+
+      const got = register.get("a1")!;
+      expect(() => {
+        (got as { status: string }).status = "ACCEPTED";
+      }).toThrow(TypeError);
+
+      expect(register.get("a1")!.status).toBe("PROPOSED");
+      expect(() => register.accept("a1")).toThrow(FounderConfirmationRequiredError);
+    });
+
+    it("mutating an object returned by allWithStatus() does not change internal state", () => {
+      const register = new AssumptionRegister();
+      register.propose({ id: "a1", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+      const [listed] = register.allWithStatus("PROPOSED");
+      expect(() => {
+        (listed as { status: string }).status = "REJECTED";
+      }).toThrow(TypeError);
+
+      expect(register.get("a1")!.status).toBe("PROPOSED");
+    });
+  });
 });

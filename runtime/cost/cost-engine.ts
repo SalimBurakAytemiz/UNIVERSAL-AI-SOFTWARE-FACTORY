@@ -2,6 +2,8 @@
 // çağrısının maliyeti izlenir. "Sessiz harcama yok" ilkesi (bölüm 147)
 // burada başlar — bir tutar bu motora kaydedilmeden harcanmış sayılmaz.
 
+import { freezeRecord } from "../util/immutable.js";
+
 export class InvalidMonetaryAmountError extends Error {
   constructor(context: string, amount: number) {
     super(
@@ -60,12 +62,18 @@ export class CostEngine {
     // korunur — bozuk bir tutarın toplamlara sızmasına asla izin verilmez.
     assertValidMonetaryAmount(entry.amountUsd, `CostEngine.record(taskId=${entry.taskId})`);
     const full: CostEntry = { ...entry, timestamp: this.now().toISOString() };
+    // İç diziye eklenen nesne İLE dışarı döndürülen nesne KASITLI OLARAK
+    // aynı referans DEĞİLDİR: çağıran döndürülen kaydı (ör. amountUsd'yi
+    // NaN'a) mutasyona uğratsa bile, iç toplamlar (total/totalFor/
+    // totalInWindow) her zaman motorun kendi, asla dışarı sızmamış
+    // kopyasını okur. Object.freeze, bu ayrımın atlanamamasını (örn.
+    // "as any" ile alan ataması) TypeError'a çevirerek garanti eder.
     this.entries.push(full);
-    return full;
+    return freezeRecord(full);
   }
 
   all(): readonly CostEntry[] {
-    return this.entries;
+    return this.entries.map((e) => freezeRecord(e));
   }
 
   /** Belirli bir kapsam (görev/ajan/proje) için toplam maliyeti hesaplar. */

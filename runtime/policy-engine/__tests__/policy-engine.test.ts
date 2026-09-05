@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PolicyEngine, lowRiskAllowRule, type PolicyRule } from "../policy-engine.js";
-import { ApprovalRequiredError, ApprovalWorkflow } from "../approval.js";
+import { ApprovalRequiredError, ApprovalWorkflow, InvalidApprovalDecisionError } from "../approval.js";
+import { AuditLog } from "../../audit/audit-log.js";
 
 /** Test helper: a rule that always DENYs, at a caller-chosen priority. */
 function denyRule(name: string, priority: number): PolicyRule {
@@ -127,5 +128,108 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     workflow.approve("deploy-4", "founder@example.com");
     workflow.execute("deploy-4");
     expect(() => workflow.execute("deploy-4")).toThrow(ApprovalRequiredError);
+  });
+
+  describe("P1 fix: approval state is not directly mutable via a leaked reference", () => {
+    it("mutating the object returned by request() cannot approve the action", () => {
+      const workflow = new ApprovalWorkflow();
+      const returned = workflow.request("deploy-5", "Deploy to production", 5);
+
+      expect(() => {
+        (returned as { status: string }).status = "APPROVED";
+      }).toThrow(TypeError); // frozen snapshot rejects the write
+
+      expect(() => workflow.execute("deploy-5")).toThrow(ApprovalRequiredError);
+    });
+
+    it("mutating objects returned by get()/list() cannot change internal state", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-6", "Deploy to production", 5);
+
+      const got = workflow.get("deploy-6")!;
+      expect(() => {
+        (got as { status: string }).status = "APPROVED";
+      }).toThrow(TypeError);
+
+      const [listed] = workflow.list();
+      expect(() => {
+        (listed as { status: string }).status = "APPROVED";
+      }).toThrow(TypeError);
+
+      expect(workflow.get("deploy-6")!.status).toBe("PENDING");
+      expect(() => workflow.execute("deploy-6")).toThrow(ApprovalRequiredError);
+    });
+
+    it("a risk-5 action can never execute without an explicit approve() call", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-7", "Deploy to production", 5);
+      expect(() => workflow.execute("deploy-7")).toThrow(ApprovalRequiredError);
+    });
+
+    it("an explicit REJECT still results in DENY-equivalent behavior: execution stays blocked", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-8", "Deploy to production", 5);
+      workflow.reject("deploy-8", "founder@example.com");
+      expect(workflow.get("deploy-8")!.status).toBe("REJECTED");
+      expect(() => workflow.execute("deploy-8")).toThrow(ApprovalRequiredError);
+    });
+
+    it("approve()/reject() require a non-empty approver identity", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-9", "Deploy to production", 5);
+      expect(() => workflow.approve("deploy-9", "")).toThrow(InvalidApprovalDecisionError);
+      expect(() => workflow.approve("deploy-9", "   ")).toThrow(InvalidApprovalDecisionError);
+      expect(() => workflow.reject("deploy-9", "")).toThrow(InvalidApprovalDecisionError);
+      // still PENDING — an invalid approver attempt never mutated state
+      expect(workflow.get("deploy-9")!.status).toBe("PENDING");
+    });
+
+    it("an already-EXECUTED approval cannot be reset back to PENDING/APPROVED via a leaked mutable reference", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-10", "Deploy to production", 5);
+      workflow.approve("deploy-10", "founder@example.com");
+      const executed = workflow.execute("deploy-10");
+
+      expect(() => {
+        (executed as { status: string }).status = "PENDING";
+      }).toThrow(TypeError);
+
+      expect(workflow.get("deploy-10")!.status).toBe("EXECUTED");
+      // Forward-only: even a legitimate-looking second execute() still fails closed.
+      expect(() => workflow.execute("deploy-10")).toThrow(ApprovalRequiredError);
+    });
+
+    it("a REJECTED approval cannot be changed externally back to APPROVED", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-11", "Deploy to production", 5);
+      const rejected = workflow.reject("deploy-11", "founder@example.com");
+
+      expect(() => {
+        (rejected as { status: string }).status = "APPROVED";
+      }).toThrow(TypeError);
+
+      expect(workflow.get("deploy-11")!.status).toBe("REJECTED");
+      expect(() => workflow.approve("deploy-11", "founder@example.com")).toThrow(); // not PENDING anymore
+    });
+
+    it("every state transition (request/approve/reject/execute) is recorded to the audit log", () => {
+      const auditLog = new AuditLog();
+      const workflow = new ApprovalWorkflow(auditLog);
+      workflow.request("deploy-12", "Deploy to production", 5);
+      workflow.approve("deploy-12", "founder@example.com", "evidence://ticket-42");
+      workflow.execute("deploy-12");
+
+      const types = auditLog.all().map((r) => r.type);
+      expect(types).toEqual(["APPROVAL_REQUESTED", "APPROVAL_APPROVED", "APPROVAL_EXECUTED"]);
+      expect(auditLog.verifyIntegrity()).toBe(true);
+    });
+
+    it("an invalid transition (approve twice, execute unapproved) fails closed and is never silently accepted", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("deploy-13", "Deploy to production", 5);
+      workflow.approve("deploy-13", "founder@example.com");
+      expect(() => workflow.approve("deploy-13", "someone-else@example.com")).toThrow();
+      expect(workflow.get("deploy-13")!.decidedBy).toBe("founder@example.com");
+    });
   });
 });

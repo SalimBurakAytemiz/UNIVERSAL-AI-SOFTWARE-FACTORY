@@ -3,6 +3,8 @@
 // çalışıyor olmak anlamına gelmez (bölüm 9) — durumu IDLE olan işçiler
 // zamanlayıcı tarafından seçilebilir.
 
+import { freezeRecord } from "../util/immutable.js";
+
 export type WorkerClass =
   | "linux-general"
   | "linux-container"
@@ -16,23 +18,36 @@ export type WorkerClass =
 
 export type WorkerStatus = "IDLE" | "BUSY" | "SUSPENDED" | "QUARANTINED";
 
-export interface WorkerRecord {
-  readonly id: string;
-  readonly workerClass: WorkerClass;
-  readonly capabilities: readonly string[];
-  readonly costPerMinuteUsd: number;
+interface MutableWorkerRecord {
+  id: string;
+  workerClass: WorkerClass;
+  capabilities: readonly string[];
+  costPerMinuteUsd: number;
   status: WorkerStatus;
 }
 
+/** Dışa döndürülen her kayıt bunun donmuş, ayrık bir kopyasıdır. */
+export type WorkerRecord = Readonly<MutableWorkerRecord>;
+
+/**
+ * P1 cross-cutting fix: `status`/`capabilities` eskiden all()/findCapable()
+ * üzerinden İÇ nesnenin kendisi olarak sızıyordu — bir çağıran
+ * `all()[0].status = "IDLE"` yaparak QUARANTINED bir işçiyi (bölüm 85,
+ * worker security) tekrar aday listesine sokabilir, ya da
+ * `.capabilities.push(...)` ile sahip olmadığı bir yeteneği "varmış gibi"
+ * gösterip findCapable()'ı yanıltabilirdi. Artık register() çağıranın
+ * geçtiği nesneyi değil bağımsız bir kopyasını saklar ve her okuma donmuş,
+ * ayrık bir kopya döndürür.
+ */
 export class WorkerRegistry {
-  private readonly workers: WorkerRecord[] = [];
+  private readonly workers: MutableWorkerRecord[] = [];
 
   register(worker: WorkerRecord): void {
-    this.workers.push(worker);
+    this.workers.push({ ...worker, capabilities: [...worker.capabilities] });
   }
 
   all(): readonly WorkerRecord[] {
-    return this.workers;
+    return this.workers.map((w) => freezeRecord(w));
   }
 
   /**
@@ -40,8 +55,8 @@ export class WorkerRegistry {
    * listesine girmez.
    */
   findCapable(requiredCapabilities: readonly string[]): WorkerRecord[] {
-    return this.workers.filter(
-      (w) => w.status !== "QUARANTINED" && requiredCapabilities.every((c) => w.capabilities.includes(c))
-    );
+    return this.workers
+      .filter((w) => w.status !== "QUARANTINED" && requiredCapabilities.every((c) => w.capabilities.includes(c)))
+      .map((w) => freezeRecord(w));
   }
 }

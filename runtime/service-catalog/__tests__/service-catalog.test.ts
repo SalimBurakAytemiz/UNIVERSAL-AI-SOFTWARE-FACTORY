@@ -39,4 +39,38 @@ describe("ServiceCatalog", () => {
     expect(catalog.get("svc-1")?.status).toBe("DEGRADED");
     expect(() => catalog.updateStatus("missing", "DOWN")).toThrow(ServiceNotFoundError);
   });
+
+  describe("P1 cross-cutting fix: status cannot be mutated via a leaked reference, bypassing updateStatus()", () => {
+    it("mutating an object returned by get()/all() does not change internal state", () => {
+      const catalog = new ServiceCatalog();
+      catalog.register({ id: "svc-1", name: "A", kind: "service", purpose: "p", status: "HEALTHY" });
+
+      const got = catalog.get("svc-1")!;
+      expect(() => {
+        (got as { status: string }).status = "DOWN";
+      }).toThrow(TypeError);
+
+      const [listed] = catalog.all();
+      expect(() => {
+        (listed as { status: string }).status = "DOWN";
+      }).toThrow(TypeError);
+
+      expect(catalog.get("svc-1")!.status).toBe("HEALTHY");
+    });
+
+    it("mutating the object passed into register() after registration does not affect internal state", () => {
+      const catalog = new ServiceCatalog();
+      const record: { id: string; name: string; kind: "service"; purpose: string; status: "HEALTHY" | "DOWN" } = {
+        id: "svc-1",
+        name: "A",
+        kind: "service",
+        purpose: "p",
+        status: "HEALTHY"
+      };
+      catalog.register(record);
+      record.status = "DOWN"; // caller mutates the object they originally passed in
+
+      expect(catalog.get("svc-1")!.status).toBe("HEALTHY");
+    });
+  });
 });

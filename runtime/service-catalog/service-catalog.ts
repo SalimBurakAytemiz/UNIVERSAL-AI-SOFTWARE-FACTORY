@@ -3,18 +3,23 @@
 // kaydı. "Her üretim servisinin bir sahibi olmalıdır" kuralı (bölüm 127)
 // burada `findUnowned()` ile denetlenebilir bir sorguya dönüşür.
 
+import { freezeRecord } from "../util/immutable.js";
+
 export type ServiceKind = "service" | "integration";
 export type ServiceHealth = "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
 
-export interface ServiceRecord {
-  readonly id: string;
-  readonly name: string;
-  readonly kind: ServiceKind;
-  readonly purpose: string;
-  readonly owner?: string;
-  readonly provider?: string;
+interface MutableServiceRecord {
+  id: string;
+  name: string;
+  kind: ServiceKind;
+  purpose: string;
+  owner?: string;
+  provider?: string;
   status: ServiceHealth;
 }
+
+/** Dışa döndürülen her kayıt bunun donmuş, ayrık bir kopyasıdır. */
+export type ServiceRecord = Readonly<MutableServiceRecord>;
 
 export class DuplicateServiceError extends Error {
   constructor(id: string) {
@@ -30,20 +35,31 @@ export class ServiceNotFoundError extends Error {
   }
 }
 
+/**
+ * P1 cross-cutting fix: `status` alanı eskiden mutable idi ve `all()`/
+ * `get()`/`findByStatus()` iç Map'teki gerçek nesneyi döndürüyordu — bir
+ * çağıran `catalog.all()[0].status = "DOWN"` ile updateStatus()'u hiç
+ * çağırmadan durumu değiştirebilirdi. Artık: (1) register() çağıranın
+ * geçtiği nesneyi DEĞİL, bağımsız bir İÇ kopyasını saklar (çağıranın
+ * elinde tuttuğu orijinal referansı sonradan mutasyona uğratması da iç
+ * durumu etkilemez), (2) her okuma API'si donmuş, ayrık bir kopya
+ * döndürür.
+ */
 export class ServiceCatalog {
-  private readonly services = new Map<string, ServiceRecord>();
+  private readonly services = new Map<string, MutableServiceRecord>();
 
   register(record: ServiceRecord): void {
     if (this.services.has(record.id)) throw new DuplicateServiceError(record.id);
-    this.services.set(record.id, record);
+    this.services.set(record.id, { ...record });
   }
 
   get(id: string): ServiceRecord | undefined {
-    return this.services.get(id);
+    const record = this.services.get(id);
+    return record ? freezeRecord(record) : undefined;
   }
 
   all(): readonly ServiceRecord[] {
-    return [...this.services.values()];
+    return [...this.services.values()].map((s) => freezeRecord(s));
   }
 
   findByStatus(status: ServiceHealth): readonly ServiceRecord[] {
@@ -59,6 +75,6 @@ export class ServiceCatalog {
     const record = this.services.get(id);
     if (!record) throw new ServiceNotFoundError(id);
     record.status = status;
-    return record;
+    return freezeRecord(record);
   }
 }

@@ -9,6 +9,7 @@
 // ESM-style .d.ts (the named `Ajv` export resolves cleanly either way).
 import { Ajv, type ValidateFunction } from "ajv";
 import schema from "../../schemas/project-genome.schema.json" with { type: "json" };
+import { assertValidProjectId } from "../sandbox/sandbox.js";
 
 export interface ProjectGenome {
   readonly project: {
@@ -54,11 +55,22 @@ export class InvalidProjectGenomeError extends Error {
   }
 }
 
-/** Doğrulamadan geçmeyen bir Genome nesnesini asla sessizce kabul etmez. */
+/**
+ * Doğrulamadan geçmeyen bir Genome nesnesini asla sessizce kabul etmez.
+ * Şema doğrulaması `project.id`'nin sadece "boş olmayan bir string"
+ * olduğunu garanti eder — bu, "../outside" gibi bir path-traversal
+ * girişimini GEÇİRİR. Bu yüzden burada AYRICA assertValidProjectId()
+ * çağrılır (bölüm 87): bir proje kimliği, aşağı akıştaki HİÇBİR
+ * scaffolding/dosya sistemi adımına, güvenli bir tanımlayıcı biçimini
+ * doğrulamadan ulaşamaz (fail closed, PROJECT ID -> VALIDATE akışının
+ * ilk adımı).
+ */
 export function parseProjectGenome(candidate: unknown): ProjectGenome {
   const result = validateProjectGenome(candidate);
   if (!result.valid) {
     throw new InvalidProjectGenomeError(result.errors);
   }
-  return candidate as ProjectGenome;
+  const genome = candidate as ProjectGenome;
+  assertValidProjectId(genome.project.id);
+  return genome;
 }

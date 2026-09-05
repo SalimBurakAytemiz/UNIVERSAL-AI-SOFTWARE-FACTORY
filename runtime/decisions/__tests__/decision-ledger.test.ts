@@ -77,4 +77,43 @@ describe("FounderDecisionLedger", () => {
       expect(restored.get("anything")).toBeUndefined();
     });
   });
+
+  describe("P1 cross-cutting fix: decision state cannot be mutated via a leaked reference", () => {
+    it("mutating the object returned by record() cannot mark it SUPERSEDED without supersede()", () => {
+      const ledger = new FounderDecisionLedger();
+      const returned = ledger.record("dec-1", "proj-a", "Use PostgreSQL", "founder chat");
+
+      expect(() => {
+        (returned as { status: string }).status = "SUPERSEDED";
+      }).toThrow(TypeError);
+
+      expect(ledger.get("dec-1")!.status).toBe("ACTIVE");
+      expect(ledger.hasActiveDecision("dec-1")).toBe(true);
+    });
+
+    it("mutating the object returned by get()/allFor() does not change internal state", () => {
+      const ledger = new FounderDecisionLedger();
+      ledger.record("dec-1", "proj-a", "Use PostgreSQL", "founder chat");
+
+      const got = ledger.get("dec-1")!;
+      expect(() => {
+        (got as { status: string }).status = "SUPERSEDED";
+      }).toThrow(TypeError);
+
+      const [listed] = ledger.allFor("proj-a");
+      expect(() => {
+        (listed as { status: string }).status = "SUPERSEDED";
+      }).toThrow(TypeError);
+
+      expect(ledger.get("dec-1")!.status).toBe("ACTIVE");
+    });
+
+    it("get() and record() never return the same object reference as internal state", () => {
+      const ledger = new FounderDecisionLedger();
+      const returned = ledger.record("dec-1", "proj-a", "Use PostgreSQL", "founder chat");
+      const got = ledger.get("dec-1")!;
+      expect(returned).not.toBe(got);
+      expect(returned).toEqual(got);
+    });
+  });
 });

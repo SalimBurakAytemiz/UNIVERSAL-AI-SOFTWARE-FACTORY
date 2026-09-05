@@ -10,12 +10,15 @@ factory:
   p0_status: >
     NOT complete. Explicit Founder instruction: do not move to P1, do not
     mark P0 complete, until an independent review finds no blocking P0
-    finding. A first independent Codex review against main found 4 blocking
-    findings; all 4 were fixed and confirmed fixed by a second Codex
-    re-review. That SAME second re-review found 4 NEW findings (1 BLOCKER,
-    3 P2); all 4 are fixed in this session (see below), fully verified, and
-    pushed for a third re-review. P0 remains open until that re-review
-    comes back clean.
+    finding. Three independent Codex review rounds so far: round 1 found 4
+    blocking findings (all fixed, confirmed fixed by round 2); round 2 found
+    4 NEW findings — 1 BLOCKER, 3 P2 (all fixed, confirmed fixed by round 3);
+    round 3 found 3 NEW P1 findings, all in the same "internal mutable state
+    leaked to callers" vulnerability class, plus asked for a cross-cutting
+    audit. All 3 named findings, PLUS 5 more instances of the same class
+    found during the audit, are fixed in this session (see below), fully
+    verified, and pushed for a fourth re-review. P0 remains open until that
+    re-review comes back clean.
 
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
@@ -162,6 +165,123 @@ completed_milestones:
   - 202/202 tests passing (up from 194 after round 1, then +8 this round);
     lint/typecheck/build/validate-requirements/secret-scan (history-aware)
     all clean.
+  - |-
+    THIS SESSION (round 3) — a third independent Codex review found 3 NEW P1
+    findings, all instances of the same vulnerability class (internal
+    mutable state returned directly to a caller, letting the caller corrupt
+    Factory state without going through any policy/validation), plus asked
+    for a cross-cutting audit for the same class elsewhere. All 3 named
+    findings are fixed:
+    - [P1] CostEngine.record()/all() returned the actual internal
+      CostEntry object/array. A caller could mutate a returned entry's
+      amountUsd to NaN/negative/Infinity AFTER a valid spend was recorded,
+      poisoning total()/totalFor()/totalInWindow() retroactively and
+      bypassing the round-2 monetary validation entirely (which only
+      guards the WRITE path, not a later mutation of an already-returned
+      reference). Fixed: added runtime/util/immutable.ts (freezeRecord/
+      freezeRecords: shallow-copies an object, freezes its array-typed
+      fields, then freezes the whole thing) and record()/all() now return
+      frozen, detached snapshots — the internal entries array is never
+      exposed. Regression tests prove mutating a returned record throws
+      and never affects subsequent totals; confirmed via git-stash that
+      these tests fail on the pre-fix code (7/7 new tests failed).
+    - [P1] Project bootstrap allowed a filesystem path escape:
+      `project.id = "../outside"` passed genome schema validation (which
+      only required a non-empty string) and reached scaffoldProjectOs(),
+      writing OUTSIDE baseDir on the real filesystem. Confirmed via
+      git-stash: the pre-fix code genuinely created /tmp/outside and
+      /tmp/escape-attempt during the reproduction. Fixed with two
+      independent layers: (1) a new assertValidProjectId()
+      (runtime/sandbox/sandbox.ts) allowing only
+      `[a-zA-Z0-9][a-zA-Z0-9_-]*`, called from parseProjectGenome()
+      immediately after schema validation; (2) scaffoldProjectOs() itself
+      now resolves the destination via assertWithinRoot() (trusted path
+      API) and verifies containment inside baseDir before any mkdirSync,
+      and orchestrator.ts performs the same confinement check right after
+      genome validation, before the Capability Gateway/policy check
+      (PROJECT ID -> VALIDATE -> RESOLVE BASE -> RESOLVE DESTINATION ->
+      VERIFY INSIDE BASE -> POLICY CHECK -> FILESYSTEM MUTATION).
+      Regression tests cover a normal id, "../outside", "../../outside",
+      an absolute path, slash/backslash variants, a sibling directory
+      left untouched, and scaffoldProjectOs() itself refusing to escape
+      when called directly.
+    - [P1] ApprovalWorkflow.request()/get() returned the actual internal
+      (mutable) ApprovalRequest object — Codex reproduced
+      `r.status = "APPROVED"; execute(id)` succeeding without any
+      approve() call, defeating the "Risk-5 can never reach EXECUTED
+      without genuine Human Founder approval" invariant (section 120).
+      Fixed: internal state is now a private MutableApprovalRequest map;
+      every public method returns a frozen, detached snapshot; execute()
+      always checks the private authoritative record. Also added a
+      required non-empty approver-identity check
+      (InvalidApprovalDecisionError), an optional evidenceRef parameter
+      (approval evidence, section 145), and AuditLog integration recording
+      every REQUESTED/APPROVED/REJECTED/EXECUTED transition. Regression
+      tests prove mutating any returned value cannot approve, reset, or
+      re-open an approval, and that empty-approver attempts are rejected
+      without mutating state; confirmed via git-stash (6/6 relevant new
+      tests failed on pre-fix code).
+    - Cross-cutting audit (as explicitly requested): grepped every
+      `return this.<map-or-array>...` across runtime/ for the same
+      "returns internal state with a controlled-transition method it can
+      bypass" shape. Found and fixed 5 more genuine instances, each with
+      its own regression tests confirmed (via git-stash) to fail on the
+      pre-fix code:
+      - runtime/audit/audit-log.ts: all() returned the internal `records`
+        array itself — a caller could push() a forged record (never
+        entering the hash chain) or splice() to silently drop the most
+        recent record, neither of which verifyIntegrity() could ever
+        detect (it only walks whatever the array currently holds). This
+        directly undermined the "append-only, tamper-evident" guarantee
+        the module exists to provide. Fixed: append()/all() now return
+        frozen, detached copies.
+      - runtime/decisions/decision-ledger.ts: get()/allFor() returned the
+        internal FounderDecision object, letting a caller set
+        `.status = "SUPERSEDED"` directly and bypass supersede()'s
+        "never delete, only supersede" invariant. Fixed the same way.
+      - runtime/service-catalog/service-catalog.ts: get()/all() returned
+        the internal ServiceRecord, letting a caller bypass
+        updateStatus(). Fixed the same way; register() also now stores an
+        independent copy instead of the caller's own object reference.
+      - runtime/assumptions/assumption-register.ts: get()/allWithStatus()
+        returned the internal Assumption, letting a caller set
+        `.status = "ACCEPTED"` on a HIGH-impact assumption and bypass
+        accept()'s Founder-confirmation gate entirely. Fixed the same
+        way.
+      - runtime/workers/registry.ts: all()/findCapable() returned the
+        internal WorkerRecord (and its live `capabilities` array),
+        letting a caller un-quarantine a worker (bypassing the
+        "QUARANTINED workers never selected" invariant, section 85) or
+        forge a capability it doesn't have. Fixed the same way;
+        register() also now stores an independent copy.
+      Reviewed but NOT changed (no controlled-transition method exists to
+      bypass, and no security-relevant field is exposed as mutable):
+      business-capability-registry.ts, technology-registry.ts,
+      artifact-registry.ts, models/registry.ts (all fields already
+      `readonly` in shape, no `status`-style mutation method to route
+      around), and project-isolation/isolation.ts (its cross-project
+      DEFAULT-DENY check happens on the callerProjectId/targetProjectId
+      comparison, not on the returned value's mutability; a caller
+      mutating their own already-authorized data does not cross the
+      isolation boundary). This scoping decision is recorded here so a
+      future session does not re-litigate it without new evidence.
+  - >-
+    Requirement registry updated a third time from this round's real
+    evidence: UASF-REQ-0007 (Project OS/orchestrator path-escape fix),
+    UASF-REQ-0008 (Project Genome — assertValidProjectId wired into
+    parseProjectGenome), UASF-REQ-0010 (Decision ledger), UASF-REQ-0011
+    (Assumption register), UASF-REQ-0020 (Human approval workflow),
+    UASF-REQ-0022 (Audit foundation), UASF-REQ-0029 (Cost engine — added
+    the freeze fix on top of round 2's monetary validation),
+    UASF-REQ-0031 (Worker registry), UASF-REQ-0033 (Sandbox —
+    assertValidProjectId), UASF-REQ-0037 (Service catalog). No status
+    raised beyond what a real test/proof supports.
+  - 251/251 tests passing (up from 202 before this round, +49 net new
+    across the 8 fixed files plus one new file, runtime/cache tests
+    unaffected); lint/typecheck/build/validate-requirements/secret-scan
+    (history-aware) all clean; every one of the 8 fixes individually
+    confirmed via git-stash to have failing regression tests against its
+    pre-fix code, then passing again with the fix restored.
 
 known_limitations:
   - >-
@@ -189,14 +309,15 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting a THIRD independent (Codex) re-review of the pushed fixes
-    (round 2's 4 new findings — 1 BLOCKER, 3 P2 — are now fixed, tested,
-    and verified per the full required sequence: lint, typecheck, build,
-    202/202 tests, validate:requirements, history-aware secret-scan, all
-    P0 proofs). Per explicit instruction: "stop at the independent-review
-    boundary" — do not push further P0 feature work, and do not declare
-    P0 complete, until that re-review confirms no blocking finding
-    remains.
+    Awaiting a FOURTH independent (Codex) re-review of the pushed fixes
+    (round 3's 3 new P1 findings, plus 5 more instances of the same
+    vulnerability class found during the requested cross-cutting audit,
+    are now fixed, tested, and verified per the full required sequence:
+    lint, typecheck, build, 251/251 tests, validate:requirements,
+    history-aware secret-scan, all P0 proofs). Per explicit instruction:
+    "stop at the independent-review boundary" — do not push further P0
+    feature work, and do not declare P0 complete, until that re-review
+    confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -215,16 +336,20 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 2's 4 Codex findings (1 BLOCKER + 3 P2) are implemented,
+  fixes for round 3's 3 P1 Codex findings, plus 5 more instances of the
+  same "internal mutable state leaked to callers" class found during the
+  requested cross-cutting audit (audit-log, decision-ledger,
+  service-catalog, assumption-register, worker-registry), are implemented,
   tested, and pushed, with the full required verification sequence run
-  clean (lint, typecheck, build, 202/202 tests, validate:requirements,
-  history-aware secret-scan, all P0 proofs including a genuine
-  restart-recovery proof for the cache). Do not proceed to further P0
-  feature work or declare P0 complete until an independent (Codex)
-  re-review of this diff confirms no blocking P0 finding remains. If/when
-  that comes back clean, resume from the prior exact_next_action: wire the
-  remaining foundation modules (Discovery, Decisions, Assumptions,
-  Technology/Business-Capability registries) into the same integrated
-  pipeline, consider a SQLite-backed StateStore, get a Founder decision on
-  P0-sufficiency and licensing (section 206). The autonomous-merge
-  governance question stays closed absent new Founder-initiated context.
+  clean (lint, typecheck, build, 251/251 tests, validate:requirements,
+  history-aware secret-scan, all P0 proofs). Every fix was individually
+  confirmed via git-stash to have failing regression tests against its
+  pre-fix code. Do not proceed to further P0 feature work or declare P0
+  complete until an independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains. If/when that comes back clean, resume from
+  the prior exact_next_action: wire the remaining foundation modules
+  (Discovery, Decisions, Assumptions, Technology/Business-Capability
+  registries) into the same integrated pipeline, consider a SQLite-backed
+  StateStore, get a Founder decision on P0-sufficiency and licensing
+  (section 206). The autonomous-merge governance question stays closed
+  absent new Founder-initiated context.

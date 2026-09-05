@@ -4,7 +4,7 @@
 // aynı proje için tekrar tekrar çağrılması güvenlidir.
 
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { assertValidProjectId, assertWithinRoot } from "../sandbox/sandbox.js";
 
 export const PROJECT_OS_SUBDIRECTORIES = [
   "project-definition",
@@ -39,17 +39,25 @@ export interface ScaffoldResult {
 }
 
 /**
- * `baseDir/projectId/<alt klasörler>` yapısını oluşturur. `baseDir`
- * sandbox kökü olarak ele alınmalıdır — çağıran taraf, projectId'nin
- * `baseDir` dışına çıkmadığını garanti etmek için
- * `runtime/sandbox/assertWithinRoot`'u kullanmalıdır (bu fonksiyon kendi
- * başına path-traversal kontrolü yapmaz; bu ayrım, tek sorumluluk
- * ilkesini korur — bkz. runtime/sandbox/sandbox.ts).
+ * `baseDir/projectId/<alt klasörler>` yapısını oluşturur.
+ *
+ * P1 fix (2nd independent review round): eskiden bu fonksiyon `projectId`'yi
+ * doğrudan `join(baseDir, projectId)` ile birleştiriyordu — bir çağıran
+ * (veya üst katmandaki doğrulamayı atlayan bir yol) `projectId = "../outside"`
+ * verirse, sonuç `baseDir` dışına çıkabiliyordu. Artık bu fonksiyon KENDİSİ
+ * de savunma katmanı olarak: (1) projectId'nin güvenli bir tanımlayıcı
+ * biçiminde olduğunu doğrular, (2) nihai hedefi GÜVENİLİR bir yol API'siyle
+ * (`assertWithinRoot`) çözüp `baseDir` içinde kaldığını doğrular — HİÇBİR
+ * dosya sistemi mutasyonundan (mkdirSync) ÖNCE. Bu, yalnızca üst katmanın
+ * (bootstrapProject) doğru doğrulama yapmasına güvenmek yerine, bu
+ * fonksiyonu doğrudan çağıran herhangi bir kod için de aynı garantiyi verir
+ * (fail closed, bölüm 87).
  */
 export function scaffoldProjectOs(baseDir: string, projectId: string): ScaffoldResult {
-  const projectRoot = join(baseDir, projectId);
+  assertValidProjectId(projectId);
+  const projectRoot = assertWithinRoot(baseDir, projectId);
   const createdDirectories = PROJECT_OS_SUBDIRECTORIES.map((sub) => {
-    const dir = join(projectRoot, sub);
+    const dir = assertWithinRoot(projectRoot, sub);
     mkdirSync(dir, { recursive: true });
     return dir;
   });

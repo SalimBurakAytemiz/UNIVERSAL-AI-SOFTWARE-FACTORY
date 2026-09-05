@@ -149,7 +149,32 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Now wired into the full pipeline via runtime/project-lifecycle/orchestrator.ts: scaffolding only happens inside a Capability Gateway authorization, and the Organization Composer's output is persisted into the scaffolded structure."
+  notes: >
+    Now wired into the full pipeline via runtime/project-lifecycle/orchestrator.ts:
+    scaffolding only happens inside a Capability Gateway authorization, and the
+    Organization Composer's output is persisted into the scaffolded structure.
+
+    P1 fix (3rd independent review round): Codex reproduced `project.id =
+    "../outside"` reaching scaffoldProjectOs() and escaping baseDir onto the
+    real filesystem. Fixed with two independent layers: (1) format validation
+    — a new assertValidProjectId() (runtime/sandbox/sandbox.ts) accepts only
+    `[a-zA-Z0-9][a-zA-Z0-9_-]*`, called from parseProjectGenome() (see
+    UASF-REQ-0008) so no downstream step ever sees an unsafe id; (2)
+    destination confinement — scaffoldProjectOs() itself now resolves the
+    project root via assertWithinRoot() (trusted path API) and verifies
+    containment inside baseDir BEFORE any mkdirSync call, and orchestrator.ts
+    performs the same confinement check immediately after genome validation,
+    before the Capability Gateway / policy check (PROJECT ID -> VALIDATE ->
+    RESOLVE BASE -> RESOLVE DESTINATION -> VERIFY INSIDE BASE -> POLICY CHECK
+    -> FILESYSTEM MUTATION). Regression tests (orchestrator.test.ts,
+    scaffold.test.ts) prove: a normal id still works, "../outside" and
+    "../../outside" are rejected before any mutation, an absolute path is
+    rejected, slash/backslash traversal variants are rejected, a sibling
+    directory outside baseDir is never touched, and scaffoldProjectOs()
+    itself refuses to escape even when called directly. Confirmed via
+    git-stash that the pre-fix code genuinely wrote outside baseDir
+    (observed writing to /tmp/outside and /tmp/escape-attempt on the real
+    filesystem) and that the fix closes this.
 
 - id: UASF-REQ-0008
   title: Project Genome schema
@@ -168,7 +193,18 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Schema covers the shape from the baseline's own example; not every nested field of every future subsystem is modeled yet. Now consumed directly by the Organization Composer and the full bootstrap pipeline."
+  notes: >
+    Schema covers the shape from the baseline's own example; not every nested
+    field of every future subsystem is modeled yet. Now consumed directly by
+    the Organization Composer and the full bootstrap pipeline.
+
+    P1 fix (3rd independent review round): the JSON Schema alone only
+    required project.id to be a non-empty string, which let a path-traversal
+    value like "../outside" pass genome validation. parseProjectGenome() now
+    additionally calls assertValidProjectId() (see UASF-REQ-0007/0033) right
+    after schema validation succeeds, so an unsafe id is rejected at the
+    earliest possible point (fail closed) before any downstream consumer
+    (Organization Composer, Project OS scaffold) ever sees it.
 
 - id: UASF-REQ-0009
   title: Discovery & clarification engine (foundation)
@@ -200,7 +236,23 @@
     - "runtime/decisions/__tests__/decision-ledger.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Now persists via runtime/state/file-store.ts (saveTo/loadFrom) — no longer in-memory only; a round-trip through a fresh store instance is tested."
+  notes: >
+    Now persists via runtime/state/file-store.ts (saveTo/loadFrom) — no
+    longer in-memory only; a round-trip through a fresh store instance is
+    tested.
+
+    P1 cross-cutting fix (3rd independent review round, found during audit
+    triggered by the ApprovalWorkflow finding below): get()/allFor()
+    returned the actual internal decision object, so a caller could do
+    `ledger.get(id).status = "SUPERSEDED"` and bypass supersede() entirely —
+    the exact same bug class as the approval-state finding, applied to "never
+    silently overwrite, only supersede" instead of "never execute without
+    approval". Fixed: record()/get()/allFor() now return a frozen, detached
+    copy (runtime/util/immutable.ts); internal transitions still happen on
+    the private authoritative object inside supersede(). Regression tests
+    prove a mutation attempt on a returned decision throws (frozen) and never
+    changes what get() subsequently returns. Confirmed via git-stash that
+    these tests fail against the pre-fix code.
 
 - id: UASF-REQ-0011
   title: Assumption register
@@ -215,7 +267,21 @@
     - "runtime/assumptions/__tests__/assumption-register.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "HIGH-impact assumptions cannot move to ACCEPTED without an explicit confirmedBy value (Founder confirmation gate), enforced in code. Now persists via runtime/state/file-store.ts (saveTo/loadFrom), including the confirmedBy field, across a simulated process restart."
+  notes: >
+    HIGH-impact assumptions cannot move to ACCEPTED without an explicit
+    confirmedBy value (Founder confirmation gate), enforced in code. Now
+    persists via runtime/state/file-store.ts (saveTo/loadFrom), including the
+    confirmedBy field, across a simulated process restart.
+
+    P1 cross-cutting fix (3rd independent review round): propose()/get()/
+    allWithStatus() returned the actual internal object, so a caller could
+    set `assumption.status = "ACCEPTED"` directly and bypass accept()'s
+    HIGH-impact Founder-confirmation gate entirely. Fixed: every read now
+    returns a frozen, detached copy (runtime/util/immutable.ts); status
+    transitions happen only through accept()/reject()/validate() on the
+    private authoritative object. Regression tests prove a mutation attempt
+    on a returned assumption throws and cannot bypass the confirmation gate.
+    Confirmed via git-stash that these tests fail against the pre-fix code.
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -391,6 +457,29 @@
   proof_refs:
     - "proofs/human-approval"
   security_refs: []
+  notes: >
+    P1 fix (3rd independent review round): request()/get() returned the
+    actual internal (mutable) ApprovalRequest object. Codex reproduced
+    `const r = workflow.request(...); r.status = "APPROVED"; execute(id)` —
+    a caller could forge an APPROVED status on their own returned copy
+    without ever calling approve(), completely bypassing the "Risk-5 can
+    never reach EXECUTED without genuine Human Founder approval" invariant
+    (section 120). Fixed: internal state is now a private
+    MutableApprovalRequest map; request()/get()/approve()/reject()/execute()
+    all return a frozen, detached snapshot (runtime/util/immutable.ts) —
+    mutating a returned value throws instead of silently succeeding, and
+    execute() always checks the private authoritative record, never a
+    caller-held reference. Also added: a required, non-empty approver
+    identity check (InvalidApprovalDecisionError), an optional evidenceRef
+    parameter on approve()/reject() (approval evidence per section 145), and
+    AuditLog integration recording every REQUESTED/APPROVED/REJECTED/
+    EXECUTED transition. Regression tests prove: mutating request()/get()/
+    list() return values cannot approve or reset an action, a risk-5 action
+    can never execute without an explicit approve(), an EXECUTED or REJECTED
+    record cannot be reset via a leaked reference, empty-approver attempts
+    are rejected without mutating state, and every transition appears in the
+    (integrity-verified) audit log. Confirmed via git-stash that these tests
+    fail against the pre-fix code.
 
 - id: UASF-REQ-0021
   title: Durable state / resume
@@ -432,7 +521,30 @@
     - "runtime/budget/__tests__/budget.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Now also consumed by BudgetGuard (runtime/budget/budget.ts) to record allowed and blocked spend checks as durable, hash-chained evidence — not just policy-engine decisions."
+  notes: >
+    Now also consumed by BudgetGuard (runtime/budget/budget.ts) to record
+    allowed and blocked spend checks as durable, hash-chained evidence — not
+    just policy-engine decisions.
+
+    P1 cross-cutting fix (3rd independent review round, found during the
+    mutability audit triggered by the ApprovalWorkflow/CostEngine findings):
+    all() returned the internal `records` array directly — a caller could
+    `auditLog.all().push(forgedRecord)` to inject a fabricated entry outside
+    the hash chain, or `.splice()` to silently drop the most recent record,
+    neither of which verifyIntegrity() would ever catch (it only walks
+    whatever the array currently contains). This directly undermined the
+    "append-only, tamper-evident" guarantee this module exists to provide.
+    Fixed: append()/all() now return frozen, detached copies
+    (runtime/util/immutable.ts) — array-level injection/deletion via a
+    returned reference is no longer possible, and a top-level field
+    reassignment throws instead of silently succeeding. Nested payload
+    mutation remains detectable (not preventable) via hash mismatch, which
+    matches the module's documented "tamper-evident" (not "tamper-proof")
+    promise and is covered by the pre-existing "detects tampering with a
+    historical record" test. New regression tests prove push()/splice() on a
+    returned array cannot inject or remove records, and a returned record's
+    fields are frozen. Confirmed via git-stash that these tests fail against
+    the pre-fix code.
 
 - id: UASF-REQ-0023
   title: Artifact foundation
@@ -603,6 +715,22 @@
     direct unit tests of assertValidMonetaryAmount as the shared
     validation primitive.
 
+    BLOCKER fix (Codex, 3rd round): even with amount validation on write,
+    record()/all() returned the actual internal CostEntry object/array — a
+    caller could mutate a returned entry's amountUsd to NaN or a negative
+    value AFTER a valid spend was recorded, poisoning totals retroactively
+    and bypassing the validation above entirely (NaN + x = NaN propagates
+    into total()/totalFor()/totalInWindow(), and budget comparisons against
+    NaN are always false). Fixed: record() and all() now return frozen,
+    detached snapshots (runtime/util/immutable.ts) — the internal entries
+    array always holds the ONLY reference used for totals, and mutating any
+    returned copy throws instead of corrupting state. Regression tests
+    prove: mutating a returned record's amountUsd to NaN/negative/Infinity
+    never affects total()/totalFor(), record() and all() never return the
+    same object reference twice, and all totals remain finite and
+    non-negative after every mutation attempt. Confirmed via git-stash that
+    these tests fail against the pre-fix code.
+
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
   description: >
@@ -676,6 +804,22 @@
   proof_refs:
     - "proofs/smallest-sufficient-worker/proof.test.ts"
   security_refs: []
+  notes: >
+    P1 cross-cutting fix (3rd independent review round): all()/findCapable()
+    returned the internal WorkerRecord objects/array directly — a caller
+    could set `worker.status = "IDLE"` on a returned reference to
+    un-quarantine a worker (bypassing the "QUARANTINED workers never
+    selected" invariant, section 85) with no updateStatus()-equivalent
+    method ever involved, or `.capabilities.push(...)` to forge a capability
+    the worker doesn't actually have, fooling findCapable(). Fixed:
+    register() now stores an independent copy (not the caller's own object
+    reference), and all()/findCapable() return frozen, detached snapshots
+    (runtime/util/immutable.ts) whose `capabilities` array is also frozen.
+    Regression tests prove: mutating a returned worker's status cannot
+    un-quarantine it, mutating its capabilities array cannot forge a
+    capability, and mutating the object originally passed to register() does
+    not affect the registry's own copy. Confirmed via git-stash that these
+    tests fail against the pre-fix code.
 
 - id: UASF-REQ-0032
   title: Scheduler (foundation)
@@ -704,7 +848,22 @@
     - "runtime/sandbox/__tests__/sandbox.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Path-traversal confinement (assertWithinRoot) and a promise timeout wrapper (withTimeout) only; command controls, output limits, and environment filtering are not yet implemented."
+  notes: >
+    Path-traversal confinement (assertWithinRoot) and a promise timeout
+    wrapper (withTimeout) only; command controls, output limits, and
+    environment filtering are not yet implemented.
+
+    P1 fix (3rd independent review round): added assertValidProjectId() — a
+    first-layer identifier-format check (only `[a-zA-Z0-9][a-zA-Z0-9_-]*`,
+    rejecting `..`, `.`, `/`, `\`, absolute paths, empty strings, and
+    encoded-traversal-looking strings) that runs BEFORE assertWithinRoot()
+    ever sees a project id, closing the "../outside project.id" finding (see
+    UASF-REQ-0007/0008). Regression tests cover normal ids, `..`/`.`,
+    relative and absolute traversal, slash/backslash variants,
+    encoded-looking variants, empty ids, and a leading-hyphen/underscore
+    case; a new prefix-confusion test also confirms assertWithinRoot()
+    itself (the second, independent confinement layer) rejects a sibling
+    path that merely shares a string prefix with the root.
 
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
@@ -795,7 +954,19 @@
     - "runtime/service-catalog/__tests__/service-catalog.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Includes findUnowned() enforcing baseline section 127 (every service should have a recorded owner); in-memory only, no real CMDB integration."
+  notes: >
+    Includes findUnowned() enforcing baseline section 127 (every service
+    should have a recorded owner); in-memory only, no real CMDB integration.
+
+    P1 cross-cutting fix (3rd independent review round): get()/all() returned
+    the internal ServiceRecord objects directly, so a caller could set
+    `record.status = "DOWN"` on a returned reference and bypass
+    updateStatus() entirely. Fixed: register() stores an independent copy of
+    the caller's input, and get()/all() return frozen, detached snapshots
+    (runtime/util/immutable.ts). Regression tests prove a mutation attempt on
+    a returned record throws and that mutating the object originally passed
+    to register() does not affect the catalog's own copy. Confirmed via
+    git-stash that these tests fail against the pre-fix code.
 
 - id: UASF-REQ-0038
   title: Logging / telemetry foundation
