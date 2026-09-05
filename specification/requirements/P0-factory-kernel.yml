@@ -36,6 +36,26 @@
     - "CI job 'secret-scan' in .github/workflows/ci.yml"
   security_refs:
     - "SECURITY.md"
+  notes: >
+    Independent review (Codex) found this requirement's description
+    ("scan tracked files AND git history") did not match the implementation
+    (current tree only) despite being marked PROOF_VERIFIED — a real
+    evidence/claim mismatch. Fixed: scanGitHistory()/listHistoricalBlobs()
+    in scripts/secret-scan.mjs now scan every unique blob reachable from
+    any ref (git rev-list --objects --all), catching a secret committed
+    and later deleted. Tested with a real temp-repo commit+delete scenario,
+    a redaction check (finding objects never carry the secret value), and
+    a dedup check (identical content committed under two paths -> one
+    finding, not two). One pre-existing historical finding (commit
+    981f0a4, before the `secret-scan:allow` marker existed) is resolved
+    via a minimal, exact-match (blob sha + line + pattern) baseline in
+    scripts/secret-scan.mjs rather than rewriting public git history.
+    Also fixed per the same review: the wholesale file-level allowlist for
+    tests/secret-scan.test.mjs and scripts/secret-scan.mjs was removed
+    (ALLOWLIST_SUBSTRINGS is now empty) — only the per-line
+    `secret-scan:allow` marker can suppress a finding, with regression
+    tests proving an unmarked credential anywhere in those files is still
+    detected.
 
 - id: UASF-REQ-0003
   title: Baseline specification preservation
@@ -378,7 +398,7 @@
 
 - id: UASF-REQ-0022
   title: Audit (foundation)
-  description: Append-only audit log for policy/approval decisions.
+  description: Append-only audit log for policy/approval/budget decisions.
   source_baseline: "BASELINE-V1 section 242"
   category: P0
   priority: HIGH
@@ -387,8 +407,10 @@
     - "runtime/audit"
   test_refs:
     - "runtime/audit/__tests__/audit-log.test.ts"
+    - "runtime/budget/__tests__/budget.test.ts"
   proof_refs: []
   security_refs: []
+  notes: "Now also consumed by BudgetGuard (runtime/budget/budget.ts) to record allowed and blocked spend checks as durable, hash-chained evidence — not just policy-engine decisions."
 
 - id: UASF-REQ-0023
   title: Artifact foundation
@@ -467,6 +489,21 @@
     - "proofs/cheapest-capable-model/proof.test.ts"
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
+  notes: >
+    Independent review (Codex) found that escalation (in routeAndExecute)
+    was computed from initialDecision.requiredTier (the risk-derived
+    minimum) rather than initialDecision.model.tier (the model actually
+    selected). When a capability requirement forces a pricier model than
+    the risk floor demands, this could re-select the exact same (or an
+    equally weak) model on "escalation" instead of genuinely moving up a
+    tier. Fixed in runtime/models/router.ts; regression tests in
+    router.test.ts construct a registry where only STANDARD/PREMIUM-tier
+    models support a capability at risk 0, and assert escalation lands on
+    PREMIUM (never re-selecting the STANDARD model), that premium fallback
+    is still blocked by default in this scenario, and that being already
+    at the top tier throws NoCapableModelError instead of looping. The
+    pre-fix code was confirmed to fail these exact tests before the fix
+    (reverted and re-run manually during review).
 
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
@@ -501,24 +538,43 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
+  notes: "CostEngine now takes an injectable clock (constructor `now` param) so tests can simulate specific timestamps, and gained totalInWindow() for time-scoped totals — both added to support real dailyUsd/monthlyUsd budget enforcement (see UASF-REQ-0030)."
 
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
   description: >
-    Task/run/project cost ceilings that stop or block execution before a
-    limit is exceeded, preventing runaway spend.
+    Task/run/project/daily/monthly cost ceilings that stop or block
+    execution before a limit is exceeded, preventing runaway spend.
   source_baseline: "BASELINE-V1 section 70, 71, 72, 306 (Proof E)"
   category: P0
   priority: CRITICAL
   status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/budget/budget.ts"
+    - "runtime/cost/cost-engine.ts"
+    - "runtime/audit/audit-log.ts"
   test_refs:
     - "runtime/budget/__tests__/budget.test.ts"
   proof_refs:
     - "proofs/budget-ceiling/proof.test.ts"
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
+  notes: >
+    Independent review (Codex) found dailyUsd/monthlyUsd were defined in
+    BudgetLimits but never checked at runtime — only perTaskUsd/perRunUsd
+    were enforced. Fixed: BudgetGuard now checks all four ceilings, with
+    dailyUsd/monthlyUsd computed as real UTC-calendar-period windows via
+    CostEngine.totalInWindow(), scoped by projectId when given. Test
+    coverage added: same-period blocking, boundary (exactly-at-ceiling
+    allowed, one cent over blocked), rollover (a new UTC day/month resets
+    the ceiling even though lifetime spend is far higher, verified with an
+    injectable clock rather than waiting on real time), per-project
+    scoping, a synchronous-burst test demonstrating the check-then-record
+    sequence has no `await` between the two steps (so no interleaved call
+    can race past the ceiling), and an AuditLog integration recording both
+    allowed and blocked budget checks as durable, hash-chained evidence
+    (BudgetGuard's optional third/fourth constructor params: `now` and
+    `auditLog`).
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)

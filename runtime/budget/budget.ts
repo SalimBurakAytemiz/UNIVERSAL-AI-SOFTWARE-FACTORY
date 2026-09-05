@@ -3,8 +3,17 @@
 // DURDURUR. Bu koruma, harcama gerçekleşmeden ÖNCE (projected amount ile)
 // çağrılmalıdır — yoksa tavanı aştıktan sonra durdurmak "sessiz harcama
 // yok" ilkesini ihlal eder.
+//
+// dailyUsd/monthlyUsd DÖNEMSEL tavanlardır: her gün/ay başında sıfırlanır
+// (UTC takvim günü/ayı — kayan 24 saat/30 gün penceresi DEĞİL, çünkü
+// dönemin ne zaman başladığı belirsizleşirse denetim de belirsizleşir).
+// `now` enjekte edilebilir bir saat fonksiyonudur; testler bunu ilerleterek
+// gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
 import type { CostEngine, CostScope } from "../cost/cost-engine.js";
+import type { AuditLog } from "../audit/audit-log.js";
+
+export type BudgetCeilingName = "perTaskUsd" | "perRunUsd" | "dailyUsd" | "monthlyUsd";
 
 export interface BudgetLimits {
   readonly perTaskUsd?: number;
@@ -15,7 +24,7 @@ export interface BudgetLimits {
 
 export class BudgetExceededError extends Error {
   constructor(
-    public readonly ceiling: "perTaskUsd" | "perRunUsd" | "dailyUsd" | "monthlyUsd",
+    public readonly ceiling: BudgetCeilingName,
     public readonly limit: number,
     public readonly wouldBeTotal: number
   ) {
@@ -27,36 +36,111 @@ export class BudgetExceededError extends Error {
   }
 }
 
+interface CeilingCheck {
+  readonly ceiling: BudgetCeilingName;
+  readonly limit: number;
+  readonly projected: number;
+}
+
+/** Verilen anın ait olduğu UTC takvim gününün başlangıcını (00:00:00.000Z) döndürür. */
+function startOfUtcDay(date: Date): string {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())).toISOString();
+}
+
+/** Verilen anın ait olduğu UTC takvim ayının başlangıcını (1. gün, 00:00:00.000Z) döndürür. */
+function startOfUtcMonth(date: Date): string {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString();
+}
+
 export class BudgetGuard {
   constructor(
     private readonly costEngine: CostEngine,
-    private readonly limits: BudgetLimits
+    private readonly limits: BudgetLimits,
+    private readonly now: () => Date = () => new Date(),
+    private readonly auditLog?: AuditLog
   ) {}
+
+  private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {
+    const checks: CeilingCheck[] = [];
+
+    if (this.limits.perTaskUsd !== undefined && scope.taskId !== undefined) {
+      checks.push({
+        ceiling: "perTaskUsd",
+        limit: this.limits.perTaskUsd,
+        projected: this.costEngine.totalFor({ taskId: scope.taskId }) + projectedAmountUsd
+      });
+    }
+
+    if (this.limits.perRunUsd !== undefined) {
+      checks.push({
+        ceiling: "perRunUsd",
+        limit: this.limits.perRunUsd,
+        projected: this.costEngine.total() + projectedAmountUsd
+      });
+    }
+
+    // dailyUsd/monthlyUsd: taskId'ye göre DEĞİL, verilirse projectId'ye göre
+    // (yoksa motorun tamamına göre) kapsamlanır — perTaskUsd'nin aksine, bu
+    // tavanlar tek bir görev için değil bir dönem için tanımlıdır.
+    const periodScope: CostScope = scope.projectId !== undefined ? { projectId: scope.projectId } : {};
+
+    if (this.limits.dailyUsd !== undefined) {
+      checks.push({
+        ceiling: "dailyUsd",
+        limit: this.limits.dailyUsd,
+        projected: this.costEngine.totalInWindow(periodScope, startOfUtcDay(this.now())) + projectedAmountUsd
+      });
+    }
+
+    if (this.limits.monthlyUsd !== undefined) {
+      checks.push({
+        ceiling: "monthlyUsd",
+        limit: this.limits.monthlyUsd,
+        projected: this.costEngine.totalInWindow(periodScope, startOfUtcMonth(this.now())) + projectedAmountUsd
+      });
+    }
+
+    return checks;
+  }
 
   /**
    * Bir eylem gerçekleştirilmeden önce çağrılır. Eylem, herhangi bir tavanı
    * aşacaksa BudgetExceededError fırlatır ve harcama hiç gerçekleşmez.
+   * Her kontrol (izin verilen ya da engellenen), bir AuditLog verildiyse,
+   * kalıcı kanıt olarak kaydedilir (bölüm 242, 303 — "no claim without
+   * evidence" bütçe kararları için de geçerlidir).
    */
   assertWithinBudget(scope: CostScope, projectedAmountUsd: number): void {
-    if (this.limits.perTaskUsd !== undefined && scope.taskId !== undefined) {
-      const projected = this.costEngine.totalFor({ taskId: scope.taskId }) + projectedAmountUsd;
-      if (projected > this.limits.perTaskUsd) {
-        throw new BudgetExceededError("perTaskUsd", this.limits.perTaskUsd, projected);
+    const checks = this.buildCeilingChecks(scope, projectedAmountUsd);
+
+    for (const check of checks) {
+      if (check.projected > check.limit) {
+        this.auditLog?.append({
+          type: "BUDGET_BLOCKED",
+          actor: "budget-guard",
+          payload: { scope, projectedAmountUsd, ...check },
+          timestamp: this.now().toISOString()
+        });
+        throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
       }
     }
 
-    if (this.limits.perRunUsd !== undefined) {
-      const projected = this.costEngine.total() + projectedAmountUsd;
-      if (projected > this.limits.perRunUsd) {
-        throw new BudgetExceededError("perRunUsd", this.limits.perRunUsd, projected);
-      }
-    }
+    this.auditLog?.append({
+      type: "BUDGET_CHECK_PASSED",
+      actor: "budget-guard",
+      payload: { scope, projectedAmountUsd, checks },
+      timestamp: this.now().toISOString()
+    });
   }
 
   /**
    * Bütçe kontrolünü geçerse maliyeti kaydeder; geçmezse hiçbir şey
    * kaydedilmeden hata fırlatır. Bu, "kontrol et sonra harca" sırasını
-   * tek bir atomik adımda garanti eder.
+   * tek bir atomik adımda garanti eder. Node.js tek iş parçacıklı olduğu
+   * ve bu iki adım arasında hiçbir `await` bulunmadığı için, aynı anda
+   * gelen birçok `spend()` çağrısı arasında bir yarış durumu (race
+   * condition) OLUŞAMAZ — her çağrı, bir sonraki başlamadan tamamen biter
+   * (eşzamanlılık güvenliği, JS çalışma zamanının kendisinden gelir).
    */
   spend(entry: {
     taskId: string;

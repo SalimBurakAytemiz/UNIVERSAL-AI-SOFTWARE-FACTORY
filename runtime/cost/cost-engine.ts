@@ -21,8 +21,16 @@ export interface CostScope {
 export class CostEngine {
   private readonly entries: CostEntry[] = [];
 
+  /**
+   * `now` enjekte edilebilir bir saat fonksiyonudur — varsayılan olarak
+   * gerçek zamanı kullanır, ancak testler (özellikle günlük/aylık bütçe
+   * sıfırlanma senaryoları) belirli bir ana "sabitlenmiş" kayıtlar
+   * üretebilmek için bunu değiştirebilir (bkz. runtime/budget/budget.ts).
+   */
+  constructor(private readonly now: () => Date = () => new Date()) {}
+
   record(entry: Omit<CostEntry, "timestamp">): CostEntry {
-    const full: CostEntry = { ...entry, timestamp: new Date().toISOString() };
+    const full: CostEntry = { ...entry, timestamp: this.now().toISOString() };
     this.entries.push(full);
     return full;
   }
@@ -33,17 +41,31 @@ export class CostEngine {
 
   /** Belirli bir kapsam (görev/ajan/proje) için toplam maliyeti hesaplar. */
   totalFor(scope: CostScope): number {
-    return this.entries
-      .filter(
-        (e) =>
-          (scope.taskId === undefined || e.taskId === scope.taskId) &&
-          (scope.agentId === undefined || e.agentId === scope.agentId) &&
-          (scope.projectId === undefined || e.projectId === scope.projectId)
-      )
-      .reduce((sum, e) => sum + e.amountUsd, 0);
+    return this.entries.filter((e) => matchesScope(e, scope)).reduce((sum, e) => sum + e.amountUsd, 0);
   }
 
   total(): number {
     return this.entries.reduce((sum, e) => sum + e.amountUsd, 0);
   }
+
+  /**
+   * Belirli bir kapsam VE zaman penceresi (sinceIso'dan itibaren) için
+   * toplam maliyeti hesaplar. Günlük/aylık bütçe tavanlarının (bölüm 70-72)
+   * gerçekten "dönemsel" olabilmesi için gereken temel sorgu budur — ISO
+   * 8601 zaman damgaları sözlüksel (string) karşılaştırmayla doğru sırada
+   * olduğundan basit bir string karşılaştırması yeterlidir.
+   */
+  totalInWindow(scope: CostScope, sinceIso: string): number {
+    return this.entries
+      .filter((e) => matchesScope(e, scope) && e.timestamp >= sinceIso)
+      .reduce((sum, e) => sum + e.amountUsd, 0);
+  }
+}
+
+function matchesScope(entry: CostEntry, scope: CostScope): boolean {
+  return (
+    (scope.taskId === undefined || entry.taskId === scope.taskId) &&
+    (scope.agentId === undefined || entry.agentId === scope.agentId) &&
+    (scope.projectId === undefined || entry.projectId === scope.projectId)
+  );
 }

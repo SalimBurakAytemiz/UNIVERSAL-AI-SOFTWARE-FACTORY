@@ -117,13 +117,21 @@ export class CheapestCapableModelRouter {
       throw new PremiumFallbackBlockedError(request.taskId);
     }
 
-    const nextTierIndex = tierRank(initialDecision.requiredTier) + 1;
+    // Escalate from the tier of the model ACTUALLY SELECTED, not the
+    // minimum risk-derived tier. If the capability filter already forced a
+    // pricier model than the risk floor required (e.g. a risk-0 task that
+    // only a STANDARD-tier model can perform), escalating from
+    // `requiredTier` would pick a tier at or below the model already
+    // tried — re-selecting the same (or an even cheaper/weaker) model
+    // instead of genuinely moving up a quality level.
+    const currentTierIndex = tierRank(initialDecision.model.tier);
+    const nextTierIndex = currentTierIndex + 1;
     const nextTier = nextTierIndex < 6 ? (Object.freeze(
       ["MOCK", "LOCAL_FREE", "VERY_LOW_COST", "STANDARD", "PREMIUM", "CRITICAL_REVIEW"] as const
     )[nextTierIndex] as ModelTier) : undefined;
 
     if (!nextTier) {
-      throw new NoCapableModelError(request, initialDecision.requiredTier);
+      throw new NoCapableModelError(request, initialDecision.model.tier);
     }
 
     const escalatedDecision = this.selectModel(request, nextTier);

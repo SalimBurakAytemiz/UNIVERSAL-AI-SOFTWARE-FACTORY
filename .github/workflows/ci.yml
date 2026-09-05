@@ -29,7 +29,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history so secret-scan can eventually inspect git log too
+          fetch-depth: 0 # full history — required so secret-scan's git-history scan sees every commit
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
