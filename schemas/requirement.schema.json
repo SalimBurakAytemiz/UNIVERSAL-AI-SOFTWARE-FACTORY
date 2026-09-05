@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/SalimBurakAytemiz/UNIVERSAL-AI-SOFTWARE-FACTORY/schemas/requirement.schema.json",
+  "title": "Baseline Requirement",
+  "description": "Machine-readable requirement record traced back to the frozen Architecture Baseline V1 specification (baseline section 293). IDs must never be reused for unrelated requirements (baseline section 293).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "description", "source_baseline", "category", "priority", "status"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^UASF-REQ-[0-9]{4,}$",
+      "description": "Stable requirement ID, e.g. UASF-REQ-0001. Never reused."
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "source_baseline": {
+      "type": "string",
+      "description": "Baseline document and section this requirement traces to, e.g. 'BASELINE-V1 section 80'."
+    },
+    "category": {
+      "type": "string",
+      "enum": ["P0", "P1", "P2", "P3"],
+      "description": "Implementation phase per baseline section 304."
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "DEFINED",
+        "PLANNED",
+        "IMPLEMENTATION_IN_PROGRESS",
+        "IMPLEMENTED",
+        "UNIT_TESTED",
+        "INTEGRATION_TESTED",
+        "PROOF_VERIFIED",
+        "PRODUCTION_VERIFIED",
+        "BLOCKED",
+        "DEPRECATED",
+        "SUPERSEDED"
+      ],
+      "description": "Per baseline section 294. No unsupported upgrades: status changes must be backed by actual commits/tests/proofs referenced in the *_refs fields."
+    },
+    "implementation_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repo-relative paths implementing this requirement."
+    },
+    "test_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "proof_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "security_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^UASF-REQ-[0-9]{4,}$" }
+    },
+    "supersedes": { "type": ["string", "null"], "pattern": "^UASF-REQ-[0-9]{4,}$" },
+    "superseded_by": { "type": ["string", "null"], "pattern": "^UASF-REQ-[0-9]{4,}$" },
+    "notes": { "type": "string" }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "universal-ai-software-factory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Universal AI Technology Factory — P0 Factory Kernel (Architecture Baseline V1)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "validate:requirements": "node scripts/validate-requirements.mjs",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "factory": "tsx runtime/cli/index.ts"
+  },
+  "bin": {
+    "factory": "dist/runtime/cli/index.js"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.2",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "ajv": "^8.17.1",
+    "eslint": "^9.17.0",
+    "js-yaml": "^4.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^5.0.0"
+  }
+}

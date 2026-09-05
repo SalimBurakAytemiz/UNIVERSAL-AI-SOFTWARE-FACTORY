@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/SalimBurakAytemiz/UNIVERSAL-AI-SOFTWARE-FACTORY/schemas/model.schema.json",
+  "title": "Model Registry Record",
+  "description": "A single provider/model record for the Model Registry (baseline section 60). Do not hardcode assumptions that a provider is permanently free, cheap, or premium — costClass/tier are data, not code.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["provider", "modelId", "tier", "costClass", "capabilities", "status"],
+  "properties": {
+    "provider": { "type": "string", "minLength": 1 },
+    "modelId": { "type": "string", "minLength": 1 },
+    "tier": {
+      "type": "string",
+      "enum": ["MOCK", "LOCAL_FREE", "VERY_LOW_COST", "STANDARD", "PREMIUM", "CRITICAL_REVIEW"],
+      "description": "Baseline section 61 model tiers."
+    },
+    "costClass": {
+      "type": "string",
+      "enum": ["FREE", "VERY_LOW", "LOW", "STANDARD", "HIGH", "PREMIUM"]
+    },
+    "costPerCall": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Flat estimated cost per call in USD, used for the cheapest-capable-model comparison. A simplification of real per-token pricing, sufficient for routing decisions at P0."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "classification", "tagging", "formatting", "summarization", "simple-docs",
+          "boilerplate", "simple-tests", "data-extraction",
+          "implementation", "code-review", "debugging", "integrations", "test-generation",
+          "critical-architecture", "security-reasoning", "distributed-systems", "incident-analysis"
+        ]
+      },
+      "minItems": 1
+    },
+    "contextWindow": { "type": "integer", "minimum": 1 },
+    "structuredOutput": { "type": "boolean" },
+    "toolUse": { "type": "boolean" },
+    "vision": { "type": "boolean" },
+    "status": {
+      "type": "string",
+      "enum": ["DISCOVERED", "EVALUATED", "APPROVED", "ACTIVE", "MONITORED", "DEPRECATED", "RETIRED"]
+    }
+  }
+}

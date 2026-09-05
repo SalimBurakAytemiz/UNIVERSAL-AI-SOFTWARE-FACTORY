@@ -1,0 +1,889 @@
+# Baseline Requirement Registry — P0 Factory Kernel batch.
+# Validated against schemas/requirement.schema.json (npm run validate:requirements).
+# See README.md in this directory for scope notes.
+
+- id: UASF-REQ-0001
+  title: Existing public repository audit
+  description: >
+    Audit the existing target repository's git state (branches, commits,
+    working tree) before any implementation work, without creating a new
+    repository.
+  source_baseline: "BASELINE-V1 section 318, 319"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs: []
+  test_refs: []
+  proof_refs:
+    - "Session audit: single 'Initial commit' with one-line README, working tree clean, no other branches/history."
+  security_refs: []
+  notes: "Performed manually at session start via git status/log; repository was effectively empty."
+
+- id: UASF-REQ-0002
+  title: Public secret / hygiene audit
+  description: >
+    Scan tracked files and git history for exposed secrets, credentials, and
+    sensitive data before major implementation.
+  source_baseline: "BASELINE-V1 section 2, 319, 307"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "scripts/secret-scan.mjs"
+  test_refs:
+    - "tests/secret-scan.test.mjs"
+  proof_refs:
+    - "CI job 'secret-scan' in .github/workflows/ci.yml"
+  security_refs:
+    - "SECURITY.md"
+  notes: >
+    Independent review (Codex) found this requirement's description
+    ("scan tracked files AND git history") did not match the implementation
+    (current tree only) despite being marked PROOF_VERIFIED — a real
+    evidence/claim mismatch. Fixed: scanGitHistory()/listHistoricalBlobs()
+    in scripts/secret-scan.mjs now scan every unique blob reachable from
+    any ref (git rev-list --objects --all), catching a secret committed
+    and later deleted. Tested with a real temp-repo commit+delete scenario,
+    a redaction check (finding objects never carry the secret value), and
+    a dedup check (identical content committed under two paths -> one
+    finding, not two). One pre-existing historical finding (commit
+    981f0a4, before the `secret-scan:allow` marker existed) is resolved
+    via a minimal, exact-match (blob sha + line + pattern) baseline in
+    scripts/secret-scan.mjs rather than rewriting public git history.
+    Also fixed per the same review: the wholesale file-level allowlist for
+    tests/secret-scan.test.mjs and scripts/secret-scan.mjs was removed
+    (ALLOWLIST_SUBSTRINGS is now empty) — only the per-line
+    `secret-scan:allow` marker can suppress a finding, with regression
+    tests proving an unmarked credential anywhere in those files is still
+    detected.
+
+- id: UASF-REQ-0003
+  title: Baseline specification preservation
+  description: >
+    Store the complete Founder-provided specification verbatim as the single
+    source of truth, plus BASELINE.md status and CHANGELOG.md.
+  source_baseline: "BASELINE-V1 section 292"
+  category: P0
+  priority: CRITICAL
+  status: IMPLEMENTED
+  implementation_refs:
+    - "specification/UNIVERSAL-AI-SOFTWARE-FACTORY-BASELINE-V1.md"
+    - "specification/BASELINE.md"
+    - "specification/CHANGELOG.md"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0004
+  title: Baseline requirement registry
+  description: >
+    Machine-readable, schema-validated requirement records with stable IDs
+    tracing to baseline sections.
+  source_baseline: "BASELINE-V1 section 293, 294"
+  category: P0
+  priority: CRITICAL
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "schemas/requirement.schema.json"
+    - "specification/requirements/P0-factory-kernel.yml"
+  test_refs:
+    - "scripts/validate-requirements.mjs"
+  proof_refs: []
+  security_refs: []
+  notes: "P0-scope batch only; full 323-section decomposition deferred (see requirements/README.md)."
+
+- id: UASF-REQ-0005
+  title: Strict schemas, fail closed
+  description: >
+    JSON Schema validation for core entities (requirements, model registry,
+    policy decisions), invalid configuration must fail closed.
+  source_baseline: "BASELINE-V1 section 280"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "schemas/requirement.schema.json"
+    - "schemas/model.schema.json"
+    - "schemas/project-genome.schema.json"
+    - "runtime/project-genome/genome.ts"
+  test_refs:
+    - "scripts/validate-requirements.mjs"
+    - "runtime/models/__tests__/registry.test.ts"
+    - "runtime/project-genome/__tests__/genome.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Three schemas now demonstrate fail-closed validation (requirement, model, project-genome); still not every core entity listed in section 280 has one."
+
+- id: UASF-REQ-0006
+  title: Factory CLI
+  description: >
+    Minimum CLI surface starting with `factory doctor`, `factory status`,
+    `factory baseline status`, `factory routing explain`, `factory costs show`.
+  source_baseline: "BASELINE-V1 section 286"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "runtime/cli"
+  test_refs:
+    - "runtime/cli/__tests__"
+  proof_refs: []
+  security_refs: []
+  notes: "Only a subset of the full command list in section 286 is implemented; remaining commands are future work."
+
+- id: UASF-REQ-0007
+  title: Project Factory / Project OS foundation
+  description: >
+    Ability to scaffold an isolated per-project directory structure
+    (project-definition, requirements, decisions, assumptions, state, etc.).
+  source_baseline: "BASELINE-V1 section 26"
+  category: P0
+  priority: MEDIUM
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/project-os/scaffold.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/project-os/__tests__/scaffold.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: "Now wired into the full pipeline via runtime/project-lifecycle/orchestrator.ts: scaffolding only happens inside a Capability Gateway authorization, and the Organization Composer's output is persisted into the scaffolded structure."
+
+- id: UASF-REQ-0008
+  title: Project Genome schema
+  description: Machine-readable Project Genome YAML schema and validator.
+  source_baseline: "BASELINE-V1 section 27"
+  category: P0
+  priority: MEDIUM
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "schemas/project-genome.schema.json"
+    - "runtime/project-genome/genome.ts"
+  test_refs:
+    - "runtime/project-genome/__tests__/genome.test.ts"
+    - "runtime/organization-composer/__tests__/composer.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: "Schema covers the shape from the baseline's own example; not every nested field of every future subsystem is modeled yet. Now consumed directly by the Organization Composer and the full bootstrap pipeline."
+
+- id: UASF-REQ-0009
+  title: Discovery & clarification engine (foundation)
+  description: >
+    Founder-idea intake pipeline with CRITICAL/IMPORTANT/OPTIONAL/DERIVABLE
+    classification.
+  source_baseline: "BASELINE-V1 section 43, 44"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/discovery/discovery-engine.ts"
+  test_refs:
+    - "runtime/discovery/__tests__/discovery-engine.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Classification and question-selection logic only; no actual Founder-facing intake UI/CLI yet."
+
+- id: UASF-REQ-0010
+  title: Founder decision ledger
+  description: Persist Founder decisions with id/status/supersession tracking.
+  source_baseline: "BASELINE-V1 section 46"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/decisions/decision-ledger.ts"
+  test_refs:
+    - "runtime/decisions/__tests__/decision-ledger.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Now persists via runtime/state/file-store.ts (saveTo/loadFrom) — no longer in-memory only; a round-trip through a fresh store instance is tested."
+
+- id: UASF-REQ-0011
+  title: Assumption register
+  description: Track assumptions with PROPOSED/ACCEPTED/REJECTED/VALIDATED/SUPERSEDED lifecycle.
+  source_baseline: "BASELINE-V1 section 47"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/assumptions/assumption-register.ts"
+  test_refs:
+    - "runtime/assumptions/__tests__/assumption-register.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "HIGH-impact assumptions cannot move to ACCEPTED without an explicit confirmedBy value (Founder confirmation gate), enforced in code. Now persists via runtime/state/file-store.ts (saveTo/loadFrom), including the confirmedBy field, across a simulated process restart."
+
+- id: UASF-REQ-0012
+  title: Requirements engine
+  description: Support BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL/... requirement types with stable IDs.
+  source_baseline: "BASELINE-V1 section 48"
+  category: P0
+  priority: MEDIUM
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "schemas/requirement.schema.json"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+  notes: "The Baseline Requirement Registry itself is the first instance of this engine's data model."
+
+- id: UASF-REQ-0013
+  title: Requirements traceability
+  description: Trace business requirement through to release, detect orphans.
+  source_baseline: "BASELINE-V1 section 49"
+  category: P0
+  priority: MEDIUM
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/requirements-traceability/traceability.ts"
+    - "runtime/cli/commands/trace-requirement.ts"
+  test_refs:
+    - "runtime/requirements-traceability/__tests__/traceability.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: "Detects status claims with zero backing evidence over this repository's own requirement registry (`factory trace requirement`); now the first, gating step of the integrated P0 pipeline (proofs/p0-integrated-flow). Does not yet trace the full business->product->story->AC->architecture->implementation->test->release chain described in section 49."
+
+- id: UASF-REQ-0014
+  title: Technology registry (foundation)
+  description: Track languages/frameworks/engines with EXPERIMENTAL..FORBIDDEN lifecycle.
+  source_baseline: "BASELINE-V1 section 53, 54"
+  category: P0
+  priority: LOW
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/technology-registry/registry.ts"
+  test_refs:
+    - "runtime/technology-registry/__tests__/registry.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "FORBIDDEN/DEPRECATED technologies are excluded from recommendable() at the data-model level; no seeded default registry or Technology Decision Engine yet."
+
+- id: UASF-REQ-0015
+  title: Business capability registry (foundation)
+  description: Registry entries for CRM/ERP/OMS/... with delivery_options (BUILD/INTEGRATE/REUSE/BUY_OR_SAAS/DEFER/NOT_REQUIRED).
+  source_baseline: "BASELINE-V1 section 29"
+  category: P0
+  priority: LOW
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/business-capability-registry/registry.ts"
+  test_refs:
+    - "runtime/business-capability-registry/__tests__/registry.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Seeded with a representative subset (identity, payments, notifications, anti-cheat), not the full section-29 list."
+
+- id: UASF-REQ-0016
+  title: Project organization composer (foundation)
+  description: Compose minimum justified project organization from Project Genome + requirements + risk + budget.
+  source_baseline: "BASELINE-V1 section 34"
+  category: P0
+  priority: LOW
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/organization-composer/composer.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/organization-composer/__tests__/composer.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: "Rule-based composition with a recorded rationale per activated team (tests assert unrelated teams are never added). composeOrganizationFromGenome() now consumes a real, validated Project Genome directly; budget input is still not wired in."
+
+- id: UASF-REQ-0017
+  title: Workflow engine (foundation)
+  description: Event-driven workflow execution substrate.
+  source_baseline: "BASELINE-V1 section 75"
+  category: P0
+  priority: MEDIUM
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "runtime/event-bus"
+  test_refs:
+    - "runtime/event-bus/__tests__"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0018
+  title: Policy engine — ALLOW/DENY/APPROVAL_REQUIRED
+  description: >
+    Central decision engine evaluating actions against policy, returning
+    ALLOW, DENY, or APPROVAL_REQUIRED, honoring the precedence order in
+    section 241 (safety/security/legal > production integrity > founder
+    policy > cost optimization > convenience).
+  source_baseline: "BASELINE-V1 section 148, 241"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/policy-engine"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/policy-engine/__tests__/policy-engine.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/human-approval"
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: >
+    Independent review (Codex) found that the risk-5 approval upgrade could
+    override an explicit DENY: because the built-in risk-5 rule ran first
+    (highest priority) and evaluate() stopped at the first non-null result,
+    a risk-5 action that an explicit, even high-priority, DENY rule matched
+    could still surface as APPROVAL_REQUIRED. Fixed in
+    runtime/policy-engine/policy-engine.ts: the risk-5 upgrade is no longer
+    a pre-seeded PolicyRule; evaluate() now runs all registered rules first,
+    tracks whether an explicit rule matched, and only applies the risk-5
+    upgrade when the resulting decision is not an explicit DENY (an
+    unmatched default-deny is still eligible, preserving the existing
+    "unaddressed risk-5 still requires approval" guarantee). Regression
+    tests added proving: explicit DENY + risk-5 stays DENY, a
+    Number.MAX_SAFE_INTEGER-priority DENY + risk-5 stays DENY, DENY beats a
+    lower-priority ALLOW rule on the same risk-5 action, an otherwise-ALLOWED
+    risk-5 action still requires approval, a default-deny (no rules) risk-5
+    action still requires approval, and risk-5 never weakens an existing
+    APPROVAL_REQUIRED decision back toward ALLOW. Confirmed via git-stash
+    that these tests fail against the pre-fix code and pass after the fix.
+
+    The integrated pipeline proof demonstrates default-deny in a realistic
+    scenario: bootstrapProject() refuses to scaffold anything until an
+    explicit policy rule allows it.
+
+- id: UASF-REQ-0019
+  title: Capability gateway (foundation)
+  description: Enforcement point routing actions through the policy engine before execution.
+  source_baseline: "BASELINE-V1 section 147"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/capability-gateway/gateway.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/capability-gateway/__tests__/gateway.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: "Tests assert the wrapped execute() function is never called on DENY or APPROVAL_REQUIRED, only on ALLOW. Now the real enforcement point in front of Project OS scaffolding in the integrated pipeline — not just a standalone demonstration."
+
+- id: UASF-REQ-0020
+  title: Human approval workflow
+  description: >
+    Risk-5 actions (production deploy, destructive DB ops, secret mutation,
+    premium-model escalation outside budget, etc.) require an explicit
+    APPROVE/REJECT/REQUEST_CHANGES decision and can never reach EXECUTED
+    without it.
+  source_baseline: "BASELINE-V1 section 145, 146"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/policy-engine/approval.ts"
+  test_refs:
+    - "runtime/policy-engine/__tests__/policy-engine.test.ts"
+  proof_refs:
+    - "proofs/human-approval"
+  security_refs: []
+
+- id: UASF-REQ-0021
+  title: Durable state / resume
+  description: >
+    Maintain project-state/current.yml recording phase, milestones, branch,
+    commit, blockers, and exact next action so interrupted work resumes
+    without repeating valid completed work.
+  source_baseline: "BASELINE-V1 section 277"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "project-state/current.yml"
+    - "runtime/state/file-store.ts"
+    - "runtime/decisions/decision-ledger.ts"
+    - "runtime/assumptions/assumption-register.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/state/__tests__/file-store.test.ts"
+    - "runtime/decisions/__tests__/decision-ledger.test.ts"
+    - "runtime/assumptions/__tests__/assumption-register.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: "project-state/current.yml is the session-level durable record (Founder-facing prose+structure). runtime/state/file-store.ts is the code-level StateStore interface (baseline section 275) with a JSON-file implementation, used by the Decision Ledger, Assumption Register, and the P0 bootstrap pipeline; a real process-restart is simulated in tests via a fresh store instance reading the same path."
+
+- id: UASF-REQ-0022
+  title: Audit (foundation)
+  description: Append-only audit log for policy/approval/budget decisions.
+  source_baseline: "BASELINE-V1 section 242"
+  category: P0
+  priority: HIGH
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/audit"
+  test_refs:
+    - "runtime/audit/__tests__/audit-log.test.ts"
+    - "runtime/budget/__tests__/budget.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Now also consumed by BudgetGuard (runtime/budget/budget.ts) to record allowed and blocked spend checks as durable, hash-chained evidence — not just policy-engine decisions."
+
+- id: UASF-REQ-0023
+  title: Artifact foundation
+  description: Minimal artifact classification/storage abstraction.
+  source_baseline: "BASELINE-V1 section 123"
+  category: P0
+  priority: LOW
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/artifacts/artifact-registry.ts"
+  test_refs:
+    - "runtime/artifacts/__tests__/artifact-registry.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "In-memory registry with the section-123 artifact classes; no actual storage backend (filesystem/object store) yet."
+
+- id: UASF-REQ-0024
+  title: Model gateway
+  description: Provider-abstraction interface so core tests never require paid APIs.
+  source_baseline: "BASELINE-V1 section 59"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/models/gateway.ts"
+  test_refs:
+    - "runtime/models/__tests__/gateway.test.ts"
+  proof_refs:
+    - "proofs/cheapest-capable-model"
+  security_refs: []
+
+- id: UASF-REQ-0025
+  title: Model registry
+  description: Registry of provider/model records with capabilities, cost_class, tier, status.
+  source_baseline: "BASELINE-V1 section 60, 61"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/models/registry.ts"
+    - "schemas/model.schema.json"
+  test_refs:
+    - "runtime/models/__tests__/registry.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0026
+  title: MockProvider
+  description: Deterministic, free, no-network model provider so the kernel's core tests are self-contained.
+  source_baseline: "BASELINE-V1 section 59"
+  category: P0
+  priority: CRITICAL
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/models/providers/mock-provider.ts"
+  test_refs:
+    - "runtime/models/__tests__/gateway.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0027
+  title: Cheapest-capable-model router
+  description: >
+    Classify task complexity/risk/required capabilities, select the
+    lowest-cost model in the registry that satisfies them; never select a
+    premium model for a trivial task.
+  source_baseline: "BASELINE-V1 section 62, 63, 306 (Proof A/B)"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/models/router.ts"
+  test_refs:
+    - "runtime/models/__tests__/router.test.ts"
+  proof_refs:
+    - "proofs/cheapest-capable-model/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: >
+    Independent review (Codex) found that escalation (in routeAndExecute)
+    was computed from initialDecision.requiredTier (the risk-derived
+    minimum) rather than initialDecision.model.tier (the model actually
+    selected). When a capability requirement forces a pricier model than
+    the risk floor demands, this could re-select the exact same (or an
+    equally weak) model on "escalation" instead of genuinely moving up a
+    tier. Fixed in runtime/models/router.ts; regression tests in
+    router.test.ts construct a registry where only STANDARD/PREMIUM-tier
+    models support a capability at risk 0, and assert escalation lands on
+    PREMIUM (never re-selecting the STANDARD model), that premium fallback
+    is still blocked by default in this scenario, and that being already
+    at the top tier throws NoCapableModelError instead of looping. The
+    pre-fix code was confirmed to fail these exact tests before the fix
+    (reverted and re-run manually during review).
+
+    Second-round finding (Codex): once escalation began, the escalated
+    (fallback) model's response was invoked but never passed back through
+    `validate()` — routeAndExecute returned it unconditionally, meaning an
+    invalid response from a pricier model could bypass validation entirely.
+    Fixed: routeAndExecute now validates every candidate, including every
+    escalation step, in a bounded loop over TIER_ORDER; if the top tier
+    (CRITICAL_REVIEW) is reached and still fails validation, it now throws
+    the new EscalationExhaustedError (fail closed) rather than returning
+    unvalidated output. Regression tests added: primary fails/first
+    escalation passes (validate called on both, in order), primary and all
+    escalations fail -> EscalationExhaustedError after validating every
+    tier exactly once, an invalid PREMIUM-tier fallback cannot be accepted
+    merely because it is pricier (validation only passes at CRITICAL_REVIEW),
+    and premium fallback policy is still enforced before any escalation is
+    attempted (PremiumFallbackBlockedError after exactly one validate call).
+    Confirmed via git-stash that these tests fail against the pre-fix code.
+
+- id: UASF-REQ-0028
+  title: Premium fallback policy (default off, evidence-based escalation)
+  description: >
+    AUTO_PREMIUM_FALLBACK defaults to false; escalation beyond the cheapest
+    capable model requires validation failure plus policy/budget approval.
+  source_baseline: "BASELINE-V1 section 64, 306 (Proof C/D)"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/models/router.ts"
+  test_refs:
+    - "runtime/models/__tests__/router.test.ts"
+  proof_refs:
+    - "proofs/premium-fallback-block/proof.test.ts"
+  security_refs: []
+  notes: >
+    See UASF-REQ-0027's second-round note: the fallback-validation-bypass
+    fix in runtime/models/router.ts (every escalated candidate, not just
+    the initial one, is now passed through the caller's validate()) applies
+    directly to this requirement's "escalation requires validation failure"
+    guarantee — a fallback response is never trusted merely for being from
+    a pricier model.
+
+- id: UASF-REQ-0029
+  title: Cost engine
+  description: Track cost per task/agent/model/provider call; no silent spending.
+  source_baseline: "BASELINE-V1 section 69"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/cost/cost-engine.ts"
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "runtime/cost/__tests__/cost-engine.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
+  proof_refs:
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: >
+    CostEngine now takes an injectable clock (constructor `now` param) so
+    tests can simulate specific timestamps, and gained totalInWindow() for
+    time-scoped totals — both added to support real dailyUsd/monthlyUsd
+    budget enforcement (see UASF-REQ-0030).
+
+    BLOCKER fix (Codex, 2nd round): CostEngine.record() itself accepted
+    NaN, Infinity, -Infinity, and negative amountUsd values, letting a
+    direct record() call (bypassing BudgetGuard) corrupt totals or
+    manufacture negative spend. Fixed: added exported
+    assertValidMonetaryAmount() (rejects non-finite and negative values,
+    zero is valid) and record() now calls it before pushing any entry —
+    so direct CostEngine.record() calls are protected even when
+    BudgetGuard is bypassed entirely. Regression tests added for NaN,
+    Infinity, -Infinity, and negative amounts (each confirmed to throw
+    InvalidMonetaryAmountError and leave `engine.all()` empty), plus
+    direct unit tests of assertValidMonetaryAmount as the shared
+    validation primitive.
+
+- id: UASF-REQ-0030
+  title: Budget engine / cost ceilings
+  description: >
+    Task/run/project/daily/monthly cost ceilings that stop or block
+    execution before a limit is exceeded, preventing runaway spend.
+  source_baseline: "BASELINE-V1 section 70, 71, 72, 306 (Proof E)"
+  category: P0
+  priority: CRITICAL
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/budget/budget.ts"
+    - "runtime/cost/cost-engine.ts"
+    - "runtime/audit/audit-log.ts"
+  test_refs:
+    - "runtime/budget/__tests__/budget.test.ts"
+  proof_refs:
+    - "proofs/budget-ceiling/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []
+  notes: >
+    Independent review (Codex) found dailyUsd/monthlyUsd were defined in
+    BudgetLimits but never checked at runtime — only perTaskUsd/perRunUsd
+    were enforced. Fixed: BudgetGuard now checks all four ceilings, with
+    dailyUsd/monthlyUsd computed as real UTC-calendar-period windows via
+    CostEngine.totalInWindow(), scoped by projectId when given. Test
+    coverage added: same-period blocking, boundary (exactly-at-ceiling
+    allowed, one cent over blocked), rollover (a new UTC day/month resets
+    the ceiling even though lifetime spend is far higher, verified with an
+    injectable clock rather than waiting on real time), per-project
+    scoping, a synchronous-burst test demonstrating the check-then-record
+    sequence has no `await` between the two steps (so no interleaved call
+    can race past the ceiling), and an AuditLog integration recording both
+    allowed and blocked budget checks as durable, hash-chained evidence
+    (BudgetGuard's optional third/fourth constructor params: `now` and
+    `auditLog`).
+
+    BLOCKER fix (Codex, 2nd round): assertWithinBudget() checked the
+    projected amount against ceilings arithmetically but never validated
+    that the amount (or the configured limits themselves) were finite and
+    non-negative — a NaN or negative projectedAmountUsd, or a NaN/negative
+    limit, could bypass every ceiling check (NaN comparisons are always
+    false; a negative amount can manufacture headroom). Fixed:
+    assertWithinBudget() now calls assertValidMonetaryAmount() on the
+    projected amount before any ceiling check, failing closed (throwing
+    InvalidMonetaryAmountError, logging BUDGET_INVALID_AMOUNT_REJECTED to
+    the audit trail) without mutating any state; the BudgetGuard
+    constructor now validates all four limits (perTaskUsd, perRunUsd,
+    dailyUsd, monthlyUsd) via a new assertValidLimit() helper, throwing
+    InvalidBudgetLimitError for NaN/Infinity/-Infinity/negative ceilings.
+    Regression tests added for: NaN/Infinity/-Infinity/negative spend
+    amounts (each leaves total spend at 0, not NaN), a negative amount
+    failing to manufacture headroom, correct enforcement continuing after
+    a rejected invalid spend, NaN/Infinity/-Infinity/negative limits
+    rejected at construction for all four ceiling kinds, a direct
+    CostEngine.record() bypass still being protected by CostEngine's own
+    validation (see UASF-REQ-0029), an exact-boundary-vs-just-over-boundary
+    test, and an audit-log assertion that a rejected invalid amount is
+    recorded as BUDGET_INVALID_AMOUNT_REJECTED.
+
+- id: UASF-REQ-0031
+  title: Worker registry (foundation)
+  description: Register worker classes (linux-general, gpu, macos, ...) with capability metadata; select smallest sufficient worker.
+  source_baseline: "BASELINE-V1 section 82, 83, 306 (Proof H)"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/workers/registry.ts"
+  test_refs:
+    - "runtime/workers/__tests__/registry.test.ts"
+  proof_refs:
+    - "proofs/smallest-sufficient-worker/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0032
+  title: Scheduler (foundation)
+  description: Resource-aware task-to-worker assignment favoring the smallest sufficient worker.
+  source_baseline: "BASELINE-V1 section 83"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/scheduler/scheduler.ts"
+  test_refs:
+    - "runtime/scheduler/__tests__/scheduler.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0033
+  title: Sandbox (foundation)
+  description: Path confinement / timeout / output-limit contract for executed actions.
+  source_baseline: "BASELINE-V1 section 87"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/sandbox/sandbox.ts"
+  test_refs:
+    - "runtime/sandbox/__tests__/sandbox.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Path-traversal confinement (assertWithinRoot) and a promise timeout wrapper (withTimeout) only; command controls, output limits, and environment filtering are not yet implemented."
+
+- id: UASF-REQ-0034
+  title: Project isolation (foundation)
+  description: Cross-project default-deny isolation of filesystem/state/budget/artifacts.
+  source_baseline: "BASELINE-V1 section 86"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/project-isolation/isolation.ts"
+  test_refs:
+    - "runtime/project-isolation/__tests__/isolation.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Default-deny keyed store proven for the data-access case; filesystem/worker-level isolation is not yet wired to this abstraction."
+
+- id: UASF-REQ-0035
+  title: Event-driven agent activation
+  description: >
+    Agents/workflows activate only on relevant events (not continuous
+    polling) and do not consume resources while idle.
+  source_baseline: "BASELINE-V1 section 41, 75, 306 (Proof F/I)"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/event-bus/event-bus.ts"
+  test_refs:
+    - "runtime/event-bus/__tests__/event-bus.test.ts"
+  proof_refs:
+    - "proofs/event-driven-activation/proof.test.ts"
+  security_refs: []
+
+- id: UASF-REQ-0036
+  title: Cache / reuse layer
+  description: >
+    Before recomputation, check durable cache for still-valid prior results
+    and reuse them instead of recomputing.
+  source_baseline: "BASELINE-V1 section 77, 78, 306 (Proof G)"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/cache/cache.ts"
+    - "runtime/cache/file-cache.ts"
+    - "runtime/state/file-store.ts"
+  test_refs:
+    - "runtime/cache/__tests__/cache.test.ts"
+    - "runtime/cache/__tests__/file-cache.test.ts"
+  proof_refs:
+    - "proofs/cache-reuse/proof.test.ts"
+  security_refs: []
+  notes: >
+    P2 finding (Codex, 2nd round): the description says "durable cache",
+    but the only implementation was runtime/cache/cache.ts, an in-memory
+    Map — proving same-process reuse, not restart durability. PROOF_VERIFIED
+    was overstated relative to that evidence.
+
+    Fixed via option (A): added runtime/cache/file-cache.ts, a FileCache<T>
+    backed by the existing StateStore/FileStateStore infrastructure (same
+    interface as runtime/state/file-store.ts used for project state) —
+    every set() persists the full entry map to a JSON file, and every
+    get()/size() reads it back from disk, so no shared in-memory reference
+    is required across instances. Restart-recovery proof added in
+    proofs/cache-reuse/proof.test.ts: a FileCache+FileStateStore instance
+    computes and persists a result inside a block scope and is then
+    discarded (no reference retained), and a SECOND, independently
+    constructed FileCache+FileStateStore instance pointed at the same file
+    path reuses the persisted result without recomputation — genuinely
+    proving restart durability, not same-instance reuse. Equivalent
+    restart-recovery tests also added directly in
+    runtime/cache/__tests__/file-cache.test.ts (including expired-entry
+    and size() cases across the simulated restart). The original in-memory
+    Cache remains available for callers that explicitly do not need
+    cross-process durability (e.g. the cache-reuse proof's original
+    same-process test).
+
+- id: UASF-REQ-0037
+  title: Service / integration catalog foundation
+  description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
+  source_baseline: "BASELINE-V1 section 97, 126"
+  category: P0
+  priority: LOW
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/service-catalog/service-catalog.ts"
+  test_refs:
+    - "runtime/service-catalog/__tests__/service-catalog.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: "Includes findUnowned() enforcing baseline section 127 (every service should have a recorded owner); in-memory only, no real CMDB integration."
+
+- id: UASF-REQ-0038
+  title: Logging / telemetry foundation
+  description: >
+    Structured logging with the recommended field set, never logging
+    secrets or unnecessary PII.
+  source_baseline: "BASELINE-V1 section 124, 125"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/telemetry/logger.ts"
+  test_refs:
+    - "runtime/telemetry/__tests__/logger.test.ts"
+  proof_refs: []
+  security_refs:
+    - "SECURITY.md"
+
+- id: UASF-REQ-0039
+  title: Turkish source code explanation standard
+  description: >
+    Important classes/functions/security-sensitive logic carry concise
+    Turkish "why" comments, per the mandatory Turkish Source Code Explanation
+    Policy.
+  source_baseline: "BASELINE-V1 section 281, 285"
+  category: P0
+  priority: HIGH
+  status: IMPLEMENTATION_IN_PROGRESS
+  implementation_refs:
+    - "runtime/policy-engine/policy-engine.ts"
+    - "runtime/models/router.ts"
+    - "runtime/budget/budget.ts"
+  test_refs: []
+  proof_refs: []
+  security_refs: []
+  notes: "Applied to P0 kernel modules implemented this session; broader repo-wide coverage is ongoing."
+
+- id: UASF-REQ-0040
+  title: Factory Doctor
+  description: "`factory doctor` checks Node/npm/Python/Git and reports READY/MISSING/OPTIONAL/BLOCKING/HUMAN_ACTION_REQUIRED per tool."
+  source_baseline: "BASELINE-V1 section 80"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/cli/commands/doctor.ts"
+  test_refs:
+    - "runtime/cli/__tests__/doctor.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0041
+  title: Baseline status command
+  description: "`factory baseline status` computes requirement counts by status from the requirement registry (not prose claims)."
+  source_baseline: "BASELINE-V1 section 296"
+  category: P0
+  priority: HIGH
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/cli/commands/baseline-status.ts"
+  test_refs:
+    - "runtime/cli/__tests__/baseline-status.test.ts"
+  proof_refs: []
+  security_refs: []
+
+- id: UASF-REQ-0042
+  title: P0 end-to-end proof
+  description: >
+    A single test run demonstrating the P0 kernel invariants together:
+    cheapest-capable routing, premium-fallback block, budget ceiling,
+    event-driven activation, and cache reuse, in one coherent scenario.
+    Extended by proofs/p0-integrated-flow to also prove the foundation
+    modules are wired together, not just independently correct: real
+    requirement-registry traceability gates a validated Project Genome,
+    which drives the Organization Composer, which is persisted alongside
+    a Capability-Gateway-authorized Project OS scaffold, cheapest-capable
+    model routing, and durable state — all readable back after a
+    simulated process restart.
+  source_baseline: "BASELINE-V1 section 304, 305, 306"
+  category: P0
+  priority: HIGH
+  status: PROOF_VERIFIED
+  implementation_refs:
+    - "runtime/project-lifecycle/orchestrator.ts"
+  test_refs:
+    - "proofs/e2e-p0-kernel/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  proof_refs:
+    - "proofs/e2e-p0-kernel/proof.test.ts"
+    - "proofs/p0-integrated-flow/proof.test.ts"
+  security_refs: []

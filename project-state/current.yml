@@ -1,0 +1,230 @@
+# Durable session state (baseline section 277). This file lets a future
+# session resume without repeating already-completed, verified work. It
+# should be updated at the end of any session that changes the P0 kernel's
+# scope, and read at the start of the next one.
+
+factory:
+  branch: claude/ai-factory-baseline-v1-seawq7
+  phase: P0_FACTORY_KERNEL
+  pull_request: https://github.com/SalimBurakAytemiz/UNIVERSAL-AI-SOFTWARE-FACTORY/pull/1
+  p0_status: >
+    NOT complete. Explicit Founder instruction: do not move to P1, do not
+    mark P0 complete, until an independent review finds no blocking P0
+    finding. A first independent Codex review against main found 4 blocking
+    findings; all 4 were fixed and confirmed fixed by a second Codex
+    re-review. That SAME second re-review found 4 NEW findings (1 BLOCKER,
+    3 P2); all 4 are fixed in this session (see below), fully verified, and
+    pushed for a third re-review. P0 remains open until that re-review
+    comes back clean.
+
+completed_milestones:
+  - Existing public repository audited; Baseline V1 specification preserved
+    verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
+    and verified against commit 8641c70.
+  - Baseline Requirement Registry (42 requirements), P0 Factory Kernel core,
+    foundation modules (Project OS, Genome, Discovery, Decision Ledger,
+    Assumption Register, Technology/Business-Capability registries,
+    Organization Composer, Capability Gateway, Sandbox, Project Isolation,
+    Requirements Traceability, Artifact registry, Service catalog), and an
+    integrated bootstrap pipeline (Genome -> Organization -> Project OS ->
+    Policy -> Routing -> durable State) — see prior entries in this file's
+    git history for full detail.
+  - |-
+    THIS SESSION — fixed 4 blocking findings from an independent Codex
+    review of the branch against main:
+    - [P1] Daily/monthly budget limits were defined but never enforced.
+      Fixed: runtime/budget/budget.ts now checks dailyUsd/monthlyUsd as
+      real UTC-calendar-period windows via a new
+      runtime/cost/cost-engine.ts method (totalInWindow), scoped by
+      projectId when given. CostEngine and BudgetGuard both take an
+      injectable clock so tests can simulate day/month rollover without
+      waiting on real time. Added: same-period blocking, exact-boundary
+      test, rollover tests (day and month), per-project scoping, a
+      synchronous-burst concurrency test, and AuditLog integration
+      recording every allowed/blocked budget check as durable evidence.
+    - [P1] Secret scanning only checked currently tracked files, not git
+      history — a secret committed and later deleted would stay exposed
+      in the public repo's history while UASF-REQ-0002 claimed
+      PROOF_VERIFIED. Fixed: scripts/secret-scan.mjs gained
+      scanGitHistory()/listHistoricalBlobs(), scanning every unique blob
+      reachable from any ref (git rev-list --objects --all), deduped by
+      content hash. Tested against a real temporary git repo: a secret
+      committed then `git rm`-deleted is still found; redaction verified
+      (finding objects never carry the actual secret value); one
+      pre-existing historical finding from before the `secret-scan:allow`
+      marker existed (commit 981f0a4) is resolved via a minimal, exact
+      (blob sha + line + pattern) baseline rather than rewriting public
+      git history.
+    - [P1] Model escalation (runtime/models/router.ts routeAndExecute) was
+      computed from the risk-derived minimum tier (requiredTier) instead
+      of the tier of the model actually selected. When a capability
+      requirement forced a pricier model than the risk floor demanded,
+      "escalation" could re-select the same model. Fixed: escalation now
+      starts from initialDecision.model.tier. Regression tests construct a
+      registry where only STANDARD/PREMIUM support a capability at risk 0
+      and assert escalation lands on PREMIUM, not a re-selected STANDARD;
+      confirmed the new tests fail against the pre-fix code and pass
+      against the fix (verified by temporarily reverting router.ts).
+    - [P2] scripts/secret-scan.mjs wholesale-excluded
+      tests/secret-scan.test.mjs (and itself) from scanning by file path,
+      creating a blind spot for any real credential pasted anywhere else
+      in that file. Fixed: ALLOWLIST_SUBSTRINGS is now empty; only the
+      per-line `secret-scan:allow` marker can suppress a finding.
+      Regression tests prove an unmarked, real-looking credential placed
+      in either file's path is still detected.
+  - >-
+    Requirement registry updated only from this real evidence: UASF-REQ-0002
+    (secret scan), UASF-REQ-0022 (audit log), UASF-REQ-0027/0028 (router),
+    UASF-REQ-0029/0030 (cost/budget) all carry updated implementation_refs/
+    test_refs/notes describing exactly what changed and why. No status was
+    raised without a corresponding real test.
+  - 164/164 tests passing (up from 142); lint/typecheck/build/validate-
+    requirements/secret-scan (now history-aware) all clean;
+    `factory trace requirement` reports zero issues.
+  - |-
+    THIS SESSION (round 2) — a second independent Codex review confirmed
+    all 4 findings above were genuinely fixed, then found 4 NEW findings
+    on the resulting branch. All 4 are now fixed:
+    - [BLOCKER] Budget enforcement could be bypassed with NaN/Infinity/
+      negative monetary values (both a projected spend amount and a
+      configured ceiling). Fixed: added exported
+      assertValidMonetaryAmount() (runtime/cost/cost-engine.ts) rejecting
+      non-finite and negative amounts; CostEngine.record() now calls it
+      before mutating state, protecting even direct record() calls that
+      bypass BudgetGuard entirely. BudgetGuard.assertWithinBudget() now
+      validates the projected amount first (fail closed, logs
+      BUDGET_INVALID_AMOUNT_REJECTED to the audit trail, no state
+      mutated) before any ceiling check, and the constructor validates
+      all four limits (perTaskUsd/perRunUsd/dailyUsd/monthlyUsd) via a
+      new assertValidLimit(), throwing InvalidBudgetLimitError for
+      NaN/Infinity/-Infinity/negative ceilings. Regression tests added
+      for NaN/Infinity/-Infinity/negative spend amounts and limits (all
+      four ceiling kinds), a negative amount failing to manufacture
+      headroom, enforcement continuing correctly after a rejected invalid
+      spend, a direct CostEngine.record() bypass, an exact-boundary vs.
+      just-over-boundary case, and an audit-log assertion for the
+      rejection event.
+    - [P2] The risk-5 "requires approval" upgrade could override an
+      explicit DENY, because the built-in risk-5 rule ran first (highest
+      priority) in runtime/policy-engine/policy-engine.ts and evaluate()
+      stopped at the first matching rule. Fixed: the risk-5 upgrade is no
+      longer a pre-seeded rule; evaluate() now runs all registered rules,
+      tracks whether an explicit rule matched, and only applies the
+      risk-5 upgrade when the result is not an explicit DENY (an
+      unmatched default-deny remains eligible, preserving "unaddressed
+      risk-5 still requires approval"). Regression tests prove: explicit
+      DENY+risk-5 stays DENY, a MAX_SAFE_INTEGER-priority DENY+risk-5
+      stays DENY, DENY beats a lower-priority ALLOW rule, an
+      otherwise-ALLOWED risk-5 action still requires approval, a
+      default-deny risk-5 action still requires approval, and risk-5
+      never weakens an existing APPROVAL_REQUIRED back toward ALLOW.
+      Confirmed via git-stash that these tests fail on the pre-fix code.
+    - [P2] Fallback (escalated) model output in
+      runtime/models/router.ts routeAndExecute bypassed validation
+      entirely — the escalated response was invoked but never passed
+      through the caller's validate() function, so an invalid response
+      from a pricier model could be returned as if trusted. Fixed:
+      routeAndExecute now validates every candidate, including every
+      escalation step, in a bounded loop over the tier order; reaching
+      the top tier (CRITICAL_REVIEW) and still failing validation now
+      throws a new EscalationExhaustedError (fail closed) instead of
+      returning unvalidated output. Regression tests added: primary
+      fails/first escalation passes (validated in order), all tiers fail
+      -> EscalationExhaustedError with every tier validated exactly once,
+      an invalid PREMIUM fallback cannot be accepted merely for being
+      pricier, and premium-fallback-off still blocks after exactly one
+      validate call. Confirmed via git-stash that these tests fail on the
+      pre-fix code.
+    - [P2] UASF-REQ-0036 ("durable cache") was PROOF_VERIFIED against an
+      in-memory-Map-only implementation (runtime/cache/cache.ts), which
+      only proves same-process reuse, not restart durability. Fixed via
+      genuine persistence (not a status downgrade): added
+      runtime/cache/file-cache.ts (FileCache<T>), backed by the existing
+      StateStore/FileStateStore infrastructure — every set() persists the
+      full entry map to a JSON file; every get()/size() reads it back
+      from disk. Added a restart-recovery proof
+      (proofs/cache-reuse/proof.test.ts and
+      runtime/cache/__tests__/file-cache.test.ts): a FileCache instance
+      computes and persists a result inside a block scope and is
+      discarded (no reference kept), then a SECOND, independently
+      constructed FileCache+FileStateStore instance pointed at the same
+      file path reuses the persisted result without recomputation —
+      proving restart durability rather than same-instance reuse.
+  - >-
+    Requirement registry updated again from this round's real evidence:
+    UASF-REQ-0018 (policy engine — DENY-always-wins), UASF-REQ-0027/0028
+    (router — fallback validation), UASF-REQ-0029 (cost engine — monetary
+    validation), UASF-REQ-0030 (budget engine — monetary/limit
+    validation), UASF-REQ-0036 (cache — added file-cache.ts as
+    implementation/test evidence, kept PROOF_VERIFIED now that a genuine
+    restart-recovery proof exists). No status raised beyond what a real
+    test/proof supports.
+  - 202/202 tests passing (up from 194 after round 1, then +8 this round);
+    lint/typecheck/build/validate-requirements/secret-scan (history-aware)
+    all clean.
+
+known_limitations:
+  - >-
+    Only ONE integrated pipeline exists (project bootstrap: Genome ->
+    Organization -> Project OS -> Policy -> Routing -> State). Discovery
+    engine, Decision Ledger, Assumption Register, Technology/Business-
+    Capability registries, Sandbox, Artifact registry, Service catalog,
+    Worker Scheduler are evidence-backed individually but not yet wired
+    into that same pipeline.
+  - Persistence is JSON-file-based (runtime/state/file-store.ts), not
+    SQLite as baseline section 275 suggests as the initial candidate.
+  - No real model provider adapters — only MockProvider (intentional at P0).
+  - Budget daily/monthly windows are UTC-calendar-based (not configurable
+    timezone or rolling-window); documented as a deliberate simplicity
+    choice, not a hidden gap.
+  - >-
+    Git-history secret scanning requires a non-shallow clone (CI already
+    uses fetch-depth: 0 in both jobs); a shallow clone would silently see
+    less history — this is reported via the "unique historical blobs
+    scanned" count in the scan output, not hidden, but there's no explicit
+    assertion in CI that the clone is actually non-shallow.
+  - No LICENSE file — LICENSE_DECISION_REQUIRED (baseline section 206).
+  - CI pins GitHub Actions by version tag, not commit SHA. No automated
+    dependency/SBOM/SCA scanning wired into CI yet.
+
+blockers:
+  - >-
+    Awaiting a THIRD independent (Codex) re-review of the pushed fixes
+    (round 2's 4 new findings — 1 BLOCKER, 3 P2 — are now fixed, tested,
+    and verified per the full required sequence: lint, typecheck, build,
+    202/202 tests, validate:requirements, history-aware secret-scan, all
+    P0 proofs). Per explicit instruction: "stop at the independent-review
+    boundary" — do not push further P0 feature work, and do not declare
+    P0 complete, until that re-review confirms no blocking finding
+    remains.
+
+governance_decision_recorded: >
+  A request (received three times, with increasing detail) to implement
+  autonomous PR-merge authority into main — including a variant using a
+  second "independent reviewer" AI session — was declined. Rationale: a
+  second AI session instructed by the same author is not genuine
+  independent review; merging into a public repo's main branch is a
+  human decision; it would contradict this codebase's own enforced rules
+  ("implementation author cannot be the final reviewer," "human final
+  control"). This was also put to the Founder via a direct question,
+  which was dismissed without selecting an option. Routine work (branches,
+  commits, pushes, opening/updating PRs, fixing CI, resolving ordinary
+  conflicts) continues without asking each time. Do not re-implement
+  autonomous merge authority without an explicit, freshly-stated Founder
+  decision.
+
+exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fixes for round 2's 4 Codex findings (1 BLOCKER + 3 P2) are implemented,
+  tested, and pushed, with the full required verification sequence run
+  clean (lint, typecheck, build, 202/202 tests, validate:requirements,
+  history-aware secret-scan, all P0 proofs including a genuine
+  restart-recovery proof for the cache). Do not proceed to further P0
+  feature work or declare P0 complete until an independent (Codex)
+  re-review of this diff confirms no blocking P0 finding remains. If/when
+  that comes back clean, resume from the prior exact_next_action: wire the
+  remaining foundation modules (Discovery, Decisions, Assumptions,
+  Technology/Business-Capability registries) into the same integrated
+  pipeline, consider a SQLite-backed StateStore, get a Founder decision on
+  P0-sufficiency and licensing (section 206). The autonomous-merge
+  governance question stays closed absent new Founder-initiated context.
