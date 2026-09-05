@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AssumptionRegister, FounderConfirmationRequiredError } from "../assumption-register.js";
+import { AssumptionRegister, DuplicateAssumptionIdError, FounderConfirmationRequiredError } from "../assumption-register.js";
 import { FileStateStore } from "../../state/file-store.js";
 
 describe("AssumptionRegister", () => {
@@ -105,6 +105,72 @@ describe("AssumptionRegister", () => {
       }).toThrow(TypeError);
 
       expect(register.get("a1")!.status).toBe("PROPOSED");
+    });
+  });
+
+  describe("P2 targeted-audit fix (7th independent review round, same class as 'duplicate approval IDs replace authoritative history')", () => {
+    it("rejects a second propose() with the same id while the first is still PROPOSED", () => {
+      const register = new AssumptionRegister();
+      register.propose({ id: "dup-1", description: "original", reason: "r", impact: "LOW", source: "s" });
+      expect(() =>
+        register.propose({ id: "dup-1", description: "replacement", reason: "r", impact: "LOW", source: "s" })
+      ).toThrow(DuplicateAssumptionIdError);
+      expect(register.get("dup-1")!.description).toBe("original");
+    });
+
+    it("BLOCKER regression: propose() cannot silently erase a Founder-confirmed HIGH-impact assumption's confirmation history", () => {
+      const register = new AssumptionRegister();
+      register.propose({
+        id: "dup-2",
+        description: "Store card numbers in plaintext for speed",
+        reason: "r",
+        impact: "HIGH",
+        source: "s"
+      });
+      register.accept("dup-2", "founder@example.com");
+
+      expect(() =>
+        register.propose({ id: "dup-2", description: "sneaky replacement", reason: "r", impact: "HIGH", source: "s" })
+      ).toThrow(DuplicateAssumptionIdError);
+
+      const stillAuthoritative = register.get("dup-2")!;
+      expect(stillAuthoritative.status).toBe("ACCEPTED");
+      expect(stillAuthoritative.confirmedBy).toBe("founder@example.com");
+      expect(stillAuthoritative.description).toBe("Store card numbers in plaintext for speed");
+    });
+
+    it("a rejected duplicate propose() cannot be used to bypass the Founder-confirmation gate on a fresh PROPOSED record", () => {
+      const register = new AssumptionRegister();
+      register.propose({ id: "dup-3", description: "original HIGH assumption", reason: "r", impact: "HIGH", source: "s" });
+      register.accept("dup-3", "founder@example.com");
+
+      expect(() =>
+        register.propose({ id: "dup-3", description: "attacker replacement", reason: "r", impact: "HIGH", source: "s" })
+      ).toThrow(DuplicateAssumptionIdError);
+
+      // The record is still the original, already-confirmed one — there is
+      // no unconfirmed PROPOSED record left to accept() without a founder.
+      expect(register.get("dup-3")!.status).toBe("ACCEPTED");
+    });
+
+    it("distinct ids remain independent — the duplicate-id guard does not cross-contaminate", () => {
+      const register = new AssumptionRegister();
+      register.propose({ id: "dup-4-a", description: "A", reason: "r", impact: "LOW", source: "s" });
+      register.propose({ id: "dup-4-b", description: "B", reason: "r", impact: "LOW", source: "s" });
+      expect(register.get("dup-4-a")!.description).toBe("A");
+      expect(register.get("dup-4-b")!.description).toBe("B");
+    });
+
+    it("the DuplicateAssumptionIdError message names the offending id", () => {
+      const register = new AssumptionRegister();
+      register.propose({ id: "dup-5", description: "d", reason: "r", impact: "LOW", source: "s" });
+      try {
+        register.propose({ id: "dup-5", description: "d2", reason: "r", impact: "LOW", source: "s" });
+        throw new Error("expected propose() to throw");
+      } catch (err) {
+        expect(err).toBeInstanceOf(DuplicateAssumptionIdError);
+        expect((err as Error).message).toContain("dup-5");
+      }
     });
   });
 });

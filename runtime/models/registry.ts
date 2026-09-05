@@ -4,6 +4,7 @@
 // gerektirmemelidir.
 
 import { freezeRecord } from "../util/immutable.js";
+import { assertValidMonetaryAmount } from "../cost/cost-engine.js";
 
 export type ModelTier =
   | "MOCK"
@@ -63,6 +64,16 @@ export class ModelRegistry {
   private readonly models: ModelRecord[] = [];
 
   register(model: ModelRecord): void {
+    // P2 fix (7th independent review round, "invalid model prices corrupt
+    // cheapest-capable routing"): önceden `costPerCall` HİÇ doğrulanmadan
+    // kabul ediliyordu. `NaN`, "en ucuz" karşılaştırmalarında (`x < NaN`,
+    // `NaN < x`) HER ZAMAN false döndüğü için önce kaydedilen (genellikle
+    // premium) adayın hiç elenmemesine yol açar — sessizce yanlış modelin
+    // seçilmesine (bölüm 60/61 ihlali). Merkezi doğrulayıcı
+    // (`assertValidMonetaryAmount`, cost-engine.ts) BURADA da kullanılır —
+    // ayrı/farklı bir kural icat edilmez — ve reddedilen bir kayıt asla
+    // `this.models` dizisine ULAŞMAZ (fail closed, mutasyondan önce kontrol).
+    assertValidMonetaryAmount(model.costPerCall, `ModelRegistry.register(modelId=${model.modelId})`);
     this.models.push(freezeRecord({ ...model }));
   }
 

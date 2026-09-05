@@ -42,6 +42,31 @@ export class FounderConfirmationRequiredError extends Error {
   }
 }
 
+/**
+ * P2 fix (7th independent review round targeted audit, same class as
+ * "duplicate approval IDs replace authoritative history" — approval.ts):
+ * propose() eskiden `this.assumptions.set(input.id, assumption)` çağrısını
+ * KOŞULSUZ yapıyordu. Bir çağıran, HALİHAZIRDA Kurucu tarafından onaylanmış
+ * (ACCEPTED, `confirmedBy` dolu) HIGH-impact bir varsayım için AYNI id ile
+ * tekrar propose() çağırarak, onu sessizce taze bir PROPOSED kayıtla
+ * DEĞİŞTİREBİLİR ve ardından `confirmedBy` OLMADAN kabul edilebilir bir
+ * duruma sokabilirdi — bölüm 47'nin "High-impact assumptions require
+ * Founder confirmation" değişmezini tamamen ATLATAN bir yol. Artık aynı id
+ * ile ikinci bir propose() çağrısı, mevcut kaydın durumu ne olursa olsun,
+ * mutasyondan ÖNCE reddedilir (fail closed) — approval.ts'teki
+ * DuplicateApprovalIdError ile AYNI desen.
+ */
+export class DuplicateAssumptionIdError extends Error {
+  constructor(id: string) {
+    super(
+      `Assumption id '${id}' already exists. Assumption ids are permanent, unique authoritative ` +
+        `identifiers and can never be reused or silently overwritten, regardless of the existing ` +
+        `record's current status — propose a new, distinct id for a new assumption.`
+    );
+    this.name = "DuplicateAssumptionIdError";
+  }
+}
+
 export interface ProposeAssumptionInput {
   readonly id: string;
   readonly description: string;
@@ -63,6 +88,9 @@ export class AssumptionRegister {
   private readonly assumptions = new Map<string, MutableAssumption>();
 
   propose(input: ProposeAssumptionInput): Assumption {
+    if (this.assumptions.has(input.id)) {
+      throw new DuplicateAssumptionIdError(input.id);
+    }
     const assumption: MutableAssumption = { ...input, status: "PROPOSED", createdAt: new Date().toISOString() };
     this.assumptions.set(input.id, assumption);
     return freezeRecord(assumption);

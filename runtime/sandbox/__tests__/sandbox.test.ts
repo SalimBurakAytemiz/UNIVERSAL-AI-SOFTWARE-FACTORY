@@ -1,8 +1,9 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  HardLinkAliasError,
   InvalidProjectIdError,
   PathEscapeError,
   SandboxTimeoutError,
@@ -11,6 +12,22 @@ import {
   assertWithinRoot,
   withTimeout
 } from "../sandbox.js";
+
+/**
+ * Hard link creation can fail across filesystem boundaries (EXDEV) or on
+ * platforms/filesystems that don't support it — an honestly-documented
+ * platform limitation (see assertNoHardLinkAlias's own doc comment in
+ * sandbox.ts). Skip rather than fail on an environment limitation unrelated
+ * to the code under test.
+ */
+function tryLink(existingPath: string, newPath: string): boolean {
+  try {
+    linkSync(existingPath, newPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Symlink creation can require elevated privileges on some Windows
@@ -339,6 +356,111 @@ describe("assertFilesystemConfinement (P1 fix: real filesystem-aware confinement
         expect(() => assertFilesystemConfinement(tempRoot, "dangling-link")).toThrow(PathEscapeError);
       }
       rmSync(outside, { recursive: true, force: true });
+    });
+  });
+
+  describe("P1 fix (7th independent review round, 'static hard-link aliases permit cross-project overwrites')", () => {
+    it("blocks writing through a destination that is a hard link to another (project B's) authoritative file", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-"));
+      const projectBFile = join(tempRoot, "project-b-genome.json");
+      writeFileSync(projectBFile, JSON.stringify({ owner: "B" }));
+      const projectAFile = join(tempRoot, "project-a-genome.json");
+
+      if (!tryLink(projectBFile, projectAFile)) return;
+
+      expect(() => assertFilesystemConfinement(tempRoot, "project-a-genome.json")).toThrow(HardLinkAliasError);
+    });
+
+    it("REPRODUCTION: project A's destination hard-linked to project B's existing genome.json — bootstrapping A never overwrites B's authoritative content", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-repro-"));
+      const projectBDir = join(tempRoot, "project-b");
+      mkdirSync(projectBDir);
+      const projectBGenome = join(projectBDir, "genome.json");
+      writeFileSync(projectBGenome, JSON.stringify({ projectId: "B", authoritative: true }));
+
+      const projectADir = join(tempRoot, "project-a");
+      mkdirSync(projectADir);
+      const projectAGenome = join(projectADir, "genome.json");
+
+      if (!tryLink(projectBGenome, projectAGenome)) return;
+
+      // Simulates bootstrapProject("A") attempting to write its own genome
+      // at what it believes is its own, exclusively-owned destination.
+      expect(() => assertFilesystemConfinement(projectADir, "genome.json")).toThrow(HardLinkAliasError);
+
+      // B's authoritative content must never have been touched.
+      expect(JSON.parse(readFileSync(projectBGenome, "utf8"))).toEqual({ projectId: "B", authoritative: true });
+    });
+
+    it("does not reject a brand-new destination that does not exist yet (no false positive on ordinary first-time creation)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-new-"));
+      expect(() => assertFilesystemConfinement(tempRoot, "brand-new-file.json")).not.toThrow();
+    });
+
+    it("does not reject an ordinary, singly-linked existing file (no false positive on legitimate re-writes)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-normal-"));
+      writeFileSync(join(tempRoot, "state.json"), "{}");
+      expect(() => assertFilesystemConfinement(tempRoot, "state.json")).not.toThrow();
+    });
+
+    it("does not reject an existing plain directory destination (hard-link aliasing check is file-scoped; POSIX directories cannot be hard-linked)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-dir-"));
+      mkdirSync(join(tempRoot, "project-subdir"));
+      expect(() => assertFilesystemConfinement(tempRoot, "project-subdir")).not.toThrow();
+    });
+
+    it("once the extra hard link is removed (back to nlink 1), the same destination is accepted again", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-recover-"));
+      const original = join(tempRoot, "shared-origin.json");
+      writeFileSync(original, "{}");
+      const aliasPath = join(tempRoot, "alias.json");
+
+      if (!tryLink(original, aliasPath)) return;
+
+      expect(() => assertFilesystemConfinement(tempRoot, "alias.json")).toThrow(HardLinkAliasError);
+
+      unlinkSync(original); // only one directory entry (alias.json) remains -> nlink back to 1
+      expect(() => assertFilesystemConfinement(tempRoot, "alias.json")).not.toThrow();
+    });
+
+    it("the HardLinkAliasError message names the destination path and reports the link count", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-msg-"));
+      const original = join(tempRoot, "origin.json");
+      writeFileSync(original, "{}");
+      const aliasPath = join(tempRoot, "alias.json");
+
+      if (!tryLink(original, aliasPath)) return;
+
+      try {
+        assertFilesystemConfinement(tempRoot, "alias.json");
+        throw new Error("expected assertFilesystemConfinement to throw");
+      } catch (err) {
+        expect(err).toBeInstanceOf(HardLinkAliasError);
+        expect((err as Error).message).toContain("alias.json");
+        expect((err as Error).message).toMatch(/\b2\b/); // nlink count is reported
+      }
+    });
+
+    it("hard-link detection does not weaken existing symlink escape protection (both checks remain active)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-symlink-"));
+      const outside = mkdtempSync(join(tmpdir(), "uasf-hardlink-symlink-outside-"));
+      const linkPath = join(tempRoot, "evil-project");
+
+      if (!trySymlink(outside, linkPath)) {
+        rmSync(outside, { recursive: true, force: true });
+        return;
+      }
+
+      expect(() => assertFilesystemConfinement(tempRoot, "evil-project")).toThrow(PathEscapeError);
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    it("hard-link detection does not weaken the project-root alias (in-baseDir symlink) protection", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-hardlink-alias-"));
+      mkdirSync(join(tempRoot, "B"));
+      if (!trySymlink(join(tempRoot, "B"), join(tempRoot, "A"))) return;
+
+      expect(() => assertFilesystemConfinement(tempRoot, "A")).toThrow(PathEscapeError);
     });
   });
 });

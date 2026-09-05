@@ -31,9 +31,21 @@ factory:
     credential-key redaction in the logger, and a prototype-unsafe cache
     key implementation), plus a narrow targeted audit for those same 3
     classes that found and fixed one more genuine instance (the logger's
-    own dictionary-building loop had the same prototype-key issue). All
-    findings are fixed in this session (see below), fully verified, and
-    pushed for a seventh re-review. P0 remains open until that re-review
+    own dictionary-building loop had the same prototype-key issue); round 7
+    confirmed all prior fixes but reproduced 4 NEW findings on b75abe4 (a
+    static hard-link filesystem alias the round-6 symlink-only confinement
+    check structurally cannot detect, a policy-engine early-break that let
+    a higher-priority ALLOW rule skip evaluating a matching lower-priority
+    DENY rule, duplicate approval IDs silently replacing authoritative
+    (including EXECUTED) approval history, and unvalidated model registry
+    prices letting a NaN-priced candidate corrupt cheapest-capable
+    selection), plus a narrow targeted audit for those same 4 classes that
+    found and fixed two more genuine instances (assumption-register.ts had
+    the identical duplicate-id history-erasure bug bypassing its
+    Founder-confirmation gate; workers/registry.ts had the identical
+    unvalidated-price bug feeding scheduler.ts's cheapest-worker reduce).
+    All findings are fixed in this session (see below), fully verified, and
+    pushed for an eighth re-review. P0 remains open until that re-review
     comes back clean.
 
 completed_milestones:
@@ -626,6 +638,146 @@ completed_milestones:
     secret-scan (history-aware) all clean; every fix confirmed via
     git-stash to have failing regression tests against its pre-fix code,
     then passing again with the fix restored.
+  - |-
+    THIS SESSION (round 7) — a seventh independent Codex review confirmed
+    the round-6 fixes (project-root symlink alias, credential-key
+    redaction, prototype-safe cache keys, plus every earlier ownership/
+    policy/approval/budget fix), then reproduced 4 NEW findings on commit
+    b75abe4, plus asked for a narrow targeted audit for those same 4
+    classes. All findings fixed:
+    - [P1] "Static hard-link aliases permit cross-project overwrites":
+      Codex reproduced project B already having genome/organization/
+      bootstrap-state files, project A's corresponding destination files
+      being HARD-LINKED (not symlinked) to B's files, and
+      bootstrapProject(A) silently overwriting B's authoritative content —
+      no race required. Every prior confinement layer (assertWithinRoot,
+      canonicalizeNearestExisting, the round-6 lexical-vs-real relative-
+      path equality check) reasons about a symlink REDIRECTING one path to
+      another; a hard link has no such redirection to detect — two
+      hard-linked paths are independent directory entries to the same
+      inode, each resolving to ITSELF via realpathSync. Fixed in
+      runtime/sandbox/sandbox.ts: assertFilesystemConfinement() now also
+      runs a new, orthogonal assertNoHardLinkAlias() check — if the
+      resolved destination already exists as a regular file with
+      `lstatSync(path).nlink > 1`, the write is rejected (new
+      HardLinkAliasError) before any mutation, since exclusive ownership
+      of a multiply-linked file cannot be proven; the check only fires for
+      already-existing regular files, so new destinations and directories
+      (which POSIX cannot hard-link) are unaffected, and every prior
+      symlink/dangling/parent/nested/canonical-root protection remains
+      fully active. Platform limitation honestly documented: `nlink` may
+      not be reported accurately on every filesystem, but is never ignored
+      where it is. Regression tests (real filesystem, real fs.linkSync)
+      prove the exact cross-project reproduction is rejected with the
+      other project's file confirmed byte-identical afterward, plus 8
+      further cases (false-positive avoidance, recovery once the extra
+      link is removed, message content, coexistence with symlink checks).
+      Confirmed via git-stash that 4 of these tests fail against the
+      pre-fix code.
+    - [P1] "Higher-priority ALLOW bypasses matching DENY": Codex reproduced
+      a priority-10 ALLOW rule and a priority-1 DENY rule both matching the
+      same action; PolicyEngine.evaluate()'s loop sorted rules by priority
+      descending and `break`-ed at the first non-null result, so the
+      lower-priority DENY rule was never evaluated once the ALLOW matched —
+      for risk-1 the action would execute, for risk-5 it surfaced as
+      APPROVAL_REQUIRED instead of DENY, violating "DENY ALWAYS WINS"
+      (section 147/241). Fixed in runtime/policy-engine/policy-engine.ts:
+      evaluate() no longer breaks early — it evaluates every applicable
+      rule, tracks the highest-priority DENY match and highest-priority
+      non-DENY match separately, and DENY wins whenever one exists,
+      regardless of relative priority; non-conflicting cases (no DENY at
+      all) still pick the highest-priority ALLOW exactly as before
+      (stable sort preserves prior tie-breaking). The existing "risk-5
+      never weakens an explicit DENY" logic from round 3 is unchanged and
+      now actually sees the DENY it is supposed to defer to. Regression
+      tests prove DENY wins over ALLOW/APPROVAL_REQUIRED regardless of
+      priority ordering (both risk-1 and risk-5), the higher-priority of
+      two DENYs is reported deterministically, non-matching DENY rules
+      never block unrelated actions, and the audit log records the DENY
+      (not the shadowed ALLOW). Confirmed via git-stash that 5 of these
+      tests fail against the pre-fix code with exactly the bypass Codex
+      described.
+    - [P2] "Duplicate approval IDs replace authoritative history": Codex
+      reproduced requesting approval id X, approving it, executing it,
+      then calling request() again with the SAME id X — the existing
+      EXECUTED record (real approver identity, decision timestamp,
+      evidence reference) was silently REPLACED with a fresh PENDING
+      record, discarding all provenance. Fixed in
+      runtime/policy-engine/approval.ts: request() now throws a new
+      DuplicateApprovalIdError before any mutation if the id already
+      exists, regardless of the existing record's current status —
+      mirroring decision-ledger.ts's existing DuplicateDecisionError
+      pattern. Regression tests prove duplicates are rejected at every
+      status (PENDING/APPROVED/REJECTED/EXECUTED), an EXECUTED record's
+      approver/timestamp/evidence/status survive a rejected duplicate
+      attempt untouched, no spurious audit entry is appended, and distinct
+      ids remain independent. Confirmed via git-stash that 8 of these
+      tests fail against the pre-fix code, including the exact
+      EXECUTED-record-erasure reproduction.
+    - [P2] "Invalid model prices corrupt cheapest-capable routing": Codex
+      reproduced a premium candidate registered FIRST with
+      `costPerCall: NaN` being SELECTED over a genuinely cheaper capable
+      free candidate, because `NaN < x`/`x < NaN` are always false,
+      breaking router.ts's cheapest-of reduce in a way that favors
+      whichever candidate registered first. Fixed in
+      runtime/models/registry.ts: register() now calls the EXISTING
+      centralized assertValidMonetaryAmount() validator (runtime/cost/
+      cost-engine.ts — not a divergent rule) on costPerCall before the
+      record reaches the registry; a rejected registration leaves the
+      registry completely unmutated. Regression tests prove NaN/Infinity/
+      -Infinity/negative prices are all rejected before insertion, zero
+      remains valid (free models), and the exact NaN-beats-free
+      reproduction can no longer occur since the poisoned record never
+      enters the registry. Confirmed via git-stash that 7 of these tests
+      fail against the pre-fix code.
+    - Targeted follow-up audit (as explicitly requested, narrow — only
+      these 4 classes): found and fixed TWO more genuine instances.
+      (1) assumption-register.ts's propose() had the identical duplicate-
+      id history-erasure bug as approval.ts — a second propose() call with
+      the same id as an already Founder-confirmed HIGH-impact assumption
+      would silently replace it with a fresh unconfirmed PROPOSED record,
+      bypassing the "High-impact assumptions require Founder confirmation"
+      gate. Fixed with the same pattern (new DuplicateAssumptionIdError,
+      checked before mutation); confirmed via git-stash that 4 regression
+      tests fail against the pre-fix code. (2) workers/registry.ts's
+      register() had the identical unvalidated-costPerMinuteUsd gap as the
+      model registry, feeding the IDENTICAL cheapest-of reduce in
+      runtime/scheduler/scheduler.ts. Fixed with the same
+      assertValidMonetaryAmount() call; confirmed via git-stash that 4
+      regression tests fail against the pre-fix code. Reviewed and found
+      NOT applicable: the P0 filesystem write surface for hard-link
+      aliasing is still exactly the same confinement-guarded scaffold/
+      orchestrator paths (other StateStore.write() callers use fixed,
+      non-project-scoped global paths, so "another project's file" does
+      not apply); no other early-break rule-evaluation loop exists besides
+      the one fixed in policy-engine.ts; business-capability-registry.ts
+      and technology-registry.ts are plain data catalogs with no
+      approval/confirmation history to lose, so re-registration under an
+      existing id is a legitimate catalog update, not history erasure;
+      decision-ledger.ts/artifact-registry.ts/service-catalog.ts already
+      had Duplicate*Error guards from earlier rounds; workers/registry.ts's
+      duplicate-ID behavior (it is array-based, allowing coexisting
+      duplicate ids rather than overwriting) is a different, unrelated bug
+      class, left unchanged; budget.ts and the informational
+      PolicyAction.costUsd/gateway costUsd fields were already validated
+      or are never used in a cheapest-of comparison. This scoping decision
+      is recorded here so a future session does not re-litigate it without
+      new evidence.
+  - >-
+    Requirement registry updated a seventh time from this round's real
+    evidence: UASF-REQ-0007 and UASF-REQ-0033 (Sandbox/orchestrator — hard-
+    link alias rejection), UASF-REQ-0018 (Policy engine — DENY-always-wins
+    regardless of rule priority), UASF-REQ-0020 (Approval workflow —
+    duplicate-ID rejection), UASF-REQ-0011 (Assumption register —
+    duplicate-ID rejection, audit-found), UASF-REQ-0025 (Model registry —
+    monetary validation on register), UASF-REQ-0031 (Worker registry —
+    monetary validation on register, audit-found). No status raised beyond
+    what a real test/proof supports.
+  - 378/378 tests passing (up from 332 before this round, +46 net new
+    across 6 fixed files); lint/typecheck/build/validate-requirements/
+    secret-scan (history-aware)/all 9 P0 proofs all clean; every fix
+    confirmed via git-stash to have failing regression tests against its
+    pre-fix code, then passing again with the fix restored.
 
 known_limitations:
   - >-
@@ -653,18 +805,23 @@ known_limitations:
 
 blockers:
   - >-
-    Awaiting a SEVENTH independent (Codex) re-review of the pushed fixes
-    (round 6's 3 new findings — a project-root symlink-alias gap the
-    round-5 confinement fix missed, incomplete credential-key redaction in
-    the logger, and a prototype-unsafe durable-cache key implementation —
-    are now fixed, tested, and verified per the full required sequence:
-    lint, typecheck, build, 332/332 tests, validate:requirements,
-    history-aware secret-scan, all P0 proofs; a narrow targeted audit for
-    those same 3 bug classes found and fixed one more genuine instance,
-    the same prototype-key issue in the logger's own redact() function).
-    Per explicit instruction: "stop at the independent-review boundary" —
-    do not push further P0 feature work, and do not declare P0 complete,
-    until that re-review confirms no blocking finding remains.
+    Awaiting an EIGHTH independent (Codex) re-review of the pushed fixes
+    (round 7's 4 new findings — a static hard-link filesystem alias the
+    round-6 symlink-only confinement check structurally cannot detect, a
+    policy-engine early-break letting a higher-priority ALLOW skip a
+    matching lower-priority DENY, duplicate approval IDs silently
+    replacing authoritative EXECUTED history, and unvalidated model
+    registry prices letting a NaN-priced candidate corrupt cheapest-
+    capable routing — are now fixed, tested, and verified per the full
+    required sequence: lint, typecheck, build, 378/378 tests,
+    validate:requirements, history-aware secret-scan, all 9 P0 proofs; a
+    narrow targeted audit for those same 4 bug classes found and fixed two
+    more genuine instances, the identical duplicate-id gap in
+    assumption-register.ts and the identical unvalidated-price gap in
+    workers/registry.ts). Per explicit instruction: "stop at the
+    independent-review boundary" — do not push further P0 feature work,
+    and do not declare P0 complete, until that re-review confirms no
+    blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -683,24 +840,30 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 6's 3 findings (project-root symlink-alias rejection via
-  a lexical-vs-real relative-path equality check in
-  assertFilesystemConfinement; expanded credential-key redaction in the
-  logger covering Authorization/Proxy-Authorization/Cookie/Set-Cookie/
-  session/bearer and hyphenated api-key/access-token/refresh-token
-  variants; a prototype-safe Map/array-based FileCache representation),
-  plus one more genuine instance found during the requested targeted
-  audit (the logger's own redact() dictionary-building loop needed the
-  same Object.create(null) prototype-safety fix as FileCache), are
-  implemented, tested, and pushed, with the full required verification
-  sequence run clean (lint, typecheck, build, 332/332 tests,
-  validate:requirements, history-aware secret-scan, all P0 proofs). Every
-  fix was individually confirmed via git-stash to have failing regression
-  tests against its pre-fix code, including a full end-to-end
-  bootstrapProject() test proving the project-root alias exploit was real
-  (Codex's reproduction: project A's bootstrap silently wrote into project
-  B's real directory). Do not proceed to further P0 feature work or
-  declare P0 complete until an independent (Codex) re-review of this diff
+  fixes for round 7's 4 findings (a new assertNoHardLinkAlias() check in
+  assertFilesystemConfinement rejecting already-existing, multiply-linked
+  (nlink > 1) destination files; PolicyEngine.evaluate() no longer
+  break-ing at the first matching rule, so a DENY at any priority always
+  wins over a non-DENY match; a new DuplicateApprovalIdError in
+  ApprovalWorkflow.request() rejecting any id collision before mutation,
+  regardless of the existing record's status; ModelRegistry.register() now
+  calling the existing assertValidMonetaryAmount() validator on
+  costPerCall before insertion), plus two more genuine instances found
+  during the requested targeted audit (assumption-register.ts's propose()
+  needed the identical duplicate-id guard as approval.ts, to protect its
+  Founder-confirmation gate; workers/registry.ts's register() needed the
+  identical monetary validation as the model registry, to protect
+  scheduler.ts's cheapest-worker selection), are implemented, tested, and
+  pushed, with the full required verification sequence run clean (lint,
+  typecheck, build, 378/378 tests, validate:requirements, history-aware
+  secret-scan, all 9 P0 proofs). Every fix was individually confirmed via
+  git-stash to have failing regression tests against its pre-fix code,
+  including the exact reproductions Codex described (a hard-linked
+  cross-project file overwrite, a priority-10 ALLOW shadowing a
+  priority-1 DENY, an EXECUTED approval's provenance silently erased by a
+  same-id request(), and a NaN-priced premium model beating a genuinely
+  cheaper free one). Do not proceed to further P0 feature work or declare
+  P0 complete until an independent (Codex) re-review of this diff
   confirms no blocking P0 finding remains. If/when that comes back clean,
   resume from the prior exact_next_action: wire the remaining foundation
   modules (Discovery, Decisions, Assumptions, Technology/

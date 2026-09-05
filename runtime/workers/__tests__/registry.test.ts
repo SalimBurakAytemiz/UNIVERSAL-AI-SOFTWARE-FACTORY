@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { WorkerRegistry } from "../registry.js";
+import { InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
 
 describe("WorkerRegistry", () => {
   it("excludes quarantined workers from capable candidates", () => {
@@ -56,6 +57,55 @@ describe("WorkerRegistry", () => {
 
       expect(registry.findCapable(["cpu"])).toHaveLength(1); // registry's own copy is unaffected
       expect(registry.findCapable(["gpu"])).toHaveLength(0);
+    });
+  });
+
+  describe("P2 targeted-audit fix (7th independent review round, same class as 'invalid model prices corrupt cheapest-capable routing')", () => {
+    it("rejects a NaN costPerMinuteUsd before the record reaches the registry", () => {
+      const registry = new WorkerRegistry();
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: Number.NaN, status: "IDLE" })
+      ).toThrow(InvalidMonetaryAmountError);
+      expect(registry.all()).toHaveLength(0);
+    });
+
+    it("rejects a negative costPerMinuteUsd", () => {
+      const registry = new WorkerRegistry();
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: -1, status: "IDLE" })
+      ).toThrow(InvalidMonetaryAmountError);
+      expect(registry.all()).toHaveLength(0);
+    });
+
+    it("rejects +Infinity/-Infinity costPerMinuteUsd", () => {
+      const registry = new WorkerRegistry();
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: Number.POSITIVE_INFINITY, status: "IDLE" })
+      ).toThrow(InvalidMonetaryAmountError);
+      expect(() =>
+        registry.register({ id: "w2", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: Number.NEGATIVE_INFINITY, status: "IDLE" })
+      ).toThrow(InvalidMonetaryAmountError);
+      expect(registry.all()).toHaveLength(0);
+    });
+
+    it("accepts a zero costPerMinuteUsd (free workers must remain valid)", () => {
+      const registry = new WorkerRegistry();
+      expect(() =>
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0, status: "IDLE" })
+      ).not.toThrow();
+      expect(registry.all()).toHaveLength(1);
+    });
+
+    it("REGRESSION: a poisoned NaN-priced worker registered first can no longer corrupt scheduler.ts's cheapest-of reduce, because registration itself fails closed", () => {
+      const registry = new WorkerRegistry();
+      expect(() =>
+        registry.register({ id: "poisoned", workerClass: "gpu", capabilities: ["gpu"], costPerMinuteUsd: Number.NaN, status: "IDLE" })
+      ).toThrow(InvalidMonetaryAmountError);
+      registry.register({ id: "genuinely-cheap", workerClass: "gpu", capabilities: ["gpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+
+      const capable = registry.findCapable(["gpu"]);
+      expect(capable).toHaveLength(1);
+      expect(capable[0]!.id).toBe("genuinely-cheap");
     });
   });
 });

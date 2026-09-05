@@ -47,12 +47,39 @@ export class InvalidApprovalDecisionError extends Error {
   }
 }
 
+/**
+ * P2 fix (7th independent review round, "duplicate approval IDs replace
+ * authoritative history"): request() eskiden `this.requests.set(id, req)`
+ * çağrısını KOŞULSUZ yapıyordu — aynı `id` ile tekrar request() çağrılması,
+ * mevcut kaydın durumu ne olursa olsun (PENDING/APPROVED/REJECTED/EXECUTED
+ * fark etmeksizin) onu SESSİZCE taze bir PENDING kayıtla DEĞİŞTİRİYORDU.
+ * Bir onay ID'si, bölüm 145 "Approval Evidence Package" gereği KALICI,
+ * benzersiz bir yetkili tanımlayıcıdır: gerçek onaylayan kimliği, karar
+ * zaman damgası, kanıt referansı ve (varsa) EXECUTED durumu asla yeniden
+ * yazılamaz/sıfırlanamaz. `decision-ledger.ts`'teki `DuplicateDecisionError`
+ * ile AYNI desen: mutasyondan ÖNCE, mevcut kaydın durumuna bakmaksızın
+ * reddedilir (fail closed).
+ */
+export class DuplicateApprovalIdError extends Error {
+  constructor(id: string) {
+    super(
+      `Approval id '${id}' already exists. Approval ids are permanent, unique authoritative ` +
+        `identifiers and can never be reused or silently overwritten, regardless of the existing ` +
+        `record's current status — request a new, distinct id for a new approval.`
+    );
+    this.name = "DuplicateApprovalIdError";
+  }
+}
+
 export class ApprovalWorkflow {
   private readonly requests = new Map<string, MutableApprovalRequest>();
 
   constructor(private readonly auditLog?: AuditLog) {}
 
   request(id: string, actionDescription: string, risk: number): ApprovalRequest {
+    if (this.requests.has(id)) {
+      throw new DuplicateApprovalIdError(id);
+    }
     const req: MutableApprovalRequest = {
       id,
       actionDescription,

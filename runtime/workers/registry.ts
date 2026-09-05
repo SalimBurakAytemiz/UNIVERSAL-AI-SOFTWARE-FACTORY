@@ -4,6 +4,7 @@
 // zamanlayıcı tarafından seçilebilir.
 
 import { freezeRecord } from "../util/immutable.js";
+import { assertValidMonetaryAmount } from "../cost/cost-engine.js";
 
 export type WorkerClass =
   | "linux-general"
@@ -43,6 +44,15 @@ export class WorkerRegistry {
   private readonly workers: MutableWorkerRecord[] = [];
 
   register(worker: WorkerRecord): void {
+    // P2 targeted-audit fix (7th independent review round, same class as
+    // "invalid model prices corrupt cheapest-capable routing" — models/
+    // registry.ts): `scheduler.ts` runs the IDENTICAL cheapest-of-candidates
+    // reduce (`current.costPerMinuteUsd < cheapest.costPerMinuteUsd`) over
+    // this registry's records. An unvalidated NaN/negative
+    // `costPerMinuteUsd` corrupts that comparison exactly as an unvalidated
+    // `costPerCall` corrupted model routing — the SAME centralized
+    // validator is reused here, not a divergent rule.
+    assertValidMonetaryAmount(worker.costPerMinuteUsd, `WorkerRegistry.register(id=${worker.id})`);
     this.workers.push({ ...worker, capabilities: [...worker.capabilities] });
   }
 

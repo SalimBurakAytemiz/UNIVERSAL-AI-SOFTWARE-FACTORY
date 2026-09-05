@@ -50,18 +50,46 @@ export class PolicyEngine {
   evaluate(action: PolicyAction): PolicyEvaluationResult {
     const ordered = [...this.rules].sort((a, b) => b.priority - a.priority);
 
-    let decision: PolicyDecision = "DENY"; // default deny (baseline section 147)
-    let matchedRule = "default-deny";
-    let explicitlyMatched = false;
+    // P1 fix (7th independent review round, "higher-priority ALLOW bypasses
+    // matching DENY"): the previous loop `break`-ed at the FIRST rule that
+    // returned a non-null decision, in priority order. That meant a
+    // lower-priority DENY rule was never even EVALUATED once a
+    // higher-priority ALLOW rule matched the same action — silently
+    // violating "DENY ALWAYS WINS" (bölüm 147/241, "güvenlik/yasal
+    // engelleyiciler" en yüksek önceliğe sahiptir, rule.priority sıralaması
+    // buna aykırı bir sonuç ÜRETEMEZ). Fix: her uygulanabilir kural
+    // (early-break OLMADAN) değerlendirilir; en yüksek öncelikli DENY
+    // eşleşmesi ile en yüksek öncelikli DENY-DIŞI eşleşme ayrı ayrı
+    // izlenir. Herhangi bir öncelikte bir DENY eşleşmesi varsa, hangi
+    // kuralın önceliği daha yüksek olursa olsun, DENY her zaman kazanır.
+    // `Array.prototype.sort` kararlı (stable, ES2019) olduğundan, her
+    // kategori içinde bulunan İLK eşleşme yine en yüksek öncelikli olandır
+    // (eşitlikte kayıt sırası korunur) — çakışmayan (non-conflicting) ALLOW
+    // durumları için önceki determinist davranış aynen korunur.
+    let denyMatch: { readonly rule: string } | null = null;
+    let bestNonDeny: { readonly decision: PolicyDecision; readonly rule: string } | null = null;
 
     for (const rule of ordered) {
       const result = rule.evaluate(action);
-      if (result !== null) {
-        decision = result;
-        matchedRule = rule.name;
-        explicitlyMatched = true;
-        break;
+      if (result === null) continue;
+      if (result === "DENY") {
+        if (denyMatch === null) denyMatch = { rule: rule.name };
+      } else if (bestNonDeny === null) {
+        bestNonDeny = { decision: result, rule: rule.name };
       }
+    }
+
+    let decision: PolicyDecision;
+    let matchedRule: string;
+    if (denyMatch !== null) {
+      decision = "DENY";
+      matchedRule = denyMatch.rule;
+    } else if (bestNonDeny !== null) {
+      decision = bestNonDeny.decision;
+      matchedRule = bestNonDeny.rule;
+    } else {
+      decision = "DENY"; // default deny (baseline section 147)
+      matchedRule = "default-deny";
     }
 
     // Risk-5 eylemler (üretime dağıtım, yıkıcı DB işlemleri, gizli anahtar
@@ -72,7 +100,7 @@ export class PolicyEngine {
     // Açık bir DENY kuralı — önceliği ne olursa olsun — HER ZAMAN kazanır;
     // risk-5 kontrolü bunun üzerine bindirilen ek bir kısıtlamadır, bir
     // geçersiz kılma değil (bölüm 241, DENY en yüksek önceliğe sahiptir).
-    const explicitDeny = explicitlyMatched && decision === "DENY";
+    const explicitDeny = denyMatch !== null;
     if (action.risk >= 5 && decision !== "APPROVAL_REQUIRED" && !explicitDeny) {
       decision = "APPROVAL_REQUIRED";
       matchedRule = RISK_5_APPROVAL_RULE_NAME;

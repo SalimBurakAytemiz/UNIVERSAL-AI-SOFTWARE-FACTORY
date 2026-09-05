@@ -165,7 +165,79 @@ export function assertFilesystemConfinement(root: string, target: string): strin
     throw new PathEscapeError(realRoot, target);
   }
 
+  // P1 fix (7th independent review round, "static hard-link aliases permit
+  // cross-project overwrites"): yukarıdaki kontrol, TEK bir dizin girdisinin
+  // BAŞKA bir konuma yönlendirilmesini (symlink/junction) yakalar — ama bir
+  // SABİT BAĞ (hard link) hiçbir yere "yönlendirmez". İki hard-linked yol,
+  // AYNI inode'u işaret eden, birbirinden BAĞIMSIZ iki dizin girdisidir; her
+  // biri `realpathSync` ile KENDİSİNE çözülür (hiçbir çözümleme farkı
+  // oluşmaz), bu yüzden yukarıdaki sözdizimsel-karşı-gerçek göreli yol
+  // eşitliği testi bunu YAPISAL OLARAK yakalayamaz. Bu, ayrı ve tamamen
+  // orthogonal bir kontrol gerektirir — bkz. assertNoHardLinkAlias().
+  assertNoHardLinkAlias(resolvedTarget);
+
   return resolvedTarget;
+}
+
+export class HardLinkAliasError extends Error {
+  constructor(target: string, nlink: number) {
+    super(
+      `Refusing to write through '${target}': it already exists as a regular file with ` +
+        `${nlink} hard link(s) (nlink > 1). A multiply-linked file has no single, ` +
+        `distinguishable owner path — it may be a static filesystem alias for another ` +
+        `project's authoritative file, and (unlike a symlink) there is no "resolve target" ` +
+        `to compare against the sandbox root. Exclusive ownership of this destination cannot ` +
+        `be proven, so the write is rejected (fail closed, baseline section 87).`
+    );
+    this.name = "HardLinkAliasError";
+  }
+}
+
+/**
+ * Bir hedef dosyanın (varsa) BEKLENMEDİK ek sabit bağlara (hard link) sahip
+ * OLMADIĞINI doğrular. Yalnızca ZATEN VAR OLAN, SIRADAN (regular) dosyalar
+ * için anlamlıdır:
+ *  - Hedef henüz yoksa (`lstatSync` başarısız olur), henüz hiçbir inode
+ *    paylaşımı yoktur — güvenle yazılabilir; bu fonksiyon sessizce döner
+ *    (canonicalizeNearestExisting zaten "henüz yok" durumunu doğru ele alır).
+ *  - Hedef bir dizin ise, POSIX'te dizinler için sabit bağ oluşturulamaz
+ *    (yalnızca `.`/`..` kendi kendine referanslardır) — bu kontrolün kapsamı
+ *    dışındadır.
+ *  - Hedef sıradan bir dosya İSE ve `nlink > 1` ise: bu dosya sistemindeki
+ *    BAŞKA bir dizin girdisi de AYNI inode'u paylaşıyor demektir. Bu Factory
+ *    kernel'i tarafından yönetilen dosyalar (`genome.json`, `organization.json`
+ *    vb.) normal koşullarda HER ZAMAN `nlink === 1` ile yaratılır
+ *    (`fs.writeFileSync` sıradan bir dosya oluşturur, sabit bağ değil); bu
+ *    yüzden `nlink > 1` görmek MEŞRU bir kullanım senaryosunda BEKLENMEZ —
+ *    yalnızca önceden yerleştirilmiş kötü niyetli (veya yanlışlıkla oluşmuş)
+ *    bir sabit bağın işaretidir. Emin olunamayan (proven değil) bir durumda
+ *    fail-closed davranılır: yazma reddedilir.
+ *
+ * DÜRÜSTÇE BELGELENEN PLATFORM SINIRLAMASI: `Stats.nlink`, TÜM platformlarda/
+ * dosya sistemlerinde güvenilir biçimde raporlanmayabilir (ör. bazı FAT/exFAT
+ * bağlamalarında veya belirli sanallaştırılmış/ağ dosya sistemlerinde her
+ * zaman `1` dönebilir, hard link'in varlığına rağmen). Bu durumda bu kontrol
+ * SESSİZCE hiçbir şey YAKALAYAMAZ — ancak platform `nlink`'i DOĞRU
+ * raporladığında (Linux/macOS ext4/APFS/HFS+ gibi yaygın POSIX dosya
+ * sistemlerinde olduğu gibi), `nlink > 1` ASLA görmezden gelinmez. Bu, var
+ * olan symlink/dangling/parent/nested/canonical-root korumalarını ZAYIFLATMAZ
+ * — bunlara EK, orthogonal bir kontroldür.
+ */
+function assertNoHardLinkAlias(target: string): void {
+  let stat;
+  try {
+    stat = lstatSync(target);
+  } catch {
+    return; // henüz yok — paylaşılan bir inode olamaz, güvenle yaratılabilir
+  }
+
+  if (!stat.isFile()) {
+    return; // dizinler/symlink'ler bu kontrolün kapsamı dışında (POSIX'te dizinler hard-link'lenemez)
+  }
+
+  if (stat.nlink > 1) {
+    throw new HardLinkAliasError(target, stat.nlink);
+  }
 }
 
 export class InvalidProjectIdError extends Error {

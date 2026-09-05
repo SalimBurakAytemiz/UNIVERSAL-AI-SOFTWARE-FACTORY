@@ -269,6 +269,31 @@
     pre-fix code's resolved projectRoot was silently the alias target)
     fail against the pre-fix (round-5) code.
 
+    P1 fix (7th independent review round, "static hard-link aliases permit
+    cross-project overwrites"): Codex reproduced project B already having
+    genome/organization/bootstrap-state files, project A's corresponding
+    destination files being HARD-LINKED (not symlinked) to B's files, and
+    bootstrapProject(A) then overwriting B's authoritative content — no
+    race required. The round-6 lexical-vs-real relative-path check cannot
+    catch this structurally: a hard link has no "resolve target" the way a
+    symlink does (two hard-linked paths are independent directory entries
+    to the same inode, each resolving to itself via realpath). Fixed with a
+    new, orthogonal check in assertFilesystemConfinement() (see
+    UASF-REQ-0033): before returning a validated destination, if that exact
+    path already exists as a regular file with `lstatSync(path).nlink > 1`,
+    the write is rejected (HardLinkAliasError, fail closed) since exclusive
+    ownership of a multiply-linked file cannot be proven. Regression tests
+    (real filesystem, real fs.linkSync) prove: a hard-linked destination is
+    rejected, the exact cross-project reproduction (project A's genome.json
+    hard-linked to project B's existing genome.json) is rejected with B's
+    content confirmed untouched, a brand-new (not-yet-existing) destination
+    is unaffected (no false positive), an ordinary singly-linked existing
+    file still succeeds, plain directories are unaffected (POSIX
+    directories cannot be hard-linked), removing the extra link restores
+    normal behavior, and all previously-fixed symlink/alias protections
+    remain active. Confirmed via git-stash that 4 of these tests fail
+    against the pre-fix code with exactly this reproduction.
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -400,6 +425,25 @@
     private authoritative object. Regression tests prove a mutation attempt
     on a returned assumption throws and cannot bypass the confirmation gate.
     Confirmed via git-stash that these tests fail against the pre-fix code.
+
+    P2 fix (7th independent review round targeted audit, found while
+    auditing for the same class as approval.ts's "duplicate approval IDs
+    replace authoritative history"): propose() called
+    `this.assumptions.set(input.id, assumption)` unconditionally — a second
+    propose() call with the SAME id as an already Founder-confirmed
+    (ACCEPTED, confirmedBy set) HIGH-impact assumption would silently
+    replace it with a fresh, unconfirmed PROPOSED record, completely
+    bypassing the "High-impact assumptions require Founder confirmation"
+    invariant this module exists to enforce. Fixed: propose() now throws a
+    new DuplicateAssumptionIdError before any mutation if the id already
+    exists, regardless of the existing record's status. Regression tests
+    prove: a duplicate id while PROPOSED is rejected, a duplicate id cannot
+    silently erase an ACCEPTED HIGH-impact assumption's confirmedBy/status/
+    description, a rejected duplicate cannot be used to bypass the
+    Founder-confirmation gate on a fresh unconfirmed record, distinct ids
+    remain independent, and the error names the offending id. Confirmed via
+    git-stash that all 4 of these tests fail against the pre-fix code with
+    exactly this confirmation-erasure symptom.
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -565,6 +609,33 @@
     scenario: bootstrapProject() refuses to scaffold anything until an
     explicit policy rule allows it.
 
+    P1 fix (7th independent review round, "higher-priority ALLOW bypasses
+    matching DENY"): Codex reproduced a priority-10 ALLOW rule and a
+    priority-1 DENY rule both matching the same action — evaluate()'s `for`
+    loop sorted rules by priority descending and `break`-ed at the FIRST
+    rule returning a non-null decision, so once the high-priority ALLOW
+    matched, the lower-priority DENY rule was never even evaluated,
+    violating "DENY ALWAYS WINS" (section 147/241) for both risk-1 (action
+    executed) and risk-5 (surfaced as APPROVAL_REQUIRED instead of DENY).
+    Fixed: evaluate() no longer breaks early — it evaluates every
+    applicable rule and separately tracks the highest-priority DENY match
+    and the highest-priority non-DENY match; a DENY match, if one exists at
+    ANY priority, always wins over a non-DENY match regardless of relative
+    rule priority (Array.prototype.sort's stability preserves prior
+    deterministic tie-breaking by registration order within each category).
+    The existing risk-5-never-weakens-an-explicit-DENY logic (round 3) is
+    unchanged and still correct now that it actually sees the DENY.
+    Regression tests prove: a low-priority DENY beats a high-priority ALLOW
+    for both risk-1 and risk-5 actions, a low-priority DENY beats a
+    high-priority APPROVAL_REQUIRED rule, a DENY at the very bottom of
+    priority order still surfaces over multiple higher ALLOWs, the
+    higher-priority of two matching DENY rules is reported deterministically,
+    non-conflicting cases (no DENY at all) still pick the highest-priority
+    ALLOW exactly as before, a non-matching DENY rule never blocks an
+    unrelated ALLOW, and the audit log records the DENY (not the shadowed
+    ALLOW). Confirmed via git-stash that 5 of these tests fail against the
+    pre-fix code with exactly the DENY-bypass Codex described.
+
 - id: UASF-REQ-0019
   title: Capability gateway (foundation)
   description: Enforcement point routing actions through the policy engine before execution.
@@ -624,6 +695,27 @@
     are rejected without mutating state, and every transition appears in the
     (integrity-verified) audit log. Confirmed via git-stash that these tests
     fail against the pre-fix code.
+
+    P2 fix (7th independent review round, "duplicate approval IDs replace
+    authoritative history"): request() called
+    `this.requests.set(id, req)` unconditionally — Codex reproduced
+    requesting approval id X, approving it, executing it, then calling
+    request() again with the SAME id X: the existing authoritative record
+    (EXECUTED, with real approver identity and evidence) was silently
+    REPLACED with a fresh PENDING record, discarding all provenance. Fixed:
+    request() now throws a new DuplicateApprovalIdError before any mutation
+    if the id already exists, regardless of the existing record's current
+    status (PENDING/APPROVED/REJECTED/EXECUTED) — mirroring
+    decision-ledger.ts's DuplicateDecisionError pattern. Regression tests
+    prove: a duplicate id is rejected while PENDING, APPROVED, and REJECTED;
+    a duplicate id cannot silently erase an EXECUTED record's approver
+    identity, decision timestamp, evidence reference, or terminal status; a
+    rejected duplicate does not mutate requestedAt or risk; no spurious
+    APPROVAL_REQUESTED audit entry is appended; distinct ids remain
+    independent; execute() still fails correctly after a rejected duplicate
+    attempt; and the error names the offending id. Confirmed via git-stash
+    that 8 of these tests fail against the pre-fix code, including the
+    exact EXECUTED-record-erasure reproduction Codex described.
 
 - id: UASF-REQ-0021
   title: Durable state / resume
@@ -785,6 +877,27 @@
     object passed into register() (or a returned record's costPerCall/
     capabilities) cannot affect subsequent routing decisions. Confirmed
     via git-stash that these tests fail on the pre-fix code.
+
+    P2 fix (7th independent review round, "invalid model prices corrupt
+    cheapest-capable routing"): register() never validated `costPerCall` at
+    all — Codex reproduced a premium candidate registered FIRST with
+    `costPerCall: NaN` being SELECTED over a genuinely cheaper, capable free
+    candidate, because `NaN < x`/`x < NaN` comparisons are always false,
+    breaking router.ts's cheapest-of reduce in a way that favors the
+    first-registered candidate regardless of actual cost. Fixed: register()
+    now calls the EXISTING centralized validator
+    (assertValidMonetaryAmount, runtime/cost/cost-engine.ts — not a
+    divergent rule) on `costPerCall` before the record ever reaches
+    `this.models`; a rejected registration leaves the registry completely
+    unmutated. Regression tests prove: NaN/+Infinity/-Infinity/negative
+    costPerCall are all rejected before insertion, zero remains valid (free
+    models), an ordinary positive price is unaffected, a rejected
+    registration does not corrupt findCapable() for previously-registered
+    valid models, the exact NaN-beats-free reproduction can no longer
+    happen (the poisoned record never enters the registry at all),
+    createDefaultModelRegistry()'s built-in models all carry valid prices,
+    and the error message identifies the offending model. Confirmed via
+    git-stash that 7 of these tests fail against the pre-fix code.
 
 - id: UASF-REQ-0026
   title: MockProvider
@@ -1056,6 +1169,23 @@
     not affect the registry's own copy. Confirmed via git-stash that these
     tests fail against the pre-fix code.
 
+    P2 fix (7th independent review round targeted audit, found while
+    auditing for the same class as models/registry.ts's "invalid model
+    prices corrupt cheapest-capable routing"): register() never validated
+    `costPerMinuteUsd`, and runtime/scheduler/scheduler.ts runs the
+    IDENTICAL cheapest-of-candidates reduce
+    (`current.costPerMinuteUsd < cheapest.costPerMinuteUsd`) over this
+    registry's records — an unvalidated NaN/negative price would corrupt
+    worker selection exactly as an unvalidated costPerCall corrupted model
+    routing. Fixed: register() now calls the same centralized
+    assertValidMonetaryAmount() validator (runtime/cost/cost-engine.ts)
+    before the record is pushed. Regression tests prove: NaN, negative, and
+    +Infinity/-Infinity costPerMinuteUsd are all rejected before insertion,
+    zero remains valid (free workers), and a poisoned NaN-priced worker
+    registered first can no longer corrupt findCapable() results since it
+    never enters the registry. Confirmed via git-stash that 4 of these
+    tests fail against the pre-fix code.
+
 - id: UASF-REQ-0032
   title: Scheduler (foundation)
   description: Resource-aware task-to-worker assignment favoring the smallest sufficient worker.
@@ -1172,6 +1302,44 @@
     fixed dangling/final/parent/nested symlink escape remains blocked.
     Confirmed via git-stash that the alias-specific tests fail against
     the pre-fix (round-5, prefix-only) code.
+
+    P1 fix (7th independent review round, "static hard-link aliases permit
+    cross-project overwrites"): all prior confinement checks (assertWithinRoot,
+    canonicalizeNearestExisting, the lexical-vs-real relative-path equality
+    test) reason about a SINGLE path being redirected via a symlink chain —
+    none of them can detect a HARD LINK, because two hard-linked paths are
+    independent directory entries pointing to the same inode; each
+    resolves to ITSELF via realpathSync, with no "redirection" to compare
+    against the root. Codex reproduced project B's genome/organization/
+    bootstrap-state files already existing, project A's corresponding
+    destination paths being hard-linked to them, and bootstrapProject(A)
+    silently overwriting B's authoritative content — no race required.
+    Fixed: assertFilesystemConfinement() now also calls a new, orthogonal
+    assertNoHardLinkAlias() check on the resolved destination — if that
+    exact path already exists as a regular file (lstatSync) with
+    `nlink > 1`, the write is rejected (new HardLinkAliasError) before any
+    mutation, since a multiply-linked file's exclusive ownership cannot be
+    proven. This does not weaken any existing check: it fires only for
+    ALREADY-EXISTING regular files, so brand-new destinations and plain
+    directories (which POSIX cannot hard-link) are unaffected, and all
+    previously-fixed symlink/dangling/parent/nested/canonical-root
+    protections remain fully active and independently tested. Honestly
+    documented platform limitation: `Stats.nlink` may not be reported
+    accurately on every filesystem/platform (e.g. some FAT/exFAT or
+    virtualized/network filesystems can always report 1 despite a real
+    hard link existing) — where the platform DOES report it correctly
+    (Linux/macOS ext4/APFS/HFS+, the CI environment), `nlink > 1` is never
+    ignored. Regression tests (real filesystem, real fs.linkSync) prove: a
+    hard-linked destination is rejected, the exact cross-project
+    reproduction is rejected with the other project's content confirmed
+    byte-identical afterward, a not-yet-existing destination is unaffected,
+    an ordinary singly-linked file still succeeds, a plain directory is
+    unaffected, removing the extra hard link (back to nlink 1) restores
+    normal acceptance, the error message names the destination and reports
+    the link count, and hard-link detection coexists with (does not
+    weaken) the symlink-escape and project-root-alias protections.
+    Confirmed via git-stash that 4 of these tests fail against the pre-fix
+    code with exactly the cross-project overwrite Codex described.
 
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
