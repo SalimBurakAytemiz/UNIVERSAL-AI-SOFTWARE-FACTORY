@@ -10,6 +10,7 @@
 // `now` enjekte edilebilir bir saat fonksiyonudur; testler bunu ilerleterek
 // gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
+import { assertValidMonetaryAmount } from "../cost/cost-engine.js";
 import type { CostEngine, CostScope } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
 
@@ -20,6 +21,23 @@ export interface BudgetLimits {
   readonly perRunUsd?: number;
   readonly dailyUsd?: number;
   readonly monthlyUsd?: number;
+}
+
+export class InvalidBudgetLimitError extends Error {
+  constructor(ceiling: BudgetCeilingName, limit: number) {
+    super(
+      `Invalid budget limit for '${ceiling}': ${limit}. Configured ceilings must be ` +
+        `finite and non-negative (NaN/Infinity/-Infinity/negative are rejected).`
+    );
+    this.name = "InvalidBudgetLimitError";
+  }
+}
+
+function assertValidLimit(ceiling: BudgetCeilingName, limit: number | undefined): void {
+  if (limit === undefined) return;
+  if (!Number.isFinite(limit) || limit < 0) {
+    throw new InvalidBudgetLimitError(ceiling, limit);
+  }
 }
 
 export class BudgetExceededError extends Error {
@@ -58,7 +76,14 @@ export class BudgetGuard {
     private readonly limits: BudgetLimits,
     private readonly now: () => Date = () => new Date(),
     private readonly auditLog?: AuditLog
-  ) {}
+  ) {
+    // Yanlış yapılandırılmış bir tavan (NaN/Infinity/negatif), kurulum
+    // anında hemen reddedilir — ilk harcama denemesine kadar beklenmez.
+    assertValidLimit("perTaskUsd", limits.perTaskUsd);
+    assertValidLimit("perRunUsd", limits.perRunUsd);
+    assertValidLimit("dailyUsd", limits.dailyUsd);
+    assertValidLimit("monthlyUsd", limits.monthlyUsd);
+  }
 
   private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {
     const checks: CeilingCheck[] = [];
@@ -111,6 +136,22 @@ export class BudgetGuard {
    * evidence" bütçe kararları için de geçerlidir).
    */
   assertWithinBudget(scope: CostScope, projectedAmountUsd: number): void {
+    // Herhangi bir karşılaştırma yapılmadan veya durum değiştirilmeden ÖNCE
+    // doğrula: NaN sızarsa `NaN > limit` HER ZAMAN false döner (tavan
+    // sessizce atlanmış olur) ve negatif bir tutar yapay bütçe payı
+    // yaratabilir. Bu yüzden fail-closed burada, en başta gerçekleşir.
+    try {
+      assertValidMonetaryAmount(projectedAmountUsd, "BudgetGuard.assertWithinBudget");
+    } catch (err) {
+      this.auditLog?.append({
+        type: "BUDGET_INVALID_AMOUNT_REJECTED",
+        actor: "budget-guard",
+        payload: { scope, projectedAmountUsd, reason: err instanceof Error ? err.message : String(err) },
+        timestamp: this.now().toISOString()
+      });
+      throw err;
+    }
+
     const checks = this.buildCeilingChecks(scope, projectedAmountUsd);
 
     for (const check of checks) {

@@ -1,12 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDefaultModelRegistry, ModelRegistry } from "../registry.js";
 import { ModelGateway } from "../gateway.js";
 import { MockProvider } from "../providers/mock-provider.js";
 import {
   CheapestCapableModelRouter,
+  EscalationExhaustedError,
   NoCapableModelError,
   PremiumFallbackBlockedError
 } from "../router.js";
+import type { ModelInvocationResponse } from "../gateway.js";
 
 function setup() {
   const registry = createDefaultModelRegistry();
@@ -70,17 +72,20 @@ describe("CheapestCapableModelRouter", () => {
     ).rejects.toThrow(PremiumFallbackBlockedError);
   });
 
-  it("Proof C: a failed low-cost model can escalate when explicitly authorized", async () => {
+  it("Proof C: a failed low-cost model can escalate when explicitly authorized, and the escalated response is itself validated", async () => {
     const { router, gateway } = setup();
+    const validate = vi.fn((response) => response.modelId === "mock-premium-architect");
     const result = await router.routeAndExecute(
       { taskId: "implementation-needs-escalation", risk: 3, requiredCapabilities: ["implementation"] },
       gateway,
       { prompt: "implement this" },
-      () => false,
+      validate,
       { allowPremiumFallback: true }
     );
     expect(result.decision.escalated).toBe(true);
     expect(result.decision.model.tier).toBe("PREMIUM");
+    // The validator was invoked for BOTH the initial (STANDARD) and escalated (PREMIUM) response.
+    expect(validate).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -137,11 +142,12 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
 
   it("escalates to the tier ABOVE the actually-selected model, not a same-or-lower tier reselection", async () => {
     const { router, gateway } = setupCapabilityDrivenPromotionScenario();
+    const validate = vi.fn((response) => response.modelId === "niche-premium");
     const result = await router.routeAndExecute(
       { taskId: "niche-task", risk: 0, requiredCapabilities: ["niche-capability"] },
       gateway,
       { prompt: "do the niche thing" },
-      () => false, // validation always fails
+      validate,
       { allowPremiumFallback: true }
     );
 
@@ -150,6 +156,7 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
     expect(result.decision.model.tier).toBe("PREMIUM");
     expect(result.decision.model.modelId).toBe("niche-premium");
     expect(result.decision.model.modelId).not.toBe("niche-standard");
+    expect(validate).toHaveBeenCalledTimes(2); // both the initial and escalated response were validated
   });
 
   it("premium fallback policy remains enforced in the capability-driven-promotion scenario", async () => {
@@ -165,7 +172,7 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
     ).rejects.toThrow(PremiumFallbackBlockedError);
   });
 
-  it("throws NoCapableModelError instead of looping when already at the top tier", async () => {
+  it("fails closed with EscalationExhaustedError instead of looping when already at the top tier", async () => {
     const registry = new ModelRegistry();
     registry.register({
       provider: "mock",
@@ -187,6 +194,142 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
         () => false,
         { allowPremiumFallback: true }
       )
-    ).rejects.toThrow(NoCapableModelError);
+    ).rejects.toThrow(EscalationExhaustedError);
+  });
+});
+
+/**
+ * BLOCKER regression: fallback/escalated model output was previously
+ * returned WITHOUT being passed through `validate` at all — a fallback
+ * response was trusted merely because it came from a different (pricier)
+ * model. Fixed: every candidate response, at every tier, is validated;
+ * fallback output is never trusted by default.
+ */
+function setupThreeTierEscalationScenario() {
+  const registry = new ModelRegistry();
+  registry.register({
+    provider: "mock",
+    modelId: "tier-mock",
+    tier: "MOCK",
+    costPerCall: 0,
+    capabilities: ["escalation-capability"],
+    status: "ACTIVE"
+  });
+  registry.register({
+    provider: "mock",
+    modelId: "tier-premium",
+    tier: "PREMIUM",
+    costPerCall: 0.5,
+    capabilities: ["escalation-capability"],
+    status: "ACTIVE"
+  });
+  registry.register({
+    provider: "mock",
+    modelId: "tier-critical",
+    tier: "CRITICAL_REVIEW",
+    costPerCall: 2,
+    capabilities: ["escalation-capability"],
+    status: "ACTIVE"
+  });
+
+  const gateway = new ModelGateway();
+  gateway.registerProvider(new MockProvider());
+  const router = new CheapestCapableModelRouter(registry);
+  return { registry, gateway, router };
+}
+
+describe("CheapestCapableModelRouter fallback output validation", () => {
+  it("primary fails, fallback (first escalation) passes -> returns the validated fallback response", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const validate = vi.fn((response) => response.modelId === "tier-premium");
+
+    const result = await router.routeAndExecute(
+      { taskId: "t1", risk: 0, requiredCapabilities: ["escalation-capability"] },
+      gateway,
+      { prompt: "x" },
+      validate,
+      { allowPremiumFallback: true }
+    );
+
+    expect(result.decision.model.modelId).toBe("tier-premium");
+    expect(validate).toHaveBeenCalledTimes(2); // tier-mock, then tier-premium
+  });
+
+  it("primary fails, fallback also fails -> continues escalating, validating every candidate, and fails closed once exhausted", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const validate = vi.fn((_response: ModelInvocationResponse) => false); // nothing ever validates
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "t2", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(EscalationExhaustedError);
+
+    // The validator was invoked for every candidate: MOCK, PREMIUM, CRITICAL_REVIEW.
+    // This also demonstrates escalation is bounded — it terminates rather than looping forever.
+    expect(validate).toHaveBeenCalledTimes(3);
+    expect(validate.mock.calls.map((call) => call[0].modelId)).toEqual([
+      "tier-mock",
+      "tier-premium",
+      "tier-critical"
+    ]);
+  });
+
+  it("an invalid premium fallback response cannot bypass validation merely because it is a pricier model", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    // The premium response fails validation; only the top (critical) tier would pass.
+    const validate = vi.fn((response) => response.modelId === "tier-critical");
+
+    const result = await router.routeAndExecute(
+      { taskId: "t3", risk: 0, requiredCapabilities: ["escalation-capability"] },
+      gateway,
+      { prompt: "x" },
+      validate,
+      { allowPremiumFallback: true }
+    );
+
+    // Never settled for the invalid PREMIUM response just because it outranks MOCK.
+    expect(result.decision.model.modelId).toBe("tier-critical");
+    expect(validate).toHaveBeenCalledTimes(3);
+  });
+
+  it("retry/escalation limits still apply: at most one attempt per tier, never an unbounded retry loop", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const validate = vi.fn(() => false);
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "t4", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        { allowPremiumFallback: true }
+      )
+    ).rejects.toThrow(EscalationExhaustedError);
+
+    // Exactly one attempt per registered tier (3), not repeated retries at the same tier.
+    expect(validate).toHaveBeenCalledTimes(3);
+  });
+
+  it("premium fallback policy is still enforced before any escalation is attempted in this scenario", async () => {
+    const { router, gateway } = setupThreeTierEscalationScenario();
+    const validate = vi.fn(() => false);
+
+    await expect(
+      router.routeAndExecute(
+        { taskId: "t5", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate
+        // allowPremiumFallback intentionally omitted -> defaults to false
+      )
+    ).rejects.toThrow(PremiumFallbackBlockedError);
+
+    // Blocked immediately after the primary attempt — no escalation happened at all.
+    expect(validate).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { CostEngine } from "../../cost/cost-engine.js";
-import { BudgetExceededError, BudgetGuard } from "../budget.js";
+import { CostEngine, InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
+import { BudgetExceededError, BudgetGuard, InvalidBudgetLimitError } from "../budget.js";
 import { AuditLog } from "../../audit/audit-log.js";
 
 /**
@@ -183,6 +183,108 @@ describe("BudgetGuard", () => {
     });
   });
 
+  describe("invalid monetary input (BLOCKER: NaN/Infinity/negative must never bypass budget enforcement)", () => {
+    it("rejects a NaN spend amount before it can poison the running total", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 });
+
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      // Nothing was recorded — total() must not become NaN.
+      expect(costEngine.total()).toBe(0);
+      expect(Number.isNaN(costEngine.total())).toBe(false);
+    });
+
+    it("rejects Infinity as a spend amount", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 });
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: Infinity })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(costEngine.total()).toBe(0);
+    });
+
+    it("rejects -Infinity as a spend amount (which would otherwise manufacture infinite headroom)", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 });
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: -Infinity })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(costEngine.total()).toBe(0);
+    });
+
+    it("rejects a negative spend amount (refunds/credits must be a separate, explicit operation)", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 });
+      guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 3 });
+
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: -10 })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      // The negative "spend" was not recorded — it cannot manufacture artificial headroom.
+      expect(costEngine.total()).toBe(3);
+    });
+
+    it("a spend attempted immediately after a rejected invalid spend is still correctly evaluated (no poisoned state)", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 });
+
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      // The ceiling is still correctly enforced afterward — NaN never entered the running total.
+      guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: 5 });
+      expect(() => guard.spend({ taskId: "t3", provider: "mock", modelId: "m1", amountUsd: 0.01 })).toThrow(
+        BudgetExceededError
+      );
+      expect(costEngine.total()).toBe(5);
+    });
+
+    it("rejects a NaN configured limit at construction time, before any spend is attempted", () => {
+      const costEngine = new CostEngine();
+      expect(() => new BudgetGuard(costEngine, { dailyUsd: NaN })).toThrow(InvalidBudgetLimitError);
+    });
+
+    it("rejects Infinity/-Infinity as a configured limit", () => {
+      const costEngine = new CostEngine();
+      expect(() => new BudgetGuard(costEngine, { monthlyUsd: Infinity })).toThrow(InvalidBudgetLimitError);
+      expect(() => new BudgetGuard(costEngine, { monthlyUsd: -Infinity })).toThrow(InvalidBudgetLimitError);
+    });
+
+    it("rejects a negative configured limit for every ceiling kind", () => {
+      const costEngine = new CostEngine();
+      expect(() => new BudgetGuard(costEngine, { perTaskUsd: -1 })).toThrow(InvalidBudgetLimitError);
+      expect(() => new BudgetGuard(costEngine, { perRunUsd: -1 })).toThrow(InvalidBudgetLimitError);
+      expect(() => new BudgetGuard(costEngine, { dailyUsd: -1 })).toThrow(InvalidBudgetLimitError);
+      expect(() => new BudgetGuard(costEngine, { monthlyUsd: -1 })).toThrow(InvalidBudgetLimitError);
+    });
+
+    it("protects direct CostEngine.record() calls too, bypassing BudgetGuard entirely", () => {
+      const costEngine = new CostEngine();
+      expect(() => costEngine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(() => costEngine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: -5 })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(() => costEngine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: Infinity })).toThrow(
+        InvalidMonetaryAmountError
+      );
+      expect(costEngine.all()).toHaveLength(0);
+      expect(costEngine.total()).toBe(0);
+    });
+
+    it("exact boundary: zero is a valid amount (allowed); the smallest negative value is not", () => {
+      const costEngine = new CostEngine();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 });
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0 })).not.toThrow();
+      expect(() => guard.spend({ taskId: "t2", provider: "mock", modelId: "m1", amountUsd: -0.0001 })).toThrow(
+        InvalidMonetaryAmountError
+      );
+    });
+  });
+
   describe("audit evidence", () => {
     it("records both allowed and blocked budget checks to the audit log", () => {
       const clock = makeClock("2026-03-10T08:00:00.000Z");
@@ -201,6 +303,20 @@ describe("BudgetGuard", () => {
 
       const blockedRecord = auditLog.all()[1]!;
       expect(blockedRecord.payload).toMatchObject({ ceiling: "perTaskUsd", limit: 1 });
+    });
+
+    it("records a rejected invalid-amount attempt to the audit log", () => {
+      const costEngine = new CostEngine();
+      const auditLog = new AuditLog();
+      const guard = new BudgetGuard(costEngine, { dailyUsd: 5 }, () => new Date(), auditLog);
+
+      expect(() => guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })).toThrow(
+        InvalidMonetaryAmountError
+      );
+
+      const types = auditLog.all().map((r) => r.type);
+      expect(types).toEqual(["BUDGET_INVALID_AMOUNT_REJECTED"]);
+      expect(auditLog.verifyIntegrity()).toBe(true);
     });
   });
 });

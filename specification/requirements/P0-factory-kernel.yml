@@ -331,7 +331,29 @@
     - "proofs/human-approval"
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "The integrated pipeline proof demonstrates default-deny in a realistic scenario: bootstrapProject() refuses to scaffold anything until an explicit policy rule allows it."
+  notes: >
+    Independent review (Codex) found that the risk-5 approval upgrade could
+    override an explicit DENY: because the built-in risk-5 rule ran first
+    (highest priority) and evaluate() stopped at the first non-null result,
+    a risk-5 action that an explicit, even high-priority, DENY rule matched
+    could still surface as APPROVAL_REQUIRED. Fixed in
+    runtime/policy-engine/policy-engine.ts: the risk-5 upgrade is no longer
+    a pre-seeded PolicyRule; evaluate() now runs all registered rules first,
+    tracks whether an explicit rule matched, and only applies the risk-5
+    upgrade when the resulting decision is not an explicit DENY (an
+    unmatched default-deny is still eligible, preserving the existing
+    "unaddressed risk-5 still requires approval" guarantee). Regression
+    tests added proving: explicit DENY + risk-5 stays DENY, a
+    Number.MAX_SAFE_INTEGER-priority DENY + risk-5 stays DENY, DENY beats a
+    lower-priority ALLOW rule on the same risk-5 action, an otherwise-ALLOWED
+    risk-5 action still requires approval, a default-deny (no rules) risk-5
+    action still requires approval, and risk-5 never weakens an existing
+    APPROVAL_REQUIRED decision back toward ALLOW. Confirmed via git-stash
+    that these tests fail against the pre-fix code and pass after the fix.
+
+    The integrated pipeline proof demonstrates default-deny in a realistic
+    scenario: bootstrapProject() refuses to scaffold anything until an
+    explicit policy rule allows it.
 
 - id: UASF-REQ-0019
   title: Capability gateway (foundation)
@@ -505,6 +527,23 @@
     pre-fix code was confirmed to fail these exact tests before the fix
     (reverted and re-run manually during review).
 
+    Second-round finding (Codex): once escalation began, the escalated
+    (fallback) model's response was invoked but never passed back through
+    `validate()` — routeAndExecute returned it unconditionally, meaning an
+    invalid response from a pricier model could bypass validation entirely.
+    Fixed: routeAndExecute now validates every candidate, including every
+    escalation step, in a bounded loop over TIER_ORDER; if the top tier
+    (CRITICAL_REVIEW) is reached and still fails validation, it now throws
+    the new EscalationExhaustedError (fail closed) rather than returning
+    unvalidated output. Regression tests added: primary fails/first
+    escalation passes (validate called on both, in order), primary and all
+    escalations fail -> EscalationExhaustedError after validating every
+    tier exactly once, an invalid PREMIUM-tier fallback cannot be accepted
+    merely because it is pricier (validation only passes at CRITICAL_REVIEW),
+    and premium fallback policy is still enforced before any escalation is
+    attempted (PremiumFallbackBlockedError after exactly one validate call).
+    Confirmed via git-stash that these tests fail against the pre-fix code.
+
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
   description: >
@@ -521,6 +560,13 @@
   proof_refs:
     - "proofs/premium-fallback-block/proof.test.ts"
   security_refs: []
+  notes: >
+    See UASF-REQ-0027's second-round note: the fallback-validation-bypass
+    fix in runtime/models/router.ts (every escalated candidate, not just
+    the initial one, is now passed through the caller's validate()) applies
+    directly to this requirement's "escalation requires validation failure"
+    guarantee — a fallback response is never trusted merely for being from
+    a pricier model.
 
 - id: UASF-REQ-0029
   title: Cost engine
@@ -538,7 +584,24 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "CostEngine now takes an injectable clock (constructor `now` param) so tests can simulate specific timestamps, and gained totalInWindow() for time-scoped totals — both added to support real dailyUsd/monthlyUsd budget enforcement (see UASF-REQ-0030)."
+  notes: >
+    CostEngine now takes an injectable clock (constructor `now` param) so
+    tests can simulate specific timestamps, and gained totalInWindow() for
+    time-scoped totals — both added to support real dailyUsd/monthlyUsd
+    budget enforcement (see UASF-REQ-0030).
+
+    BLOCKER fix (Codex, 2nd round): CostEngine.record() itself accepted
+    NaN, Infinity, -Infinity, and negative amountUsd values, letting a
+    direct record() call (bypassing BudgetGuard) corrupt totals or
+    manufacture negative spend. Fixed: added exported
+    assertValidMonetaryAmount() (rejects non-finite and negative values,
+    zero is valid) and record() now calls it before pushing any entry —
+    so direct CostEngine.record() calls are protected even when
+    BudgetGuard is bypassed entirely. Regression tests added for NaN,
+    Infinity, -Infinity, and negative amounts (each confirmed to throw
+    InvalidMonetaryAmountError and leave `engine.all()` empty), plus
+    direct unit tests of assertValidMonetaryAmount as the shared
+    validation primitive.
 
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
@@ -575,6 +638,29 @@
     allowed and blocked budget checks as durable, hash-chained evidence
     (BudgetGuard's optional third/fourth constructor params: `now` and
     `auditLog`).
+
+    BLOCKER fix (Codex, 2nd round): assertWithinBudget() checked the
+    projected amount against ceilings arithmetically but never validated
+    that the amount (or the configured limits themselves) were finite and
+    non-negative — a NaN or negative projectedAmountUsd, or a NaN/negative
+    limit, could bypass every ceiling check (NaN comparisons are always
+    false; a negative amount can manufacture headroom). Fixed:
+    assertWithinBudget() now calls assertValidMonetaryAmount() on the
+    projected amount before any ceiling check, failing closed (throwing
+    InvalidMonetaryAmountError, logging BUDGET_INVALID_AMOUNT_REJECTED to
+    the audit trail) without mutating any state; the BudgetGuard
+    constructor now validates all four limits (perTaskUsd, perRunUsd,
+    dailyUsd, monthlyUsd) via a new assertValidLimit() helper, throwing
+    InvalidBudgetLimitError for NaN/Infinity/-Infinity/negative ceilings.
+    Regression tests added for: NaN/Infinity/-Infinity/negative spend
+    amounts (each leaves total spend at 0, not NaN), a negative amount
+    failing to manufacture headroom, correct enforcement continuing after
+    a rejected invalid spend, NaN/Infinity/-Infinity/negative limits
+    rejected at construction for all four ceiling kinds, a direct
+    CostEngine.record() bypass still being protected by CostEngine's own
+    validation (see UASF-REQ-0029), an exact-boundary-vs-just-over-boundary
+    test, and an audit-log assertion that a rejected invalid amount is
+    recorded as BUDGET_INVALID_AMOUNT_REJECTED.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -663,11 +749,38 @@
   status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/cache/cache.ts"
+    - "runtime/cache/file-cache.ts"
+    - "runtime/state/file-store.ts"
   test_refs:
     - "runtime/cache/__tests__/cache.test.ts"
+    - "runtime/cache/__tests__/file-cache.test.ts"
   proof_refs:
     - "proofs/cache-reuse/proof.test.ts"
   security_refs: []
+  notes: >
+    P2 finding (Codex, 2nd round): the description says "durable cache",
+    but the only implementation was runtime/cache/cache.ts, an in-memory
+    Map — proving same-process reuse, not restart durability. PROOF_VERIFIED
+    was overstated relative to that evidence.
+
+    Fixed via option (A): added runtime/cache/file-cache.ts, a FileCache<T>
+    backed by the existing StateStore/FileStateStore infrastructure (same
+    interface as runtime/state/file-store.ts used for project state) —
+    every set() persists the full entry map to a JSON file, and every
+    get()/size() reads it back from disk, so no shared in-memory reference
+    is required across instances. Restart-recovery proof added in
+    proofs/cache-reuse/proof.test.ts: a FileCache+FileStateStore instance
+    computes and persists a result inside a block scope and is then
+    discarded (no reference retained), and a SECOND, independently
+    constructed FileCache+FileStateStore instance pointed at the same file
+    path reuses the persisted result without recomputation — genuinely
+    proving restart durability, not same-instance reuse. Equivalent
+    restart-recovery tests also added directly in
+    runtime/cache/__tests__/file-cache.test.ts (including expired-entry
+    and size() cases across the simulated restart). The original in-memory
+    Cache remains available for callers that explicitly do not need
+    cross-process durability (e.g. the cache-reuse proof's original
+    same-process test).
 
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation

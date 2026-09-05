@@ -32,23 +32,10 @@ export interface PolicyEvaluationResult {
   readonly action: PolicyAction;
 }
 
-/**
- * Risk-5 eylemler (üretime dağıtım, yıkıcı DB işlemleri, gizli anahtar
- * değişikliği, bütçe dışı premium model kullanımı vb.) hiçbir zaman
- * doğrudan ALLOW alamaz — bölüm 146, 147 gereği en az APPROVAL_REQUIRED
- * döner. Bu, motor içine gömülü, override edilemeyen bir kuraldır.
- */
-const RISK_5_NEVER_AUTO_ALLOW: PolicyRule = {
-  name: "risk-5-requires-approval",
-  priority: Number.MAX_SAFE_INTEGER,
-  evaluate(action) {
-    if (action.risk >= 5) return "APPROVAL_REQUIRED";
-    return null;
-  }
-};
+export const RISK_5_APPROVAL_RULE_NAME = "risk-5-requires-approval";
 
 export class PolicyEngine {
-  private readonly rules: PolicyRule[] = [RISK_5_NEVER_AUTO_ALLOW];
+  private readonly rules: PolicyRule[] = [];
 
   constructor(private readonly auditLog: AuditLog = new AuditLog()) {}
 
@@ -65,14 +52,30 @@ export class PolicyEngine {
 
     let decision: PolicyDecision = "DENY"; // default deny (baseline section 147)
     let matchedRule = "default-deny";
+    let explicitlyMatched = false;
 
     for (const rule of ordered) {
       const result = rule.evaluate(action);
       if (result !== null) {
         decision = result;
         matchedRule = rule.name;
+        explicitlyMatched = true;
         break;
       }
+    }
+
+    // Risk-5 eylemler (üretime dağıtım, yıkıcı DB işlemleri, gizli anahtar
+    // değişikliği vb.) hiçbir zaman doğrudan ALLOW alamaz — bölüm 146, 147
+    // gereği en az APPROVAL_REQUIRED döner. AMA bu, "aksi halde YASAK olan
+    // bir eylemi onaylanabilir hale getiren" bir mekanizma DEĞİLDİR: bu
+    // yükseltme yalnızca kararın zaten DENY olmadığı durumlarda uygulanır.
+    // Açık bir DENY kuralı — önceliği ne olursa olsun — HER ZAMAN kazanır;
+    // risk-5 kontrolü bunun üzerine bindirilen ek bir kısıtlamadır, bir
+    // geçersiz kılma değil (bölüm 241, DENY en yüksek önceliğe sahiptir).
+    const explicitDeny = explicitlyMatched && decision === "DENY";
+    if (action.risk >= 5 && decision !== "APPROVAL_REQUIRED" && !explicitDeny) {
+      decision = "APPROVAL_REQUIRED";
+      matchedRule = RISK_5_APPROVAL_RULE_NAME;
     }
 
     this.auditLog.append({

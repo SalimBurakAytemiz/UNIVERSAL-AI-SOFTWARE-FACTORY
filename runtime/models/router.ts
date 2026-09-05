@@ -7,7 +7,7 @@
 // false'tur (AUTO_PREMIUM_FALLBACK = FALSE, bölüm 64).
 
 import { ModelGateway, type ModelInvocationRequest, type ModelInvocationResponse } from "./gateway.js";
-import { ModelRegistry, tierRank, type ModelRecord, type ModelTier } from "./registry.js";
+import { ModelRegistry, TIER_ORDER, tierRank, type ModelRecord, type ModelTier } from "./registry.js";
 
 export interface RoutingRequest {
   readonly taskId: string;
@@ -40,6 +40,16 @@ export class PremiumFallbackBlockedError extends Error {
         `Escalation requires explicit allowPremiumFallback=true from an authorized caller.`
     );
     this.name = "PremiumFallbackBlockedError";
+  }
+}
+
+export class EscalationExhaustedError extends Error {
+  constructor(taskId: string, finalTier: ModelTier) {
+    super(
+      `Task ${taskId} failed validation even after escalating all the way to tier '${finalTier}'. ` +
+        `Failing closed rather than returning unvalidated output (baseline section 64).`
+    );
+    this.name = "EscalationExhaustedError";
   }
 }
 
@@ -94,10 +104,17 @@ export class CheapestCapableModelRouter {
   }
 
   /**
-   * Seç + çalıştır + doğrula akışı. Doğrulama başarısız olursa ve
-   * premium fallback açıkça izinliyse, bir üst kalite seviyesindeki en
-   * ucuz modele TEK seviye yükseltme yapar (bölüm 64'teki kontrollü
-   * eskalasyon zinciri sadeleştirilmiş haliyle).
+   * Seç + çalıştır + doğrula akışı. Doğrulama başarısız olursa ve premium
+   * fallback açıkça izinliyse, bir üst kalite seviyesine yükselir. KRİTİK:
+   * yükseltilen (fallback) yanıt da AYNI `validate` fonksiyonundan geçirilir
+   * — bir yanıtın daha pahalı/daha üst seviye bir modelden gelmiş olması,
+   * onu otomatik olarak güvenilir kılmaz (bölüm 64). Doğrulama yine
+   * başarısız olursa ve daha yüksek bir seviye varsa, o seviyeye de
+   * (yeniden doğrulanarak) yükselinir; tepe seviyeye (CRITICAL_REVIEW)
+   * ulaşılıp orada da başarısız olunursa fail-closed olunur
+   * (EscalationExhaustedError) — asla doğrulanmamış bir çıktı sessizce
+   * döndürülmez. Seviye sayısı sonlu (6 kademe) olduğundan bu döngü
+   * doğası gereği sınırlıdır; sonsuz bir yeniden deneme riski yoktur.
    */
   async routeAndExecute(
     request: RoutingRequest,
@@ -106,36 +123,38 @@ export class CheapestCapableModelRouter {
     validate: (response: ModelInvocationResponse) => boolean,
     options: RouteAndExecuteOptions = {}
   ): Promise<RouteAndExecuteResult> {
-    const initialDecision = this.selectModel(request);
-    const initialResponse = await gateway.invoke(initialDecision.model, invocationRequest);
+    let decision = this.selectModel(request);
+    let response = await gateway.invoke(decision.model, invocationRequest);
 
-    if (validate(initialResponse)) {
-      return { response: initialResponse, decision: initialDecision };
+    if (validate(response)) {
+      return { response, decision };
     }
 
     if (!options.allowPremiumFallback) {
       throw new PremiumFallbackBlockedError(request.taskId);
     }
 
-    // Escalate from the tier of the model ACTUALLY SELECTED, not the
-    // minimum risk-derived tier. If the capability filter already forced a
-    // pricier model than the risk floor required (e.g. a risk-0 task that
-    // only a STANDARD-tier model can perform), escalating from
-    // `requiredTier` would pick a tier at or below the model already
-    // tried — re-selecting the same (or an even cheaper/weaker) model
-    // instead of genuinely moving up a quality level.
-    const currentTierIndex = tierRank(initialDecision.model.tier);
-    const nextTierIndex = currentTierIndex + 1;
-    const nextTier = nextTierIndex < 6 ? (Object.freeze(
-      ["MOCK", "LOCAL_FREE", "VERY_LOW_COST", "STANDARD", "PREMIUM", "CRITICAL_REVIEW"] as const
-    )[nextTierIndex] as ModelTier) : undefined;
+    // Eskalasyon, modelin GERÇEKTEN seçildiği seviyeden başlar (risk
+    // tabanlı minimum seviyeden değil) — bkz. selectModel() yorumu: bir
+    // yetenek filtresi zaten daha pahalı bir modeli zorunlu kılmış
+    // olabilir, bu durumda `requiredTier`'dan başlamak aynı modelin
+    // tekrar seçilmesine yol açabilir.
+    for (;;) {
+      const nextTierIndex = tierRank(decision.model.tier) + 1;
+      const nextTier = nextTierIndex < TIER_ORDER.length ? TIER_ORDER[nextTierIndex] : undefined;
 
-    if (!nextTier) {
-      throw new NoCapableModelError(request, initialDecision.model.tier);
+      if (!nextTier) {
+        throw new EscalationExhaustedError(request.taskId, decision.model.tier);
+      }
+
+      decision = this.selectModel(request, nextTier);
+      response = await gateway.invoke(decision.model, invocationRequest);
+
+      if (validate(response)) {
+        return { response, decision };
+      }
+      // Doğrulama yine başarısız oldu -> döngü bir üst seviyeye devam eder
+      // (ya da üst seviye kalmadıysa yukarıdaki throw ile fail-closed olur).
     }
-
-    const escalatedDecision = this.selectModel(request, nextTier);
-    const escalatedResponse = await gateway.invoke(escalatedDecision.model, invocationRequest);
-    return { response: escalatedResponse, decision: escalatedDecision };
   }
 }
