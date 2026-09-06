@@ -316,6 +316,72 @@ factory:
     per the fifteenth review's own framing, a potential final P0 closure
     candidate. P0 remains open.
 
+    Sixteenth independent Codex P0 closure review (all required
+    verification — lint, typecheck, build, 610/610 tests, requirement
+    validation, secret scanning, required P0 checks — confirmed passing
+    beforehand) reproduced TWO remaining findings. [P1] "outstanding
+    budget reservations are not shared across guards using one cost
+    ledger": two `BudgetGuard` instances constructed over the SAME
+    `CostEngine` each kept a PRIVATE `Map` of outstanding reservations,
+    invisible to each other — two concurrent $0.60 `reserve()` calls, one
+    per guard, both independently saw zero outstanding reservations
+    against a shared $1.00 ceiling and both succeeded, reintroducing the
+    exact race the 10th round's reservation model was meant to make
+    structurally impossible, one layer up (across guard instances rather
+    than within one guard). [P2] "durable cache read-modify-write is not
+    safe across processes": `FileCache.set()`'s read-modify-write cycle
+    (load the whole persisted map, mutate a copy, atomically replace the
+    file) protected each individual write from partial content but not
+    the full transaction — two real, independent processes could both
+    read the same snapshot, both mutate their own copy, and the second
+    process's atomic replace would silently erase the first process's
+    already-successful write (classic cross-process lost-update race);
+    the same race could hit `get()`'s expired-entry cleanup racing a
+    concurrent `set()`. Both fixed this session (see below): reservation
+    storage moved onto the shared `CostEngine` ledger itself (so every
+    `BudgetGuard` bound to one ledger enforces ceilings against the SAME
+    outstanding reservations, regardless of which guard created any of
+    them), and a new dependency-free cross-process file-lock
+    (`runtime/cache/file-lock.ts`, built on `mkdirSync`'s atomicity, with
+    bounded-wait timeout, PID-liveness-based instant dead-lock recovery,
+    and age-based stale-lock reclaim gated by a token so a reclaimed lock
+    can never be deleted out from under its new owner) now serializes
+    `FileCache`'s entire read-modify-write transaction, always re-reading
+    latest state AFTER the lock is held. Both fixes verified via
+    temporary in-place bypasses reproducing the exact predicted failure
+    symptoms (25 budget tests failing with "expected to throw but didn't"
+    when `CostEngine.reservedTotal()` was forced to always return 0;
+    consistent lost-update counts — 58, 53, 66 instead of 75 — across 3
+    separate runs when `FileCache`'s lock was bypassed entirely), then
+    reverted. Regression evidence: 12 new budget.test.ts cases (shared-
+    ledger exact reproduction, concurrent-reservation rejection,
+    committed+reserved enforcement, cross-guard release/protected-
+    reconciliation/commit-visibility, ownership isolation across every
+    dimension, independent-ledger isolation, no-double-accounting,
+    construction-order independence) and a NEW file,
+    `runtime/cache/__tests__/file-cache.cross-process.test.ts`, with 9
+    tests using REAL, separately-spawned Node.js child processes (via
+    `tsx`, not multiple in-process FileCache instances) covering
+    concurrent-different-key writes, 5-process/75-key high-contention
+    safety, expiration-cleanup-vs-set() racing, crash-while-holding-the-
+    lock recovery, stale-lock reclaim safety, same-process correctness,
+    restart persistence, and malformed-write state preservation. Two
+    narrow targeted audits performed (budget construction paths across
+    gateway.ts/router.ts/orchestrator.ts: confirmed only one production
+    `BudgetGuard`/`CostEngine` construction site exists and neither
+    gateway.ts nor router.ts ever constructs its own, so no path can form
+    a separate reservation universe; durable-cache read-modify-write
+    root class across the P0 persistence path: confirmed
+    assumption-register.ts/decision-ledger.ts use a structurally
+    different explicit one-shot saveTo()/loadFrom() snapshot pattern, not
+    FileCache's automatic per-operation reload-mutate-rewrite cycle, and
+    orchestrator.ts's writes are one-shot to unique per-project paths —
+    no other genuine instance found). Fully verified (lint, typecheck, a
+    real `rm -rf dist && npm run build`, 630/630 tests, requirement
+    validation, secret scan, Factory Doctor, all 9 P0 proofs); pushed for
+    a seventeenth independent review — per the sixteenth review's own
+    framing, a potential final P0 closure candidate. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -2104,6 +2170,136 @@ completed_milestones:
     tests (590 + 20 new), validate:requirements, history-aware
     secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
     (13 assertions) — all clean.
+  - |-
+    THIS SESSION (round 17) — a sixteenth independent Codex review
+    (confirmed the full required sequence passing BEFORE listing the
+    findings) reproduced TWO remaining findings, both now fixed:
+    - [P1] "Outstanding budget reservations are not shared across guards
+      using one cost ledger": two `BudgetGuard` instances constructed
+      over the SAME `CostEngine` each kept their own PRIVATE `Map` of
+      outstanding (not-yet-committed) reservations — a reservation opened
+      through guard A was invisible to guard B's own ceiling checks.
+      Codex reproduced two concurrent $0.60 `reserve()` calls, one
+      through each guard, both independently seeing zero outstanding
+      reservations against a shared $1.00 `perRunUsd` ceiling and both
+      succeeding — $1.20 committed, reintroducing (one layer up, across
+      guard instances rather than within one) the exact race the 10th
+      independent review round's reservation model was meant to make
+      structurally impossible. Fixed (the shared-ledger option the review
+      offered): reservation storage now lives on `CostEngine` itself —
+      the object every cooperating `BudgetGuard` already shares by
+      construction, exactly as it already did for COMMITTED spend. Five
+      new synchronous `CostEngine` methods (`createReservation()`,
+      `getReservation()`, `markReservationReconciliationFailed()`,
+      `deleteReservation()`, `reservedTotal()`) replace `BudgetGuard`'s
+      former private `Map`; `reserve()`/`commit()`/`release()`/
+      `buildCeilingChecks()` now delegate entirely to `this.costEngine`,
+      while every public signature, error type, and audit event is
+      UNCHANGED — only the underlying storage moved, so every existing
+      caller and prior regression test continues to work unmodified.
+      Concurrency safety is preserved by the same argument the 10th round
+      established: every new `CostEngine` reservation method is fully
+      synchronous with no `await` inside it, so "read shared ledger ->
+      check ceilings -> write shared ledger" inside `reserve()` still
+      executes as one indivisible JS tick regardless of how many
+      `BudgetGuard` instances share the ledger. Twelve regression tests
+      added (budget.test.ts, new describe block) prove the exact
+      reproduction, that two concurrent $0.60 reservations across two
+      guards cannot both succeed, committed+reserved enforcement across
+      guards, `release()` from a DIFFERENT guard than the one that
+      created the reservation restoring exactly the correct capacity, a
+      protected RECONCILIATION_FAILED reservation created via one guard
+      remaining protected against `release()` from a different guard, a
+      correct `commit()` through one guard being immediately visible to a
+      sibling guard's ceiling checks, task/project/agent/provider/model
+      ownership isolation across guards sharing one ledger, independent
+      `CostEngine` ledgers remaining fully independent, no double
+      accounting, and constructing a second `BudgetGuard` over an
+      existing ledger not resetting or hiding already-outstanding
+      reservations. Confirmed via a temporary bypass
+      (`CostEngine.reservedTotal()` forced to always return 0) that 25
+      tests failed with exactly the predicted "expected to throw but
+      didn't" symptom (this round's 6 new cross-guard-visibility tests
+      plus every prior round's `reservedTotal()`-dependent regression
+      test), then reverted and re-confirmed 622/622 tests passing.
+    - [P2] "Durable cache read-modify-write is not safe across
+      processes": `FileCache.set()`'s read-modify-write cycle (load the
+      whole persisted map, mutate a copy, atomically REPLACE the file)
+      protected each individual write from partial/corrupt content, but
+      not the FULL transaction — Codex reproduced two independent
+      processes both reading the same persisted snapshot, both mutating
+      their own copy, and the second process's atomic replace silently
+      erasing the first process's already-successful write (classic
+      cross-process lost-update race); the same race could hit `get()`'s
+      expired-entry cleanup racing a concurrent `set()`. Fixed: added
+      `runtime/cache/file-lock.ts`, a minimal, dependency-free
+      cross-process mutual-exclusion primitive built on `mkdirSync`'s
+      atomicity (directory creation either fully succeeds or fails with
+      EEXIST — no "check then create" window), consistent with this
+      repository's existing zero-dependency durable-persistence
+      philosophy. `acquireFileLock()` supports a bounded-wait timeout and
+      reclaims a lock as stale — via a token-gated `rmSync` so a
+      reclaimed lock is never later deleted out from under its NEW owner
+      — either once older than a configurable `staleMs` or the instant
+      its recorded owner PID is provably no longer alive (checked via
+      `process.kill(pid, 0)`), so a crashed holder never causes a lasting
+      deadlock. `FileCache.set()` and the expired-entry cleanup path
+      inside `get()` now run their entire read-modify-write cycle (lock
+      -> re-read the LATEST persisted contents -> mutate -> atomic write
+      -> release) inside the lock's critical section, always re-reading
+      fresh state after the lock is held; `loadAll()`/`size()`/the
+      non-expired branch of `get()` remain lock-free reads, safe because
+      StateStore's rename-based atomic write already guarantees a reader
+      only ever observes a fully-old or fully-new file. Nine regression
+      tests added in a NEW file, `runtime/cache/__tests__/
+      file-cache.cross-process.test.ts`, using REAL, separately-spawned
+      Node.js child processes (via `tsx` and a standalone worker fixture)
+      rather than multiple in-process `FileCache` instances — covering
+      the exact reproduction, 5-process/75-key high-contention safety,
+      expiration-cleanup-vs-concurrent-set() racing, crash-while-holding-
+      the-lock recovery (dead-PID detection, no permanent deadlock),
+      stale-lock reclaim safety (including the original holder's own
+      eventual release() becoming a safe no-op via the token check),
+      same-process correctness, restart persistence across real process
+      boundaries, and malformed-write state preservation. Confirmed via a
+      temporary bypass (`withLock()` made a no-op) that the high-
+      contention test consistently lost updates across 3 separate runs
+      (58, 53, and 66 keys observed instead of the expected 75 each
+      time), then reverted and re-confirmed 630/630 tests passing.
+    - Targeted audit (scoped to exactly these two root classes, as
+      explicitly requested): (1) budget construction paths across
+      gateway.ts/router.ts/orchestrator.ts confirmed only ONE production
+      `BudgetGuard`/`CostEngine` construction site exists
+      (orchestrator.ts's `bootstrapProject()`, which only ever calls
+      non-mutating `assertWithinBudget()`/synchronous `spend()`, never
+      `reserve()`/`commit()`/`release()`) and that gateway.ts/router.ts
+      both take a caller-supplied `BudgetGuard` as a dependency, never
+      constructing their own — no path found that could accidentally
+      form a separate reservation universe over a shared ledger; (2)
+      every `StateStore.read()`/`.write()` call site outside
+      file-store.ts/file-cache.ts confirmed that
+      assumption-register.ts/decision-ledger.ts use a structurally
+      DIFFERENT explicit one-shot saveTo()/loadFrom() snapshot pattern
+      (not FileCache's automatic per-operation reload-mutate-rewrite
+      cycle), and orchestrator.ts's writes are one-shot to unique
+      per-project paths — no other genuine instance of the durable-cache
+      cross-process root class found in the P0 path.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0030 (Budget engine / cost ceilings — the
+    shared-ledger reservation fix, its 12 new regression tests, the
+    temp-bypass verification results, and the budget-construction-paths
+    narrow-audit note) and UASF-REQ-0036 (Cache / reuse layer — the
+    cross-process file-lock fix, its 9 new real-child-process regression
+    tests, the temp-bypass verification results, and the durable-cache
+    root-class narrow-audit note). No status field was raised on any
+    requirement beyond what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ deletion and rebuild), 630/630
+    tests (610 + 20 new), validate:requirements, history-aware
+    secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
+    (13 assertions) — all clean.
 
 known_limitations:
   - >-
@@ -2332,6 +2528,36 @@ blockers:
     P0 complete, until that re-review confirms no blocking finding
     remains.
 
+    A SIXTEENTH independent Codex review (all required verification —
+    lint, typecheck, build, 610/610 tests, requirement validation, secret
+    scan, required P0 checks — confirmed passing BEFORE the findings were
+    listed) reproduced TWO remaining findings: [P1] two `BudgetGuard`
+    instances sharing one `CostEngine` each kept a PRIVATE outstanding-
+    reservation `Map`, invisible to each other, letting two concurrent
+    $0.60 reservations both succeed against a shared $1.00 ceiling; [P2]
+    `FileCache`'s read-modify-write cycle was not safe across processes —
+    two independent processes could both read the same persisted
+    snapshot and the second's atomic write would silently erase the
+    first's already-successful update. Both fixed this session:
+    reservation storage moved onto the shared `CostEngine` ledger itself
+    (so every `BudgetGuard` bound to one ledger enforces ceilings against
+    the SAME outstanding reservations, regardless of which guard created
+    them), and a new dependency-free cross-process lock
+    (`runtime/cache/file-lock.ts`, built on `mkdirSync` atomicity, with
+    bounded-wait timeout, instant dead-PID-based deadlock recovery, and
+    token-gated stale-lock reclaim) now serializes `FileCache`'s entire
+    read-modify-write transaction. Tested (630/630 tests, +20 net new,
+    including 9 tests using REAL separately-spawned child processes for
+    the cross-process fix) and verified per the full required sequence —
+    see completed_milestones for full detail. Two narrow targeted audits
+    confirmed no other genuine instance of either root class exists in
+    the P0 path. Now awaiting a SEVENTEENTH independent review — per the
+    sixteenth review's own framing, a potential final P0 closure
+    candidate. Per explicit instruction: "stop at the independent-review
+    boundary" — do not push further P0 feature work, and do not declare
+    P0 complete, until that re-review confirms no blocking finding
+    remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -2348,6 +2574,77 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fixes for the sixteenth independent Codex review's TWO remaining
+  findings are implemented, tested, and pushed to
+  claude/ai-factory-baseline-v1-seawq7, with the full required
+  verification sequence run clean (lint, typecheck, a REAL `npm run
+  build` emission — confirmed via a clean `dist/` deletion and rebuild —
+  630/630 tests, validate:requirements, history-aware secret-scan,
+  Factory Doctor READY, all 9 P0 proofs). Summary of the fixes:
+
+  [P1] `runtime/budget/budget.ts`'s `BudgetGuard` used to store
+  outstanding reservations in a PRIVATE `Map` — two guard instances
+  sharing one `CostEngine` were blind to each other's reservations,
+  letting two concurrent $0.60 reservations both succeed against a
+  shared $1.00 ceiling. Fixed: reservation storage moved onto
+  `runtime/cost/cost-engine.ts`'s `CostEngine` itself (five new
+  synchronous methods: `createReservation()`, `getReservation()`,
+  `markReservationReconciliationFailed()`, `deleteReservation()`,
+  `reservedTotal()`) — the object every cooperating `BudgetGuard` already
+  shares by construction, exactly as it already did for committed spend.
+  `reserve()`/`commit()`/`release()`/`buildCeilingChecks()` now delegate
+  entirely to `this.costEngine`; every public signature, error type, and
+  audit event is unchanged. Twelve new regression tests
+  (`budget.test.ts`) prove cross-guard visibility, isolation, and
+  no-double-accounting; verified via a temporary bypass
+  (`CostEngine.reservedTotal()` forced to return 0) confirming 25 tests
+  failed with the exact predicted symptom, then reverted. A narrow audit
+  of gateway.ts/router.ts/orchestrator.ts confirmed only one production
+  `BudgetGuard`/`CostEngine` construction site exists and neither
+  gateway.ts nor router.ts constructs its own — no path can form a
+  separate reservation universe.
+
+  [P2] `runtime/cache/file-cache.ts`'s `set()`/expiration-cleanup
+  read-modify-write cycle was not safe across processes: two independent
+  processes could both read the same persisted snapshot, and the
+  second's atomic write would silently erase the first's already-
+  successful update. Fixed: new `runtime/cache/file-lock.ts`, a
+  dependency-free cross-process lock built on `mkdirSync` atomicity, with
+  a bounded-wait timeout and stale-lock reclaim gated by a token (safe
+  even if the original holder later tries to release a lock it no longer
+  owns) — reclaimed either after `staleMs` or instantly once the holder's
+  PID is provably dead (no permanent deadlock on a crash).
+  `FileCache.set()`/`get()`'s cleanup path now run their entire
+  read-modify-write cycle inside the lock, always re-reading latest state
+  after acquiring it. Nine new regression tests
+  (`runtime/cache/__tests__/file-cache.cross-process.test.ts`) use REAL,
+  separately-spawned Node.js child processes (via `tsx`) — not multiple
+  in-process instances — covering concurrent writes, high contention,
+  expiration-vs-set() racing, crash recovery, stale-lock reclaim,
+  same-process correctness, and restart persistence; verified via a
+  temporary bypass (lock skipped entirely) confirming consistent
+  lost-update counts (58/53/66 instead of 75) across 3 runs, then
+  reverted. A narrow audit confirmed assumption-register.ts/
+  decision-ledger.ts use a structurally different one-shot snapshot
+  pattern (not FileCache's automatic per-operation cycle) — no other
+  genuine instance of this root class exists in the P0 path.
+
+  Requirement registry updated (UASF-REQ-0030, UASF-REQ-0036) from this
+  real evidence only — no status raised beyond what is genuinely
+  supported. Do not proceed to further P0 feature work or declare P0
+  complete until a SEVENTEENTH independent (Codex) re-review of this
+  diff confirms no blocking P0 finding remains — per that review's own
+  framing, this may be the final P0 closure candidate. If/when that comes
+  back clean, resume from the prior exact_next_action (below): wire the
+  remaining foundation modules (Discovery, Decisions, Assumptions,
+  Technology/Business-Capability registries) into the same integrated
+  pipeline, consider a SQLite-backed StateStore, get a Founder decision
+  on P0-sufficiency and licensing (section 206). The autonomous-merge
+  governance question stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fix for the fifteenth independent Codex review's ONE remaining P2
   finding is implemented, tested, and pushed to

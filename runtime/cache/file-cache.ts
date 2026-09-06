@@ -8,6 +8,7 @@
 
 import type { StateStore } from "../state/file-store.js";
 import type { CacheEntry } from "./cache.js";
+import { acquireFileLock, type FileLockOptions } from "./file-lock.js";
 
 /**
  * P2 fix (6th independent review round, "durable cache loses __proto__
@@ -34,8 +35,44 @@ type PersistedEntries<T> = readonly PersistedEntry<T>[];
 export class FileCache<T = unknown> {
   constructor(
     private readonly stateStore: StateStore,
-    private readonly path: string
+    private readonly path: string,
+    private readonly lockOptions?: FileLockOptions
   ) {}
+
+  /**
+   * P2 fix (16th independent review round, "durable cache read-modify-
+   * write is not safe across processes"): `set()` and expired-entry
+   * cleanup used to read the WHOLE persisted map, mutate a private
+   * in-memory copy, then atomically REPLACE the file — but "replace the
+   * file atomically" only protects that ONE write from partial/corrupt
+   * content; it does nothing to stop TWO processes from both reading the
+   * SAME snapshot, both mutating their own copy, and the second one's
+   * write silently overwriting (losing) the first one's successfully
+   * applied change (classic cross-process lost-update race, bkz.
+   * runtime/cache/file-lock.ts'in üstündeki fix notu). Every mutating
+   * read-modify-write cycle below now runs entirely inside
+   * `acquireFileLock()`'s critical section AND re-reads the latest
+   * persisted contents AFTER the lock is held (never reusing a snapshot
+   * taken before acquiring it) — so a concurrent process's already-
+   * completed write is always seen and preserved, never clobbered.
+   * `loadAll()`/`size()` remain lock-free: they are pure reads of an
+   * atomically-written file (StateStore's rename-based write guarantees
+   * a reader always sees either the fully-old or fully-new content,
+   * never a partial one), which is safe without serialization — only
+   * the MUTATION path needs the lock.
+   */
+  private lockPath(): string {
+    return `${this.path}.lock`;
+  }
+
+  private withLock<R>(fn: () => R): R {
+    const release = acquireFileLock(this.lockPath(), this.lockOptions);
+    try {
+      return fn();
+    } finally {
+      release();
+    }
+  }
 
   private loadAll(): Map<string, CacheEntry<T>> {
     const persisted = this.stateStore.read<PersistedEntries<T>>(this.path) ?? [];
@@ -54,22 +91,41 @@ export class FileCache<T = unknown> {
     const entry = all.get(key);
     if (!entry) return undefined;
     if (entry.expiresAt !== undefined && entry.expiresAt < Date.now()) {
-      // Süresi dolmuş girdi diskte de asla sessizce yeniden kullanılmaz.
-      all.delete(key);
-      this.saveAll(all);
+      // Süresi dolmuş girdi diskte de asla sessizce yeniden kullanılmaz —
+      // ama bu bir MUTASYONdur, bu yüzden set() ile AYNI kilitli,
+      // yeniden-okuyan yola gider (bkz. yukarıdaki sınıf fix notu): kilit
+      // altında en güncel harita yeniden okunur ve girdi HÂLÂ süresi
+      // dolmuş görünüyorsa (başka bir process bu arada onu tazelemediyse)
+      // silinir — aksi halde, kilit alınmadan önce okunmuş BAYAT bir
+      // haritayı geri yazmak, tam da bu ikinci finding'in tarif ettiği
+      // gibi, o process'in az önce başarıyla yazdığı tazelenmiş girdiyi
+      // (veya tamamen alakasız başka bir anahtarı) sessizce silebilirdi.
+      this.withLock(() => {
+        const latest = this.loadAll();
+        const latestEntry = latest.get(key);
+        if (latestEntry && latestEntry.expiresAt !== undefined && latestEntry.expiresAt < Date.now()) {
+          latest.delete(key);
+          this.saveAll(latest);
+        }
+      });
       return undefined;
     }
     return entry.value;
   }
 
   set(key: string, value: T, ttlMs?: number): void {
-    const all = this.loadAll();
-    all.set(key, {
-      value,
-      computedAt: Date.now(),
-      expiresAt: ttlMs !== undefined ? Date.now() + ttlMs : undefined
+    this.withLock(() => {
+      // Kilit ALINDIKTAN SONRA en güncel içerik yeniden okunur — kilit
+      // beklerken başka bir process'in tamamladığı yazma burada asla
+      // görünmez kalmaz (bkz. yukarıdaki sınıf fix notu).
+      const all = this.loadAll();
+      all.set(key, {
+        value,
+        computedAt: Date.now(),
+        expiresAt: ttlMs !== undefined ? Date.now() + ttlMs : undefined
+      });
+      this.saveAll(all);
     });
-    this.saveAll(all);
   }
 
   has(key: string): boolean {

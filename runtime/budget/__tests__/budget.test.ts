@@ -1351,4 +1351,207 @@ describe("BudgetGuard", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (16th independent review round, 'outstanding budget reservations are not shared across guards " +
+      "using one cost ledger'): reservation state now lives on the shared CostEngine, so every BudgetGuard " +
+      "bound to the same ledger enforces ceilings against the SAME outstanding reservations, not a private map",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: shared CostEngine + Guard A + Guard B, $1 ceiling, A reserves " +
+          "$0.60, B's $0.60 attempt is REJECTED before any provider invocation would occur",
+        () => {
+          const costEngine = new CostEngine();
+          const guardA = new BudgetGuard(costEngine, { perRunUsd: 1 });
+          const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+          const reservationA = guardA.reserve({ taskId: "a" }, 0.6);
+          expect(reservationA.amountUsd).toBe(0.6);
+
+          // Guard B must see A's outstanding reservation on the SHARED
+          // ledger and reject before ever reaching a provider call.
+          expect(() => guardB.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+
+          // Nothing was ever committed by either guard.
+          expect(costEngine.total()).toBe(0);
+        }
+      );
+
+      it("two concurrent $0.60 reservations across two guards over one ledger cannot both succeed", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservationA = guardA.reserve({ taskId: "a" }, 0.6);
+        expect(() => guardB.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+
+        // A's own reservation is still intact and can be committed normally
+        // — rejecting B never disturbed A's outstanding reservation.
+        const committed = guardA.commit(reservationA.id, {
+          taskId: "a",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.6
+        });
+        expect(committed.amountUsd).toBe(0.6);
+        expect(costEngine.total()).toBe(0.6);
+      });
+
+      it("committed + reserved is enforced together across guards: A commits $0.60, B's further $0.60 reservation still sees the committed total via the shared CostEngine", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservationA = guardA.reserve({ taskId: "a" }, 0.6);
+        guardA.commit(reservationA.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        // $0.60 already committed (shared CostEngine) — B's own $0.60
+        // reservation would push the shared $1 ceiling to $1.20.
+        expect(() => guardB.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+        expect(costEngine.total()).toBe(0.6);
+      });
+
+      it("release() from either guard restores only the correct, exact capacity on the shared ledger", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservationA = guardA.reserve({ taskId: "a" }, 0.6);
+        expect(() => guardB.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+
+        // Releasing A's reservation (even via a DIFFERENT guard instance
+        // bound to the same ledger) frees EXACTLY its $0.60 — no more, no
+        // less — since release() is a shared-ledger operation identified
+        // by reservation id, not by which guard object created it.
+        guardB.release(reservationA.id);
+        expect(() => guardB.reserve({ taskId: "b" }, 0.6)).not.toThrow();
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("a protected RECONCILIATION_FAILED reservation (created via Guard A) remains protected when Guard B attempts to release() it", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservationA = guardA.reserve({ taskId: "a" }, 0.6);
+        expect(() =>
+          guardA.commit(reservationA.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+
+        // Guard B (a DIFFERENT guard instance, same ledger) sees the
+        // SAME protected, unresolved reservation and is likewise
+        // rejected from releasing it.
+        expect(() => guardB.release(reservationA.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guardB.reserve({ taskId: "b" }, 1.0)).toThrow(BudgetExceededError);
+
+        // The only safe path forward — retrying commit() with a
+        // corrected amount — works from EITHER guard, since ownership is
+        // defined by the reservation's own scope, not by which guard
+        // object originally created it.
+        const recorded = guardB.commit(reservationA.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(recorded.amountUsd).toBe(0.6);
+        expect(costEngine.total()).toBe(0.6);
+      });
+
+      it("a correct commit() made through Guard A is immediately visible to Guard B's own ceiling checks", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perTaskUsd: 0.6 });
+        const guardB = new BudgetGuard(costEngine, { perTaskUsd: 0.6 });
+
+        const reservationA = guardA.reserve({ taskId: "shared-task" }, 0.6);
+        guardA.commit(reservationA.id, { taskId: "shared-task", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        // Guard B's OWN perTaskUsd ceiling for the SAME task is now
+        // fully consumed, even though Guard B never reserved/committed
+        // anything itself — because committed spend has ALWAYS been
+        // shared via CostEngine (this was already true before this
+        // round's fix; verified here alongside the reservation-sharing
+        // fix for completeness).
+        expect(() => guardB.reserve({ taskId: "shared-task" }, 0.01)).toThrow(BudgetExceededError);
+      });
+
+      it("task/project ownership remains correctly isolated across guards sharing one ledger (no cross-task/cross-project interference)", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perTaskUsd: 0.6 });
+        const guardB = new BudgetGuard(costEngine, { perTaskUsd: 0.6 });
+
+        guardA.reserve({ taskId: "task-a", projectId: "project-1" }, 0.6);
+        // A DIFFERENT task (even on the SAME shared ledger, via a
+        // DIFFERENT guard) has its OWN, unaffected $0.6 ceiling.
+        expect(() => guardB.reserve({ taskId: "task-b", projectId: "project-1" }, 0.6)).not.toThrow();
+        // A different project reusing the SAME taskId is likewise isolated.
+        expect(() => guardB.reserve({ taskId: "task-a", projectId: "project-2" }, 0.6)).not.toThrow();
+      });
+
+      it("agent ownership remains correctly isolated across guards sharing one ledger", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1.2 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1.2 });
+
+        const reservationA = guardA.reserve({ taskId: "t", agentId: "agent-1" }, 0.6);
+        const reservationB = guardB.reserve({ taskId: "t", agentId: "agent-2" }, 0.6);
+
+        guardA.commit(reservationA.id, { taskId: "t", agentId: "agent-1", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        guardB.commit(reservationB.id, { taskId: "t", agentId: "agent-2", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        expect(costEngine.totalFor({ agentId: "agent-1" })).toBe(0.6);
+        expect(costEngine.totalFor({ agentId: "agent-2" })).toBe(0.6);
+      });
+
+      it("provider/model ownership dimensions remain correctly isolated across guards sharing one ledger", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1.2 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1.2 });
+
+        const reservationA = guardA.reserve({ taskId: "t", provider: "prov-a", modelId: "model-a" }, 0.6);
+        const reservationB = guardB.reserve({ taskId: "t2", provider: "prov-b", modelId: "model-b" }, 0.6);
+
+        // Guard B cannot commit reservationA under provider/model B's identity.
+        expect(() =>
+          guardB.commit(reservationA.id, { taskId: "t", provider: "prov-b", modelId: "model-b", amountUsd: 0.6 })
+        ).toThrow(ReservationOwnershipMismatchError);
+
+        // Correct commits from either guard succeed independently.
+        guardA.commit(reservationA.id, { taskId: "t", provider: "prov-a", modelId: "model-a", amountUsd: 0.6 });
+        guardB.commit(reservationB.id, { taskId: "t2", provider: "prov-b", modelId: "model-b", amountUsd: 0.6 });
+        expect(costEngine.total()).toBeCloseTo(1.2);
+      });
+
+      it("different, independent CostEngine ledgers remain fully independent (no cross-ledger interference)", () => {
+        const ledgerOne = new CostEngine();
+        const ledgerTwo = new CostEngine();
+        const guardOne = new BudgetGuard(ledgerOne, { perRunUsd: 1 });
+        const guardTwo = new BudgetGuard(ledgerTwo, { perRunUsd: 1 });
+
+        guardOne.reserve({ taskId: "a" }, 0.6);
+        // guardTwo's ledger has never seen guardOne's reservation at all.
+        expect(() => guardTwo.reserve({ taskId: "b" }, 0.6)).not.toThrow();
+        expect(ledgerOne.reservedTotal({})).toBe(0.6);
+        expect(ledgerTwo.reservedTotal({})).toBe(0.6);
+      });
+
+      it("no double accounting occurs: a single committed spend is counted exactly once regardless of how many guards share the ledger", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        void guardB;
+
+        const reservationA = guardA.reserve({ taskId: "a" }, 0.6);
+        guardA.commit(reservationA.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        expect(costEngine.all()).toHaveLength(1);
+        expect(costEngine.total()).toBe(0.6);
+      });
+
+      it("constructing a second BudgetGuard over an existing ledger does not reset or hide already-outstanding reservations", () => {
+        const costEngine = new CostEngine();
+        const guardA = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        guardA.reserve({ taskId: "a" }, 0.6);
+
+        // Guard B is constructed AFTER the reservation already exists.
+        const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        expect(() => guardB.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+      });
+    }
+  );
 });

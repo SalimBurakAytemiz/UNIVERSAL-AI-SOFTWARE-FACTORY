@@ -11,9 +11,19 @@
 // gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
 import { assertValidMonetaryAmount, exceedsMonetaryAmount } from "../cost/cost-engine.js";
-import type { CostEngine, CostEntry, CostScope } from "../cost/cost-engine.js";
+import type { CostEngine, CostEntry, CostScope, ReservationOwnership } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
+
+// P1 fix (16th independent review round, "outstanding budget reservations
+// are not shared across guards using one cost ledger"): re-exported here
+// (rather than only from cost-engine.ts) purely for API stability —
+// `ReservationOwnership` used to be DEFINED in this file; it now lives in
+// cost-engine.ts (the new authoritative home for reservation state, bkz.
+// aşağıdaki `reservations`/`reserve()`/`commit()`/`release()`'in üstündeki
+// fix notları), but any code that imported the type from here (or from
+// this module's own `Reservation` interface) sees no shape change.
+export type { ReservationOwnership };
 
 export type BudgetCeilingName = "perTaskUsd" | "perRunUsd" | "dailyUsd" | "monthlyUsd";
 
@@ -82,30 +92,6 @@ interface CeilingCheck {
   readonly ceiling: BudgetCeilingName;
   readonly limit: number;
   readonly projected: number;
-}
-
-/**
- * P1 fix (13th independent review round, "reservation ownership checks
- * omit agent identity" + "provider/model identity can still change
- * accounting and audit evidence"): a `Reservation`'s authoritative
- * ownership used to be exactly `CostScope` (taskId/agentId/projectId) —
- * `agentId` was ALREADY part of `CostScope` but `commit()`'s mismatch
- * check (11th/12th round fix) only ever compared `taskId`/`projectId`,
- * never `agentId`, so a reservation made for one agent could be
- * committed under a DIFFERENT agent with zero rejection. Separately,
- * `provider`/`modelId` were not part of a reservation's ownership AT
- * ALL — `commit()` recorded whatever `provider`/`modelId` the caller (or,
- * in gateway.ts's case, the PROVIDER'S OWN RESPONSE) supplied, with no
- * way to validate it against what was actually authorized/reserved.
- * `ReservationOwnership` extends `CostScope` with optional `provider`/
- * `modelId` fields, captured at `reserve()` time (BEFORE any provider
- * call), so every ownership dimension a reservation can carry is fixed
- * atomically at the moment capacity is set aside — never derived later
- * from a caller argument or a provider's own (untrusted) response.
- */
-export interface ReservationOwnership extends CostScope {
-  readonly provider?: string;
-  readonly modelId?: string;
 }
 
 export interface Reservation {
@@ -199,23 +185,6 @@ export class ReservationOwnershipMismatchError extends Error {
   }
 }
 
-/**
- * İki AYRI CostScope'un aynı "sorguyu" karşılayıp karşılamadığını
- * kontrol eder — cost-engine.ts'nin `matchesScope`'u ile AYNI alan-eşleme
- * mantığı (taskId/agentId/projectId), ama bir CostEntry yerine bekleyen
- * bir rezervasyonun KENDİ kapsamına karşı çalışır. Tavan hesaplamalarının
- * (buildCeilingChecks) hem GERÇEKLEŞMİŞ harcamaları (CostEngine) hem de
- * HENÜZ gerçekleşmemiş ama zaten "ayrılmış" tutarları (reservations) AYNI
- * kapsam kuralıyla toplayabilmesi için tek kaynak.
- */
-function scopeMatches(record: CostScope, query: CostScope): boolean {
-  return (
-    (query.taskId === undefined || record.taskId === query.taskId) &&
-    (query.agentId === undefined || record.agentId === query.agentId) &&
-    (query.projectId === undefined || record.projectId === query.projectId)
-  );
-}
-
 /** Verilen anın ait olduğu UTC takvim gününün başlangıcını (00:00:00.000Z) döndürür. */
 function startOfUtcDay(date: Date): string {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())).toISOString();
@@ -278,13 +247,41 @@ export class BudgetGuard {
    * adapter that CAN incur a partial cost on failure must report that
    * partial cost via `commit()` with the partial amount, not `release()`,
    * which is out of scope for the MockProvider this repository ships).
+   *
+   * P1 fix (16th independent review round, "outstanding budget
+   * reservations are not shared across guards using one cost ledger"):
+   * this class used to own a PRIVATE `Map` of outstanding reservations —
+   * Codex reproduced two `BudgetGuard` instances constructed over the
+   * SAME `CostEngine` each keeping their own separate reservation map,
+   * so a reservation opened through guard A was completely invisible to
+   * guard B's own `buildCeilingChecks()`. Two concurrent $0.60
+   * invocations, one authorized through each guard, both independently
+   * saw zero outstanding reservations and both succeeded against a
+   * shared $1.00 ceiling — $1.20 committed, reintroducing the exact race
+   * the 10th round's reservation model was meant to make structurally
+   * impossible, one layer up. Fixed: reservation storage now lives on
+   * `this.costEngine` itself (`createReservation()`/`getReservation()`/
+   * `markReservationReconciliationFailed()`/`deleteReservation()`/
+   * `reservedTotal()` — bkz. runtime/cost/cost-engine.ts) — the SAME
+   * object every cooperating `BudgetGuard` already shares by
+   * construction, exactly as it already was for COMMITTED spending
+   * (`record()`/`totalFor()`). This class no longer stores reservation
+   * state itself at all; `reserve()`/`commit()`/`release()` below are
+   * unchanged in their PUBLIC signatures, error types, ownership-mismatch
+   * validation, and audit events — only the underlying storage moved, so
+   * every existing caller (gateway.ts, router.ts, all prior regression
+   * tests) continues to work unchanged, but now genuinely enforces
+   * ceilings against every reservation on the shared ledger, regardless
+   * of which `BudgetGuard` instance created it. This remains fully
+   * concurrency-safe: `createReservation()`/`getReservation()`/
+   * `markReservationReconciliationFailed()`/`deleteReservation()` are all
+   * synchronous with no `await` inside them, so the combined "read
+   * shared ledger -> check ceilings -> write shared ledger" sequence in
+   * `reserve()` still executes as one indivisible JS tick — a second,
+   * concurrent `reserve()` call (whether on this same guard, another
+   * guard over the same ledger, or a different ledger entirely) can
+   * never observe a partially-updated state.
    */
-  private readonly reservations = new Map<
-    string,
-    { scope: Readonly<ReservationOwnership>; amountUsd: number; status: ReservationStatus }
-  >();
-  private reservationSeq = 0;
-
   constructor(
     private readonly costEngine: CostEngine,
     limits: BudgetLimits,
@@ -324,25 +321,17 @@ export class BudgetGuard {
    * (`spend()` her zaman `projectId` geçmek ZORUNDA değildir) desteklediği
    * meşru bir kullanım şeklidir.
    */
-  /** Verilen sorguyla eşleşen TÜM açık rezervasyonların toplamı (bkz. scopeMatches). */
-  private reservedTotal(query: CostScope): number {
-    let total = 0;
-    for (const reservation of this.reservations.values()) {
-      if (scopeMatches(reservation.scope, query)) {
-        total += reservation.amountUsd;
-      }
-    }
-    return total;
-  }
-
   /**
    * Her tavan kontrolü artık ÜÇ bileşenin toplamına karşı değerlendirilir:
    * (1) CostEngine'e zaten KAYDEDİLMİŞ gerçek harcamalar, (2) henüz
    * mutabakata varılmamış ama zaten AYRILMIŞ (`reserve()` ile açılmış,
-   * henüz `commit()`/`release()` edilmemiş) tutarlar, (3) bu ÇAĞRININ
-   * kendi projeksiyonu. (2)'nin dahil edilmesi, tam olarak 10th
-   * independent review round'un eşzamanlılık düzeltmesidir — onsuz, iki
-   * eşzamanlı `reserve()` çağrısı yine birbirini GÖRMEZ ve ikisi de geçer.
+   * henüz `commit()`/`release()` edilmemiş) tutarlar — artık
+   * `this.costEngine.reservedTotal()` üzerinden bu ledger'a bağlı HER
+   * `BudgetGuard`'ın PAYLAŞTIĞI tek/yetkili toplam (bkz. 16th independent
+   * review round fix notu, bu dosyanın üstünde), (3) bu ÇAĞRININ kendi
+   * projeksiyonu. (2)'nin dahil edilmesi, tam olarak 10th independent
+   * review round'un eşzamanlılık düzeltmesidir — onsuz, iki eşzamanlı
+   * `reserve()` çağrısı yine birbirini GÖRMEZ ve ikisi de geçer.
    */
   private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {
     const checks: CeilingCheck[] = [];
@@ -353,7 +342,7 @@ export class BudgetGuard {
       checks.push({
         ceiling: "perTaskUsd",
         limit: this.limits.perTaskUsd,
-        projected: this.costEngine.totalFor(taskScope) + this.reservedTotal(taskScope) + projectedAmountUsd
+        projected: this.costEngine.totalFor(taskScope) + this.costEngine.reservedTotal(taskScope) + projectedAmountUsd
       });
     }
 
@@ -361,7 +350,7 @@ export class BudgetGuard {
       checks.push({
         ceiling: "perRunUsd",
         limit: this.limits.perRunUsd,
-        projected: this.costEngine.total() + this.reservedTotal({}) + projectedAmountUsd
+        projected: this.costEngine.total() + this.costEngine.reservedTotal({}) + projectedAmountUsd
       });
     }
 
@@ -376,7 +365,7 @@ export class BudgetGuard {
         limit: this.limits.dailyUsd,
         projected:
           this.costEngine.totalInWindow(periodScope, startOfUtcDay(this.now())) +
-          this.reservedTotal(periodScope) +
+          this.costEngine.reservedTotal(periodScope) +
           projectedAmountUsd
       });
     }
@@ -387,7 +376,7 @@ export class BudgetGuard {
         limit: this.limits.monthlyUsd,
         projected:
           this.costEngine.totalInWindow(periodScope, startOfUtcMonth(this.now())) +
-          this.reservedTotal(periodScope) +
+          this.costEngine.reservedTotal(periodScope) +
           projectedAmountUsd
       });
     }
@@ -509,18 +498,20 @@ export class BudgetGuard {
       }
     }
 
-    const id = `res-${++this.reservationSeq}`;
-    const frozenScope = freezeRecord({ ...scope });
-    this.reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
+    // Rezervasyon, bu ledger'a bağlı HER `BudgetGuard`'ın PAYLAŞTIĞI
+    // `this.costEngine`'in KENDİSİNDE oluşturulur — artık bu sınıfın
+    // kendi özel bir Map'inde DEĞİL (bkz. bu sınıfın üstündeki 16th
+    // independent review round fix notu).
+    const created = this.costEngine.createReservation(scope, amountUsd);
 
     this.auditLog?.append({
       type: "BUDGET_RESERVATION_CREATED",
       actor: "budget-guard",
-      payload: { reservationId: id, scope, amountUsd, checks },
+      payload: { reservationId: created.id, scope, amountUsd, checks },
       timestamp: this.now().toISOString()
     });
 
-    return freezeRecord({ id, scope: frozenScope, amountUsd });
+    return freezeRecord({ id: created.id, scope: created.scope, amountUsd: created.amountUsd });
   }
 
   /**
@@ -566,7 +557,7 @@ export class BudgetGuard {
     reservationId: string,
     entry: { taskId: string; agentId?: string; projectId?: string; provider: string; modelId: string; amountUsd: number }
   ) {
-    const reservation = this.reservations.get(reservationId);
+    const reservation = this.costEngine.getReservation(reservationId);
     if (!reservation) {
       throw new UnknownReservationError(reservationId);
     }
@@ -612,8 +603,12 @@ export class BudgetGuard {
       // a malformed amount (bkz. aşağıdaki catch bloğu) — it must enter
       // the SAME protected state, marked BEFORE the error is thrown (not
       // after), so no window exists where the reservation is both
-      // "mismatch detected" and "still releasable."
-      reservation.status = "RECONCILIATION_FAILED";
+      // "mismatch detected" and "still releasable." Marked on the SHARED
+      // ledger (`this.costEngine`) — bkz. bu dosyanın üstündeki 16th
+      // independent review round fix notu — so every `BudgetGuard` bound
+      // to this same ledger observes the protected state, not just this
+      // one guard instance.
+      this.costEngine.markReservationReconciliationFailed(reservationId);
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
         actor: "budget-guard",
@@ -650,8 +645,9 @@ export class BudgetGuard {
       // `UnresolvedReconciliationError`'ın üstündeki not — bu, release()'in
       // bu rezervasyonu ARTIK KABUL ETMEYECEĞİ anlamına gelir; TEK ileri
       // yol, düzeltilmiş bir tutarla commit()'i AYNI id ile tekrar
-      // denemektir.
-      reservation.status = "RECONCILIATION_FAILED";
+      // denemektir. Marked on the SHARED ledger, visible to every
+      // `BudgetGuard` bound to it (bkz. 16th independent review round).
+      this.costEngine.markReservationReconciliationFailed(reservationId);
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_COMMIT_FAILED",
         actor: "budget-guard",
@@ -669,8 +665,9 @@ export class BudgetGuard {
 
     // Rezervasyon ANCAK ŞİMDİ, gerçek maliyet GÜVENLE ve KALICI olarak
     // kaydedildikten SONRA silinir — "başarılı mutabakat, rezervasyonu
-    // TAM OLARAK BİR KEZ serbest bırakır/dönüştürür."
-    this.reservations.delete(reservationId);
+    // TAM OLARAK BİR KEZ serbest bırakır/dönüştürür." SHARED ledger'dan
+    // silinir, bu yüzden her bağlı `BudgetGuard` bunu HEMEN görür.
+    this.costEngine.deleteReservation(reservationId);
 
     const overages = this.buildCeilingChecks({ taskId: entry.taskId, projectId: entry.projectId }, 0).filter((check) =>
       exceedsMonetaryAmount(check.projected, check.limit)
@@ -721,7 +718,7 @@ export class BudgetGuard {
    * as before.
    */
   release(reservationId: string): void {
-    const reservation = this.reservations.get(reservationId);
+    const reservation = this.costEngine.getReservation(reservationId);
     if (!reservation) {
       throw new UnknownReservationError(reservationId);
     }
@@ -734,7 +731,7 @@ export class BudgetGuard {
       });
       throw new UnresolvedReconciliationError(reservationId);
     }
-    this.reservations.delete(reservationId);
+    this.costEngine.deleteReservation(reservationId);
 
     this.auditLog?.append({
       type: "BUDGET_RESERVATION_RELEASED",

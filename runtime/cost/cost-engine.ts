@@ -83,8 +83,64 @@ export interface CostScope {
   readonly projectId?: string;
 }
 
+/**
+ * P1 fix (16th independent review round, "outstanding budget reservations
+ * are not shared across guards using one cost ledger"): Codex reproduced
+ * two `BudgetGuard` instances constructed over the SAME `CostEngine` —
+ * each guard kept its OWN private `Map` of outstanding (not-yet-committed)
+ * reservations, so a reservation opened by guard A was completely
+ * invisible to guard B's own ceiling checks. Two concurrent $0.60
+ * invocations, one authorized through EACH guard, both independently saw
+ * "$0 reserved so far" and both succeeded against a shared $1.00
+ * `perRunUsd` ceiling — $1.20 committed, the exact race the 10th round's
+ * reservation model was supposed to make structurally impossible, just
+ * reintroduced one layer up (across guards instead of within one guard).
+ * `CostEngine` already WAS the single, shared source of truth for
+ * COMMITTED spending (`record()`/`totalFor()`/`total()`/`totalInWindow()`)
+ * — the fix is to make it the SAME authoritative source of truth for
+ * OUTSTANDING reservations too, since it is the object every cooperating
+ * `BudgetGuard` already shares by construction. `ReservationOwnership`
+ * (moved here from `runtime/budget/budget.ts`, which now imports/
+ * re-exports it for API stability) captures every ownership dimension a
+ * reservation can carry — `CostScope`'s `taskId`/`agentId`/`projectId`
+ * plus `provider`/`modelId` — exactly as before; only WHERE this state
+ * lives has changed, not its shape or its ownership-validation semantics
+ * (which remain entirely `BudgetGuard`'s responsibility — this ledger is
+ * deliberately "dumb storage + aggregation," mirroring `record()`/
+ * `totalFor()`'s own division of labor between mechanism (here) and
+ * policy (`BudgetGuard`'s ceilings)).
+ */
+export interface ReservationOwnership extends CostScope {
+  readonly provider?: string;
+  readonly modelId?: string;
+}
+
+export type ReservationLedgerStatus = "ACTIVE" | "RECONCILIATION_FAILED";
+
+export interface LedgerReservation {
+  readonly id: string;
+  readonly scope: Readonly<ReservationOwnership>;
+  readonly amountUsd: number;
+  readonly status: ReservationLedgerStatus;
+}
+
 export class CostEngine {
   private readonly entries: CostEntry[] = [];
+
+  /**
+   * Bu ledger'a bağlı HER `BudgetGuard`'ın PAYLAŞTIĞI, tek/yetkili
+   * bekleyen-rezervasyon deposu — bkz. `ReservationOwnership`'in üstündeki
+   * fix notu. `reserve()`/`commit()`/`release()`'in KENDİSİ (politika:
+   * hangi tavanların uygulanacağı, sahiplik uyuşmazlığı kontrolü, hangi
+   * hataların fırlatılacağı) hâlâ TAMAMEN `BudgetGuard`'da yaşar — bu sınıf
+   * yalnızca ham depolama ve toplama sağlar, tıpkı `record()`/`totalFor()`
+   * gibi.
+   */
+  private readonly reservations = new Map<
+    string,
+    { scope: Readonly<ReservationOwnership>; amountUsd: number; status: ReservationLedgerStatus }
+  >();
+  private reservationSeq = 0;
 
   /**
    * `now` enjekte edilebilir bir saat fonksiyonudur — varsayılan olarak
@@ -134,9 +190,71 @@ export class CostEngine {
       .filter((e) => matchesScope(e, scope) && e.timestamp >= sinceIso)
       .reduce((sum, e) => sum + e.amountUsd, 0);
   }
+
+  /**
+   * Yeni bir bekleyen rezervasyon açar — bu ledger'a bağlı HER
+   * `BudgetGuard`'ın PAYLAŞTIĞI tek depoya yazar (bkz. `ReservationOwnership`'in
+   * üstündeki fix notu). Senkron ve HİÇBİR `await` içermez — çağıranın
+   * (`BudgetGuard.reserve()`) kendi tavan kontrolüyle AYNI JS "tick"inde
+   * çalışır, bu yüzden birleşik işlem (kontrol + rezervasyon oluşturma)
+   * hâlâ atomiktir; JS'in tek iş parçacıklı çalışma zamanı iki eşzamanlı
+   * `reserve()` çağrısının ASLA iç içe geçmemesini garanti eder. Doğrudan
+   * (BudgetGuard atlanarak) çağrılsa bile tutar doğrulanır — `record()`
+   * ile AYNI felsefe: bozuk bir tutarın hiçbir yoldan sızmaması.
+   */
+  createReservation(scope: ReservationOwnership, amountUsd: number): LedgerReservation {
+    assertValidMonetaryAmount(amountUsd, "CostEngine.createReservation");
+    const id = `res-${++this.reservationSeq}`;
+    const frozenScope = freezeRecord({ ...scope });
+    this.reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
+    return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
+  }
+
+  /** Verilen id'deki rezervasyonun donmuş, ayrık bir anlık görüntüsü — bulunamazsa `undefined`. */
+  getReservation(id: string): LedgerReservation | undefined {
+    const r = this.reservations.get(id);
+    if (!r) return undefined;
+    return freezeRecord({ id, scope: r.scope, amountUsd: r.amountUsd, status: r.status });
+  }
+
+  /**
+   * Bir rezervasyonu "ÇÖZÜLMEMİŞ MUTABAKAT BAŞARISIZLIĞI" durumuna işaretler
+   * — bkz. `runtime/budget/budget.ts`'deki `ReservationStatus`/
+   * `UnresolvedReconciliationError`'ın notu. Rezervasyon zaten yoksa
+   * sessizce hiçbir şey yapmaz (çağıran — `BudgetGuard` — varlığını zaten
+   * `getReservation()` ile doğrulamış olmalıdır; bu yalnızca dahili bir
+   * durum geçişidir, kendi başına bir "bulundu mu?" sözleşmesi değildir).
+   */
+  markReservationReconciliationFailed(id: string): void {
+    const r = this.reservations.get(id);
+    if (r) r.status = "RECONCILIATION_FAILED";
+  }
+
+  /** Bir rezervasyonu ledger'dan KALICI OLARAK kaldırır (başarılı commit() veya release() sonrası). */
+  deleteReservation(id: string): void {
+    this.reservations.delete(id);
+  }
+
+  /**
+   * Verilen sorguyla eşleşen TÜM açık (durumu ne olursa olsun — ACTIVE
+   * VEYA RECONCILIATION_FAILED, ikisi de kapasiteyi KORUMAYA devam eder)
+   * rezervasyonun toplamı. Bu ledger'a bağlı HER `BudgetGuard`'ın
+   * `buildCeilingChecks()`'i bu TEK, PAYLAŞILAN toplamı okur — 16th
+   * independent review round'dan ÖNCE her `BudgetGuard`'ın kendi ayrı,
+   * paylaşılmayan bir toplamı vardı (bkz. bu dosyanın üstündeki fix notu).
+   */
+  reservedTotal(query: CostScope): number {
+    let total = 0;
+    for (const reservation of this.reservations.values()) {
+      if (matchesScope(reservation.scope, query)) {
+        total += reservation.amountUsd;
+      }
+    }
+    return total;
+  }
 }
 
-function matchesScope(entry: CostEntry, scope: CostScope): boolean {
+function matchesScope(entry: CostScope, scope: CostScope): boolean {
   return (
     (scope.taskId === undefined || entry.taskId === scope.taskId) &&
     (scope.agentId === undefined || entry.agentId === scope.agentId) &&
