@@ -34,6 +34,7 @@ import { CostEngine } from "../cost/cost-engine.js";
 import { BudgetGuard, type BudgetLimits } from "../budget/budget.js";
 import { FileStateStore, type StateStore } from "../state/file-store.js";
 import type { TraceabilityIssue } from "../requirements-traceability/traceability.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export class PreflightTraceabilityFailedError extends Error {
   constructor(issues: readonly TraceabilityIssue[]) {
@@ -91,6 +92,24 @@ export interface BootstrapProjectResult {
  * stateStore are class instances) is sufficient, since a later
  * `input.costEngine = ...` reassignment cannot change what an
  * already-captured local variable points to.
+ *
+ * P1 fix (12th independent review round, "bootstrap retains mutable
+ * budget configuration across await"): Codex reproduced a further,
+ * subtler instance of the SAME class the 11th round's fix above missed:
+ * `budgetLimits` is a PLAIN DATA object (`{ perTaskUsd?, perRunUsd?, ... }`),
+ * not a class instance like `costEngine`/`modelRegistry`/`stateStore` —
+ * capturing its REFERENCE into a local `const` (as the 11th round's fix
+ * did) is NOT sufficient, because the reference still points at the
+ * SAME caller-owned object, and `new BudgetGuard(costEngine, budgetLimits
+ * ?? {})` (which reads its FIELDS, not just checks the reference) only
+ * runs AFTER this function's first `await`. A caller mutating
+ * `budgetLimits.perTaskUsd` (e.g. $0 -> $1) while `gateway.authorize(...)`
+ * was pending would have the BudgetGuard constructed from the MUTATED
+ * ceiling, silently bypassing the ORIGINALLY intended $0 limit. Fixed:
+ * `budgetLimits` is now copied into a frozen, detached snapshot
+ * (`freezeRecord`) at the SAME point every other field is captured —
+ * before the first `await` — and `budgetGuardLimits` (never the original
+ * `budgetLimits` reference) is what `BudgetGuard` is constructed from.
  */
 export async function bootstrapProject(input: BootstrapProjectInput): Promise<BootstrapProjectResult> {
   if (input.preflightTraceabilityIssues && input.preflightTraceabilityIssues.length > 0) {
@@ -99,10 +118,14 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
 
   // Herhangi bir `await`den ÖNCE: bu çağrının kullanacağı HER alan yerel
   // `const`'lara yakalanır — bkz. yukarıdaki fix notu. Bundan sonra
-  // `input.xxx` bir daha ASLA okunmaz.
+  // `input.xxx` bir daha ASLA okunmaz. `budgetLimits` düz bir veri
+  // nesnesi olduğundan (bir sınıf örneği değil), yalnızca REFERANSINI
+  // değil, ALANLARININ KENDİSİNİ de donmuş bir kopyaya alır (bkz.
+  // yukarıdaki fix notu).
   const { genomeCandidate, baseDir, policy, modelRegistry, budgetLimits, costEngine: callerCostEngine, stateStore: callerStateStore } =
     input;
   const risk = input.risk ?? 1;
+  const budgetGuardLimits: BudgetLimits = budgetLimits ? freezeRecord({ ...budgetLimits }) : {};
 
   // PROJECT ID -> VALIDATE (parseProjectGenome, assertValidProjectId içinde
   // çağrılır) -> RESOLVE BASE DIRECTORY -> RESOLVE PROJECT DESTINATION ->
@@ -136,7 +159,7 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   });
 
   const costEngine = callerCostEngine ?? new CostEngine();
-  const budget = new BudgetGuard(costEngine, budgetLimits ?? {});
+  const budget = new BudgetGuard(costEngine, budgetGuardLimits);
   budget.spend({
     taskId: `bootstrap:${genome.project.id}`,
     projectId: genome.project.id,

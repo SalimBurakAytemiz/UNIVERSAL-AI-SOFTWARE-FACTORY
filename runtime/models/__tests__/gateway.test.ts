@@ -29,13 +29,16 @@ function permissiveBudget(costEngine: CostEngine = new CostEngine()): BudgetGuar
 class ControllableProvider implements ModelProvider {
   readonly id = "controllable";
   invocationCount = 0;
+  /** A snapshot of exactly what `model` looked like AT THE MOMENT this provider was called, for each call. */
+  receivedModels: ModelRecord[] = [];
   private pending: Array<() => void> = [];
 
   async invoke(model: ModelRecord, _request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
     this.invocationCount++;
+    this.receivedModels.push({ ...model, capabilities: [...model.capabilities] });
     return new Promise((resolve) => {
       this.pending.push(() =>
-        resolve({ modelId: model.modelId, provider: this.id, costUsd: model.costPerCall, output: "controllable-output" })
+        resolve({ modelId: model.modelId, provider: model.provider, costUsd: model.costPerCall, output: "controllable-output" })
       );
     });
   }
@@ -583,6 +586,189 @@ describe("ModelGateway + MockProvider", () => {
         await expect(
           gateway.invoke(model, { prompt: "x" }, { policy, budget, risk: 0, taskId: "task-b" })
         ).resolves.toBeDefined();
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (12th independent review round, 'model identity snapshot is not used during provider execution'): " +
+      "invoke() passes a frozen, detached authorizedModel snapshot into the provider boundary — never the " +
+      "caller-owned mutable model object",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: mutating model.modelId WHILE the provider call is pending has " +
+          "ZERO effect — the provider receives, and accounting/reconciliation use, the ORIGINAL model id",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ControllableProvider();
+          gateway.registerProvider(provider);
+          const costEngine = new CostEngine();
+          const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+
+          // A mutable, caller-owned model object — NOT a frozen registry
+          // record — exactly the shape a careless/malicious caller might
+          // construct and continue to hold a reference to.
+          const model: { provider: string; modelId: string; tier: "STANDARD"; costPerCall: number; capabilities: string[]; status: "ACTIVE" } = {
+            provider: "controllable",
+            modelId: "original-model",
+            tier: "STANDARD",
+            costPerCall: 0.4,
+            capabilities: ["classification"],
+            status: "ACTIVE"
+          };
+
+          const responsePromise = gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget,
+            risk: 0,
+            taskId: "t1"
+          });
+
+          // Mutate model identity WHILE the provider call is pending.
+          model.modelId = "swapped-model";
+
+          provider.resolveAll();
+          const response = await responsePromise;
+
+          expect(provider.receivedModels[0]!.modelId).toBe("original-model");
+          expect(response.modelId).toBe("original-model");
+          expect(costEngine.all()[0]!.modelId).toBe("original-model");
+        }
+      );
+
+      it("mutating model.provider WHILE pending has zero effect — ownership remains the ORIGINAL provider", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+
+        const model: { provider: string; modelId: string; tier: "STANDARD"; costPerCall: number; capabilities: string[]; status: "ACTIVE" } = {
+          provider: "controllable",
+          modelId: "m1",
+          tier: "STANDARD",
+          costPerCall: 0.2,
+          capabilities: ["classification"],
+          status: "ACTIVE"
+        };
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "t1"
+        });
+
+        model.provider = "some-other-provider";
+
+        provider.resolveAll();
+        const response = await responsePromise;
+
+        expect(provider.receivedModels[0]!.provider).toBe("controllable");
+        expect(response.provider).toBe("controllable");
+        expect(costEngine.all()[0]!.provider).toBe("controllable");
+      });
+
+      it("mutating tier/cost metadata WHILE pending has zero effect — authorization/accounting used the ORIGINAL snapshot", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        // A ceiling that only the ORIGINAL ($0.30), not the mutated ($999), cost would satisfy.
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 0.3 });
+
+        const model: { provider: string; modelId: string; tier: "STANDARD" | "PREMIUM"; costPerCall: number; capabilities: string[]; status: "ACTIVE" } = {
+          provider: "controllable",
+          modelId: "m1",
+          tier: "STANDARD",
+          costPerCall: 0.3,
+          capabilities: ["classification"],
+          status: "ACTIVE"
+        };
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "t1"
+        });
+
+        // If this mutation were ever consulted for accounting, it would
+        // blow through the $0.30 ceiling (already reserved against the
+        // ORIGINAL amount before this mutation happened).
+        model.tier = "PREMIUM";
+        model.costPerCall = 999;
+
+        provider.resolveAll();
+        const response = await responsePromise;
+
+        expect(provider.receivedModels[0]!.costPerCall).toBe(0.3);
+        expect(provider.receivedModels[0]!.tier).toBe("STANDARD");
+        expect(response.costUsd).toBe(0.3);
+        expect(costEngine.total()).toBe(0.3);
+      });
+
+      it("validation and audit reference the ORIGINAL immutable execution identity, not a post-mutation value", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const policy = permissivePolicy();
+        const budget = permissiveBudget();
+
+        const model: { provider: string; modelId: string; tier: "STANDARD"; costPerCall: number; capabilities: string[]; status: "ACTIVE" } = {
+          provider: "controllable",
+          modelId: "audited-model",
+          tier: "STANDARD",
+          costPerCall: 0.1,
+          capabilities: ["classification"],
+          status: "ACTIVE"
+        };
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, { policy, budget, risk: 0, taskId: "t1" });
+        model.modelId = "tampered-after-authorization";
+        provider.resolveAll();
+        await responsePromise;
+
+        const policyEvent = policy.auditTrail.all().find((e) => e.type === "POLICY_DECISION");
+        expect(policyEvent).toBeDefined();
+        expect((policyEvent!.payload as { action: { description: string } }).action.description).toContain(
+          "audited-model"
+        );
+        expect((policyEvent!.payload as { action: { description: string } }).action.description).not.toContain(
+          "tampered-after-authorization"
+        );
+      });
+
+      it("concurrent reuse of one caller-owned model object across two invocations cannot cross-contaminate their executions", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const policy = permissivePolicy();
+
+        const sharedModel: { provider: string; modelId: string; tier: "STANDARD"; costPerCall: number; capabilities: string[]; status: "ACTIVE" } = {
+          provider: "controllable",
+          modelId: "first-model",
+          tier: "STANDARD",
+          costPerCall: 0.2,
+          capabilities: ["classification"],
+          status: "ACTIVE"
+        };
+
+        const p1 = gateway.invoke(sharedModel, { prompt: "x" }, { policy, budget, risk: 0, taskId: "first" });
+        sharedModel.modelId = "second-model";
+        sharedModel.costPerCall = 0.35;
+        const p2 = gateway.invoke(sharedModel, { prompt: "x" }, { policy, budget, risk: 0, taskId: "second" });
+
+        provider.resolveAll();
+        const [r1, r2] = await Promise.all([p1, p2]);
+
+        expect(r1.modelId).toBe("first-model");
+        expect(r1.costUsd).toBe(0.2);
+        expect(r2.modelId).toBe("second-model");
+        expect(r2.costUsd).toBe(0.35);
+        expect(provider.receivedModels.map((m) => m.modelId).sort()).toEqual(["first-model", "second-model"]);
       });
     }
   );

@@ -1059,6 +1059,38 @@
     `runtime/project-lifecycle/orchestrator.ts`'s `bootstrapProject()`
     (see UASF-REQ-0042's notes) and fixed it the same way.
 
+    P1 fix (12th independent review round, "model identity snapshot is
+    not used during provider execution"): Codex reproduced `invoke()`'s
+    11th-round `executionScope` snapshot protecting ACCOUNTING fields
+    (taskId/projectId/modelId/provider/costPerCallUsd, all read from
+    `model` at snapshot time) while the ACTUAL provider dispatch
+    (`this.#rawInvoke(model, request)`) still received the caller's raw,
+    still-mutable `model` object — a caller mutating `model.modelId` or
+    `model.provider` WHILE the provider call was pending caused the real
+    provider to receive a different model identity than the one every
+    accounting/audit/reconciliation record referenced. Fixed: `invoke()`
+    now captures `const authorizedModel: ModelRecord =
+    freezeRecord({...model})` as the FIRST statement in the function
+    (before `executionScope` is even built), `executionScope` derives its
+    fields from `authorizedModel` (not `model`), and `#rawInvoke()` is
+    called with `authorizedModel` — `model` (the original parameter) is
+    never read again after that first line. Regression tests
+    (gateway.test.ts, new describe block) prove: mutating `model.modelId`
+    while the (real, awaited, `ControllableProvider`-based) provider call
+    is pending has zero effect on what the provider receives or what
+    accounting/audit records, the same for `model.provider` and for
+    `model.tier`/`costPerCall`, validation/audit reference the identity
+    that was authorized (not any later mutation), and two concurrent
+    invocations sharing (and mutating) the same `model` object cannot
+    cross-contaminate each other's provider-received identity. Verified
+    via a temporary bypass (`this.#rawInvoke(model, request)` instead of
+    `authorizedModel`) — confirmed exactly 4 of the 5 new tests fail (the
+    exact-reproduction modelId test, the provider-id test, the tier/cost
+    metadata test, and the concurrent-reuse test; the validation/audit
+    identity-reference test happened to still pass under this specific
+    bypass since it only inspects the policy audit description string,
+    not the provider's received identity), then reverted.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -1275,6 +1307,49 @@
     required no code change beyond what the paragraph above already
     describes, since the atomicity fix lives entirely in
     BudgetGuard.reserve()/commit()/release().
+
+    P1 fix (12th independent review round, "routing retries can change
+    execution ownership and fallback permission"): Codex reproduced
+    `request`/`options` (both caller-owned, mutable objects) being read
+    DIRECTLY across MULTIPLE `await` boundaries inside routeAndExecute() —
+    the initial call read `request.taskId`/`.risk`/`.requiredCapabilities`
+    and `options.allowPremiumFallback` before the first await, but the
+    escalation loop (running only after that first await resolved) read
+    `request`/`options` AGAIN via `selectModel(request, nextTier)` and
+    `invokeAuthorized(decision, request, ...)`. A caller mutating
+    `request.taskId` (A -> B) or flipping `options.allowPremiumFallback`
+    (false -> true) WHILE the first candidate's provider call was still
+    pending could make a subsequent escalation attempt run under a
+    different task ownership than the one ever authorized, or exercise a
+    fallback permission never actually granted at routing start — splitting
+    cost across two owners and letting a per-task ceiling be bypassed by
+    repeated calls. Fixed: `request`/`options` are captured into frozen,
+    detached snapshots (`routingScope = freezeRecord({...request})`, and
+    `allowPremiumFallback` normalized into a local const) as the VERY
+    FIRST thing routeAndExecute() does, before `selectModel()` is even
+    called the first time; every `selectModel()`/`invokeAuthorized()` call
+    — initial AND every escalation step — uses ONLY `routingScope`/the
+    captured boolean, never the original `request`/`options` parameters
+    again. Regression tests (router.test.ts, new describe block) prove:
+    mutating `request.taskId` mid-flight keeps every escalation step and
+    all recorded cost under the originally-authorized task, flipping
+    `options.allowPremiumFallback` from false to true mid-flight does not
+    grant fallback permission that was never authorized at call start (and
+    the reverse: flipping true to false does not retroactively revoke
+    already-authorized fallback), mutating `request.requiredCapabilities`
+    mid-flight cannot make an otherwise-ineligible cheaper candidate
+    wrongly eligible, mutating `request.risk` has no effect (an
+    already-safe property, since risk-based tier derivation only ever runs
+    on the FIRST `selectModel()` call — escalation always passes
+    `nextTier` explicitly), and two concurrent `routeAndExecute()` calls
+    sharing one mutated `request` object remain fully isolated from each
+    other. Verified via a temporary bypass (reverting all snapshot reads
+    back to reading `request`/`options` directly at all 6 call sites) —
+    confirmed exactly 4 of the 6 new tests fail (task-mutation and both
+    allowPremiumFallback-flip tests, plus the requiredCapabilities-mutation
+    test; the risk-mutation and concurrent-isolation tests correctly still
+    passed under this bypass, since those properties were independently
+    safe for reasons unrelated to this specific snapshot), then reverted.
 
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
@@ -1616,6 +1691,82 @@
     already-atomic write-then-rename) found no other instance of this
     ordering bug — `approval.ts` mutates status fields in place and never
     deletes a pending record at all, so it cannot exhibit this class.
+
+    P1 fix (12th independent review round, "failed reconciliation
+    reservations can still be released"): Codex reproduced the 11th
+    round's fix (reservation PRESERVED, not deleted, on a failed commit())
+    being insufficient on its own: a caller could still call `release()`
+    on that same still-open reservation after the failed commit(), which
+    deleted it anyway — restoring the full ceiling and letting a second
+    full-ceiling reservation succeed, all while the recorded cost for the
+    first attempt remained zero, even though a real (or potentially real)
+    provider call may already have happened. `release()` had no concept
+    of "this reservation already had a failed commit attempt" — it
+    treated every open reservation identically. Fixed by introducing an
+    explicit reservation lifecycle state: `ReservationStatus = "ACTIVE" |
+    "RECONCILIATION_FAILED"`, stored alongside `scope`/`amountUsd` in the
+    internal reservations map. `commit()`'s existing failure-catch block
+    now marks `reservation.status = "RECONCILIATION_FAILED"` before
+    re-throwing (in addition to preserving the reservation, from the 11th
+    round). `release()` now checks this status FIRST: a
+    `RECONCILIATION_FAILED` reservation is rejected with the new
+    `UnresolvedReconciliationError` (a `BUDGET_RESERVATION_RELEASE_
+    REJECTED_UNRESOLVED` audit event is recorded, never silent) instead of
+    being deleted — the reservation keeps counting against every ceiling
+    via `reservedTotal()`, and the ONLY safe path forward is retrying
+    `commit()` with a corrected amount on the same reservation id (which
+    was already proven safe by the 11th round's fix). Regression tests
+    (budget.test.ts, new describe block) prove: the exact reproduction
+    (reserve -> commit(NaN) fails -> release() is REJECTED, not silently
+    accepted, and a second full-ceiling reservation is correctly blocked,
+    with total recorded cost still zero), an ACTIVE reservation (no failed
+    commit attempt) can still be release()d normally, a reservation that
+    successfully retries commit() after an initial failure transitions out
+    of the unresolved state and no longer blocks release() being called on
+    a DIFFERENT, still-active reservation, every rejected release() records
+    the new audit event, and an UnknownReservationError still takes
+    priority for an id that was never reserved at all. Verified via a
+    temporary bypass (`if (false && reservation.status ===
+    "RECONCILIATION_FAILED")` in release()) — confirmed exactly 5 of the
+    new tests fail against the bypassed code, then reverted.
+
+    P1 fix (12th independent review round, "commit accepts accounting
+    ownership unrelated to the reservation"): Codex reproduced `commit()`
+    trusting its caller-supplied `entry.taskId`/`entry.projectId`
+    completely independently of the reservation being committed against --
+    reserving budget for project P/task A, then calling `commit()` with
+    project Q/task B, recorded the cost under Q/B in CostEngine while the
+    reservation (which had actually protected P/A's capacity) was deleted,
+    silently making P/A's full capacity available again with zero cost
+    ever attributed to it. A reservation's `scope` was already the
+    authoritative record of what it was FOR (stored at `reserve()` time,
+    already frozen) — `commit()` simply never checked its caller-supplied
+    ownership against it. Fixed (validation approach, one of two options
+    the review explicitly sanctioned — the other, removing the redundant
+    caller-supplied ownership parameters entirely, was rejected here to
+    avoid a mechanical signature change across every existing commit()
+    call site for no additional security benefit): `commit()` now checks
+    `entry.taskId`/`entry.projectId` against `reservation.scope` IMMEDIATELY
+    after the existence check, before any mutation of state — a mismatch
+    throws the new `ReservationOwnershipMismatchError` (with a
+    `BUDGET_RESERVATION_OWNERSHIP_MISMATCH` audit event identifying the
+    reservation's OWN authoritative owner alongside the rejected supplied
+    values) and leaves the reservation, CostEngine, and every ceiling
+    completely untouched. Regression tests (budget.test.ts, new describe
+    block) prove: the exact reproduction (reserve P/A, commit Q/B) is
+    rejected with zero cost recorded and the P/A reservation still fully
+    intact (protecting its original capacity), a matching taskId with a
+    mismatched projectId (and vice versa) is also rejected, an
+    undefined-vs-defined projectId mismatch is rejected, a genuinely
+    matching commit() (the existing, correct usage pattern) is unaffected,
+    a retry after a rejected mismatched commit() can still successfully
+    commit with the CORRECT matching ownership on the same reservation,
+    and the ownership-mismatch audit event always identifies the
+    reservation's authoritative scope, never the caller's rejected one.
+    Verified via a temporary bypass (`if (false && (entry.taskId !==
+    reservation.scope.taskId || entry.projectId !==
+    reservation.scope.projectId))`) — confirmed exactly 8 of the new tests
+    fail against the bypassed code, then reverted.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -2349,3 +2500,68 @@
     fail against the bypassed code (the modelRegistry one throwing
     NoCapableModelError, the stateStore one recording 3 writes into the
     fake store instead of 0), then reverted.
+
+    P1 fix (12th independent review round, "bootstrap retains mutable
+    budget configuration across await"): Codex reproduced the 11th
+    round's fix being insufficient for `budgetLimits` specifically —
+    unlike `costEngine`/`modelRegistry`/`stateStore` (class instances,
+    where capturing the REFERENCE into a local `const` is sufficient
+    protection since the object's own internal state doesn't change based
+    on which fields a caller pokes at from outside), `budgetLimits` is a
+    PLAIN DATA object. Capturing its reference does nothing to stop a
+    caller mutating its FIELDS: `new BudgetGuard(costEngine, budgetLimits
+    ?? {})` reads `budgetLimits.perTaskUsd` (etc.) at construction time,
+    which happens AFTER `bootstrapProject()`'s first `await
+    gateway.authorize(...)`. A caller supplying `budgetLimits =
+    {perTaskUsd: 0}`, then mutating `budgetLimits.perTaskUsd = 1` while
+    that first await was pending, caused the eventual `BudgetGuard` to be
+    constructed from the MUTATED $1 ceiling, silently bypassing the
+    originally-intended $0 ceiling. Fixed: `budgetLimits` is now copied
+    into a frozen, detached snapshot (`budgetGuardLimits = budgetLimits ?
+    freezeRecord({...budgetLimits}) : {}`) at the exact same point every
+    other field is captured — before the first `await` — and
+    `budgetGuardLimits` (never the original `budgetLimits` reference) is
+    what `BudgetGuard` is constructed from; `budgetLimits` itself is never
+    read again afterward. Regression tests (orchestrator.test.ts, new
+    describe block) prove: an initial $0 `perTaskUsd` ceiling mutated to
+    $1 while bootstrap is pending still correctly rejects a non-free
+    model's spend with `BudgetExceededError` (the exact reproduction), the
+    reverse direction (an initial $1 ceiling mutated down to $0 mid-flight)
+    does not retroactively block a spend the ORIGINAL $1 ceiling genuinely
+    allowed, and two concurrent `bootstrapProject()` calls sharing ONE
+    caller-owned `budgetLimits` object remain isolated — each uses
+    whichever ceiling was in effect at its OWN synchronous entry point,
+    never a value the other call's later mutation introduced. Verified via
+    a temporary bypass (reverting to `new BudgetGuard(costEngine,
+    budgetLimits ?? {})`, reading the unsnapshotted object directly) — ran
+    the 3 new tests and confirmed exactly this predicted failure: the
+    exact-reproduction test's promise resolved successfully instead of
+    rejecting (the mutated $1 ceiling was consulted, so a full
+    `bootstrapProject()` result — genome, scaffold, modelDecision,
+    totalCostUsd: 0.6 — came back where `BudgetExceededError` should have
+    been thrown), and 3 of 3 new tests failed in total (all three exercise
+    this exact snapshot property from different angles); then the bypass
+    was reverted and all 26 orchestrator tests re-confirmed passing.
+
+    Targeted cross-cutting audit (12th independent review round, scoped
+    to exactly this session's 5 "authorize/snapshot one value -> await ->
+    reread mutable caller value" findings plus the general pattern, within
+    the P0 model/budget/bootstrap execution path only): re-examined every
+    async function in `runtime/models/gateway.ts`, `router.ts`,
+    `registry.ts`, `runtime/budget/budget.ts`, `runtime/cost/
+    cost-engine.ts`, this file's `bootstrapProject()`, `runtime/
+    policy-engine/policy-engine.ts`, and `runtime/capability-gateway/
+    gateway.ts`'s `authorize()` for any caller-supplied object/array read
+    both before and after an `await` (or inside an awaiting loop) for a
+    security/cost/ownership-relevant purpose. `registry.ts`,
+    `budget.ts`'s own methods (`reserve`/`commit`/`release`/`spend`),
+    `cost-engine.ts`, and `policy-engine.ts`'s `evaluate()` are all fully
+    synchronous — no `await` exists inside them, so this class of race is
+    structurally impossible there regardless of parameter mutability.
+    `CapabilityGateway.authorize()` reads `action.actionType`/
+    `.description` only on the DENY/APPROVAL_REQUIRED paths (which never
+    call `execute()`); on the ALLOW path no `action` field is read again
+    after `execute()` starts. No new genuine instance of the pattern was
+    found in this scope beyond the 5 already fixed this round — the
+    pattern is fully closed here. Per the review's explicit instruction,
+    this audit did not expand into unrelated architecture work.

@@ -153,11 +153,39 @@ export class ModelGateway {
    * senkron ön ekinde (herhangi bir await'ten önce) kendi bağımsız anlık
    * görüntüsünü alır, bu yüzden birbirlerini kirletemezler.
    */
+  /**
+   * P1 fix (12th independent review round, "model identity snapshot is
+   * not used during provider execution"): Codex reproduced the
+   * `executionScope` snapshot above capturing `model.modelId`/
+   * `model.provider`/`model.costPerCall` for ACCOUNTING purposes, but the
+   * ORIGINAL, caller-owned `model` object was still what actually got
+   * passed into `#rawInvoke(model, request)` — so a caller mutating the
+   * `model` object's fields (id, provider, tier, costPerCall) WHILE the
+   * provider call was pending could make the ACTUAL provider invocation
+   * (and, if a real adapter reads `model` lazily, its costUsd) diverge
+   * from the identity that was authorized/reserved/accounted for, even
+   * though `executionScope`'s COPY of those same fields stayed correct.
+   * A snapshot that isn't the thing actually used protects nothing. Fix:
+   * `model` is copied into a frozen, detached `authorizedModel`
+   * (`freezeRecord`) as the very FIRST thing `invoke()` does — before
+   * `executionScope` is even built (which now reads from
+   * `authorizedModel`, not `model`) and certainly before any async work
+   * — and `authorizedModel` (never the original `model` parameter) is
+   * what gets passed to `#rawInvoke()`. `capabilities` is an array field;
+   * `freezeRecord` freezes a COPY of it too, so `model.capabilities.push(...)`
+   * afterward cannot even reach the snapshot's array.
+   */
   async invoke(
     model: ModelRecord,
     request: ModelInvocationRequest,
     context: ModelInvocationContext
   ): Promise<ModelInvocationResponse> {
+    // Herhangi bir asenkron iş BAŞLAMADAN ÖNCE: yetkili, ayrık model
+    // kimliği anlık görüntüsü — bkz. yukarıdaki fix notu. Bundan sonra
+    // `model` parametresinin KENDİSİ bir daha ASLA okunmaz/geçirilmez;
+    // sadece `authorizedModel` kullanılır.
+    const authorizedModel: ModelRecord = freezeRecord({ ...model });
+
     // Herhangi bir asenkron iş (hatta CapabilityGateway.authorize()'ın
     // KENDİSİ) başlamadan ÖNCE: yetkili sahiplik anlık görüntüsü.
     const executionScope = freezeRecord({
@@ -165,10 +193,11 @@ export class ModelGateway {
       projectId: context.projectId,
       risk: context.risk,
       description:
-        context.description ?? `Invoke model '${model.modelId}' (${model.tier}) for task ${context.taskId}`,
-      modelId: model.modelId,
-      provider: model.provider,
-      costPerCallUsd: model.costPerCall
+        context.description ??
+        `Invoke model '${authorizedModel.modelId}' (${authorizedModel.tier}) for task ${context.taskId}`,
+      modelId: authorizedModel.modelId,
+      provider: authorizedModel.provider,
+      costPerCallUsd: authorizedModel.costPerCall
     });
     // `policy`/`budget` REFERANSLARI da hemen yakalanır — bkz. yukarıdaki
     // fix notu. `context.policy`/`context.budget`'a bundan sonra ASLA
@@ -208,7 +237,7 @@ export class ModelGateway {
 
         let response: ModelInvocationResponse;
         try {
-          response = await this.#rawInvoke(model, request);
+          response = await this.#rawInvoke(authorizedModel, request);
         } catch (err) {
           // Belgelenen mutabakat kuralı: provider hata fırlatırsa hiçbir
           // gerçek maliyet oluşmadığı varsayılır, rezervasyon TAMAMEN

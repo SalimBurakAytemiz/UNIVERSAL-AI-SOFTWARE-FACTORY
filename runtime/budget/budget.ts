@@ -78,6 +78,73 @@ export class UnknownReservationError extends Error {
 }
 
 /**
+ * P1 fix (12th independent review round, "failed reconciliation
+ * reservations can still be released"): a reservation whose `commit()`
+ * attempt failed (malformed actual amount) used to remain in the map with
+ * NO explicit state of its own — it was structurally identical to a
+ * fresh, never-committed reservation. That meant `release()` (the
+ * documented rule for "the provider call itself threw, no cost ever
+ * occurred") could ALSO be called on it, deleting it and silently
+ * restoring the budget capacity it protected — even though a REAL (or
+ * potentially real) provider call may already have happened and only the
+ * RECONCILIATION of its cost failed, not the call itself. Those are two
+ * completely different situations that must never share one escape
+ * hatch. `ReservationStatus` makes this explicit: "ACTIVE" is the normal
+ * open state (`release()` is legitimate here — nothing was ever
+ * incurred); "RECONCILIATION_FAILED" means a `commit()` attempt failed
+ * AFTER the provider may have already run — `release()` is REJECTED in
+ * this state (bkz. `UnresolvedReconciliationError`), and the ONLY way
+ * forward is a corrected `commit()` retry on the SAME reservation id
+ * (safe/idempotent, since nothing was deleted). A reservation leaves the
+ * map ENTIRELY only on a genuinely terminal transition — a successful
+ * `commit()` (cost durably recorded) or a legitimate `release()` from
+ * "ACTIVE" — so "terminal exactly once" is enforced by the Map itself:
+ * once removed, any further commit()/release() call sees "not found"
+ * (`UnknownReservationError`), never a silent no-op.
+ */
+export type ReservationStatus = "ACTIVE" | "RECONCILIATION_FAILED";
+
+export class UnresolvedReconciliationError extends Error {
+  constructor(reservationId: string) {
+    super(
+      `Reservation '${reservationId}' has an UNRESOLVED reconciliation failure (a prior commit() ` +
+        `attempt failed after the provider call may already have run) and cannot be release()d — ` +
+        `release() is only for a reservation where NO cost was ever incurred. Retry commit() with a ` +
+        `corrected amount on this same reservation id instead; that is the only safe path forward.`
+    );
+    this.name = "UnresolvedReconciliationError";
+  }
+}
+
+/**
+ * P1 fix (12th independent review round, "commit() accepts accounting
+ * ownership unrelated to the reservation"): `commit()`'s caller-supplied
+ * `entry.taskId`/`entry.projectId` used to be recorded VERBATIM into
+ * CostEngine with no check against what was ACTUALLY reserved — a caller
+ * could reserve for project P / task A and then commit() under project Q
+ * / task B, recording the real cost under Q/B while A's protected
+ * capacity silently became available again (accounting and reservation
+ * ownership diverging). A reservation's OWN `scope` (captured atomically
+ * at `reserve()` time, before any provider call) is now the authoritative
+ * owner of its own commit — `commit()` validates the caller-supplied
+ * taskId/projectId against `reservation.scope` and fails closed
+ * (BEFORE any mutation: no cost recorded, no reservation state change)
+ * on any mismatch, per this class.
+ */
+export class ReservationOwnershipMismatchError extends Error {
+  constructor(reservationId: string, reservationScope: Readonly<CostScope>, suppliedScope: CostScope) {
+    super(
+      `commit(reservationId=${reservationId}) supplied ownership (taskId=${String(suppliedScope.taskId)}, ` +
+        `projectId=${String(suppliedScope.projectId)}) does not match the reservation's OWN authoritative ` +
+        `ownership (taskId=${String(reservationScope.taskId)}, projectId=${String(reservationScope.projectId)}). ` +
+        `A reservation is the authoritative source of ownership for its own commit — this call was rejected ` +
+        `before any accounting mutation or reservation state change.`
+    );
+    this.name = "ReservationOwnershipMismatchError";
+  }
+}
+
+/**
  * İki AYRI CostScope'un aynı "sorguyu" karşılayıp karşılamadığını
  * kontrol eder — cost-engine.ts'nin `matchesScope`'u ile AYNI alan-eşleme
  * mantığı (taskId/agentId/projectId), ama bir CostEntry yerine bekleyen
@@ -157,7 +224,10 @@ export class BudgetGuard {
    * partial cost via `commit()` with the partial amount, not `release()`,
    * which is out of scope for the MockProvider this repository ships).
    */
-  private readonly reservations = new Map<string, { scope: Readonly<CostScope>; amountUsd: number }>();
+  private readonly reservations = new Map<
+    string,
+    { scope: Readonly<CostScope>; amountUsd: number; status: ReservationStatus }
+  >();
   private reservationSeq = 0;
 
   constructor(
@@ -389,7 +459,7 @@ export class BudgetGuard {
 
     const id = `res-${++this.reservationSeq}`;
     const frozenScope = freezeRecord({ ...scope });
-    this.reservations.set(id, { scope: frozenScope, amountUsd });
+    this.reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
 
     this.auditLog?.append({
       type: "BUDGET_RESERVATION_CREATED",
@@ -449,13 +519,45 @@ export class BudgetGuard {
       throw new UnknownReservationError(reservationId);
     }
 
+    // P1 fix (12th independent review round, "commit() accepts accounting
+    // ownership unrelated to the reservation"): validated BEFORE anything
+    // else — no cost recorded, no reservation state change — see
+    // `ReservationOwnershipMismatchError`'s note above. The reservation's
+    // OWN `scope` (fixed at reserve() time) is authoritative; a caller
+    // cannot redefine it merely by supplying different values here.
+    if (entry.taskId !== reservation.scope.taskId || entry.projectId !== reservation.scope.projectId) {
+      this.auditLog?.append({
+        type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
+        actor: "budget-guard",
+        payload: {
+          reservationId,
+          reservedScope: reservation.scope,
+          suppliedTaskId: entry.taskId,
+          suppliedProjectId: entry.projectId
+        },
+        timestamp: this.now().toISOString()
+      });
+      throw new ReservationOwnershipMismatchError(reservationId, reservation.scope, {
+        taskId: entry.taskId,
+        projectId: entry.projectId
+      });
+    }
+
     let recorded: CostEntry;
     try {
       assertValidMonetaryAmount(entry.amountUsd, `BudgetGuard.commit(reservationId=${reservationId})`);
       recorded = this.costEngine.record(entry);
     } catch (err) {
       // Rezervasyon KASITLI OLARAK silinmez — mutabakat başarısız oldu,
-      // korunan kapasite açık/çözülmemiş kalmalıdır.
+      // korunan kapasite açık/çözülmemiş kalmalıdır. P1 fix (12th
+      // independent review round, "failed reconciliation reservations can
+      // still be released"): durum artık AÇIKÇA "RECONCILIATION_FAILED"
+      // olarak işaretlenir — bkz. `ReservationStatus`/
+      // `UnresolvedReconciliationError`'ın üstündeki not — bu, release()'in
+      // bu rezervasyonu ARTIK KABUL ETMEYECEĞİ anlamına gelir; TEK ileri
+      // yol, düzeltilmiş bir tutarla commit()'i AYNI id ile tekrar
+      // denemektir.
+      reservation.status = "RECONCILIATION_FAILED";
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_COMMIT_FAILED",
         actor: "budget-guard",
@@ -505,11 +607,38 @@ export class BudgetGuard {
    * SERBEST BIRAKILIR. Kısmi faturalandırma yapabilen GERÇEK bir provider
    * adaptörü bunun yerine `commit()`'i KISMİ gerçek tutarla çağırmalıdır
    * — bu P0 kapsamının dışındadır.
+   *
+   * P1 fix (12th independent review round, "failed reconciliation
+   * reservations can still be released"): Codex reproduced reserve() ->
+   * commit(NaN) (fails, reservation KORUNUR per the 11th round's fix) ->
+   * release() — release() had NO concept of a reservation being in an
+   * unresolved-reconciliation state, so it happily deleted it anyway,
+   * silently restoring the FULL protected capacity even though the
+   * provider call the reservation was protecting may already have
+   * happened. `release()` is documented as being for the "the provider
+   * call itself threw, nothing was ever incurred" case ONLY — it must
+   * NEVER become a backdoor for "reconciliation failed, so let's just
+   * pretend nothing happened." Fixed: `release()` now checks
+   * `reservation.status` and REJECTS
+   * (`UnresolvedReconciliationError`, without deleting anything) a
+   * reservation whose prior `commit()` attempt failed — bkz.
+   * `ReservationStatus`'ın üstündeki not. An ordinary "ACTIVE" reservation
+   * (the normal, documented provider-failure case) is released exactly
+   * as before.
    */
   release(reservationId: string): void {
     const reservation = this.reservations.get(reservationId);
     if (!reservation) {
       throw new UnknownReservationError(reservationId);
+    }
+    if (reservation.status === "RECONCILIATION_FAILED") {
+      this.auditLog?.append({
+        type: "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED",
+        actor: "budget-guard",
+        payload: { reservationId, scope: reservation.scope, amountUsd: reservation.amountUsd },
+        timestamp: this.now().toISOString()
+      });
+      throw new UnresolvedReconciliationError(reservationId);
     }
     this.reservations.delete(reservationId);
 

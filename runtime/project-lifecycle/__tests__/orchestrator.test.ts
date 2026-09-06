@@ -11,6 +11,7 @@ import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
 import { FileStateStore, type StateStore } from "../../state/file-store.js";
 import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
 import { CostEngine } from "../../cost/cost-engine.js";
+import { BudgetExceededError, type BudgetLimits } from "../../budget/budget.js";
 import type { TraceabilityIssue } from "../../requirements-traceability/traceability.js";
 
 function validGenome(id: string) {
@@ -606,6 +607,136 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         // Everything was persisted via the ORIGINAL FileStateStore, never the swapped-in one.
         expect(writes).toHaveLength(0);
         expect(existsSync(result.statePath)).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (12th independent review round, 'bootstrap retains mutable budget configuration across await'): " +
+      "budgetLimits' OWN FIELDS (not just the object reference) are snapshotted before bootstrapProject()'s " +
+      "first await",
+    () => {
+      // Project identity mutation (genomeCandidate.project.id) is already
+      // covered by the 8th independent review round's describe block above
+      // ("caller mutation changes project identity during bootstrap") —
+      // not duplicated here.
+
+      it(
+        "BLOCKER regression, exact reproduction: an initial $0 perTaskUsd ceiling, mutated to $1 WHILE bootstrap " +
+          "is pending, still blocks a non-free model's spend — the ORIGINAL $0 ceiling remains authoritative",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-race-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "mock",
+            modelId: "paid-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          // A mutable budgetLimits object — the SAME reference is retained
+          // and mutated by the "caller" after bootstrap starts, mutating a
+          // NESTED FIELD (not replacing the whole object, which the 11th
+          // round's reference-capture fix already handles).
+          const budgetLimits: { perTaskUsd?: number } = { perTaskUsd: 0 };
+
+          const input: BootstrapProjectInput = {
+            genomeCandidate: validGenome("proj-budget-race-blocked"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry,
+            budgetLimits: budgetLimits as BudgetLimits
+          };
+
+          Promise.resolve().then(() => {
+            budgetLimits.perTaskUsd = 1; // would legalize the $0.60 spend if ever consulted
+          });
+
+          await expect(bootstrapProject(input)).rejects.toThrow(BudgetExceededError);
+        }
+      );
+
+      it(
+        "an initial $1 perTaskUsd ceiling, mutated DOWN to $0 WHILE bootstrap is pending, does not retroactively " +
+          "block a spend the ORIGINAL $1 ceiling genuinely allowed",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-race-allowed-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "mock",
+            modelId: "paid-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          const budgetLimits: { perTaskUsd?: number } = { perTaskUsd: 1 };
+
+          const input: BootstrapProjectInput = {
+            genomeCandidate: validGenome("proj-budget-race-allowed"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry,
+            budgetLimits: budgetLimits as BudgetLimits
+          };
+
+          Promise.resolve().then(() => {
+            budgetLimits.perTaskUsd = 0; // would wrongly block the ALREADY-authorized $0.60 spend if ever consulted
+          });
+
+          const result = await bootstrapProject(input);
+          expect(result.totalCostUsd).toBe(0.6);
+        }
+      );
+
+      it("concurrent bootstrapProject() calls sharing ONE caller-owned budgetLimits object remain isolated — each uses the ceiling in effect at ITS OWN start", async () => {
+        const rootA = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-concurrent-a-"));
+        const rootB = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-concurrent-b-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-summarizer",
+          tier: "MOCK",
+          costPerCall: 0.6,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+
+        const sharedBudgetLimits: { perTaskUsd?: number } = { perTaskUsd: 0 };
+
+        // Call A starts (synchronously captures perTaskUsd=0 at entry).
+        const callA = bootstrapProject({
+          genomeCandidate: validGenome("proj-concurrent-a"),
+          baseDir: rootA,
+          policy,
+          modelRegistry: paidRegistry,
+          budgetLimits: sharedBudgetLimits as BudgetLimits
+        });
+        // Mutate the SHARED object before issuing call B.
+        sharedBudgetLimits.perTaskUsd = 1;
+        // Call B starts (synchronously captures perTaskUsd=1, already in effect at ITS OWN entry).
+        const callB = bootstrapProject({
+          genomeCandidate: validGenome("proj-concurrent-b"),
+          baseDir: rootB,
+          policy,
+          modelRegistry: paidRegistry,
+          budgetLimits: sharedBudgetLimits as BudgetLimits
+        });
+
+        await expect(callA).rejects.toThrow(BudgetExceededError); // A's own $0 snapshot, taken before the mutation
+        await expect(callB).resolves.toMatchObject({ totalCostUsd: 0.6 }); // B's own $1 snapshot
+
+        rmSync(rootA, { recursive: true, force: true });
+        rmSync(rootB, { recursive: true, force: true });
       });
     }
   );

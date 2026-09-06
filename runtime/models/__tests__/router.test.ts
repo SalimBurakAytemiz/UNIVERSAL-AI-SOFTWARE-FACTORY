@@ -544,3 +544,216 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
     expect(providerInvokeSpy).not.toHaveBeenCalled();
   });
 });
+
+describe(
+  "P1 fix (12th independent review round, 'routing retries can change execution ownership and fallback " +
+    "permission'): routeAndExecute() snapshots request/options into a frozen routingScope + normalized " +
+    "allowPremiumFallback BEFORE the first await, and every selectModel()/invokeAuthorized() call — initial and " +
+    "every escalation step — uses ONLY that snapshot",
+  () => {
+    it(
+      "BLOCKER regression, exact reproduction: mutating request.taskId (A -> B) WHILE the initial candidate is " +
+        "pending has no effect — every escalation attempt, and all recorded cost, stays under task A",
+      async () => {
+        const { router, gateway, policy } = setupThreeTierEscalationScenario();
+        const costEngine = new CostEngine();
+        const isolatedBudget = new BudgetGuard(costEngine, { perRunUsd: 1000 });
+        const validate = vi.fn((response: ModelInvocationResponse) => response.modelId === "tier-premium");
+
+        const request: { taskId: string; risk: 0; requiredCapabilities: string[] } = {
+          taskId: "task-A",
+          risk: 0,
+          requiredCapabilities: ["escalation-capability"]
+        };
+
+        // Scheduled BEFORE calling routeAndExecute(), landing in the
+        // earliest possible microtask slot relative to the function's own
+        // internal await-driven resumption — the ordering most favorable
+        // to a caller actually winning such a race (same technique
+        // verified in prior rounds for gateway.ts/orchestrator.ts).
+        Promise.resolve().then(() => {
+          request.taskId = "task-B";
+        });
+
+        const result = await router.routeAndExecute(
+          request,
+          gateway,
+          { prompt: "x" },
+          validate,
+          policy,
+          isolatedBudget,
+          { allowPremiumFallback: true }
+        );
+
+        expect(result.decision.model.modelId).toBe("tier-premium");
+        expect(costEngine.totalFor({ taskId: "task-A" })).toBeCloseTo(0.5); // tier-mock ($0) + tier-premium ($0.5)
+        expect(costEngine.totalFor({ taskId: "task-B" })).toBe(0);
+      }
+    );
+
+    it("mutating options.allowPremiumFallback (false -> true) WHILE the initial candidate is pending has no effect — fallback stays blocked", async () => {
+      const { router, gateway, policy, budget, provider } = setupThreeTierEscalationScenario();
+      const providerInvokeSpy = vi.spyOn(provider, "invoke");
+      const validate = vi.fn(() => false); // primary always fails
+
+      const options: { allowPremiumFallback?: boolean } = { allowPremiumFallback: false };
+      Promise.resolve().then(() => {
+        options.allowPremiumFallback = true;
+      });
+
+      await expect(
+        router.routeAndExecute(
+          { taskId: "t-fallback-flip", risk: 0, requiredCapabilities: ["escalation-capability"] },
+          gateway,
+          { prompt: "x" },
+          validate,
+          policy,
+          budget,
+          options
+        )
+      ).rejects.toThrow(PremiumFallbackBlockedError);
+
+      // Only the initial (tier-mock) candidate was ever invoked — the
+      // fallback permission flip never reached the already-captured snapshot.
+      expect(providerInvokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+    });
+
+    it("mutating options.allowPremiumFallback (true -> false) WHILE the initial candidate is pending has no effect — a previously-granted permission is not silently revoked mid-flight", async () => {
+      const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
+      const validate = vi.fn((response: ModelInvocationResponse) => response.modelId === "tier-premium");
+
+      const options: { allowPremiumFallback?: boolean } = { allowPremiumFallback: true };
+      Promise.resolve().then(() => {
+        options.allowPremiumFallback = false;
+      });
+
+      const result = await router.routeAndExecute(
+        { taskId: "t-fallback-flip-2", risk: 0, requiredCapabilities: ["escalation-capability"] },
+        gateway,
+        { prompt: "x" },
+        validate,
+        policy,
+        budget,
+        options
+      );
+
+      expect(result.decision.model.modelId).toBe("tier-premium");
+    });
+
+    it(
+      "risk mutation while pending has no effect (documented invariant: risk is read exactly once, at the " +
+        "very first synchronous selectModel() call, in both the pre- and post-fix code — escalation steps " +
+        "always pass their next tier explicitly and never re-derive it from risk)",
+      async () => {
+        const { router, gateway, policy, budget } = setup();
+        const request: { taskId: string; risk: 0 | 4; requiredCapabilities: string[] } = {
+          taskId: "risk-mutation",
+          risk: 0,
+          requiredCapabilities: ["tagging"]
+        };
+        Promise.resolve().then(() => {
+          request.risk = 4;
+        });
+
+        const decision = await router
+          .routeAndExecute(request, gateway, { prompt: "x" }, () => true, policy, budget)
+          .then((r) => r.decision);
+
+        // risk=0 -> MOCK tier floor -> the free classifier, never a
+        // PREMIUM-floor candidate a mutated risk=4 would have required.
+        expect(decision.model.tier).toBe("MOCK");
+      }
+    );
+
+    it(
+      "BLOCKER regression: mutating request.requiredCapabilities WHILE the initial candidate is pending has no " +
+        "effect on escalation candidate selection — retries still require the ORIGINALLY captured capabilities",
+      async () => {
+        const registry = new ModelRegistry();
+        registry.register({
+          provider: "mock",
+          modelId: "narrow-mock",
+          tier: "MOCK",
+          costPerCall: 0,
+          capabilities: ["needs-both-a-and-b"],
+          status: "ACTIVE"
+        });
+        registry.register({
+          provider: "mock",
+          modelId: "narrow-premium",
+          tier: "PREMIUM",
+          costPerCall: 0.5,
+          capabilities: ["needs-both-a-and-b"],
+          status: "ACTIVE"
+        });
+        // A cheaper PREMIUM-tier model that only satisfies a DIFFERENT
+        // (narrower) capability set — this must NEVER be selected on
+        // escalation, even if `requiredCapabilities` is mutated to match it.
+        registry.register({
+          provider: "mock",
+          modelId: "wrong-candidate",
+          tier: "PREMIUM",
+          costPerCall: 0.01,
+          capabilities: ["only-a"],
+          status: "ACTIVE"
+        });
+
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const router = new CheapestCapableModelRouter(registry);
+        const policy = permissivePolicy();
+        const budget = permissiveBudget();
+        const validate = vi.fn((response: ModelInvocationResponse) => response.modelId === "narrow-premium");
+
+        const request: { taskId: string; risk: 0; requiredCapabilities: string[] } = {
+          taskId: "t-capability-mutation",
+          risk: 0,
+          requiredCapabilities: ["needs-both-a-and-b"]
+        };
+        Promise.resolve().then(() => {
+          // If this mutation were ever consulted, "wrong-candidate" (only
+          // requires "only-a") would become newly eligible and, being
+          // cheaper, would be wrongly selected over "narrow-premium".
+          request.requiredCapabilities = ["only-a"];
+        });
+
+        const result = await router.routeAndExecute(
+          request,
+          gateway,
+          { prompt: "x" },
+          validate,
+          policy,
+          budget,
+          { allowPremiumFallback: true }
+        );
+
+        expect(result.decision.model.modelId).toBe("narrow-premium");
+      }
+    );
+
+    it("concurrent routeAndExecute() calls sharing ONE caller-owned request/options object cannot cross-contaminate their snapshots", async () => {
+      const { router, gateway, policy, budget, costEngine } = setup();
+
+      const sharedRequest: { taskId: string; risk: 0; requiredCapabilities: string[] } = {
+        taskId: "shared-1",
+        risk: 0,
+        requiredCapabilities: ["tagging"]
+      };
+      const sharedOptions: { allowPremiumFallback?: boolean } = { allowPremiumFallback: false };
+
+      const p1 = router.routeAndExecute(sharedRequest, gateway, { prompt: "x" }, () => true, policy, budget, sharedOptions);
+      // Mutate the SAME shared objects before issuing the second call.
+      sharedRequest.taskId = "shared-2";
+      sharedOptions.allowPremiumFallback = true;
+      const p2 = router.routeAndExecute(sharedRequest, gateway, { prompt: "x" }, () => true, policy, budget, sharedOptions);
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.decision.model.modelId).toBe("mock-classifier");
+      expect(r2.decision.model.modelId).toBe("mock-classifier");
+      // Each call's own cost landed under its OWN taskId snapshot, not a
+      // merged/contaminated one.
+      expect(costEngine.totalFor({ taskId: "shared-1" })).toBe(0);
+      expect(costEngine.totalFor({ taskId: "shared-2" })).toBe(0);
+    });
+  }
+);

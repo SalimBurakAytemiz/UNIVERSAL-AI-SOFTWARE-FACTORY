@@ -157,6 +157,57 @@ factory:
     (also fixed); fully verified (515/515 tests); pushed for a twelfth
     independent review. P0 remains open.
 
+    Twelfth independent Codex P0 closure review (reviewed HEAD: bdd15a4)
+    confirmed the eleventh round's fixes (supplied-capabilityGateway
+    deletion, executionScope ownership snapshot, reservation-preserved-on-
+    failed-commit) but reproduced 5 NEW P1 findings, all further instances
+    of the SAME "authorize/snapshot one value -> await -> reread mutable
+    caller value" root pattern the last several rounds have been closing
+    one call site at a time: (1) "model identity snapshot is not used
+    during provider execution" — `ModelGateway.invoke()`'s
+    `executionScope` snapshot protected ACCOUNTING fields, but the actual
+    `#rawInvoke(model, request)` provider call still received the
+    caller's raw, still-mutable `model` object, so a mid-flight mutation
+    of `model.modelId`/`.provider` reached the real provider while every
+    accounting/audit record referenced the pre-mutation identity; (2)
+    "routing retries can change execution ownership and fallback
+    permission" — `CheapestCapableModelRouter.routeAndExecute()` read
+    `request`/`options` directly both before its first `await` and again,
+    unprotected, inside its own escalation retry loop, so mutating
+    `request.taskId` or flipping `options.allowPremiumFallback` mid-flight
+    could redirect a later escalation attempt's cost ownership or grant a
+    fallback permission never actually authorized at call start; (3)
+    "failed reconciliation reservations can still be released" — the
+    eleventh round's fix (preserve, don't delete, a reservation on a
+    failed `commit()`) was insufficient on its own, since a caller could
+    still call `release()` on that same still-open reservation afterward,
+    which deleted it anyway and restored the full ceiling despite the
+    recorded cost remaining zero; (4) "commit accepts accounting ownership
+    unrelated to the reservation" — `BudgetGuard.commit()` trusted its
+    caller-supplied `entry.taskId`/`.projectId` completely independently
+    of the reservation being committed against, so reserving for project
+    P/task A then committing with project Q/task B recorded cost under
+    Q/B while silently freeing P/A's protected capacity; (5) "bootstrap
+    retains mutable budget configuration across await" — the eleventh
+    round's orchestrator.ts fix captured `budgetLimits`' REFERENCE into a
+    local const, which is sufficient for class instances
+    (costEngine/modelRegistry/stateStore) but not for `budgetLimits`
+    itself, a plain data object — `new BudgetGuard(costEngine, budgetLimits
+    ?? {})` still read the object's FIELDS after the function's first
+    await, so a caller mutating `budgetLimits.perTaskUsd` (e.g. $0 -> $1)
+    while bootstrap was pending got the BudgetGuard constructed from the
+    MUTATED ceiling. All 5 fixed this session (see below) by the same
+    established pattern (freeze a detached snapshot of every needed field
+    or object as literally the first statement, before any await, and
+    never read the original mutable parameter again afterward); a narrow
+    targeted cross-cutting audit for exactly these 5 classes plus the
+    general pattern (scoped to the P0 model/budget/bootstrap execution
+    path only, per explicit instruction not to expand into unrelated
+    architecture work) found no further genuine instance; fully verified
+    (545/545 tests, including a real `npm run build` emission check per
+    explicit instruction that the twelfth review itself had not run one);
+    pushed for a thirteenth independent review. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -1425,6 +1476,183 @@ completed_milestones:
     - Re-ran the full required sequence: lint, typecheck, build,
       515/515 tests (491 + 24 new), validate:requirements, history-aware
       secret-scan, all P0 proofs, full CLI smoke test — all clean.
+  - |-
+    THIS SESSION (round 13) — a twelfth independent Codex review (reviewed
+    HEAD: bdd15a4) confirmed the eleventh round's 3 fixes, then reproduced
+    5 NEW P1 findings, all further instances of the "authorize/snapshot
+    one value -> await -> reread mutable caller value" root pattern. All
+    5 fixed:
+    - [P1] "Model identity snapshot is not used during provider
+      execution": `ModelGateway.invoke()`'s existing `executionScope`
+      snapshot (from the 11th round) protected accounting fields, but the
+      actual provider dispatch, `this.#rawInvoke(model, request)`, still
+      received the caller's raw, still-mutable `model` parameter — a
+      caller mutating `model.modelId`/`.provider`/`.tier`/`.costPerCall`
+      WHILE the real provider call was pending reached the provider with
+      a different identity than every accounting/audit/reconciliation
+      record referenced. Fixed in runtime/models/gateway.ts: `invoke()`
+      now captures `const authorizedModel: ModelRecord =
+      freezeRecord({...model})` as the literal FIRST statement (before
+      `executionScope` is even built); `executionScope`'s fields now
+      derive from `authorizedModel`, and `#rawInvoke()` is called with
+      `authorizedModel` — the original `model` parameter is never read
+      again. Regression tests (gateway.test.ts, using a
+      `ControllableProvider` test double whose `invoke()` only resolves
+      when the test explicitly calls `resolveAll()`, so the test can
+      genuinely prove pending-call behavior rather than relying on
+      synchronous-execution-order coincidence) prove: mutating
+      `model.modelId`/`.provider`/`.tier`/`.costPerCall` while the
+      provider call is pending has zero effect on what the provider
+      receives or what is accounted/audited, validation/audit reference
+      the identity that was actually authorized, and two concurrent
+      invocations sharing (and mutating) the same `model` object cannot
+      cross-contaminate each other's provider-received identity.
+      Confirmed via a temporary bypass (`this.#rawInvoke(model, request)`
+      instead of `authorizedModel`) that exactly 4 of 5 new tests fail,
+      then reverted.
+    - [P1] "Routing retries can change execution ownership and fallback
+      permission": `CheapestCapableModelRouter.routeAndExecute()` read
+      caller-owned, mutable `request`/`options` parameters directly both
+      before its first `await` (initial `selectModel()`/
+      `invokeAuthorized()` call) AND again, unprotected, inside its own
+      escalation retry loop (which only runs after that first await has
+      already resolved) — mutating `request.taskId` mid-flight could move
+      a subsequent escalation attempt's cost under a different task than
+      the one ever authorized, and flipping `options.allowPremiumFallback`
+      mid-flight could grant a fallback permission never actually granted
+      when routing started, letting repeated calls split cost across two
+      owners or bypass a per-task ceiling. Fixed in runtime/models/router.ts:
+      `request`/`options` are captured into a frozen `routingScope =
+      freezeRecord({...request})` snapshot and a normalized
+      `allowPremiumFallback` local const, both as the VERY FIRST thing
+      `routeAndExecute()` does, before `selectModel()` is even called the
+      first time; every subsequent `selectModel()`/`invokeAuthorized()`
+      call (initial and every escalation step) uses ONLY these, never the
+      original parameters again. Regression tests (router.test.ts) prove:
+      mutating `request.taskId` mid-flight keeps every escalation step and
+      all recorded cost under the originally-authorized task, flipping
+      `allowPremiumFallback` in either direction mid-flight has no effect
+      on the permission actually granted at call start, mutating
+      `request.requiredCapabilities` mid-flight cannot make an
+      otherwise-ineligible cheaper candidate wrongly eligible, mutating
+      `request.risk` has no effect (already safe, since risk-based tier
+      derivation only runs on the FIRST `selectModel()` call), and two
+      concurrent `routeAndExecute()` calls sharing one mutated `request`
+      remain isolated. Confirmed via a temporary bypass (reverting all 6
+      snapshot-read call sites back to reading `request`/`options`
+      directly) that exactly 4 of 6 new tests fail, then reverted.
+    - [P1] "Failed reconciliation reservations can still be released":
+      the 11th round's fix (preserve, don't delete, a reservation on a
+      failed `commit()`) was insufficient alone — a caller could still
+      call `release()` on that same still-open reservation afterward,
+      which deleted it anyway, restoring the full ceiling for a second
+      full reservation while the first attempt's recorded cost stayed
+      zero, even though a real provider call may already have happened.
+      Fixed in runtime/budget/budget.ts: introduced an explicit
+      `ReservationStatus = "ACTIVE" | "RECONCILIATION_FAILED"` lifecycle
+      field stored alongside each reservation; `commit()`'s existing
+      failure path now marks the reservation `RECONCILIATION_FAILED`
+      before re-throwing (in addition to preserving it, from the 11th
+      round); `release()` now checks this status first and rejects a
+      `RECONCILIATION_FAILED` reservation with the new
+      `UnresolvedReconciliationError` (recording a
+      `BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED` audit event)
+      instead of deleting it — the ONLY safe path forward is retrying
+      `commit()` with a corrected amount on the same id. Regression tests
+      (budget.test.ts) prove the exact reproduction (reserve -> commit(NaN)
+      fails -> release() is REJECTED, not silently accepted, second
+      reservation correctly blocked, total cost stays zero), an ACTIVE
+      reservation can still be release()d normally, a reservation that
+      successfully retries commit() no longer blocks release(), and every
+      rejection is audited. Confirmed via a temporary bypass (`if (false
+      && reservation.status === "RECONCILIATION_FAILED")` in release())
+      that exactly 5 new tests fail, then reverted.
+    - [P1] "Commit accepts accounting ownership unrelated to the
+      reservation": `BudgetGuard.commit()` trusted its caller-supplied
+      `entry.taskId`/`.projectId` completely independently of the
+      reservation being committed against — reserving for project P/task
+      A then committing with project Q/task B recorded the cost under
+      Q/B while the reservation protecting P/A's capacity was deleted,
+      silently freeing it with zero cost ever attributed to it. Fixed
+      (the validation approach, one of two the review explicitly
+      sanctioned — chosen over removing the redundant caller-supplied
+      ownership parameters entirely, to avoid a mechanical signature
+      change across every existing call site for no added security
+      benefit): `commit()` now validates `entry.taskId`/`.projectId`
+      against the reservation's OWN authoritative `scope` (captured at
+      `reserve()` time) immediately after the existence check, before any
+      mutation — a mismatch throws the new
+      `ReservationOwnershipMismatchError` (with a
+      `BUDGET_RESERVATION_OWNERSHIP_MISMATCH` audit event identifying the
+      reservation's real owner) and leaves all state untouched.
+      Regression tests (budget.test.ts) prove the exact reproduction is
+      rejected with the P/A reservation still fully intact, partial
+      (taskId-only or projectId-only) mismatches are also rejected, a
+      genuinely matching commit() is unaffected, and a retry with the
+      CORRECT ownership on the same reservation still succeeds. Confirmed
+      via a temporary bypass (`if (false && (entry.taskId !==
+      reservation.scope.taskId || entry.projectId !==
+      reservation.scope.projectId))`) that exactly 8 new tests fail, then
+      reverted.
+    - [P1] "Bootstrap retains mutable budget configuration across await":
+      the 11th round's orchestrator.ts fix captured `budgetLimits`'
+      REFERENCE into a local const, sufficient for class instances
+      (costEngine/modelRegistry/stateStore) but not for `budgetLimits`
+      itself, a plain data object — `new BudgetGuard(costEngine,
+      budgetLimits ?? {})` still read the object's OWN FIELDS after
+      `bootstrapProject()`'s first `await`, so a caller mutating
+      `budgetLimits.perTaskUsd` (e.g. $0 -> $1) while bootstrap was
+      pending got the eventual BudgetGuard constructed from the MUTATED
+      ceiling. Fixed in runtime/project-lifecycle/orchestrator.ts:
+      `budgetLimits` is now copied into a frozen snapshot
+      (`budgetGuardLimits = budgetLimits ? freezeRecord({...budgetLimits})
+      : {}`) at the same point every other field is captured — before the
+      first await — and `BudgetGuard` is constructed from
+      `budgetGuardLimits`, never the original reference. Regression tests
+      (orchestrator.test.ts) prove: an initial $0 ceiling mutated to $1
+      mid-flight still correctly rejects with `BudgetExceededError` (the
+      exact reproduction), the reverse direction (an initial $1 ceiling
+      mutated down to $0) does not retroactively block a spend the
+      ORIGINAL ceiling allowed, and two concurrent `bootstrapProject()`
+      calls sharing one `budgetLimits` object remain isolated. Confirmed
+      via a temporary bypass (reverting to `new BudgetGuard(costEngine,
+      budgetLimits ?? {})`) that all 3 new tests fail — the
+      exact-reproduction test's promise resolved successfully (totalCostUsd
+      0.6) instead of rejecting — then reverted.
+    - Targeted cross-cutting audit (as explicitly requested, narrow —
+      scoped to exactly these 5 classes plus the general
+      "snapshot -> await -> reread" pattern within the P0
+      model/budget/bootstrap execution path only, explicitly NOT expanding
+      into unrelated architecture work): re-examined every async function
+      in gateway.ts, router.ts, registry.ts, budget.ts, cost-engine.ts,
+      orchestrator.ts's bootstrapProject(), policy-engine.ts, and
+      capability-gateway's authorize() for a caller-supplied object read
+      both before and after an await for a security/cost/ownership-
+      relevant purpose. registry.ts, budget.ts's own methods
+      (reserve/commit/release/spend), cost-engine.ts, and
+      policy-engine.ts's evaluate() are all fully synchronous — no await
+      exists inside them, so this race class is structurally impossible
+      there. CapabilityGateway.authorize() reads `action` fields only on
+      the DENY/APPROVAL_REQUIRED paths, which never call execute(); on the
+      ALLOW path no `action` field is read again after execute() starts.
+      No new genuine instance found beyond the 5 already fixed — the
+      pattern is fully closed in this scope.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0024 (Model gateway — model-identity snapshot fix),
+    UASF-REQ-0027 (Cheapest-capable-model router — routing-input snapshot
+    fix), UASF-REQ-0030 (Budget engine — reservation lifecycle status +
+    commit() ownership binding), UASF-REQ-0042 (P0 end-to-end proof —
+    orchestrator.ts budgetLimits snapshot fix + the round-13 targeted
+    audit note). No status field was raised on any requirement beyond
+    what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ timestamp, per explicit
+    instruction that the twelfth review itself had not run this),
+    545/545 tests (515 + 30 new), validate:requirements, history-aware
+    secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
+    (13 assertions) — all clean.
 
 known_limitations:
   - >-
@@ -1511,6 +1739,37 @@ blockers:
     further P0 feature work, and do not declare P0 complete, until that
     re-review confirms no blocking finding remains.
 
+    A TWELFTH independent Codex review (reviewed HEAD: bdd15a4) then
+    reproduced 5 NEW P1 findings, all further instances of the same
+    "authorize/snapshot one value -> await -> reread mutable caller
+    value" root pattern: ModelGateway.invoke()'s executionScope snapshot
+    protected accounting fields but not the actual provider-call argument
+    itself (fixed by snapshotting `model` into `authorizedModel` before
+    any await and using it for both); routeAndExecute()'s escalation
+    retry loop re-read mutable `request`/`options` after the first await
+    instead of a snapshot taken before it (fixed the same way, extending
+    to every escalation step); BudgetGuard.release() could still delete a
+    reservation whose commit() had already failed reconciliation (fixed
+    by adding an explicit ReservationStatus lifecycle and rejecting
+    release() on a RECONCILIATION_FAILED reservation); BudgetGuard.commit()
+    trusted caller-supplied ownership independent of the reservation
+    itself, permitting scope substitution (fixed by validating supplied
+    ownership against the reservation's own authoritative scope, failing
+    closed on mismatch); and bootstrapProject()'s budgetLimits reference-
+    capture (from the 11th round) was insufficient since budgetLimits is a
+    plain data object whose FIELDS, not just its reference, needed
+    snapshotting (fixed by freezing a copy of budgetLimits before the
+    first await). All 5 fixed, tested (545/545 tests, +30 net new), and
+    verified per the full required sequence, including a real `npm run
+    build` emission check per explicit instruction — see
+    completed_milestones for full detail. A narrow targeted audit for
+    exactly these 5 classes plus the general pattern, scoped to the P0
+    model/budget/bootstrap execution path only, found no further genuine
+    instance. Now awaiting a THIRTEENTH independent review. Per explicit
+    instruction: "stop at the independent-review boundary" — do not push
+    further P0 feature work, and do not declare P0 complete, until that
+    re-review confirms no blocking finding remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -1528,7 +1787,59 @@ governance_decision_recorded: >
 
 exact_next_action: >
   STOP at the independent-review boundary, per explicit instruction: the
-  fixes for round 9's 3 findings (routeAndExecute() in
+  fixes for the twelfth independent Codex review's 5 findings are
+  implemented, tested, and pushed to claude/ai-factory-baseline-v1-seawq7,
+  with the full required verification sequence run clean (lint, typecheck,
+  a REAL `npm run build` emission — confirmed via a fresh dist/ timestamp,
+  since the twelfth review explicitly noted it had not run one itself —
+  545/545 tests, validate:requirements, history-aware secret-scan, Factory
+  Doctor READY, all 9 P0 proofs). Summary of the 5 fixes: (1)
+  ModelGateway.invoke() now snapshots `model` into a frozen
+  `authorizedModel` as its first statement and uses ONLY that for both
+  `executionScope` and the actual `#rawInvoke()` provider call — a caller
+  mutating `model` mid-flight can no longer desynchronize what the
+  provider receives from what accounting/audit records; (2)
+  CheapestCapableModelRouter.routeAndExecute() now snapshots
+  `request`/`options` into `routingScope`/a captured `allowPremiumFallback`
+  boolean as its first statement, before the first `selectModel()` call,
+  and every escalation-loop iteration uses ONLY those, never re-reading
+  the original mutable parameters; (3) BudgetGuard gained an explicit
+  `ReservationStatus` lifecycle (ACTIVE/RECONCILIATION_FAILED) — a failed
+  `commit()` now marks the reservation RECONCILIATION_FAILED, and
+  `release()` rejects such a reservation with a new
+  UnresolvedReconciliationError instead of deleting it, so a caller can no
+  longer free protected capacity via release() after a failed
+  reconciliation; (4) BudgetGuard.commit() now validates caller-supplied
+  `entry.taskId`/`.projectId` against the reservation's OWN authoritative
+  `scope` before any mutation, throwing a new
+  ReservationOwnershipMismatchError on any mismatch, so accounting can no
+  longer be redirected to an unrelated task/project; (5)
+  bootstrapProject() now snapshots `budgetLimits`' OWN FIELDS (not just
+  its reference) into a frozen `budgetGuardLimits` before the first await,
+  so a caller mutating the budgetLimits object mid-flight can no longer
+  change the ceiling BudgetGuard is actually constructed from. Every fix
+  was individually verified via a temporary in-place bypass confirmed to
+  reproduce the exact predicted regression-test failures, then reverted.
+  A narrow targeted cross-cutting audit for exactly these 5 classes plus
+  the general "snapshot -> await -> reread" pattern, scoped to the P0
+  model/budget/bootstrap execution path only (per explicit instruction not
+  to expand into unrelated architecture work), found no further genuine
+  instance. Requirement registry updated (UASF-REQ-0024, UASF-REQ-0027,
+  UASF-REQ-0030, UASF-REQ-0042) from this real evidence only — no status
+  raised beyond what is genuinely supported. Do not proceed to further P0
+  feature work or declare P0 complete until a THIRTEENTH independent
+  (Codex) re-review of this diff confirms no blocking P0 finding remains.
+  If/when that comes back clean, resume from the prior exact_next_action
+  (below): wire the remaining foundation modules (Discovery, Decisions,
+  Assumptions, Technology/Business-Capability registries) into the same
+  integrated pipeline, consider a SQLite-backed StateStore, get a Founder
+  decision on P0-sufficiency and licensing (section 206). The
+  autonomous-merge governance question stays closed absent new
+  Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
+  The fixes for round 9's 3 findings (routeAndExecute() in
   runtime/models/router.ts now takes REQUIRED policy/budget parameters and
   routes every candidate invocation — initial and every escalation step —
   through a new invokeAuthorized() helper that checks CapabilityGateway/

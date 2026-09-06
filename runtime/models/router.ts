@@ -10,6 +10,7 @@ import { ModelGateway, type ModelInvocationRequest, type ModelInvocationResponse
 import { ModelRegistry, TIER_ORDER, tierRank, type ModelRecord, type ModelTier } from "./registry.js";
 import type { PolicyEngine } from "../policy-engine/policy-engine.js";
 import type { BudgetGuard } from "../budget/budget.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export interface RoutingRequest {
   readonly taskId: string;
@@ -167,6 +168,34 @@ export class CheapestCapableModelRouter {
    * `policy`/`budget` artık ZORUNLU parametrelerdir — HER aday (ilk seçim
    * dahil), invokeAuthorized() üzerinden aynı yetkilendirme kapısından
    * geçer (bkz. yukarıdaki fix notu).
+   *
+   * P1 fix (12th independent review round, "routing retries can change
+   * execution ownership and fallback permission"): Codex reproduced
+   * `request`/`options` being caller-owned, mutable objects that this
+   * method kept reading DIRECTLY across MULTIPLE `await` boundaries — the
+   * initial call reads `request.taskId`/`.risk`/`.requiredCapabilities`
+   * and `options.allowPremiumFallback` BEFORE the first await, but the
+   * escalation loop (which only runs AFTER that first await has already
+   * resolved) reads `request`/`options` AGAIN via `selectModel(request,
+   * nextTier)` and `invokeAuthorized(decision, request, ...)`. A caller
+   * mutating `request.taskId` (A -> B) or flipping
+   * `options.allowPremiumFallback` (false -> true) WHILE the first
+   * candidate's provider call was still pending could make a SUBSEQUENT
+   * escalation attempt run under a different task/project ownership than
+   * the one that was ever authorized, or exercise a fallback permission
+   * that was never actually granted when routing started — splitting
+   * cost across two owners and letting a per-task ceiling be bypassed by
+   * repeated calls. Fixed: `request`/`options` are captured into frozen,
+   * detached snapshots (`routingScope`/`allowPremiumFallback`) as the
+   * VERY FIRST thing this method does, before `selectModel()` is even
+   * called the first time. `routingScope` (never the original `request`
+   * parameter) is what every `selectModel()`/`invokeAuthorized()` call —
+   * initial AND every escalation step — actually uses; the normalized
+   * `allowPremiumFallback` boolean is captured once and reused, never
+   * re-read from `options`. As with gateway.ts's identical fix, this
+   * holds regardless of scheduling, because JS guarantees an async
+   * function's synchronous prefix runs to completion before any
+   * caller-scheduled microtask can interleave.
    */
   async routeAndExecute(
     request: RoutingRequest,
@@ -177,15 +206,23 @@ export class CheapestCapableModelRouter {
     budget: BudgetGuard,
     options: RouteAndExecuteOptions = {}
   ): Promise<RouteAndExecuteResult> {
-    let decision = this.selectModel(request);
-    let response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, policy, budget);
+    // Herhangi bir asenkron iş (hatta İLK selectModel() çağrısı) başlamadan
+    // ÖNCE: yetkili yönlendirme girdisi anlık görüntüsü — bkz. yukarıdaki
+    // fix notu. `requiredCapabilities` bir dizi alanıdır; `freezeRecord`
+    // onun da bir KOPYASINI dondurur. Bundan sonra `request`/`options`
+    // parametrelerinin KENDİLERİ bir daha ASLA okunmaz.
+    const routingScope: RoutingRequest = freezeRecord({ ...request });
+    const allowPremiumFallback = options.allowPremiumFallback ?? false;
+
+    let decision = this.selectModel(routingScope);
+    let response = await this.invokeAuthorized(decision, routingScope, gateway, invocationRequest, policy, budget);
 
     if (validate(response)) {
       return { response, decision };
     }
 
-    if (!options.allowPremiumFallback) {
-      throw new PremiumFallbackBlockedError(request.taskId);
+    if (!allowPremiumFallback) {
+      throw new PremiumFallbackBlockedError(routingScope.taskId);
     }
 
     // Eskalasyon, modelin GERÇEKTEN seçildiği seviyeden başlar (risk
@@ -198,11 +235,11 @@ export class CheapestCapableModelRouter {
       const nextTier = nextTierIndex < TIER_ORDER.length ? TIER_ORDER[nextTierIndex] : undefined;
 
       if (!nextTier) {
-        throw new EscalationExhaustedError(request.taskId, decision.model.tier);
+        throw new EscalationExhaustedError(routingScope.taskId, decision.model.tier);
       }
 
-      decision = this.selectModel(request, nextTier);
-      response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, policy, budget);
+      decision = this.selectModel(routingScope, nextTier);
+      response = await this.invokeAuthorized(decision, routingScope, gateway, invocationRequest, policy, budget);
 
       if (validate(response)) {
         return { response, decision };
