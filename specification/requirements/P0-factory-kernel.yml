@@ -2808,6 +2808,92 @@
     creation with no locking semantics and no deletion at all — no other
     genuine instance of any of these four root classes exists.
 
+    P2 fix (19th independent review round, "make stale reclaim-gate
+    recovery ownership-safe"): the 17th round's `tryReclaimStaleLock()`
+    fix protected `lockDirPath` itself from unsafe reclamation via an
+    exclusive `.reclaim` gate (`acquireReclaimGate()`) — but Codex
+    reproduced the IDENTICAL unsafe pattern one level in: the `.reclaim`
+    GATE's OWN prior-holder-crashed recovery path
+    (`acquireReclaimGate`'s EEXIST branch) used a bare
+    stat-then-unconditional-`rmSync`, with NO identity check and no
+    re-validation — Process A could observe an abandoned `.reclaim` gate
+    (left behind by a crashed reclaimer), remove it, and create a fresh
+    replacement; Process B, acting on its own now-outdated observation of
+    the SAME abandoned gate, could then unconditionally delete A's
+    brand-new replacement gate, letting both A and B believe they alone
+    held exclusive access to `tryReclaimStaleLock()`'s protected body
+    (the code that actually manipulates `lockDirPath`) — reintroducing,
+    one level deeper, the exact overlapping-critical-section race the
+    17th round's fix was meant to close entirely. Required invariant
+    (identical in shape to the 17th round's, one level in): a process may
+    only remove the EXACT abandoned reclaim-gate instance it observed and
+    proved abandoned; a stale observation must never authorize deleting a
+    newer gate another contender created. Fixed: `claimPath` now carries
+    the SAME identity scheme as `lockDirPath` itself (pid + token +
+    acquiredAt, written via a new shared `writeGateIdentity()` helper) and
+    is subject to the SAME three-state (`isLockStale`) live/dead/unknown
+    distinction — age alone never authorizes reclaiming it either.
+    Recovery of an abandoned claim gate is now gated by a SECOND,
+    generation-keyed exclusive gate (`${claimPath}.recover-${observedToken}`,
+    derived from the SPECIFIC abandoned generation's own token and
+    acquired via `mkdirSync`) — every contender racing to recover the
+    SAME abandoned generation targets the SAME recovery-gate path, so
+    `mkdirSync`'s atomicity guarantees exactly one winner; losers back off
+    without ever touching `claimPath`. The winner re-validates
+    `isLockStale(claimPath, ...)` one more time — now with no other
+    recoverer able to interleave, since it holds the exclusive recovery
+    gate — immediately before the actual delete, closing the TOCTOU
+    window to zero for the common (single-crash) case. Because the
+    recovery gate's path is keyed to a token that, once superseded, is
+    never again observed as "the current abandoned generation," it is
+    safe to leave unrecovered forever in the ordinary case (no cleanup
+    race). One narrow, explicitly documented, ACCEPTED residual limitation
+    remains (analogous to the file's existing documented PID-reuse
+    limitation): if the recovery-gate WINNER itself also crashes mid-
+    recovery — reachable only via TWO independent, sequential process
+    crashes (the original lock owner, then the reclaimer that won the
+    recovery gate) — `acquireRecoveryGate()`'s own abandonment check
+    is a single-level, age-only (`mtime`) fallback rather than a third
+    nested exclusive gate, since adding further nesting would be an
+    unbounded, disproportionate "broad redesign" for an astronomically
+    rare compound-failure scenario, contrary to the review's own
+    instruction to prefer "the smallest dependency-free architecture-
+    consistent solution." Two new real-child-process regression tests
+    added to `runtime/cache/__tests__/file-cache.cross-process.test.ts`:
+    one repeats (5 trials) a ready/barrier-synchronized race between two
+    processes recovering the SAME fabricated abandoned reclaim gate
+    (itself sitting atop a fabricated abandoned lock, reproducing the
+    review's exact scenario), using the same marker-file overlap witness
+    as the 17th round's tests, proving no overlap and no dangling
+    lock/gate/marker afterward; the other proves that after the winner of
+    such a race releases normally, the loser can subsequently acquire,
+    and cache entries written by each contender in sequence are preserved
+    (no lost updates). Verified via two temporary, carefully-scoped
+    bypasses that together reproduced the exact predicted failure: (1)
+    reverting `acquireReclaimGate`'s EEXIST branch to keep the CORRECT
+    staleness decision (still PID-liveness-aware, to preserve tight race
+    timing) but perform the unsafe unconditional delete-then-recreate
+    with no recovery gate; (2) additionally widening (via a short,
+    clearly-marked `sleepSync`) the natural but ordinarily sub-millisecond
+    gap between "decided stale" and "acted on it" in both the bypassed
+    `acquireReclaimGate` and the downstream `tryReclaimStaleLock` body, to
+    make the inherently timing-sensitive race reliably observable in this
+    environment's fast local-disk syscall timing (this mirrors, at finer
+    grain, the same "decide-then-act" root pattern the real fix closes;
+    it does not test a different bug). Under this combined bypass, the
+    exact predicted overlap symptom reproduced in 2 of 3 repeated runs of
+    the new tests (a probabilistic race, consistent with its nature);
+    both bypasses were fully reverted afterward and 649/649 tests
+    reconfirmed passing, stable across 3 repeated full-suite runs. A
+    narrow audit (scoped to exactly the four root classes named: stale
+    observation deleting a newer gate, old token releasing a newer gate,
+    unconditional rmSync/unlink of ownership-sensitive paths, timeout/
+    error cleanup deleting someone else's gate) re-confirmed `file-lock.ts`
+    remains the ONLY lock/staleness/ownership protocol in `runtime/`, and
+    found no other genuine instance beyond the one fixed here — this
+    round did not touch or need to touch `file-store.ts`/`scaffold.ts`
+    (already cleared by the 18th round's identical audit).
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).

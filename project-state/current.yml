@@ -446,6 +446,41 @@ factory:
     independent review — the eighteenth review's own framing calls this
     the P0 closure re-review. P0 remains open.
 
+    A NINETEENTH independent Codex review found ONE remaining P2
+    correctness blocker, back in the runtime kernel's lock protocol:
+    `runtime/cache/file-lock.ts`'s `acquireReclaimGate()` — the 17th
+    round's fix that protects `lockDirPath` itself from unsafe
+    reclamation via an exclusive `.reclaim` gate — had the IDENTICAL
+    unsafe pattern one level in, in the `.reclaim` GATE's OWN prior-
+    holder-crashed recovery path: a bare stat-then-unconditional-`rmSync`
+    with no identity check, letting one process delete another's brand-
+    new replacement reclaim gate and both believe they held exclusive
+    access to the protected critical section that manipulates
+    `lockDirPath`. Fixed this session: the claim gate now carries the
+    same pid+token+acquiredAt identity scheme as `lockDirPath` itself and
+    is subject to the same live/dead/unknown staleness distinction;
+    recovery of an abandoned claim gate is now itself gated by a second,
+    generation-keyed exclusive gate (derived from the specific abandoned
+    generation's own token), so exactly one recoverer ever wins per
+    abandoned generation, with a final re-validation immediately before
+    the actual delete. Two new real-child-process regression tests added
+    (a 5-trial ready/barrier-synchronized race for the SAME fabricated
+    abandoned reclaim gate, and a winner-then-loser sequence test proving
+    no lost cache updates); both verified via two combined temporary
+    bypasses (removing the recovery gate, then also widening the natural
+    decide-then-act gap to make the inherently timing-sensitive race
+    reliably observable) that reproduced the exact predicted overlap
+    symptom in 2 of 3 runs, then fully reverted. One narrow, explicitly
+    documented residual limitation remains (reachable only via two
+    independent, sequential crashes), consistent with this file's
+    existing documented PID-reuse limitation and the review's own
+    instruction to prefer the smallest dependency-free solution over a
+    broad redesign. Fully verified (lint, typecheck, a real `rm -rf dist
+    && npm run build`, 649/649 tests, requirement validation, secret
+    scan, Factory Doctor, all 9 P0 proofs); pushed for a twentieth
+    independent review — the nineteenth review's own framing calls this
+    the P0 closure re-review. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -2565,6 +2600,108 @@ completed_milestones:
     secret-scan (genuinely PASS against this repository's real current
     tree and history), Factory Doctor (READY on all checks), all 9 P0
     proofs (13 assertions) — all clean.
+  - |-
+    THIS SESSION (round 20) — a nineteenth independent Codex review
+    (all required verification, including 633/633 tests, confirmed
+    passing BEFORE the finding was listed) reproduced ONE remaining P2
+    finding, now fixed:
+    - [P2] "Make stale reclaim-gate recovery ownership-safe":
+      `runtime/cache/file-lock.ts`'s `acquireReclaimGate()` — the 17th
+      round's exclusive gate meant to serialize all reclamation of a
+      given `lockDirPath` — had the IDENTICAL unsafe pattern the 17th
+      round fixed for `lockDirPath` itself, but one level IN: its OWN
+      "the `.reclaim` gate directory looks abandoned" recovery path used
+      a bare stat-then-unconditional-`rmSync`, with no identity check and
+      no re-validation. Codex reproduced: a crashed reclaimer leaves an
+      abandoned `.reclaim` gate; Process A observes it, removes it, and
+      creates a fresh replacement gate; Process B, acting on its own now-
+      outdated observation of the SAME abandoned gate, unconditionally
+      deletes A's brand-new replacement — both A and B then believe they
+      alone hold exclusive access to `tryReclaimStaleLock()`'s protected
+      body (the code that actually manipulates `lockDirPath`),
+      reintroducing the overlapping-critical-section race one level
+      deeper than the 17th round closed it. Required invariant (same
+      shape, one level in): a process may only remove the EXACT abandoned
+      reclaim-gate instance it observed and proved abandoned — a stale
+      observation must never authorize deleting a newer gate another
+      contender created. Fixed: the claim gate now carries the SAME
+      pid+token+acquiredAt identity scheme as `lockDirPath` (written via
+      a new shared `writeGateIdentity()` helper) and is subject to the
+      SAME three-state (live/dead/unknown) `isLockStale()` distinction —
+      age alone never authorizes reclaiming it either. Recovery of an
+      abandoned claim gate now goes through a SECOND, generation-keyed
+      exclusive gate (`${claimPath}.recover-${observedToken}`, derived
+      from the specific abandoned generation's own token, acquired via
+      `mkdirSync`) — every contender racing to recover the SAME abandoned
+      generation targets the SAME recovery-gate path, so exactly one
+      wins; losers back off without ever touching the claim gate. The
+      winner re-validates staleness one more time — with no other
+      recoverer able to interleave, since it holds the exclusive recovery
+      gate — immediately before the actual delete, closing the TOCTOU
+      window to zero for the common (single-crash) case. Because the
+      recovery-gate path is keyed to a token that, once superseded, is
+      never again observed as "the current abandoned generation," an
+      unrecovered one is safe to leave forever (no cleanup race needed).
+      One narrow, explicitly documented, ACCEPTED residual limitation
+      remains (reachable only via TWO independent, sequential crashes —
+      the original lock owner, then the reclaimer that won the recovery
+      gate): the recovery gate's own abandonment recovery is a single-
+      level, age-only fallback rather than a third nested exclusive gate,
+      since further nesting would be an unbounded "broad redesign" for an
+      astronomically rare compound-failure scenario — consistent with the
+      file's existing documented PID-reuse limitation and the review's
+      own instruction to prefer the smallest dependency-free solution.
+    - Two new real-child-process regression tests added to
+      `runtime/cache/__tests__/file-cache.cross-process.test.ts` (13
+      tests total in that file now): a 5-trial ready/barrier-synchronized
+      race between two processes recovering the SAME fabricated abandoned
+      reclaim gate (itself sitting atop a fabricated abandoned lock,
+      reproducing the review's exact scenario), using the same marker-
+      file overlap witness as the 17th round's tests, proving no overlap
+      and no dangling lock/gate/marker afterward; and a winner-then-loser
+      sequence test proving that after the winner releases normally, the
+      loser can subsequently acquire, and cache entries written by each
+      contender are preserved (no lost updates).
+    - Verified via two temporary, carefully-scoped bypasses applied
+      TOGETHER: (1) reverting `acquireReclaimGate`'s EEXIST branch to
+      keep the CORRECT staleness decision (still PID-liveness-aware, to
+      preserve tight race timing) but perform the unsafe unconditional
+      delete-then-recreate with no recovery gate; (2) additionally
+      widening (via a short, clearly-marked `sleepSync`) the natural but
+      ordinarily sub-millisecond gap between "decided stale" and "acted
+      on it" in both the bypassed `acquireReclaimGate` and the downstream
+      `tryReclaimStaleLock` body, needed to make this inherently timing-
+      sensitive race reliably observable on this environment's fast
+      local-disk syscall timing (the SAME "decide-then-act" root pattern
+      the real fix closes, at finer grain — not a different bug). Under
+      this combined bypass, the exact predicted overlap symptom
+      reproduced in 2 of 3 repeated runs (a probabilistic race, as
+      expected of its nature); both bypasses fully reverted afterward,
+      649/649 tests reconfirmed passing, stable across 3 repeated
+      full-suite runs.
+    - A narrow audit (scoped to exactly the four root classes named:
+      stale observation deleting a newer gate, old token releasing a
+      newer gate, unconditional rmSync/unlink of ownership-sensitive
+      paths, timeout/error cleanup deleting someone else's gate)
+      re-confirmed `file-lock.ts` remains the ONLY lock/staleness/
+      ownership protocol in `runtime/`, with no other genuine instance
+      beyond the one fixed here — `file-store.ts`/`scaffold.ts` were
+      already cleared by the 18th round's identical audit and needed no
+      further changes.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0036 (Cache / reuse layer — the reclaim-gate
+    identity scheme, the generation-keyed recovery gate, the 2 new real-
+    child-process regression tests, the combined temp-bypass verification
+    results, the documented accepted residual limitation, and the
+    four-root-class narrow-audit note). No status field was raised on any
+    requirement beyond what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ deletion and rebuild), 649/649
+    tests (647 + 2 new), validate:requirements, history-aware secret-scan
+    (PASS), Factory Doctor (READY on all checks), all 9 P0 proofs (13
+    assertions) — all clean.
 
 known_limitations:
   - >-
@@ -2878,6 +3015,36 @@ blockers:
     P0 complete, until that re-review confirms no blocking finding
     remains.
 
+    A NINETEENTH independent Codex review found ONE remaining P2
+    finding, back in the lock protocol: `acquireReclaimGate()`'s own
+    "the `.reclaim` gate looks abandoned" recovery path used a bare
+    stat-then-unconditional-`rmSync`, with no identity check — the
+    IDENTICAL unsafe pattern the 17th round fixed for `lockDirPath`
+    itself, but one level in. One process could recover an abandoned
+    claim gate and create a fresh replacement; another, acting on its own
+    outdated observation of the SAME abandoned gate, could unconditionally
+    delete that replacement — both then believing they held exclusive
+    access to the protected body that manipulates `lockDirPath`. Fixed
+    this session: the claim gate now carries the same pid+token+
+    acquiredAt identity as `lockDirPath` and the same live/dead/unknown
+    staleness distinction; recovery of an abandoned claim gate goes
+    through a second, generation-keyed exclusive gate so exactly one
+    recoverer wins per abandoned generation, with a final re-validation
+    immediately before the actual delete. Two new real-child-process
+    regression tests added; verified via two combined temporary bypasses
+    that reproduced the exact predicted overlap symptom in 2 of 3 runs,
+    then reverted. One narrow, documented residual limitation remains
+    (reachable only via two independent, sequential crashes), consistent
+    with the file's existing PID-reuse limitation and the review's own
+    preference for the smallest dependency-free fix. Tested (649/649
+    tests, +2 net new) and verified per the full required sequence — see
+    completed_milestones for full detail. Now awaiting a TWENTIETH
+    independent review — per the nineteenth review's own framing, this
+    remains the P0 closure re-review. Per explicit instruction: "stop at
+    the independent-review boundary" — do not push further P0 feature
+    work, and do not declare P0 complete, until that re-review confirms
+    no blocking finding remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -2894,6 +3061,72 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fix for the nineteenth independent Codex review's ONE remaining P2
+  finding is implemented, tested, and pushed to
+  claude/ai-factory-baseline-v1-seawq7, with the full required
+  verification sequence run clean (lint, typecheck, a REAL `npm run
+  build` emission — confirmed via a clean `dist/` deletion and rebuild —
+  649/649 tests, validate:requirements, history-aware secret-scan,
+  Factory Doctor READY, all 9 P0 proofs). The finding was scoped
+  entirely to `runtime/cache/file-lock.ts`'s reclaim-gate recovery path
+  (the 19th review did not reproduce any secret-scan or budget-ledger
+  finding). Summary of the fix:
+
+  [P2] `acquireReclaimGate()`'s "the `.reclaim` gate looks abandoned"
+  recovery path used a bare stat-then-unconditional-`rmSync`, with no
+  identity check — the SAME unsafe pattern the 17th round fixed for
+  `lockDirPath` itself, one level in. One process could recover an
+  abandoned claim gate and create a fresh replacement; another, acting
+  on its own outdated observation of the SAME abandoned gate, could
+  unconditionally delete that replacement — both then believing they
+  held exclusive access to `tryReclaimStaleLock()`'s protected body.
+  Fixed: the claim gate now carries the same pid+token+acquiredAt
+  identity as `lockDirPath` (via a new `writeGateIdentity()` helper) and
+  the same live/dead/unknown staleness distinction. Recovery of an
+  abandoned claim gate now goes through a SECOND, generation-keyed
+  exclusive gate (`${claimPath}.recover-${observedToken}`) — every
+  contender racing to recover the SAME abandoned generation targets the
+  SAME path, so `mkdirSync`'s atomicity guarantees exactly one winner;
+  losers back off without touching the claim gate. The winner
+  re-validates staleness immediately before the actual delete, with no
+  other recoverer able to interleave, closing the TOCTOU window for the
+  common case. One narrow, documented, accepted residual remains
+  (reachable only via two independent, sequential crashes): the recovery
+  gate's own abandonment recovery is a single-level, age-only fallback
+  rather than a third nested gate, per the review's own preference for
+  the smallest dependency-free fix over a broad redesign.
+
+  Two new real-child-process regression tests added to
+  `runtime/cache/__tests__/file-cache.cross-process.test.ts`: a 5-trial
+  ready/barrier-synchronized race between two processes recovering the
+  SAME fabricated abandoned reclaim gate, using the same marker-file
+  overlap witness as prior rounds; and a winner-then-loser sequence test
+  proving no lost cache updates. Verified via two combined temporary
+  bypasses (removing the recovery gate; additionally widening the
+  natural decide-then-act gap to make the race reliably observable on
+  this environment's fast local-disk timing) that reproduced the exact
+  predicted overlap symptom in 2 of 3 runs, then fully reverted with
+  649/649 tests reconfirmed passing. A narrow audit re-confirmed
+  `file-lock.ts` remains the only lock/staleness/ownership protocol in
+  the P0 path, with no other genuine instance of the four named root
+  classes.
+
+  Requirement registry updated (UASF-REQ-0036) from this real evidence
+  only — no status raised beyond what is genuinely supported. Do not
+  proceed to further P0 feature work or declare P0 complete until a
+  TWENTIETH independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains — per the nineteenth review's own framing,
+  this remains the P0 closure re-review. If/when that comes back clean,
+  resume from the prior exact_next_action (below): wire the remaining
+  foundation modules (Discovery, Decisions, Assumptions, Technology/
+  Business-Capability registries) into the same integrated pipeline,
+  consider a SQLite-backed StateStore, get a Founder decision on
+  P0-sufficiency and licensing (section 206). The autonomous-merge
+  governance question stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fix for the eighteenth independent Codex review's ONE remaining P2
   finding is implemented, tested, and pushed to

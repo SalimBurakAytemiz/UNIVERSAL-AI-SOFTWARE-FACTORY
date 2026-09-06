@@ -210,24 +210,137 @@ function tryReclaimStaleLock(lockDirPath: string, metaPath: string, staleMs: num
 }
 
 /**
- * `claimPath`'i atomik olarak (mkdirSync ile) alır. Zaten alınmışsa
- * (EEXIST), bu işaretin KENDİSİNİN de terk edilmiş olup olmadığını
- * (kendi `mtime`'ı üzerinden, `staleMs` ile) kontrol eder — meşru bir
- * reclaim işlemi bir avuç senkron syscall'dan oluşup neredeyse anında
- * bittiğinden, bu işaretin `staleMs`'den daha uzun süredir açık kalması,
- * onu ALAN process'in reclaim SIRASINDA çökmüş olduğunu gösterir; bu
- * durumda işaret zorla temizlenip yeniden denenir — aksi halde çökmüş bir
- * reclaim'in yarım kalan kapı işareti, bu `lockDirPath`'in SONSUZA DEK bir
- * daha asla geri kazanılamamasına (kalıcı kilitlenme) yol açardı.
+ * `metaPath`'e rastgele bir token içeren kimlik bilgisi (pid + token +
+ * acquiredAt) yazar — kimlik-etiketli HERHANGİ bir dizin (hem
+ * `lockDirPath` hem de aşağıdaki reclaim/recovery kapıları) için ortak
+ * kullanılan tek bir yazma yordamı. Yazma başarısız olsa bile (best-
+ * effort) dizinin kendisi zaten alınmıştır; sadece BİLİNMEYEN-sahip
+ * stale tespiti dizin mtime'ına geri düşer (bkz. `isLockStale`).
+ */
+function writeGateIdentity(metaPath: string): void {
+  try {
+    const meta: LockMeta = { pid: process.pid, token: randomBytes(8).toString("hex"), acquiredAt: Date.now() };
+    writeFileSync(metaPath, JSON.stringify(meta), "utf8");
+  } catch {
+    // En iyi çaba (best-effort).
+  }
+}
+
+/**
+ * P2 fix (19th independent review round, "make stale reclaim-gate
+ * recovery ownership-safe"): eskiden bu fonksiyon, `claimPath`'in
+ * KENDİSİ terk edilmiş görünüyorsa (yalnızca dizinin `mtime`'ına
+ * bakarak) DOĞRUDAN `rmSync(claimPath)` çağırıyordu — hiçbir kimlik
+ * doğrulaması, hiçbir tekrar-kontrol OLMADAN. Codex, tam olarak
+ * `tryReclaimStaleLock`'ın KENDİSİNİN `lockDirPath` için çözdüğü SORUNUN
+ * (17th independent review round) AYNISININ, bu kez bir SEVİYE İÇERİDE
+ * — `claimPath`'in KENDİ terk edilmiş-kapı kurtarma yolunda — yeniden
+ * ortaya çıktığını gösterdi: Process A eski/terk edilmiş `claimPath`'i
+ * gözlemler, Process B AYNI eski `claimPath`'i gözlemler, A onu kaldırıp
+ * KENDİ yeni kapısını oluşturur, B ise hâlâ ESKİ gözlemine dayanarak
+ * KOŞULSUZ `rmSync` çağırarak A'nın YENİ kapısını yanlışlıkla siler —
+ * ardından hem A hem B `tryReclaimStaleLock`'ın korumalı kritik bölümüne
+ * AYNI ANDA girip birbirinin `lockDirPath` yedeğine müdahale edebilir.
+ *
+ * Gereken değişmez (bir seviye içeride de AYNI): bir process, SADECE
+ * GÖZLEMLEDİĞİ TAM O terk edilmiş kapı ÖRNEĞİNİ kaldırabilir; başka bir
+ * kurtarıcının (recoverer) oluşturduğu YENİ bir kapıyı ASLA silemez.
+ * Fixed: `claimPath`'in kendisi de artık `lockDirPath` ile AYNI kimlik
+ * şemasını taşır (pid + token + acquiredAt, `writeGateIdentity` ile
+ * yazılır) ve AYNI üç-durumlu (`isLockStale`) canlı/ölü/bilinmeyen
+ * ayrımına tabidir — yaş TEK BAŞINA burada da hiçbir şeyi terk edilmiş
+ * SAYDIRMAZ; gözlemlenen sahip CANLIYSA kurtarma girişimi HİÇ başlamaz.
+ * Kurtarma girişiminin KENDİSİ, gözlemlenen belirli NESİL'in (generation)
+ * token'ına göre TÜRETİLMİŞ, TEK-KULLANIMLIK bir "recovery kapısı"
+ * (`${claimPath}.recover-${observedToken}`) üzerinden atomik olarak
+ * (`acquireRecoveryGate`, `mkdirSync` ile) alınır — AYNI terk edilmiş
+ * NESLİ kurtarmaya çalışan TÜM kurtarıcılar AYNI recovery kapısını
+ * hedefler, bu yüzden TAM OLARAK BİRİ kazanır; kaybedenler `claimPath`'e
+ * ASLA dokunmadan geri çekilir. Kazanan, `claimPath`'in HÂLÂ terk
+ * edilmiş olduğunu (bu arada meşru şekilde yenilenmediğini) SİLMEDEN
+ * HEMEN ÖNCE YENİDEN doğrular — recovery kapısı, "aynı anda başka HİÇBİR
+ * kurtarma girişimi olamaz"ı garanti ettiğinden, TOCTOU penceresi burada
+ * da KALMAZ. Recovery kapısının token'a göre türetilmiş olması, onu
+ * TEK-KULLANIMLIK yapar: bir kez BAŞARIYLA kullanıldıktan (ya da
+ * `claimPath` başka biri tarafından meşru şekilde ilerletildikten) SONRA,
+ * bu ÖZEL token bir daha ASLA "şu anki terk edilmiş nesil" olarak
+ * gözlemlenmez — bu yüzden sonsuza dek kullanılmayan bir artık olarak
+ * kalması ZARARSIZDIR (gelecekteki hiçbir kurtarma denemesi onu bir daha
+ * hedeflemez). Kabul edilen, belgelenmiş, DAR bir sınırlama: recovery
+ * kapısını ALAN process'in KENDİSİ de kurtarma SIRASINDA çökerse
+ * (yalnızca İKİ BAĞIMSIZ çökme —özgün sahip VE reclaim'i— art arda
+ * gerçekleştiğinde ulaşılabilen, son derece nadir bir bileşik senaryo),
+ * `acquireRecoveryGate` KENDİSİ basit, tek-seviyeli bir yaş-tabanlı
+ * (mtime) geri düşüşle kurtarılır (üçüncü bir iç içe kapı EKLEMEDEN) —
+ * bu, "kalıcı kilitlenme asla" gereksinimini korur, ancak yalnızca bu
+ * son derece nadir bileşik senaryoda TOCTOU'ya karşı tam korumalı
+ * DEĞİLDİR; bu, PID yeniden kullanımı sınırlaması gibi, bu dosyanın
+ * kasıtlı olarak kabul ettiği ve belgelediği bir P0-minimal ödünleşimdir.
  */
 function acquireReclaimGate(claimPath: string, staleMs: number): boolean {
+  const claimMetaPath = join(claimPath, "owner.json");
   try {
     mkdirSync(claimPath);
+    writeGateIdentity(claimMetaPath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    if (!isLockStale(claimPath, claimMetaPath, staleMs)) {
+      // Kapı hâlâ meşru şekilde tutuluyor (canlı bir sahip VEYA henüz
+      // yaşlanmamış) — ASLA dokunma.
+      return false;
+    }
+    const observedToken = readLockMeta(claimMetaPath)?.token ?? "unknown-generation";
+    const recoveryGatePath = `${claimPath}.recover-${observedToken}`;
+    if (!acquireRecoveryGate(recoveryGatePath, staleMs)) {
+      return false;
+    }
+    try {
+      // Recovery kapısını ALDIKTAN SONRA yeniden doğrula — aynı anda
+      // başka HİÇBİR kurtarıcı bu AYNI nesli hedefleyemez, bu yüzden bu
+      // kontrol ile gerçek `rmSync` arasında TOCTOU penceresi KALMAZ.
+      if (!isLockStale(claimPath, claimMetaPath, staleMs)) {
+        return false;
+      }
+      try {
+        rmSync(claimPath, { recursive: true, force: true });
+      } catch {
+        // En iyi çaba: çağıran döngü zaten yeniden deneyecek.
+      }
+      try {
+        mkdirSync(claimPath);
+        writeGateIdentity(claimMetaPath);
+        return true;
+      } catch {
+        return false;
+      }
+    } finally {
+      try {
+        rmSync(recoveryGatePath, { recursive: true, force: true });
+      } catch {
+        // En iyi çaba: token'a göre türetilmiş olduğundan, temizlenemese
+        // bile bir daha ASLA hedeflenmeyecek zararsız bir artıktır.
+      }
+    }
+  }
+}
+
+/**
+ * `recoveryGatePath`'i atomik olarak alır — `acquireReclaimGate`'in
+ * üstündeki fix notuna bkz. Bu kapı, gözlemlenen BELİRLİ terk edilmiş
+ * nesle (`observedToken`) göre türetildiğinden TEK-KULLANIMLIKTIR;
+ * kendi terk edilme kontrolü bu yüzden kasıtlı olarak basit ve TEK
+ * seviyelidir (üçüncü bir iç içe kapı yok) — bu yola ancak İKİ BAĞIMSIZ
+ * çökme art arda gerçekleştiğinde ulaşılır (bkz. yukarıdaki not).
+ */
+function acquireRecoveryGate(recoveryGatePath: string, staleMs: number): boolean {
+  try {
+    mkdirSync(recoveryGatePath);
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     try {
-      const stat = statSync(claimPath);
+      const stat = statSync(recoveryGatePath);
       if (Date.now() - stat.mtimeMs <= staleMs) {
         return false;
       }
@@ -235,12 +348,12 @@ function acquireReclaimGate(claimPath: string, staleMs: number): boolean {
       return false;
     }
     try {
-      rmSync(claimPath, { recursive: true, force: true });
+      rmSync(recoveryGatePath, { recursive: true, force: true });
     } catch {
       return false;
     }
     try {
-      mkdirSync(claimPath);
+      mkdirSync(recoveryGatePath);
       return true;
     } catch {
       return false;

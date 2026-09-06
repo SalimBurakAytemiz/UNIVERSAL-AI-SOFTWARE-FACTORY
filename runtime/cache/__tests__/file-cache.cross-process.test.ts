@@ -327,6 +327,137 @@ describe(
     );
 
     it(
+      "P2 fix (19th independent review round, 'make stale reclaim-gate recovery ownership-safe'): two " +
+        "processes racing to RECOVER the SAME abandoned .reclaim gate (left behind by a crashed reclaimer) " +
+        "never both believe they own the critical section, and the loser never deletes the winner's " +
+        "replacement gate (repeated across several trials for determinism)",
+      async () => {
+        // The 17th round's `tryReclaimStaleLock()` fix protects `lockPath`
+        // itself from unsafe reclamation via an exclusive `.reclaim` gate
+        // — but Codex reproduced the IDENTICAL unsafe pattern one level
+        // in: if the `.reclaim` GATE's own prior holder crashed mid-
+        // reclaim (leaving an abandoned `.reclaim` directory behind), the
+        // OLD `acquireReclaimGate()` recovered it via a bare
+        // stat-then-unconditional-`rmSync`, with no identity check — two
+        // contenders could both observe that same abandoned gate, one
+        // reclaims and creates a fresh replacement gate, and the OTHER
+        // (acting on its stale observation) deletes that brand-new
+        // replacement, letting both simultaneously enter the protected
+        // critical section. Each trial below fabricates BOTH an abandoned
+        // lock (dead PID) AND an abandoned `.reclaim` gate (a second dead
+        // PID, simulating a crashed reclaimer) directly on disk, then uses
+        // the same ready/barrier handshake to force two contenders to hit
+        // `acquireFileLock()` — and therefore the reclaim-gate recovery
+        // path specifically — at essentially the same instant.
+        const trials = 5;
+        for (let trial = 0; trial < trials; trial++) {
+          const trialRoot = mkdtempSync(join(tmpdir(), `uasf-file-cache-xproc-gate-race-${trial}-`));
+          try {
+            const lockPath = join(trialRoot, "cache.json.lock");
+            const claimPath = `${lockPath}.reclaim`;
+            const readyA = join(trialRoot, "ready-a");
+            const readyB = join(trialRoot, "ready-b");
+            const barrier = join(trialRoot, "barrier");
+            const marker = join(trialRoot, "marker");
+            const resultA = join(trialRoot, "result-a.json");
+            const resultB = join(trialRoot, "result-b.json");
+            const lockOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 5_000, pollIntervalMs: 5 });
+            const deadLockOwnerPid = spawnDeadPid();
+            const crashedReclaimerPid = spawnDeadPid();
+
+            // Fabricate the exact reproduction precondition: an abandoned
+            // lock AND an abandoned reclaim gate already sitting on disk
+            // before either contender starts.
+            const createLock = await runWorker(["create-dead-lock", lockPath, String(deadLockOwnerPid), "0"]);
+            expect(createLock.code, createLock.stderr).toBe(0);
+            const createGate = await runWorker(["create-dead-lock", claimPath, String(crashedReclaimerPid), "0"]);
+            expect(createGate.code, createGate.stderr).toBe(0);
+            expect(existsSync(claimPath)).toBe(true);
+
+            const childA = runWorker(["race-reclaim", lockPath, readyA, barrier, marker, resultA, "80", lockOptions]);
+            const childB = runWorker(["race-reclaim", lockPath, readyB, barrier, marker, resultB, "80", lockOptions]);
+
+            const readyDeadline = Date.now() + 10_000;
+            while (!(existsSync(readyA) && existsSync(readyB))) {
+              if (Date.now() > readyDeadline) throw new Error(`trial ${trial}: contenders never signaled ready`);
+            }
+            writeFileSync(barrier, "go");
+
+            const [outcomeA, outcomeB] = await Promise.all([childA, childB]);
+            expect(outcomeA.code, `trial ${trial} A: ${outcomeA.stderr}`).toBe(0);
+            expect(outcomeB.code, `trial ${trial} B: ${outcomeB.stderr}`).toBe(0);
+
+            const parsedA = JSON.parse(readFileSync(resultA, "utf8")) as { overlap: boolean };
+            const parsedB = JSON.parse(readFileSync(resultB, "utf8")) as { overlap: boolean };
+            expect(parsedA.overlap, `trial ${trial}: A observed overlap`).toBe(false);
+            expect(parsedB.overlap, `trial ${trial}: B observed overlap`).toBe(false);
+
+            // Both contenders eventually succeeded in turn, and no lock,
+            // reclaim gate, recovery-gate marker, or critical-section
+            // marker is left dangling afterward.
+            expect(existsSync(lockPath)).toBe(false);
+            expect(existsSync(claimPath)).toBe(false);
+            expect(existsSync(marker)).toBe(false);
+          } finally {
+            rmSync(trialRoot, { recursive: true, force: true });
+          }
+        }
+      },
+      60_000
+    );
+
+    it(
+      "after the winner of a reclaim-gate recovery race releases normally, the loser can subsequently " +
+        "acquire, and independently-written cache entries from each contender are preserved",
+      async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-gate-sequence-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const lockPath = `${cachePath}.lock`;
+        const claimPath = `${lockPath}.reclaim`;
+        const readyA = join(tempRoot, "ready-a");
+        const readyB = join(tempRoot, "ready-b");
+        const barrier = join(tempRoot, "barrier");
+        const marker = join(tempRoot, "marker");
+        const resultA = join(tempRoot, "result-a.json");
+        const resultB = join(tempRoot, "result-b.json");
+        const lockOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 5_000, pollIntervalMs: 5 });
+
+        const createLock = await runWorker(["create-dead-lock", lockPath, String(spawnDeadPid()), "0"]);
+        expect(createLock.code, createLock.stderr).toBe(0);
+        const createGate = await runWorker(["create-dead-lock", claimPath, String(spawnDeadPid()), "0"]);
+        expect(createGate.code, createGate.stderr).toBe(0);
+
+        // Both contenders will use `set` via the SAME cache path once
+        // they win the (recovered) lock, each writing a different key —
+        // proving the eventual winner-then-loser sequence never loses
+        // either contender's independently-written entry.
+        const childA = runWorker(["race-reclaim", lockPath, readyA, barrier, marker, resultA, "50", lockOptions]);
+        const childB = runWorker(["race-reclaim", lockPath, readyB, barrier, marker, resultB, "50", lockOptions]);
+
+        const readyDeadline = Date.now() + 10_000;
+        while (!(existsSync(readyA) && existsSync(readyB))) {
+          if (Date.now() > readyDeadline) throw new Error("contenders never signaled ready");
+        }
+        writeFileSync(barrier, "go");
+
+        const [outcomeA, outcomeB] = await Promise.all([childA, childB]);
+        expect(outcomeA.code, outcomeA.stderr).toBe(0);
+        expect(outcomeB.code, outcomeB.stderr).toBe(0);
+
+        // After both have finished (the loser only after the winner
+        // released), the lock/gate are fully released and a fresh writer
+        // can immediately proceed with no residual contention.
+        const setResult = await runWorker(["set", cachePath, "after-sequence", "value", "", lockOptions]);
+        expect(setResult.code, setResult.stderr).toBe(0);
+        const cache = new FileCache<string>(new FileStateStore(), cachePath);
+        expect(cache.get("after-sequence")).toBe("value");
+        expect(existsSync(lockPath)).toBe(false);
+        expect(existsSync(claimPath)).toBe(false);
+      },
+      20_000
+    );
+
+    it(
       "a long-running valid critical section is never overlapped by concurrent contenders, even when it " +
         "outlives their configured staleMs",
       async () => {
