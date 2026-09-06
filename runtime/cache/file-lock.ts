@@ -36,9 +36,13 @@ export interface FileLockOptions {
   /** How long to wait for the lock before throwing FileLockTimeoutError. */
   readonly timeoutMs?: number;
   /**
-   * How old an unreleased lock must be (or, independent of age, whether
-   * its owning PID is provably no longer alive) before it is considered
-   * abandoned and safe to reclaim.
+   * How old an unreleased lock must be, WHEN ITS OWNER'S LIVENESS CANNOT
+   * BE DETERMINED, before it is treated as abandoned and safe to reclaim.
+   * This is deliberately NEVER sufficient on its own to reclaim a lock
+   * whose owner is confirmed alive (17th independent review round fix,
+   * bkz. `isLockStale`'in üstündeki not) — a confirmed-dead owner is
+   * reclaimed immediately regardless of age, and a confirmed-live owner
+   * is never reclaimed regardless of age.
    */
   readonly staleMs?: number;
   readonly pollIntervalMs?: number;
@@ -70,14 +74,26 @@ function sleepSync(ms: number): void {
   Atomics.wait(flag, 0, 0, ms);
 }
 
+/**
+ * P2 fix (17th independent review round, "do not reclaim locks held by
+ * live processes"): eskiden `process.kill(pid, 0)` EPERM DIŞINDA
+ * fırlattığı HERHANGİ bir hatayı (yalnızca ESRCH değil) "process ölü"
+ * olarak yorumluyordu — talimatın kendi ifadesiyle, "her arama
+ * başarısızlığını sahibin ölümü SAYMAMALI" kuralını ihlal eden, aşırı
+ * agresif bir varsayılan. Artık yalnızca AÇIKÇA ESRCH (bu PID hiç yok)
+ * "ölü" sayılır; EPERM (var ama sinyal izni yok) VEYA beklenmeyen HERHANGİ
+ * BİR başka hata "muhafazakâr" biçimde CANLI varsayılır — bir kilidi
+ * yanlışlıkla çalmaktansa gereksiz yere biraz daha beklemek her zaman
+ * daha güvenlidir.
+ */
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    // EPERM: process exists but we lack permission to signal it — still
-    // alive. Anything else (ESRCH included) means it is genuinely gone.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    return true;
   }
 }
 
@@ -90,24 +106,31 @@ function readLockMeta(metaPath: string): LockMeta | undefined {
 }
 
 /**
- * Bir kilidin TERK EDİLMİŞ (stale) sayılıp sayılmayacağına karar verir.
- * İki bağımsız yol vardır: (1) sahibi olan PID artık HİÇ YAŞAMIYORSA
- * (bkz. `isProcessAlive`) — bu durumda `staleMs` kadar beklemeye HİÇ
- * gerek yoktur, çökmüş bir process asla kilidi serbest bırakamayacağı
- * için sonsuz kilitlenmeyi (deadlock) önler; (2) kilit, PID hâlâ
- * yaşıyor olsa bile `staleMs`'den daha uzun süredir açık kalmışsa.
- * Metadata dosyası okunamazsa (yarış/bozulma), dizinin kendi
- * `mtime`'ına geri düşülür; dizin de hiç yoksa (bu sırada serbest
- * bırakılmış), "stale değil" döner — çağıran döngü zaten `mkdirSync`'i
- * yeniden deneyecek ve bu durumda doğrudan başarılı olacaktır.
+ * P2 fix (17th independent review round, "do not reclaim locks held by
+ * live processes"): eskiden bir kilit, sahibi HÂLÂ YAŞIYOR olsa bile
+ * SADECE `staleMs`'den daha uzun süredir açık olması nedeniyle "stale"
+ * sayılıyordu — Codex, uzun süren MEŞRU bir kritik bölümün (canlı sahip,
+ * `staleMs`'i aşan ama hâlâ devam eden bir okuma-değiştir-yazma) başka
+ * bir process tarafından "terk edilmiş" sanılıp ÇALINABİLDİĞİNİ,
+ * ardından İKİ process'in aynı anda "sahibiz" sanabileceğini gösterdi —
+ * tam da bu kilidin önlemesi gereken kalıcı-önbellek kayıp-güncelleme
+ * yarışını YENİDEN AÇAR. Gereken değişmez: YAŞ TEK BAŞINA, kanıtlanmış
+ * CANLI bir sahibin kilidini çalmak için ASLA yetki vermez. Artık üç
+ * ayrık durum vardır: (1) CANLI (meta okunabildi VE `isProcessAlive`
+ * true) → ASLA stale, yaş ne olursa olsun; (2) ÖLÜ (meta okunabildi VE
+ * `isProcessAlive` false, yani PID'ye ESRCH) → HER ZAMAN stale, ANINDA
+ * (kalıcı kilitlenmeyi önlemek için `staleMs` kadar beklemeye gerek
+ * YOKTUR); (3) BİLİNMEYEN (metadata okunamadı — yarış, bozulma, disk
+ * hatası) → sahibin kimliği belirlenemediğinden ne "canlı" ne "ölü"
+ * varsayılabilir; TEK güvenli, SINIRLI kurtarma sinyali dizinin kendi
+ * `mtime`'ı üzerinden `staleMs`'tir (bu, dizi meta yazımı başarısız olsa
+ * bile kilidin sonsuza dek kilitli kalmamasını sağlayan, belgelenmiş bir
+ * politikadır — her arama hatasını ölüm SAYMAK değildir).
  */
 function isLockStale(lockDirPath: string, metaPath: string, staleMs: number): boolean {
   const meta = readLockMeta(metaPath);
-  if (meta && !isProcessAlive(meta.pid)) {
-    return true;
-  }
   if (meta) {
-    return Date.now() - meta.acquiredAt > staleMs;
+    return !isProcessAlive(meta.pid);
   }
   try {
     const stat = statSync(lockDirPath);
@@ -118,11 +141,130 @@ function isLockStale(lockDirPath: string, metaPath: string, staleMs: number): bo
 }
 
 /**
+ * P2 fix (17th independent review round, "stale-lock reclamation is not
+ * serialized across contenders"): eskiden BİRDEN FAZLA process AYNI terk
+ * edilmiş kilidi "stale" olarak GÖZLEMLEYİP, ikisi de KOŞULSUZ olarak
+ * `rmSync(lockDirPath)` çağırabiliyordu — Codex, Process A'nın stale
+ * kilidi kaldırıp KENDİ YENİ, GEÇERLİ kilidini oluşturduğu, ardından
+ * Process B'nin (hâlâ ESKİ gözlemine dayanarak) KOŞULSUZ silme işlemiyle
+ * A'nın YENİ kilidini yanlışlıkla sildiğini ve sonra kendi kilidini
+ * oluşturduğunu gösterdi — iki process aynı anda "kritik bölümün sahibi
+ * benim" sanabiliyordu. Gereken değişmez: bir process, SADECE GÖZLEMLEDİĞİ
+ * TAM O stale kilit ÖRNEĞİNİ kaldırabilir; başka bir yarışmacının
+ * oluşturduğu YENİ bir yedek kiliDİ ASLA silemez. Fixed: geri kazanım
+ * (reclaim) artık İKİ AYRI atomik kapı üzerinden geçer: (1) sabit,
+ * `lockDirPath`'e göre TÜRETİLMİŞ bir "reclaim kapısı" dizini
+ * (`lockDirPath + ".reclaim"`) — `mkdirSync` ile atomik olarak alınır; AYNI
+ * `lockDirPath`'i geri kazanmaya çalışan TÜM yarışmacılar AYNI kapıyı
+ * hedefler, bu yüzden `mkdirSync`'in atomikliği sayesinde TAM OLARAK BİR
+ * tanesi kazanır — kaybedenler `lockDirPath`'e ASLA dokunmadan geri çekilir
+ * (normal bekleme/yeniden deneme döngüsüne döner); (2) kapıyı kazanan
+ * process, `lockDirPath`'in HÂLÂ stale olduğunu (canlı bir sahip tarafından
+ * bu arada meşru şekilde yenilenmediğini) SİLMEDEN HEMEN ÖNCE YENİDEN
+ * doğrular — kapı, "aynı anda başka HİÇBİR reclaim girişimi olamaz"ı
+ * garanti ettiğinden, bu son kontrol ile gerçek `rmSync` çağrısı arasında
+ * TOCTOU penceresi KALMAZ (tek istisna: `lockDirPath`'in kendisi meşru,
+ * SIRADAN bir `mkdirSync` denemesiyle -reclaim mekanizmasının DIŞINDA-
+ * doldurulması, ki bu zaten normal/adil bir yarıştır, "canlı bir sahibi
+ * çalmak" değildir). Kapının kendisi de kendi stale-tespitine tabidir
+ * (aşağıdaki `acquireReclaimGate`'e bkz.) — meşru bir reclaim işlemi
+ * birkaç senkron syscall'dan oluşup neredeyse anında biter; kapıyı ALAN
+ * process'in KENDİSİ reclaim SIRASINDA çökerse, kapı `staleMs` sonra yine
+ * kurtarılabilir hale gelir, böylece kalıcı bir kilitlenme oluşmaz.
+ * Döndürülen `true`, kaldırmanın (silmenin) fiilen denendiği (ve
+ * `lockDirPath`'in artık boş olması BEKLENDİĞİ) anlamına gelir — çağıran
+ * döngü bu durumda HEMEN `mkdirSync(lockDirPath)`'i yeniden dener; `false`,
+ * ya kapının kaybedildiği ya da son kontrolün kilidi artık stale
+ * BULMADIĞI (canlı bir sahip tarafından meşru şekilde yenilendiği)
+ * anlamına gelir — çağıran normal zaman aşımı/bekleme yoluna döner
+ * (gereksiz sıkı döngüden -busy loop- kaçınmak için).
+ */
+function tryReclaimStaleLock(lockDirPath: string, metaPath: string, staleMs: number): boolean {
+  const claimPath = `${lockDirPath}.reclaim`;
+  if (!acquireReclaimGate(claimPath, staleMs)) {
+    return false;
+  }
+  try {
+    if (!isLockStale(lockDirPath, metaPath, staleMs)) {
+      // Sahip, bizim ilk gözlemimizle şimdi arasında meşru şekilde
+      // yenilendi (ör. canlı bir sahip release() edip yeniden kilitledi,
+      // ya da hiç stale değilmiş) — ASLA dokunma.
+      return false;
+    }
+    try {
+      rmSync(lockDirPath, { recursive: true, force: true });
+    } catch {
+      // En iyi çaba: kaldırma başarısız olsa bile, çağıran döngü zaten
+      // `mkdirSync`'i yeniden deneyip gerçek durumu gözlemleyecek.
+    }
+    return true;
+  } finally {
+    try {
+      rmSync(claimPath, { recursive: true, force: true });
+    } catch {
+      // En iyi çaba: kendi kapı işaretimizi temizleyemesek bile, bu
+      // işaretin kendi stale-tespiti (bkz. `acquireReclaimGate`) onu
+      // ileride başka bir process için kurtarılabilir hale getirir.
+    }
+  }
+}
+
+/**
+ * `claimPath`'i atomik olarak (mkdirSync ile) alır. Zaten alınmışsa
+ * (EEXIST), bu işaretin KENDİSİNİN de terk edilmiş olup olmadığını
+ * (kendi `mtime`'ı üzerinden, `staleMs` ile) kontrol eder — meşru bir
+ * reclaim işlemi bir avuç senkron syscall'dan oluşup neredeyse anında
+ * bittiğinden, bu işaretin `staleMs`'den daha uzun süredir açık kalması,
+ * onu ALAN process'in reclaim SIRASINDA çökmüş olduğunu gösterir; bu
+ * durumda işaret zorla temizlenip yeniden denenir — aksi halde çökmüş bir
+ * reclaim'in yarım kalan kapı işareti, bu `lockDirPath`'in SONSUZA DEK bir
+ * daha asla geri kazanılamamasına (kalıcı kilitlenme) yol açardı.
+ */
+function acquireReclaimGate(claimPath: string, staleMs: number): boolean {
+  try {
+    mkdirSync(claimPath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    try {
+      const stat = statSync(claimPath);
+      if (Date.now() - stat.mtimeMs <= staleMs) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    try {
+      rmSync(claimPath, { recursive: true, force: true });
+    } catch {
+      return false;
+    }
+    try {
+      mkdirSync(claimPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
  * `lockDirPath`'te process'ler-arası bir kilit alır ve bir `release()`
  * geri çağırımı döndürür. Aşırı yüklenme (contention) altında `timeoutMs`
- * kadar bekler; bu sürede terk edilmiş bir kilit tespit edilirse (bkz.
- * `isLockStale`) onu ZORLA temizler ve HEMEN yeniden dener (çökmüş bir
- * sahip asla kalıcı bir kilitlenmeye yol açmaz).
+ * kadar bekler; bu sürede kanıtlanmış şekilde terk edilmiş bir kilit
+ * tespit edilirse (bkz. `isLockStale`), onu YALNIZCA `tryReclaimStaleLock`'ın
+ * kimlik-doğrulamalı, tek-kazananlı protokolü ÜZERİNDEN kaldırır — asla
+ * koşulsuz/doğrudan bir `rmSync` ile değil.
+ *
+ * Bilinen, kasıtlı sınırlama (P0 kapsamı): sahiplik kimliği yalnızca PID +
+ * rastgele bir token ile belirlenir; işletim sisteminin PID'leri yeniden
+ * kullanabilmesi (PID reuse) teorik olarak ÇOK dar bir pencerede yanlış-
+ * pozitif bir "canlı" sonucuna yol açabilir (bir process ölür, aynı PID
+ * neredeyse anında BAŞKA bir process'e atanır). Process başlangıç
+ * zaman damgasını taşınabilir (Windows dahil), ek bağımlılık gerektirmeyen
+ * bir şekilde okumanın standart bir yolu yoktur (`/proc` yalnızca Linux'a
+ * özgüdür ve "gereksiz platforma özgü varsayım eklenmeyecek" ilkesini
+ * ihlal eder) — bu yüzden bilinçli olarak eklenmemiştir.
  */
 export function acquireFileLock(lockDirPath: string, options: FileLockOptions = {}): () => void {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -145,8 +287,8 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
         writeFileSync(metaPath, JSON.stringify(meta), "utf8");
       } catch {
         // En iyi çaba (best-effort): metadata yazılamasa bile kilidin
-        // kendisi (dizin) zaten alınmıştır; sadece yaş-tabanlı stale
-        // tespiti dizin mtime'ına geri düşer.
+        // kendisi (dizin) zaten alınmıştır; sadece BİLİNMEYEN-sahip
+        // stale tespiti dizin mtime'ına geri düşer.
       }
       let released = false;
       return () => {
@@ -156,13 +298,7 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (isLockStale(lockDirPath, metaPath, staleMs)) {
-        try {
-          rmSync(lockDirPath, { recursive: true, force: true });
-        } catch {
-          // Başka bir process aynı temizliği yarışarak yapıyor olabilir
-          // — sorun değil, döngü başa dönüp yeniden dener.
-        }
+      if (isLockStale(lockDirPath, metaPath, staleMs) && tryReclaimStaleLock(lockDirPath, metaPath, staleMs)) {
         continue;
       }
       if (Date.now() >= deadline) {
@@ -179,7 +315,10 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
  * BAŞKA bir process tarafından zaten ele geçirilmiş olabilir — token
  * kontrolü olmadan yapılacak koşulsuz bir kaldırma, o YENİ sahibin
  * kilidini silerdi, bu da iki process'in aynı anda kilidi tuttuğunu
- * SANMASINA (tam olarak önlenmesi gereken yarış durumu) yol açardı.
+ * SANMASINA (tam olarak önlenmesi gereken yarış durumu) yol açardı. Bu
+ * kural hem NORMAL release() için hem de stale/ölü-sahip geri kazanımı
+ * için AYNI şekilde geçerlidir (bkz. `tryReclaimStaleLock`'ın kendi
+ * kimlik-doğrulamalı deseni).
  */
 function releaseFileLock(lockDirPath: string, metaPath: string, token: string): void {
   const meta = readLockMeta(metaPath);

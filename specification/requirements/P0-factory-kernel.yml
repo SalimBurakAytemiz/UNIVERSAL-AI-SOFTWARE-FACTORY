@@ -2621,6 +2621,100 @@
     was found in the P0 path; no further changes made beyond `file-cache.ts`
     and the new `file-lock.ts`.
 
+    P2 fix (17th independent review round, "do not reclaim locks held by
+    live processes" + "stale-lock reclamation is not serialized across
+    contenders"): the 16th round's `file-lock.ts` fixed the durable-cache
+    read-modify-write race, but Codex reproduced two remaining
+    correctness gaps in the LOCK PROTOCOL ITSELF. [1] `isLockStale()`
+    treated ANY lock older than `staleMs` as reclaimable, EVEN IF its
+    owner was confirmed still alive — a long-running, perfectly
+    legitimate critical section that merely outlived `staleMs` could be
+    "reclaimed" out from under its live owner, reintroducing the exact
+    lost-update race the lock exists to prevent, one layer up. [2] the
+    reclaim path called `rmSync(lockDirPath)` UNCONDITIONALLY once a lock
+    was judged stale, with no re-validation immediately before deleting —
+    Codex reproduced process A reclaiming a stale lock and creating a
+    fresh, valid replacement, then process B (acting on its own, now-
+    outdated "stale" observation) unconditionally deleting A's BRAND-NEW
+    lock and creating its own, so both A and B could believe they alone
+    owned the critical section at overlapping times. Required invariant:
+    lock age ALONE must never authorize reclaiming a confirmed-live
+    owner's lock, and a process may only remove the EXACT stale lock
+    instance it observed, never a newer replacement created by another
+    contender. Fixed: `isLockStale()` now has three distinct outcomes —
+    CONFIRMED LIVE (metadata readable, owning PID alive) → never stale,
+    regardless of age; CONFIRMED DEAD (metadata readable, owning PID
+    provably gone via `process.kill(pid, 0)` throwing ESRCH) → always
+    stale, immediately, with no `staleMs` wait (preserving "no permanent
+    deadlock on a crash"); UNKNOWN (metadata unreadable — race/corruption/
+    disk error) → falls back to a BOUNDED, documented age-based recovery
+    signal via the lock directory's own `mtime`, since no liveness signal
+    exists at all in that case. `isProcessAlive()` was also corrected to
+    fail conservatively: only an explicit ESRCH is treated as "dead";
+    EPERM or any other unexpected error is now treated as "alive" (the
+    OLD code treated every non-EPERM error as death, which could
+    misclassify a live owner under an unusual/unexpected errno). Actual
+    reclamation now goes through a new `tryReclaimStaleLock()`, gated by
+    an atomic, per-`lockDirPath`-derived "reclaim gate" directory
+    (`${lockDirPath}.reclaim`, itself taken via `mkdirSync` — atomic,
+    EEXIST if already held): ALL contenders reclaiming the SAME
+    `lockDirPath` race for this ONE gate, so exactly one wins (the
+    losers back off WITHOUT ever touching `lockDirPath`, returning to the
+    normal wait/retry loop); the winner then RE-VALIDATES `isLockStale()`
+    one more time (now with NO other reclaimer able to interleave, since
+    it holds the exclusive gate) immediately before the actual `rmSync` —
+    if the lock was legitimately refreshed by a live owner in the
+    meantime, the winner backs off too, touching nothing. The gate itself
+    is subject to its own bounded staleness check (via its own `mtime`
+    against the same `staleMs`) so a reclaimer that itself crashes
+    mid-reclaim cannot permanently block all future reclamation of that
+    `lockDirPath`. `release()`'s existing token-based ownership check
+    (bkz. 16th round) is unchanged and applies uniformly to both normal
+    release and reclaim. Twelve tests total in
+    `runtime/cache/__tests__/file-cache.cross-process.test.ts` now cover
+    this ground (4 new/rewritten for this round, using REAL, separately-
+    spawned child processes throughout, several with an explicit ready/
+    barrier handshake to force a tight, deterministic race window rather
+    than hoping independent process-spawn timing happens to interleave):
+    a live owner exceeding `staleMs` is never reclaimed (a waiter with a
+    shorter timeout genuinely times out — proven via elapsed-time and
+    exit-code assertions — rather than stealing the lock, and the live
+    owner's lock/metadata survives completely untouched); a confirmed-
+    dead owner (fabricated via a genuinely-exited child process's PID,
+    isolating the liveness check from any timing race) is reclaimed
+    near-instantly even under a deliberately generous 60-second `staleMs`;
+    two processes forced via a ready/barrier handshake to race reclaiming
+    the SAME fabricated dead lock, repeated across 5 trials, never both
+    enter the critical section (detected via a marker file written on
+    entry and checked-for-pre-existence, an unmistakable overlap witness)
+    and never leave a dangling lock/marker afterward; and 3 fresh
+    contenders racing a brand-new lock with a deliberately tiny `staleMs`
+    against a much longer legitimate hold never overlap either. All prior
+    16th-round regression tests (concurrent-different-key writes,
+    high-contention, expiration-vs-set() racing, crash-while-holding-the-
+    lock, same-process correctness, restart persistence, malformed-write
+    preservation) continue to pass unchanged. Verified via two separate
+    temporary bypasses: (a) reverting `isLockStale()` to pure age-based
+    staleness (ignoring liveness) — confirmed the live-owner and long-
+    running-critical-section tests failed with exactly the predicted
+    "waiter stole the lock instead of timing out" / "overlap detected"
+    symptoms; (b) reverting the reclaim path to an unconditional, gate-
+    free `rmSync` on any observed-stale lock — confirmed the race-reclaim
+    test failed deterministically (an overlap detected in at least one of
+    5 trials) across 3 repeated runs of the bypassed code. Both bypasses
+    reverted and 633/633 tests reconfirmed passing after each. A narrow
+    audit (scoped to exactly these four root classes: live lock reclaimed
+    by age, stale observation deleting a newer replacement, release
+    deleting a different-token lock, waiter timeout removing an active
+    lock) confirmed `file-lock.ts` is the ONLY lock/staleness/ownership
+    protocol anywhere in `runtime/` — `file-store.ts`'s `unlinkSync` only
+    ever removes its OWN uniquely-PID-and-random-suffixed temp file in the
+    same synchronous call that created it (no staleness/ownership concept,
+    no cross-process reach), and `runtime/project-os/scaffold.ts`'s
+    `mkdirSync({recursive:true})` calls are plain idempotent directory
+    creation with no locking semantics and no deletion at all — no other
+    genuine instance of any of these four root classes exists.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).

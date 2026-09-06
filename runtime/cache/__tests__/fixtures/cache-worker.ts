@@ -1,15 +1,13 @@
-// Test-only fixture (16th independent review round, Finding #2: "durable
-// cache read-modify-write is not safe across processes"). Deliberately a
-// standalone, REAL Node.js entry point (spawned as its own OS process by
-// runtime/cache/__tests__/file-cache.cross-process.test.ts via `tsx`) —
-// two `FileCache` instances constructed inside ONE test process would
-// never exercise the actual cross-process lock file at all, since they'd
-// share the same process's file descriptors/OS-level view but not
-// reproduce a genuinely independent process crashing, holding a lock
-// across a real process boundary, etc. This file is excluded from the
-// project's own lint/typecheck/build source set the same way other
-// __tests__ content is (see tsconfig.json's excludes), since it is only
-// ever invoked by `tsx` directly, never imported.
+// Test-only fixture (16th/17th independent review rounds, "durable cache
+// read-modify-write is not safe across processes" and its follow-up lock-
+// correctness findings). Deliberately a standalone, REAL Node.js entry
+// point (spawned as its own OS process by runtime/cache/__tests__/
+// file-cache.cross-process.test.ts via `tsx`) — two `FileCache`/
+// `acquireFileLock` calls inside ONE test process would never exercise
+// the actual cross-process lock file, PID-liveness machinery, or genuine
+// OS-level race timing at all. This file is only ever invoked by `tsx`
+// directly, never imported.
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { FileStateStore } from "../../../state/file-store.js";
 import { FileCache } from "../../file-cache.js";
 import { acquireFileLock, type FileLockOptions } from "../../file-lock.js";
@@ -22,6 +20,16 @@ function parseLockOptions(raw: string | undefined): FileLockOptions | undefined 
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+/** Busy-waits (synchronously) until `path` exists, or `timeoutMs` elapses. */
+function waitForFile(path: string, timeoutMs: number): void {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitForFile: '${path}' did not appear within ${timeoutMs}ms`);
+    }
+  }
 }
 
 const [, , mode, ...rest] = process.argv;
@@ -64,16 +72,75 @@ switch (mode) {
     break;
   }
   case "hold-lock-then-release": {
+    // Acquires the lock, stays ALIVE (this process never exits) for
+    // `holdMs`, then releases normally — used to prove a CONFIRMED-LIVE
+    // holder is never reclaimed by age alone (17th independent review
+    // round fix), however long `holdMs` exceeds the waiter's `staleMs`.
     const [cachePath, holdMsArg, lockOptionsArg] = rest;
     const holdMs = Number(holdMsArg);
     const release = acquireFileLock(`${cachePath}.lock`, parseLockOptions(lockOptionsArg));
     process.stdout.write("LOCKED\n");
     sleepSync(holdMs);
-    // If another process already reclaimed this lock as stale while we
-    // were "stuck", this release() call must be a safe no-op (token
-    // mismatch) rather than deleting the NEW owner's lock.
     release();
     process.exit(0);
+    break;
+  }
+  case "create-dead-lock": {
+    // Fabricates an ABANDONED lock directly on disk, attributed to a PID
+    // that is GENUINELY dead (the parent test spawns and awaits a
+    // trivial child, then hands us its now-exited PID) — this lets tests
+    // deterministically set up a "dead owner" precondition without
+    // relying on any timing race to actually kill a lock-holding process.
+    const [lockDirPath, deadPidArg, ageMsArg] = rest;
+    const deadPid = Number(deadPidArg);
+    const ageMs = ageMsArg ? Number(ageMsArg) : 0;
+    mkdirSync(lockDirPath, { recursive: true });
+    writeFileSync(
+      `${lockDirPath}/owner.json`,
+      JSON.stringify({ pid: deadPid, token: "fabricated-dead-owner", acquiredAt: Date.now() - ageMs }),
+      "utf8"
+    );
+    process.exit(0);
+    break;
+  }
+  case "race-reclaim": {
+    // Two (or more) instances of this mode, pointed at the SAME
+    // `lockPath`/`markerPath` but each with a DISTINCT `resultPath`, are
+    // used to force a genuine, tightly-synchronized race for the exact
+    // same lock: each writes its own `readyPath` immediately, then
+    // busy-waits for a SHARED `barrierPath` the parent test only creates
+    // once EVERY contender has signaled ready — so all contenders reach
+    // `acquireFileLock()` at essentially the same instant, deterministically
+    // exercising the reclaim race rather than hoping OS scheduling happens
+    // to interleave two independently-timed spawns. `markerPath` is used
+    // as a mutual-exclusion witness: whoever's `acquireFileLock()` call
+    // returns, we check whether the marker ALREADY exists (which could
+    // only happen if another contender is ALSO currently inside the
+    // critical section, i.e. that other contender's own removal of the
+    // marker on exit hasn't happened yet) — an unmistakable, deterministic
+    // proof of overlapping "exclusive" ownership if the lock is ever
+    // actually broken.
+    const [lockPath, readyPath, barrierPath, markerPath, resultPath, holdMsArg, lockOptionsArg] = rest;
+    writeFileSync(readyPath, String(process.pid));
+    waitForFile(barrierPath, 10_000);
+    const release = acquireFileLock(lockPath, parseLockOptions(lockOptionsArg));
+    let overlap = false;
+    if (existsSync(markerPath)) {
+      overlap = true;
+    } else {
+      writeFileSync(markerPath, String(process.pid));
+    }
+    sleepSync(Number(holdMsArg));
+    if (!overlap) {
+      try {
+        rmSync(markerPath, { force: true });
+      } catch {
+        // best-effort
+      }
+    }
+    release();
+    writeFileSync(resultPath, JSON.stringify({ pid: process.pid, overlap }));
+    process.exit(overlap ? 1 : 0);
     break;
   }
   default: {

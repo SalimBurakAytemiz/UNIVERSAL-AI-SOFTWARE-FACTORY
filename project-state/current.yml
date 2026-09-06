@@ -382,6 +382,44 @@ factory:
     a seventeenth independent review — per the sixteenth review's own
     framing, a potential final P0 closure candidate. P0 remains open.
 
+    Seventeenth independent Codex review independently CONFIRMED all of
+    round 17's fixes (shared-ledger budget reservations, concurrent-
+    reservation rejection, failed-reconciliation cross-guard protection,
+    cross-guard commit/release behavior, committed+reserved accounting,
+    genuine real-process cache tests, atomic-write/restart persistence)
+    and all required verification (lint, typecheck, build, 630/630 tests,
+    requirement validation, secret scan, Factory Doctor, 13 P0 proof
+    tests) — but found TWO remaining P2 correctness gaps in the LOCK
+    PROTOCOL `file-lock.ts` itself introduced: (1) "do not reclaim locks
+    held by live processes" — `isLockStale()` treated ANY lock older than
+    `staleMs` as reclaimable even with a CONFIRMED-LIVE owner, letting a
+    long-running legitimate critical section be stolen purely due to age;
+    (2) "stale-lock reclamation is not serialized across contenders" —
+    reclaiming a stale lock called `rmSync` unconditionally with no
+    identity revalidation immediately before deleting, so one process
+    could delete ANOTHER process's brand-new replacement lock created
+    moments earlier, letting two contenders both believe they owned the
+    critical section. Both fixed this session: `isLockStale()` now
+    distinguishes CONFIRMED LIVE (never stale, any age) / CONFIRMED DEAD
+    (always stale, immediately, no wait) / UNKNOWN (bounded mtime-based
+    fallback only when no liveness signal exists at all); reclamation now
+    goes through an atomic, per-lock "reclaim gate" (its own `mkdirSync`-
+    based mutual exclusion) so exactly one contender may ever attempt a
+    given lock's reclamation, with a final re-validation immediately
+    before the actual delete, closing the TOCTOU window entirely. Four
+    new/rewritten real-child-process regression tests (ready/barrier-
+    synchronized to force deterministic race timing, using a marker-file
+    overlap witness) prove both fixes; both verified via temporary
+    bypasses reproducing the exact predicted failure symptoms (a stolen
+    live lock; a detected overlap across repeated trials), then reverted.
+    A narrow audit confirmed `file-lock.ts` is the only lock/staleness/
+    ownership protocol anywhere in the P0 path. Fully verified (lint,
+    typecheck, a real `rm -rf dist && npm run build`, 633/633 tests,
+    requirement validation, secret scan, Factory Doctor, all 9 P0
+    proofs); pushed for an eighteenth independent review — per the
+    seventeenth review's own framing, this remains the P0 closure
+    re-review. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -2300,6 +2338,117 @@ completed_milestones:
     tests (610 + 20 new), validate:requirements, history-aware
     secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
     (13 assertions) — all clean.
+  - |-
+    THIS SESSION (round 18) — a seventeenth independent Codex review
+    independently CONFIRMED round 17's shared-ledger budget and
+    cross-process cache fixes and all required verification, then
+    reproduced TWO remaining P2 findings scoped entirely to the LOCK
+    PROTOCOL (`runtime/cache/file-lock.ts`) the 16th round introduced,
+    both now fixed:
+    - [P2] "Do not reclaim locks held by live processes": `isLockStale()`
+      treated ANY lock older than `staleMs` as reclaimable, EVEN IF its
+      owner was confirmed still alive — Codex reproduced a long-running,
+      perfectly legitimate critical section (live owner, mid-operation)
+      being "reclaimed" out from under it purely because it outlived
+      `staleMs`, letting two processes believe they simultaneously owned
+      the same exclusive critical section — reintroducing, one layer up,
+      the exact durable-cache lost-update race this lock exists to
+      prevent. Required invariant: lock age ALONE must never authorize
+      stealing a confirmed-live owner's lock. Fixed: `isLockStale()` now
+      distinguishes three states — CONFIRMED LIVE (metadata readable,
+      `process.kill(pid, 0)` does not throw ESRCH) → NEVER stale,
+      regardless of age; CONFIRMED DEAD (metadata readable, PID provably
+      gone) → ALWAYS stale, IMMEDIATELY, with no `staleMs` wait
+      (preserving "no permanent deadlock on a crash," bkz. 16th round);
+      UNKNOWN (metadata unreadable — race/corruption/disk error) → falls
+      back to a bounded, documented age-based signal via the lock
+      directory's own `mtime`, since no liveness signal exists at all.
+      `isProcessAlive()` was also corrected: only explicit ESRCH means
+      "dead" now; EPERM or any OTHER unexpected error is conservatively
+      treated as "alive" (the old code treated every non-EPERM error as
+      death — an overly aggressive default the review explicitly called
+      out: "must not treat every lookup failure as owner death").
+    - [P2] "Stale-lock reclamation is not serialized across contenders":
+      reclaiming a stale lock called `rmSync(lockDirPath)`
+      UNCONDITIONALLY with no re-validation immediately before deleting —
+      Codex reproduced process A reclaiming a stale lock and creating a
+      fresh, valid replacement, then process B (acting on its own,
+      now-outdated "stale" observation) unconditionally deleting A's
+      BRAND-NEW lock and creating its own, so both A and B could believe
+      they alone owned the critical section at overlapping times.
+      Required invariant: a process may only remove the EXACT stale lock
+      instance it observed, never a newer replacement another contender
+      created. Fixed: reclamation now goes through a new
+      `tryReclaimStaleLock()`, gated by an atomic, per-`lockDirPath`-
+      derived "reclaim gate" directory (`mkdirSync`-based, so exactly ONE
+      contender ever wins it per lock; losers back off WITHOUT touching
+      `lockDirPath` at all, returning to the normal wait/retry loop); the
+      winner then RE-VALIDATES `isLockStale()` one more time — now with
+      no other reclaimer able to interleave, since it holds the exclusive
+      gate — immediately before the actual delete, closing the TOCTOU
+      window entirely. The gate itself is subject to its own bounded
+      `mtime`-based staleness check so a reclaimer that crashes
+      mid-reclaim cannot permanently block all future reclamation of that
+      lock. `release()`'s existing token-based ownership check (16th
+      round) is unchanged and applies uniformly to both normal release
+      and reclaim.
+    - Four new/rewritten regression tests in
+      `runtime/cache/__tests__/file-cache.cross-process.test.ts` (now 11
+      tests total in that file), all using REAL, separately-spawned child
+      processes, several with an explicit ready/barrier handshake to
+      force deterministic race timing rather than hoping independent
+      spawn timing happens to interleave: a live owner exceeding
+      `staleMs` is never reclaimed (a waiter with a shorter timeout
+      genuinely times out — proven via elapsed-time and exit-code
+      assertions, not just "eventually succeeded" — and the live owner's
+      lock/metadata survives completely untouched); a confirmed-dead
+      owner (fabricated via a genuinely-exited child process's own PID,
+      isolating the liveness check from any timing race) is reclaimed
+      near-instantly even under a deliberately generous 60-second
+      `staleMs`; two processes forced to race reclaiming the SAME
+      fabricated dead lock, repeated across 5 trials, never both enter
+      the critical section (detected via a marker file written on entry
+      and checked-for-pre-existence — an unmistakable overlap witness)
+      and never leave a dangling lock/marker afterward; and 3 fresh
+      contenders racing a brand-new lock with a tiny `staleMs` against a
+      much longer legitimate hold never overlap either. All prior 16th-
+      round cross-process regression tests continue to pass unchanged.
+    - Verified via two separate temporary bypasses, each reverted after
+      confirming the exact predicted failure: (a) reverting
+      `isLockStale()` to pure age-based staleness (ignoring liveness) —
+      the live-owner and long-running-critical-section tests failed with
+      exactly the predicted "waiter stole the lock instead of timing out"
+      / "overlap detected" symptoms; (b) reverting the reclaim path to an
+      unconditional, gate-free `rmSync` on any observed-stale lock — the
+      race-reclaim test failed deterministically (an overlap detected in
+      at least one of 5 trials) across 3 repeated runs of the bypassed
+      code. 633/633 tests reconfirmed passing after each revert.
+    - Narrow audit (scoped to exactly the four root classes named: live
+      lock reclaimed by age, stale observation deleting a newer
+      replacement, release deleting a different-token lock, waiter
+      timeout removing an active lock): confirmed `file-lock.ts` is the
+      ONLY lock/staleness/ownership protocol anywhere in `runtime/` —
+      `file-store.ts`'s `unlinkSync` only ever removes its OWN uniquely-
+      PID-and-random-suffixed temp file within the same synchronous call
+      that created it (no staleness/ownership concept, no cross-process
+      reach), and `runtime/project-os/scaffold.ts`'s
+      `mkdirSync({recursive:true})` calls are plain idempotent directory
+      creation with no locking semantics and no deletion at all — no
+      other genuine instance of any of these four root classes exists.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0036 (Cache / reuse layer — the live-owner
+    protection fix, the reclaim-gate serialization fix, the 4 new/
+    rewritten real-child-process regression tests, both temp-bypass
+    verification results, and the four-root-class narrow-audit note). No
+    status field was raised on any requirement beyond what real evidence
+    supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ deletion and rebuild), 633/633
+    tests (630 + 3 net new), validate:requirements, history-aware
+    secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
+    (13 assertions) — all clean.
 
 known_limitations:
   - >-
@@ -2558,6 +2707,37 @@ blockers:
     P0 complete, until that re-review confirms no blocking finding
     remains.
 
+    A SEVENTEENTH independent Codex review independently CONFIRMED all of
+    round 17's fixes (shared-ledger budget reservations and the
+    cross-process cache lock) and all required verification (lint,
+    typecheck, build, 630/630 tests, requirement validation, secret scan,
+    Factory Doctor, 13 P0 proof tests), then reproduced TWO remaining P2
+    findings scoped entirely to the lock protocol itself: `isLockStale()`
+    treated ANY lock older than `staleMs` as reclaimable even with a
+    CONFIRMED-LIVE owner (a long-running legitimate critical section
+    could be stolen purely due to age); and stale-lock reclamation called
+    `rmSync` unconditionally with no identity revalidation immediately
+    before deleting, so one process could delete another's brand-new
+    replacement lock. Both fixed this session: `isLockStale()` now
+    distinguishes CONFIRMED LIVE (never stale, any age) / CONFIRMED DEAD
+    (always stale, immediately) / UNKNOWN (bounded mtime-based fallback
+    only); reclamation now goes through an atomic, per-lock "reclaim
+    gate" so exactly one contender may attempt a given lock's
+    reclamation, with a final re-validation immediately before the
+    actual delete. Four new/rewritten real-child-process regression
+    tests (ready/barrier-synchronized for deterministic race timing)
+    prove both fixes; both verified via temporary bypasses reproducing
+    the exact predicted failure symptoms, then reverted. Tested
+    (633/633 tests, +3 net new) and verified per the full required
+    sequence — see completed_milestones for full detail. A narrow audit
+    confirmed `file-lock.ts` is the only lock/staleness/ownership
+    protocol anywhere in the P0 path. Now awaiting an EIGHTEENTH
+    independent review — per the seventeenth review's own framing, this
+    remains the P0 closure re-review. Per explicit instruction: "stop at
+    the independent-review boundary" — do not push further P0 feature
+    work, and do not declare P0 complete, until that re-review confirms
+    no blocking finding remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -2574,6 +2754,83 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fixes for the seventeenth independent Codex review's TWO remaining
+  findings are implemented, tested, and pushed to
+  claude/ai-factory-baseline-v1-seawq7, with the full required
+  verification sequence run clean (lint, typecheck, a REAL `npm run
+  build` emission — confirmed via a clean `dist/` deletion and rebuild —
+  633/633 tests, validate:requirements, history-aware secret-scan,
+  Factory Doctor READY, all 9 P0 proofs). Both findings were scoped
+  entirely to `runtime/cache/file-lock.ts`, the lock protocol the 16th
+  round introduced (the 17th review independently confirmed round 17's
+  shared-ledger budget and cross-process cache fixes as correct — no
+  further budget/CostEngine changes were needed this round). Summary of
+  the fixes:
+
+  [P2] `isLockStale()` treated ANY lock older than `staleMs` as
+  reclaimable, EVEN IF its owner was confirmed still alive — a long-
+  running legitimate critical section could be stolen purely due to age,
+  reintroducing the durable-cache lost-update race one layer up. Fixed:
+  three distinct outcomes now — CONFIRMED LIVE (metadata readable, PID
+  alive) → never stale, any age; CONFIRMED DEAD (metadata readable, PID
+  provably gone via ESRCH) → always stale, immediately, no wait; UNKNOWN
+  (metadata unreadable) → bounded mtime-based fallback only, since no
+  liveness signal exists. `isProcessAlive()` also corrected to fail
+  conservatively: only ESRCH means dead; EPERM or any other unexpected
+  error means alive.
+
+  [P2] Reclaiming a stale lock called `rmSync` UNCONDITIONALLY with no
+  identity revalidation immediately before deleting — one process could
+  delete ANOTHER process's brand-new replacement lock created moments
+  earlier, letting two contenders both believe they owned the critical
+  section. Fixed: reclamation now goes through a new
+  `tryReclaimStaleLock()`, gated by an atomic, per-lock "reclaim gate"
+  directory (`mkdirSync`-based — exactly one contender ever wins it per
+  lock; losers back off without touching the lock at all); the winner
+  re-validates `isLockStale()` one more time — now with no other
+  reclaimer able to interleave — immediately before the actual delete,
+  closing the TOCTOU window. The gate itself has its own bounded
+  staleness check so a reclaimer that crashes mid-reclaim cannot
+  permanently block future reclamation.
+
+  Four new/rewritten regression tests in
+  `runtime/cache/__tests__/file-cache.cross-process.test.ts` (11 tests
+  total in that file now), all using REAL, separately-spawned child
+  processes, several with an explicit ready/barrier handshake to force
+  deterministic race timing: a live owner exceeding `staleMs` is never
+  reclaimed (a waiter with a shorter timeout genuinely times out, proven
+  via elapsed-time and exit-code assertions, and the live owner's lock
+  survives untouched); a confirmed-dead owner (fabricated via a
+  genuinely-exited child process's own PID) is reclaimed near-instantly
+  even under a 60-second `staleMs`; two processes racing to reclaim the
+  SAME fabricated dead lock, repeated across 5 trials, never both enter
+  the critical section (a marker-file overlap witness) and never leave a
+  dangling lock/marker; and 3 fresh contenders racing a brand-new lock
+  with a tiny `staleMs` against a much longer legitimate hold never
+  overlap. Verified via two separate temporary bypasses (age-only
+  staleness ignoring liveness; unconditional gate-free reclaim), each
+  reproducing the exact predicted failure symptom, then reverted with
+  633/633 tests reconfirmed passing. A narrow audit confirmed
+  `file-lock.ts` is the only lock/staleness/ownership protocol anywhere
+  in the P0 path — no other genuine instance of any of the four named
+  root classes exists.
+
+  Requirement registry updated (UASF-REQ-0036) from this real evidence
+  only — no status raised beyond what is genuinely supported. Do not
+  proceed to further P0 feature work or declare P0 complete until an
+  EIGHTEENTH independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains — per the seventeenth review's own
+  framing, this remains the P0 closure re-review. If/when that comes
+  back clean, resume from the prior exact_next_action (below): wire the
+  remaining foundation modules (Discovery, Decisions, Assumptions,
+  Technology/Business-Capability registries) into the same integrated
+  pipeline, consider a SQLite-backed StateStore, get a Founder decision
+  on P0-sufficiency and licensing (section 206). The autonomous-merge
+  governance question stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fixes for the sixteenth independent Codex review's TWO remaining
   findings are implemented, tested, and pushed to

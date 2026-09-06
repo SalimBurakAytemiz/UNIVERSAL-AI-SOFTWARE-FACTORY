@@ -1,9 +1,9 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { FileStateStore } from "../../state/file-store.js";
 import { FileCache } from "../file-cache.js";
 
@@ -42,6 +42,19 @@ function runWorker(args: readonly string[]): Promise<WorkerResult> {
     child.on("error", reject);
     child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
   });
+}
+
+/**
+ * Spawns and fully waits out a genuinely trivial child process, then
+ * returns its (now provably exited, i.e. dead) PID — used to fabricate a
+ * "dead owner" lock precondition deterministically, without relying on a
+ * timing race to actually kill a lock-holding process.
+ */
+function spawnDeadPid(): number {
+  const result = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+  const pid = result.pid;
+  if (!pid) throw new Error("spawnDeadPid: child process did not report a pid");
+  return pid;
 }
 
 describe(
@@ -145,26 +158,213 @@ describe(
     );
 
     it(
-      "stale lock recovery is safe: a second process reclaims a lock that has outlived its own staleness " +
-        "window, and the original (still-alive but overdue) holder's own release() becomes a safe no-op",
+      "a live owner is never reclaimed merely because it exceeds staleMs: a waiter with a shorter timeout " +
+        "times out rather than stealing the lock, and the live owner's lock survives untouched",
       async () => {
-        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-stale-"));
+        // P2 fix (17th independent review round, "do not reclaim locks
+        // held by live processes"): the OLD behavior treated ANY lock
+        // older than `staleMs` as reclaimable regardless of whether its
+        // owner was still alive and actively working — Codex reproduced
+        // a long-running, perfectly legitimate critical section being
+        // stolen out from under its live owner purely due to age. This
+        // test proves the fix directly: the holder stays ALIVE for
+        // `holdMs` (well beyond `staleMs`), and a waiter configured with
+        // a `timeoutMs` shorter than `holdMs` (but longer than `staleMs`)
+        // MUST time out — if it instead "succeeded" quickly, that would
+        // mean it stole the still-live owner's lock.
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-live-"));
         const cachePath = join(tempRoot, "cache.json");
-        const holdMs = 400;
-        const fastLockOptions = JSON.stringify({ timeoutMs: 5_000, staleMs: 100, pollIntervalMs: 20 });
+        const lockPath = `${cachePath}.lock`;
+        const holdMs = 1_000;
+        const holderOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 100, pollIntervalMs: 20 });
+        const waiterOptions = JSON.stringify({ timeoutMs: 300, staleMs: 100, pollIntervalMs: 20 });
 
-        const holderPromise = runWorker(["hold-lock-then-release", cachePath, String(holdMs), fastLockOptions]);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        const setResult = await runWorker(["set", cachePath, "reclaimed-key", "reclaimed-value", "", fastLockOptions]);
+        const holderPromise = runWorker(["hold-lock-then-release", cachePath, String(holdMs), holderOptions]);
+        // Give the holder a brief head start so it has genuinely acquired
+        // the lock before the waiter's own attempt begins.
+        await new Promise((resolve) => setTimeout(resolve, 100));
 
-        expect(setResult.code, setResult.stderr).toBe(0);
+        const waiterStart = Date.now();
+        const waiterResult = await runWorker(["set", cachePath, "stolen-key", "stolen-value", "", waiterOptions]);
+        const waiterElapsedMs = Date.now() - waiterStart;
+
+        // The waiter must FAIL (non-zero exit from the uncaught
+        // FileLockTimeoutError) — never succeed by stealing the lock —
+        // and it must have genuinely waited out its own timeout, not
+        // returned instantly.
+        expect(waiterResult.code).not.toBe(0);
+        expect(waiterResult.stderr).toContain("FileLockTimeoutError");
+        expect(waiterElapsedMs).toBeGreaterThanOrEqual(250);
+
+        // The live owner's lock must still be exactly as it was — the
+        // waiter's failed attempt must never have touched it.
+        expect(existsSync(lockPath)).toBe(true);
+        const ownerMetaDuringHold = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8")) as {
+          token: string;
+        };
+        expect(typeof ownerMetaDuringHold.token).toBe("string");
+
         const holderResult = await holderPromise;
         expect(holderResult.code, holderResult.stderr).toBe(0);
 
+        // The key the waiter tried (and failed) to write must never have
+        // been recorded, and the lock must be gone now that the live
+        // owner released it normally (no permanent deadlock either).
         const cache = new FileCache<string>(new FileStateStore(), cachePath);
-        expect(cache.get("reclaimed-key")).toBe("reclaimed-value");
+        expect(cache.get("stolen-key")).toBeUndefined();
+        expect(existsSync(lockPath)).toBe(false);
       },
       20_000
+    );
+
+    it(
+      "a confirmed-dead owner's fabricated lock is reclaimed immediately, without waiting out staleMs",
+      async () => {
+        // Uses `create-dead-lock` to fabricate an abandoned lock
+        // attributed to a PID that is DETERMINISTICALLY, provably dead
+        // (a trivial child process spawned and fully awaited beforehand)
+        // — this isolates "dead-PID-based instant recovery" from any
+        // timing race, and proves it does not depend on waiting out a
+        // generous `staleMs` (set here to a value FAR longer than this
+        // test's own execution time).
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-dead-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const lockPath = `${cachePath}.lock`;
+        const deadPid = spawnDeadPid();
+        const generousStaleOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 60_000, pollIntervalMs: 20 });
+
+        const createResult = await runWorker(["create-dead-lock", lockPath, String(deadPid), "0"]);
+        expect(createResult.code, createResult.stderr).toBe(0);
+        expect(existsSync(lockPath)).toBe(true);
+
+        const start = Date.now();
+        const setResult = await runWorker(["set", cachePath, "after-dead-owner", "value", "", generousStaleOptions]);
+        const elapsedMs = Date.now() - start;
+
+        expect(setResult.code, setResult.stderr).toBe(0);
+        // Recovery must be near-instant (well under the 60s staleMs) —
+        // proving it was the PID-liveness check, not an age fallback,
+        // that authorized reclamation.
+        expect(elapsedMs).toBeLessThan(5_000);
+
+        const cache = new FileCache<string>(new FileStateStore(), cachePath);
+        expect(cache.get("after-dead-owner")).toBe("value");
+      },
+      20_000
+    );
+
+    it(
+      "stale-lock reclamation is serialized across contenders: two processes racing to reclaim the SAME " +
+        "fabricated dead lock never both believe they own the critical section, and the loser never deletes " +
+        "the winner's replacement lock (repeated across several trials for determinism)",
+      async () => {
+        // P2 fix (17th independent review round, "stale-lock reclamation
+        // is not serialized across contenders"): the OLD code let ANY
+        // process that observed a lock as stale unconditionally `rmSync`
+        // it — Codex reproduced process A reclaiming and creating a
+        // fresh, valid replacement lock, then process B (acting on its
+        // own, now-outdated "stale" observation) unconditionally deleting
+        // A's brand-new lock and creating its own, so both A and B
+        // believed they alone owned the critical section. Each trial
+        // below fabricates a dead-owner lock, then uses a ready/barrier
+        // handshake (bkz. fixtures/cache-worker.ts's "race-reclaim" mode)
+        // to force BOTH contenders to reach their own `acquireFileLock()`
+        // call at essentially the same instant — a marker file written
+        // inside the critical section and checked-for-pre-existence on
+        // entry makes any overlap immediately, deterministically visible
+        // (a non-zero exit code from either contender).
+        const trials = 5;
+        for (let trial = 0; trial < trials; trial++) {
+          const trialRoot = mkdtempSync(join(tmpdir(), `uasf-file-cache-xproc-race-${trial}-`));
+          try {
+            const lockPath = join(trialRoot, "cache.json.lock");
+            const readyA = join(trialRoot, "ready-a");
+            const readyB = join(trialRoot, "ready-b");
+            const barrier = join(trialRoot, "barrier");
+            const marker = join(trialRoot, "marker");
+            const resultA = join(trialRoot, "result-a.json");
+            const resultB = join(trialRoot, "result-b.json");
+            const lockOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 5_000, pollIntervalMs: 5 });
+            const deadPid = spawnDeadPid();
+
+            const createResult = await runWorker(["create-dead-lock", lockPath, String(deadPid), "0"]);
+            expect(createResult.code, createResult.stderr).toBe(0);
+
+            const childA = runWorker(["race-reclaim", lockPath, readyA, barrier, marker, resultA, "80", lockOptions]);
+            const childB = runWorker(["race-reclaim", lockPath, readyB, barrier, marker, resultB, "80", lockOptions]);
+
+            // Only raise the barrier once BOTH contenders have signaled
+            // they are ready to race — maximizing the chance they hit
+            // `acquireFileLock()` at essentially the same wall-clock
+            // instant, rather than one finishing long before the other
+            // even starts.
+            const readyDeadline = Date.now() + 10_000;
+            while (!(existsSync(readyA) && existsSync(readyB))) {
+              if (Date.now() > readyDeadline) throw new Error(`trial ${trial}: contenders never signaled ready`);
+            }
+            writeFileSync(barrier, "go");
+
+            const [outcomeA, outcomeB] = await Promise.all([childA, childB]);
+            expect(outcomeA.code, `trial ${trial} A: ${outcomeA.stderr}`).toBe(0);
+            expect(outcomeB.code, `trial ${trial} B: ${outcomeB.stderr}`).toBe(0);
+
+            const parsedA = JSON.parse(readFileSync(resultA, "utf8")) as { overlap: boolean };
+            const parsedB = JSON.parse(readFileSync(resultB, "utf8")) as { overlap: boolean };
+            expect(parsedA.overlap, `trial ${trial}: A observed overlap`).toBe(false);
+            expect(parsedB.overlap, `trial ${trial}: B observed overlap`).toBe(false);
+
+            // Both contenders eventually succeeded (each acquired,
+            // worked, and released in turn) and no lock/marker is left
+            // dangling afterward.
+            expect(existsSync(lockPath)).toBe(false);
+            expect(existsSync(marker)).toBe(false);
+          } finally {
+            rmSync(trialRoot, { recursive: true, force: true });
+          }
+        }
+      },
+      60_000
+    );
+
+    it(
+      "a long-running valid critical section is never overlapped by concurrent contenders, even when it " +
+        "outlives their configured staleMs",
+      async () => {
+        // Fresh (non-fabricated) contention: three processes race for a
+        // BRAND-NEW lock with a deliberately tiny `staleMs`, and whichever
+        // one wins holds it for far longer than that `staleMs` — proving
+        // the others correctly wait (never reclaim a live winner) via the
+        // same marker-based overlap witness as the dedicated race test.
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-longcs-"));
+        const lockPath = join(tempRoot, "cache.json.lock");
+        const barrier = join(tempRoot, "barrier");
+        const marker = join(tempRoot, "marker");
+        const lockOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 50, pollIntervalMs: 10 });
+        const contenderCount = 3;
+
+        const readyPaths = Array.from({ length: contenderCount }, (_, i) => join(tempRoot, `ready-${i}`));
+        const resultPaths = Array.from({ length: contenderCount }, (_, i) => join(tempRoot, `result-${i}.json`));
+        const children = readyPaths.map((readyPath, i) =>
+          runWorker(["race-reclaim", lockPath, readyPath, barrier, marker, resultPaths[i], "300", lockOptions])
+        );
+
+        const readyDeadline = Date.now() + 10_000;
+        while (!readyPaths.every((p) => existsSync(p))) {
+          if (Date.now() > readyDeadline) throw new Error("contenders never signaled ready");
+        }
+        writeFileSync(barrier, "go");
+
+        const outcomes = await Promise.all(children);
+        for (const outcome of outcomes) {
+          expect(outcome.code, outcome.stderr).toBe(0);
+        }
+        for (const resultPath of resultPaths) {
+          const parsed = JSON.parse(readFileSync(resultPath, "utf8")) as { overlap: boolean };
+          expect(parsed.overlap).toBe(false);
+        }
+        expect(existsSync(lockPath)).toBe(false);
+      },
+      30_000
     );
 
     it("same-process behavior remains correct after adding cross-process locking", () => {
