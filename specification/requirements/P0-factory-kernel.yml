@@ -1091,6 +1091,74 @@
     bypass since it only inspects the policy audit description string,
     not the provider's received identity), then reverted.
 
+    P1 fix (13th independent review round, "provider/model identity can
+    still change accounting and audit evidence"): the 12th round's fix
+    closed the gap for the PROVIDER CALL itself (`#rawInvoke` receives
+    `authorizedModel`), but `commit()` was still called with
+    `provider: response.provider, modelId: response.modelId` — the
+    IDENTITY FIELDS of the raw response an EXTERNAL `ModelProvider.invoke()`
+    implementation returns, not the identity that was ever authorized.
+    Since a provider adapter is untrusted from this class's point of view,
+    a misbehaving/compromised one could return any `modelId`/`provider` it
+    likes, silently redefining accounting/audit/reconciliation ownership
+    via its OWN return value even with the 12th round's model-mutation gap
+    fully closed. Required invariant: authorize ONE identity -> invoke
+    that identity -> account/reconcile/audit that SAME identity — no
+    response object may redefine it. Fixed: `commit()` is now called with
+    `provider: authorizedModel.provider, modelId: authorizedModel.modelId`
+    — the pre-authorized snapshot — never `response.provider`/
+    `response.modelId`; `response.costUsd` (a legitimate actual-amount
+    value, not an identity field) is still used for the dollar amount.
+    `authorizedModel.provider`/`.modelId` are also now passed to
+    `budget.reserve()` (see UASF-REQ-0030's notes on `ReservationOwnership`)
+    so `commit()`'s OWN ownership-mismatch check independently re-verifies
+    this at the reservation layer too — defense in depth, not reliance on
+    this call site alone. Regression tests (gateway.test.ts, new describe
+    block, using a `ControllableProvider.forgedResponseIdentity` option
+    that simulates a provider whose response claims a different
+    modelId/provider than the one it was actually invoked with) prove: a
+    forged response modelId does not redefine the durable accounting
+    record, a forged response provider likewise does not, reconciliation
+    never raises a spurious `ReservationOwnershipMismatchError` from a
+    forged response (since both `reserve()` and `commit()` derive identity
+    from the SAME authorized snapshot), audit/policy evidence references
+    the authorized identity regardless of the forged response, and
+    concurrent invocations against a provider forging the SAME response
+    identity for both still keep their own distinct authorized identities
+    in accounting. Verified via a temporary bypass (reverting both the
+    `reserve()` and `commit()` calls to omit/re-read
+    `response.provider`/`response.modelId`) — confirmed exactly 4 of the 5
+    new tests fail (the audit-description test stays green under this
+    specific bypass, for the same reason as the 12th round's equivalent
+    test), then reverted.
+
+    P1 fix (13th independent review round, "invocation payload remains
+    caller-mutable during execution"): `request` (prompt/taskType) was
+    passed DIRECTLY into `#rawInvoke(model, request)` with no snapshot of
+    its own — the SAME class of bug the 12th round fixed for `model`, just
+    for the invocation payload instead of the model identity. A caller
+    mutating `request.prompt`/`.taskType` WHILE the provider call was
+    pending (and a provider that reads its `request` reference LAZILY,
+    e.g. after its own internal work, rather than copying it immediately)
+    could execute a replacement payload under the authorization/budget
+    already reserved for the ORIGINAL prompt. Fixed the same way as
+    `model`: `request` is copied into a frozen, detached `authorizedRequest`
+    in the SAME synchronous prefix as `authorizedModel`, before any await,
+    and `authorizedRequest` (never the original `request` parameter) is
+    what gets passed to `#rawInvoke()`. Regression tests (gateway.test.ts)
+    use a `ControllableProvider` that reads `request`'s fields LAZILY (at
+    `resolveAll()` time, not at `invoke()`-call time — a synchronous copy
+    at call time cannot observe this race at all, since JS guarantees the
+    function's synchronous prefix, including any such copy, completes
+    before a caller-scheduled mutation can run) and prove: mutating
+    `request.prompt` while pending has zero effect on what the provider
+    receives, the same for `request.taskType`, and concurrent reuse of one
+    caller-owned request object across two invocations cannot
+    cross-contaminate their payloads. Verified via a temporary bypass
+    (`this.#rawInvoke(authorizedModel, request)` instead of
+    `authorizedRequest`) — confirmed exactly 3 of 3 new tests fail, then
+    reverted.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -1350,6 +1418,62 @@
     test; the risk-mutation and concurrent-isolation tests correctly still
     passed under this bypass, since those properties were independently
     safe for reasons unrelated to this specific snapshot), then reverted.
+
+    P1 fix (13th independent review round, "routing drops project
+    ownership"): `RoutingRequest` had no `projectId` field at all — only
+    `taskId` — even though `ModelInvocationContext.projectId` has always
+    existed and been fully honored by `gateway.invoke()`. Codex reproduced
+    a project-bearing invocation routed through `routeAndExecute()` being
+    accounted under `taskId` ALONE (project silently dropped), then a
+    SEPARATE direct `gateway.invoke()` call for the SAME project/task
+    seeing an empty project-scoped ceiling and succeeding — both calls
+    together bypassing what should have been a single shared per-task
+    ceiling. Fixed: `RoutingRequest` gained an optional `projectId` field,
+    captured into the SAME `routingScope` snapshot as every other routing
+    field, and `invokeAuthorized()` now passes `projectId: request.projectId`
+    into `ModelInvocationContext` (previously omitted entirely). Regression
+    tests (router.test.ts, new describe block) prove the exact
+    reproduction (a routed project P/task A invocation followed by a
+    direct `gateway.invoke()` for the same project/task correctly share
+    one consumed ceiling), two routed invocations for DIFFERENT projects
+    sharing the SAME taskId use INDEPENDENT ceilings (routing must not
+    downgrade project+task ownership into task-only ownership), project
+    identity survives every escalation/retry/fallback step (all three
+    tiers' cost lands under the same project), and omitting `projectId`
+    (the pre-existing, still-supported project-agnostic use case) is
+    unaffected. Verified via a temporary bypass (omitting `projectId` from
+    the `invokeAuthorized()` call) — confirmed exactly 3 of 4 new tests
+    fail (the project-agnostic backward-compat test correctly stayed
+    green), then reverted.
+
+    P1 fix (13th independent review round, "invocation payload remains
+    caller-mutable during execution"): `routeAndExecute()` passed
+    `invocationRequest` (the model prompt/taskType payload — a SEPARATE
+    object from `request`/`routingScope`, which only carries routing
+    metadata) UNSNAPSHOTTED to every `invokeAuthorized()` call, including
+    every escalation/fallback step. `gateway.invoke()`'s own per-call
+    snapshot (see UASF-REQ-0024) protects a SINGLE call against a
+    mutation racing its own pending provider call, but not ACROSS
+    retries: a caller mutating `invocationRequest.prompt` between this
+    method's own sequential escalation steps could make a LATER attempt
+    execute a different payload than the FIRST attempt (and the caller)
+    ever authorized. Fixed: `invocationRequest` is captured into a frozen
+    `invocationScope` snapshot in the SAME synchronous prefix as
+    `routingScope`, before the first `selectModel()`/`invokeAuthorized()`
+    call; `invocationScope` (never the original parameter) is what every
+    candidate — initial, every escalation step, and fallback — receives.
+    Regression tests prove: mutating `invocationRequest.prompt` while the
+    initial candidate is pending has no effect on a LATER escalation
+    attempt's actual payload (the escalated response reflects the
+    ORIGINAL prompt, verified via `MockProvider`'s own prompt-echoing
+    output), and concurrent `routeAndExecute()` calls sharing one
+    caller-owned `invocationRequest` object cannot cross-contaminate their
+    payloads. Verified via a temporary bypass (reverting only the
+    escalation loop's second `invokeAuthorized()` call to re-read
+    `invocationRequest` directly) — confirmed exactly 1 of 2 new tests
+    fails (the exact-reproduction escalation test; the concurrent-isolation
+    test, which never reaches the escalation loop, correctly stayed
+    green), then reverted.
 
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
@@ -1767,6 +1891,75 @@
     reservation.scope.taskId || entry.projectId !==
     reservation.scope.projectId))`) — confirmed exactly 8 of the new tests
     fail against the bypassed code, then reverted.
+
+    P1 fix (13th independent review round, "ownership-mismatch failure
+    leaves reservation releasable"): Codex reproduced the 12th round's
+    ownership-mismatch check (previous paragraph) THROWING without first
+    marking the reservation's lifecycle state — `reservation.status`
+    stayed "ACTIVE" after a mismatch, so a caller catching the thrown
+    `ReservationOwnershipMismatchError` could then legally call
+    `release()` (which only rejects "RECONCILIATION_FAILED"), silently
+    restoring the FULL protected capacity even though a real (or
+    potentially real) provider call may already have occurred under the
+    reservation's authoritative ownership. This is the identical
+    "FAIL -> THROW -> RELEASE -> RESTORE BUDGET" fail-open shape the 12th
+    round already closed for a malformed-amount commit() failure — an
+    ownership mismatch is exactly the same class of "reconciliation could
+    not be safely completed," and needed the SAME protection. Fixed:
+    the mismatch branch now sets `reservation.status =
+    "RECONCILIATION_FAILED"` BEFORE appending the audit event and
+    throwing (mirroring the pre-existing amount-failure catch block
+    immediately below it in the same function) — `release()`'s existing
+    status check (from the 12th round) then rejects it exactly like any
+    other unresolved reconciliation. Regression tests (budget.test.ts,
+    new describe block) prove: the exact reproduction (reserve ->
+    mismatched commit() -> catch -> release() is REJECTED, not silently
+    accepted, full ceiling stays protected), a project-only mismatch also
+    protects the reservation from release(), a retry with the CORRECT
+    ownership after a protected mismatch still succeeds and accounts
+    exactly once (retry remains safe by construction, since nothing was
+    ever deleted), and the release() rejection is audited with both the
+    ownership-mismatch AND the release-rejection event types. Verified
+    via a temporary bypass (removing the `reservation.status =
+    "RECONCILIATION_FAILED"` assignment from the mismatch branch only) —
+    confirmed exactly 5 of the new tests fail (all asserting release() is
+    rejected), then reverted.
+
+    P1 fix (13th independent review round, "reservation ownership checks
+    omit agent identity"): Codex reproduced a reservation belonging to
+    one agent being `commit()`-ed as a DIFFERENT agent successfully,
+    because the 12th round's ownership-mismatch check compared only
+    `taskId`/`projectId` — never `agentId` (already a `CostScope` field
+    used elsewhere in this same module) — nor `provider`/`modelId` (not
+    previously part of a reservation's stored ownership at all). Required
+    invariant: every ownership dimension a reservation actually captured
+    at `reserve()` time must be authoritative for its own `commit()`.
+    Fixed: introduced `ReservationOwnership` (`CostScope` extended with
+    optional `provider`/`modelId`), so `Reservation.scope` now can record
+    agentId (already supported via CostScope)/provider/modelId at
+    `reserve()` time; `commit()`'s mismatch check now ALSO compares
+    `entry.agentId` against `reservation.scope.agentId` (always — both
+    sides default to `undefined` when omitted, so this is backward
+    compatible) and `entry.provider`/`entry.modelId` against the
+    reservation's own values (only enforced when the reservation itself
+    recorded them, so pre-existing callers that never supplied a
+    provider/modelId at `reserve()` time are unaffected). `gateway.invoke()`
+    now passes `authorizedModel.provider`/`.modelId` to `budget.reserve()`
+    too (see UASF-REQ-0024's notes), so the real model-invocation path
+    gets this protection automatically. Regression tests (budget.test.ts,
+    new describe block) prove: the exact reproduction (an owner-agent
+    reservation committed as a different agent is rejected, no spend is
+    recorded for the other agent, the reservation stays protected, and a
+    retry under the ORIGINAL owner-agent succeeds), a reservation with no
+    agentId/provider/modelId recorded does not enforce those dimensions
+    (no regression for the pre-existing call shape), provider and modelId
+    mismatches are independently rejected when the reservation recorded
+    them, multiple dimensions can combine (any single mismatching
+    dimension is sufficient to reject), and the ownership-mismatch audit
+    event identifies the reservation's authoritative owner across ALL
+    five dimensions, never the caller's rejected values. Verified via a
+    temporary bypass (reducing the mismatch condition to taskId/projectId
+    only) — confirmed exactly 6 of the new tests fail, then reverted.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -2565,3 +2758,107 @@
     found in this scope beyond the 5 already fixed this round — the
     pattern is fully closed here. Per the review's explicit instruction,
     this audit did not expand into unrelated architecture work.
+
+    P2 fix (13th independent review round, "bootstrap validates budget
+    limits after filesystem mutation"): Codex reproduced `perTaskUsd: NaN`
+    being ultimately rejected with `InvalidBudgetLimitError`, but only
+    once `new BudgetGuard(costEngine, budgetGuardLimits)` ran — by which
+    point `scaffoldProjectOs()` had ALREADY created 24 real directories on
+    disk. `BudgetLimits` validation had never been anything more than an
+    implicit side effect of `BudgetGuard`'s own constructor; no caller
+    ever validated it eagerly, up front, before performing its own side
+    effects. Fixed: `runtime/budget/budget.ts` gained an exported
+    `assertValidBudgetLimits(limits)` (the SAME four `assertValidLimit()`
+    calls the constructor already made, now a shared, reusable primitive
+    — the constructor itself now just calls it, removing the duplication),
+    and `bootstrapProject()` calls it on `budgetGuardLimits` immediately
+    after the config snapshot is captured — still before
+    `parseProjectGenome()`/`assertFilesystemConfinement()`/
+    `gateway.authorize(() => scaffoldProjectOs(...))`, i.e. before this
+    function's FIRST filesystem mutation of any kind. Regression tests
+    (orchestrator.test.ts, new describe block) prove: NaN/Infinity/
+    negative ceilings (across different ceiling kinds) are all rejected
+    with ZERO filesystem mutations (the base temp directory stays
+    completely empty — confirmed via `readdirSync`), an invalid ceiling
+    among otherwise-valid ones is still caught, a genuinely valid
+    `budgetLimits` object still creates the full expected project
+    structure (no regression), and a caller mutating budgetLimits from
+    valid to invalid WHILE bootstrap is already pending has zero effect
+    (validation already ran against the ORIGINAL snapshot). Verified via a
+    temporary bypass (removing the early `assertValidBudgetLimits()` call)
+    — confirmed exactly the 4 exact-reproduction tests fail, each with a
+    real, non-empty project directory present where zero mutations were
+    expected, then reverted.
+
+    Targeted cross-cutting audit (13th independent review round, scoped to
+    exactly this session's 6 findings' root-cause classes, within the P0
+    model/router/budget/bootstrap execution path only): re-examined every
+    file in that path for (1) authorized identity redefined by a response/
+    caller object, (2) a failure state leaving a resource releasable, (3)
+    an ownership field silently dropped between layers, (4) a caller-owned
+    mutable object reread after an await instead of using a pre-await
+    snapshot, (5) an ownership check covering only some of a resource's
+    authoritative dimensions, (6) a side effect performed before
+    validating configuration whose failure would waste it. Classes 1, 2,
+    4, and 5 were confirmed fully closed with no further instance in
+    scope. Two genuine findings were surfaced:
+    - Class 6 (genuine, FIXED): `bootstrapProject()`'s
+      `router.selectModel()` (throws `NoCapableModelError` if the
+      registry has no capability-matching model) and the real
+      `budget.spend()` call (throws `BudgetExceededError` once the
+      SPECIFIC selected model's real cost is checked against a
+      perfectly-VALID-but-insufficient ceiling) both still ran AFTER
+      `scaffoldProjectOs()`'s real directory creation — a rejection from
+      either would still leave an orphaned, half-bootstrapped project
+      directory on disk, the identical root-cause shape as the
+      `budgetGuardLimits` finding above, just triggered by a legitimate
+      runtime-enforcement rejection rather than malformed static config.
+      Fixed conservatively: `selectModel()` (pure, no side effects, no
+      policy dependency) now runs BEFORE the scaffold, and a NEW,
+      NON-MUTATING `budget.assertWithinBudget()` pre-check (the existing
+      check-only method BudgetGuard already exposed for exactly this
+      purpose — bkz. `runtime/budget/budget.ts`) also runs before the
+      scaffold using the now-known selected model's real cost. The
+      AUTHORITATIVE `budget.spend()` call deliberately STAYS in its
+      original position, after the policy-gated scaffold succeeds — this
+      preserves the existing (if previously accidental) "a policy DENY
+      blocks the spend too" property, which reordering `spend()` itself
+      would have broken (a DENY would then let spend() run with nothing
+      ever scaffolded). Regression tests prove: a registry with no
+      capability-matching model is rejected with ZERO filesystem
+      mutations, a budget too tight for the selected model's REAL (not
+      malformed) cost is likewise rejected with ZERO mutations, a policy
+      DENY still blocks BOTH the scaffold AND the spend (the new
+      pre-check does not weaken this), and a genuinely valid,
+      sufficiently-budgeted bootstrap still creates the full expected
+      structure. Verified via a temporary bypass (reverting
+      `selectModel()`/`assertWithinBudget()` back to their original
+      post-scaffold position) — confirmed exactly the 2 exact-reproduction
+      tests fail (each with a real orphaned project directory present),
+      then reverted.
+    - Class 3 (genuine, NOT fixed — scoping decision recorded here):
+      `budget.ts`'s `CostScope`/`ReservationOwnership` and its own
+      `commit()` ownership check fully support an `agentId` dimension
+      (this round's finding #5 fix), but NEITHER `ModelInvocationContext`
+      (gateway.ts) NOR `RoutingRequest` (router.ts) — nor
+      `BootstrapProjectInput` (orchestrator.ts) — has an `agentId` field
+      at all, and none of `gateway.invoke()`'s `reserve()`/`commit()`
+      calls, `routeAndExecute()`, or `bootstrapProject()`'s `budget.spend()`
+      call ever supply one. This makes `commit()`'s `agentId` ownership
+      check a permanent no-op (`undefined === undefined`) for every
+      invocation reachable through the public model-invocation/bootstrap
+      path. This is DIFFERENT from the just-fixed `projectId` gap
+      (finding #3): `projectId` already existed as a concept in BOTH
+      `RoutingRequest` and `ModelInvocationContext` and was simply not
+      threaded between them — a genuine "dropped in transit" bug fixable
+      by adding one field and one pass-through line. An "agent" concept,
+      by contrast, does not exist ANYWHERE in the model-invocation/
+      bootstrap execution path today (only in the lower-level `CostScope`/
+      `CostEntry` primitives) — introducing it end-to-end would mean
+      adding a new field to two-plus public interfaces and deciding what
+      an "agent" even means at the orchestration layer, which is
+      architecture/feature work, not a bug fix within existing plumbing.
+      Per the review's explicit instruction not to expand into unrelated
+      architecture work, this was NOT fixed this round. Recorded here so
+      a future session (or an explicit Founder/review request to add
+      agent-scoped model invocation) does not need to re-discover it.

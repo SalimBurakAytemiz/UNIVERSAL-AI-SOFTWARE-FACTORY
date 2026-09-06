@@ -41,6 +41,29 @@ function assertValidLimit(ceiling: BudgetCeilingName, limit: number | undefined)
   }
 }
 
+/**
+ * P2 fix (13th independent review round, "bootstrap validates budget
+ * limits after filesystem mutation"): the ONLY place `BudgetLimits` was
+ * ever validated used to be `BudgetGuard`'s own constructor — which is
+ * correct for `BudgetGuard` itself, but meant any CALLER that performs
+ * side effects (filesystem writes, external calls, ...) BEFORE
+ * constructing its `BudgetGuard` discovers an invalid ceiling (NaN/
+ * Infinity/negative) only AFTER those side effects already happened.
+ * Codex reproduced exactly this in `runtime/project-lifecycle/
+ * orchestrator.ts`'s `bootstrapProject()`: `perTaskUsd: NaN` was
+ * ultimately rejected, but only once `new BudgetGuard(...)` ran — by
+ * which point `scaffoldProjectOs()` had already created 24 real
+ * directories on disk. Exported here (rather than duplicated at each
+ * call site) so `BudgetGuard`'s constructor and any caller that needs to
+ * fail BEFORE its own side effects share the exact same validation rule.
+ */
+export function assertValidBudgetLimits(limits: BudgetLimits): void {
+  assertValidLimit("perTaskUsd", limits.perTaskUsd);
+  assertValidLimit("perRunUsd", limits.perRunUsd);
+  assertValidLimit("dailyUsd", limits.dailyUsd);
+  assertValidLimit("monthlyUsd", limits.monthlyUsd);
+}
+
 export class BudgetExceededError extends Error {
   constructor(
     public readonly ceiling: BudgetCeilingName,
@@ -61,9 +84,33 @@ interface CeilingCheck {
   readonly projected: number;
 }
 
+/**
+ * P1 fix (13th independent review round, "reservation ownership checks
+ * omit agent identity" + "provider/model identity can still change
+ * accounting and audit evidence"): a `Reservation`'s authoritative
+ * ownership used to be exactly `CostScope` (taskId/agentId/projectId) —
+ * `agentId` was ALREADY part of `CostScope` but `commit()`'s mismatch
+ * check (11th/12th round fix) only ever compared `taskId`/`projectId`,
+ * never `agentId`, so a reservation made for one agent could be
+ * committed under a DIFFERENT agent with zero rejection. Separately,
+ * `provider`/`modelId` were not part of a reservation's ownership AT
+ * ALL — `commit()` recorded whatever `provider`/`modelId` the caller (or,
+ * in gateway.ts's case, the PROVIDER'S OWN RESPONSE) supplied, with no
+ * way to validate it against what was actually authorized/reserved.
+ * `ReservationOwnership` extends `CostScope` with optional `provider`/
+ * `modelId` fields, captured at `reserve()` time (BEFORE any provider
+ * call), so every ownership dimension a reservation can carry is fixed
+ * atomically at the moment capacity is set aside — never derived later
+ * from a caller argument or a provider's own (untrusted) response.
+ */
+export interface ReservationOwnership extends CostScope {
+  readonly provider?: string;
+  readonly modelId?: string;
+}
+
 export interface Reservation {
   readonly id: string;
-  readonly scope: Readonly<CostScope>;
+  readonly scope: Readonly<ReservationOwnership>;
   readonly amountUsd: number;
 }
 
@@ -132,13 +179,21 @@ export class UnresolvedReconciliationError extends Error {
  * on any mismatch, per this class.
  */
 export class ReservationOwnershipMismatchError extends Error {
-  constructor(reservationId: string, reservationScope: Readonly<CostScope>, suppliedScope: CostScope) {
+  constructor(
+    reservationId: string,
+    reservationScope: Readonly<ReservationOwnership>,
+    suppliedScope: ReservationOwnership
+  ) {
     super(
       `commit(reservationId=${reservationId}) supplied ownership (taskId=${String(suppliedScope.taskId)}, ` +
-        `projectId=${String(suppliedScope.projectId)}) does not match the reservation's OWN authoritative ` +
-        `ownership (taskId=${String(reservationScope.taskId)}, projectId=${String(reservationScope.projectId)}). ` +
+        `projectId=${String(suppliedScope.projectId)}, agentId=${String(suppliedScope.agentId)}, ` +
+        `provider=${String(suppliedScope.provider)}, modelId=${String(suppliedScope.modelId)}) does not match ` +
+        `the reservation's OWN authoritative ownership (taskId=${String(reservationScope.taskId)}, ` +
+        `projectId=${String(reservationScope.projectId)}, agentId=${String(reservationScope.agentId)}, ` +
+        `provider=${String(reservationScope.provider)}, modelId=${String(reservationScope.modelId)}). ` +
         `A reservation is the authoritative source of ownership for its own commit — this call was rejected ` +
-        `before any accounting mutation or reservation state change.`
+        `before any accounting mutation, and the reservation has been marked RECONCILIATION_FAILED (protected ` +
+        `from release()) rather than left releasable, since a real invocation may already have occurred.`
     );
     this.name = "ReservationOwnershipMismatchError";
   }
@@ -226,7 +281,7 @@ export class BudgetGuard {
    */
   private readonly reservations = new Map<
     string,
-    { scope: Readonly<CostScope>; amountUsd: number; status: ReservationStatus }
+    { scope: Readonly<ReservationOwnership>; amountUsd: number; status: ReservationStatus }
   >();
   private reservationSeq = 0;
 
@@ -238,10 +293,7 @@ export class BudgetGuard {
   ) {
     // Yanlış yapılandırılmış bir tavan (NaN/Infinity/negatif), kurulum
     // anında hemen reddedilir — ilk harcama denemesine kadar beklenmez.
-    assertValidLimit("perTaskUsd", limits.perTaskUsd);
-    assertValidLimit("perRunUsd", limits.perRunUsd);
-    assertValidLimit("dailyUsd", limits.dailyUsd);
-    assertValidLimit("monthlyUsd", limits.monthlyUsd);
+    assertValidBudgetLimits(limits);
     this.limits = freezeRecord({ ...limits });
   }
 
@@ -431,7 +483,7 @@ export class BudgetGuard {
    * fail-closed olunur ve HİÇBİR rezervasyon oluşturulmaz — çağıran,
    * provider'ı ASLA çağırmamalıdır.
    */
-  reserve(scope: CostScope, amountUsd: number): Reservation {
+  reserve(scope: ReservationOwnership, amountUsd: number): Reservation {
     try {
       assertValidMonetaryAmount(amountUsd, "BudgetGuard.reserve");
     } catch (err) {
@@ -520,12 +572,48 @@ export class BudgetGuard {
     }
 
     // P1 fix (12th independent review round, "commit() accepts accounting
-    // ownership unrelated to the reservation"): validated BEFORE anything
-    // else — no cost recorded, no reservation state change — see
-    // `ReservationOwnershipMismatchError`'s note above. The reservation's
-    // OWN `scope` (fixed at reserve() time) is authoritative; a caller
-    // cannot redefine it merely by supplying different values here.
-    if (entry.taskId !== reservation.scope.taskId || entry.projectId !== reservation.scope.projectId) {
+    // ownership unrelated to the reservation"), extended in the 13th
+    // independent review round ("reservation ownership checks omit agent
+    // identity" + "provider/model identity can still change accounting
+    // and audit evidence"): validated BEFORE anything else — no cost
+    // recorded — see `ReservationOwnershipMismatchError`'s note above.
+    // The reservation's OWN `scope` (fixed at reserve() time, BEFORE any
+    // provider call) is authoritative across EVERY dimension it captured
+    // — taskId/projectId/agentId (always compared) and provider/modelId
+    // (compared only when the reservation itself recorded them, so
+    // existing callers that never supplied a provider/modelId at
+    // reserve() time remain unaffected by this dimension). A caller
+    // cannot redefine ANY of these merely by supplying different values
+    // here — including via a provider's own (untrusted) response, which
+    // is exactly why gateway.ts derives its `commit()` call's
+    // provider/modelId from the pre-authorized model snapshot, never from
+    // `response.provider`/`response.modelId` (see gateway.ts's `invoke()`).
+    const reservedProvider = reservation.scope.provider;
+    const reservedModelId = reservation.scope.modelId;
+    const ownershipMismatch =
+      entry.taskId !== reservation.scope.taskId ||
+      entry.projectId !== reservation.scope.projectId ||
+      entry.agentId !== reservation.scope.agentId ||
+      (reservedProvider !== undefined && entry.provider !== reservedProvider) ||
+      (reservedModelId !== undefined && entry.modelId !== reservedModelId);
+
+    if (ownershipMismatch) {
+      // P1 fix (13th independent review round, "ownership-mismatch
+      // failure leaves reservation releasable"): Codex reproduced
+      // reserve() -> mismatched commit() -> catch -> release() SUCCEEDING
+      // — the mismatch check above used to just throw, leaving
+      // `reservation.status` at "ACTIVE", so a caller catching the thrown
+      // error could legally call `release()` next (release() only
+      // rejects "RECONCILIATION_FAILED"), silently restoring the FULL
+      // protected capacity even though a real (or potentially real)
+      // provider call may already have happened under the reservation's
+      // authoritative ownership. An ownership mismatch is EXACTLY the
+      // same "reconciliation could not be safely completed" situation as
+      // a malformed amount (bkz. aşağıdaki catch bloğu) — it must enter
+      // the SAME protected state, marked BEFORE the error is thrown (not
+      // after), so no window exists where the reservation is both
+      // "mismatch detected" and "still releasable."
+      reservation.status = "RECONCILIATION_FAILED";
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
         actor: "budget-guard",
@@ -533,13 +621,19 @@ export class BudgetGuard {
           reservationId,
           reservedScope: reservation.scope,
           suppliedTaskId: entry.taskId,
-          suppliedProjectId: entry.projectId
+          suppliedProjectId: entry.projectId,
+          suppliedAgentId: entry.agentId,
+          suppliedProvider: entry.provider,
+          suppliedModelId: entry.modelId
         },
         timestamp: this.now().toISOString()
       });
       throw new ReservationOwnershipMismatchError(reservationId, reservation.scope, {
         taskId: entry.taskId,
-        projectId: entry.projectId
+        projectId: entry.projectId,
+        agentId: entry.agentId,
+        provider: entry.provider,
+        modelId: entry.modelId
       });
     }
 

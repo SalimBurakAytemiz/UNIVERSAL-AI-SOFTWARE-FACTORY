@@ -1119,4 +1119,236 @@ describe("BudgetGuard", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (13th independent review round, 'ownership-mismatch failure leaves reservation releasable'): a " +
+      "commit() ownership mismatch now marks the reservation RECONCILIATION_FAILED BEFORE throwing, so a caller " +
+      "catching the thrown error cannot then call release() to restore the protected capacity",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: reserve -> mismatched commit() -> catch -> release() is " +
+          "REJECTED, not silently accepted",
+        () => {
+          const costEngine = new CostEngine();
+          const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+          const reservation = guard.reserve({ taskId: "a" }, 0.6);
+
+          expect(() =>
+            guard.commit(reservation.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+          ).toThrow(ReservationOwnershipMismatchError);
+
+          // The caller catches the mismatch error and (incorrectly)
+          // assumes release() is now the safe cleanup path — it must be
+          // REJECTED, not silently accepted, since a real provider call
+          // may already have occurred under this reservation's authority.
+          expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+
+          // The full ceiling remains protected — a second full-ceiling
+          // reservation cannot slip through a release() that should never
+          // have succeeded.
+          expect(() => guard.reserve({ taskId: "c" }, 1.0)).toThrow(BudgetExceededError);
+          expect(costEngine.total()).toBe(0);
+        }
+      );
+
+      it("a project mismatch also protects the reservation from release()", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "a", projectId: "P" }, 0.6);
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "a", projectId: "Q", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(ReservationOwnershipMismatchError);
+        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+      });
+
+      it("a retry with the CORRECT ownership after a protected mismatch still succeeds and accounts exactly once", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "a" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(ReservationOwnershipMismatchError);
+        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+
+        // The ONLY safe path forward: retry commit() with the CORRECT ownership.
+        const recorded = guard.commit(reservation.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(recorded.amountUsd).toBe(0.6);
+        expect(costEngine.total()).toBe(0.6); // exactly once
+
+        // Now genuinely terminal.
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(UnknownReservationError);
+        expect(() => guard.release(reservation.id)).toThrow(UnknownReservationError);
+      });
+
+      it("an ownership-mismatch release() rejection is audited with the same event type as an amount-failure rejection", () => {
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 1 }, undefined, auditLog);
+        const reservation = guard.reserve({ taskId: "a" }, 0.5);
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.5 })
+        ).toThrow(ReservationOwnershipMismatchError);
+        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+
+        const events = auditLog.all();
+        expect(events.some((e) => e.type === "BUDGET_RESERVATION_OWNERSHIP_MISMATCH")).toBe(true);
+        expect(events.some((e) => e.type === "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED")).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (13th independent review round, 'reservation ownership checks omit agent identity'): commit()'s " +
+      "ownership check now covers agentId, provider, and modelId in addition to taskId/projectId — every " +
+      "dimension a reservation actually captured at reserve() time is authoritative",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: an owner-agent reservation, committed as a DIFFERENT agent, is " +
+          "REJECTED — the reservation remains protected and no spending is recorded for the other agent",
+        () => {
+          const costEngine = new CostEngine();
+          const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+          const reservation = guard.reserve({ taskId: "a", agentId: "owner-agent" }, 0.6);
+
+          expect(() =>
+            guard.commit(reservation.id, {
+              taskId: "a",
+              agentId: "other-agent",
+              provider: "mock",
+              modelId: "m1",
+              amountUsd: 0.6
+            })
+          ).toThrow(ReservationOwnershipMismatchError);
+
+          // No spend was ever recorded under the other agent's identity.
+          expect(costEngine.totalFor({ agentId: "other-agent" })).toBe(0);
+          expect(costEngine.total()).toBe(0);
+          // The reservation remains protected — release() is also rejected
+          // (bkz. the mismatch-marks-RECONCILIATION_FAILED fix above).
+          expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+
+          // A correct retry under the ORIGINAL owner-agent still succeeds.
+          const recorded = guard.commit(reservation.id, {
+            taskId: "a",
+            agentId: "owner-agent",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.6
+          });
+          expect(recorded.agentId).toBe("owner-agent");
+          expect(costEngine.totalFor({ agentId: "owner-agent" })).toBe(0.6);
+        }
+      );
+
+      it("a reservation with no agentId rejects a commit() that supplies one", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "a" }, 0.6); // no agentId
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "a", agentId: "some-agent", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(ReservationOwnershipMismatchError);
+      });
+
+      it("a provider mismatch is REJECTED when the reservation itself recorded a provider at reserve() time", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "a", provider: "authorized-provider" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "a", provider: "substituted-provider", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(ReservationOwnershipMismatchError);
+        expect(costEngine.total()).toBe(0);
+
+        const recorded = guard.commit(reservation.id, { taskId: "a", provider: "authorized-provider", modelId: "m1", amountUsd: 0.6 });
+        expect(recorded.provider).toBe("authorized-provider");
+      });
+
+      it("a modelId mismatch is REJECTED when the reservation itself recorded a modelId at reserve() time", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "a", modelId: "authorized-model" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "a", provider: "mock", modelId: "substituted-model", amountUsd: 0.6 })
+        ).toThrow(ReservationOwnershipMismatchError);
+        expect(costEngine.total()).toBe(0);
+
+        const recorded = guard.commit(reservation.id, { taskId: "a", provider: "mock", modelId: "authorized-model", amountUsd: 0.6 });
+        expect(recorded.modelId).toBe("authorized-model");
+      });
+
+      it(
+        "a reservation with NO provider/modelId recorded (the pre-existing, still-supported call shape) does " +
+          "not enforce those dimensions — no regression for callers that never declared them",
+        () => {
+          const costEngine = new CostEngine();
+          const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+          const reservation = guard.reserve({ taskId: "a" }, 0.6); // no provider/modelId
+          const recorded = guard.commit(reservation.id, {
+            taskId: "a",
+            provider: "whatever-provider",
+            modelId: "whatever-model",
+            amountUsd: 0.6
+          });
+          expect(recorded.provider).toBe("whatever-provider");
+          expect(recorded.modelId).toBe("whatever-model");
+        }
+      );
+
+      it("agentId/provider/modelId mismatches can combine with taskId/projectId mismatches — ANY dimension mismatching is sufficient to reject", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve(
+          { taskId: "a", projectId: "P", agentId: "agent-1", provider: "prov-1", modelId: "model-1" },
+          0.6
+        );
+
+        expect(() =>
+          guard.commit(reservation.id, {
+            taskId: "a",
+            projectId: "P",
+            agentId: "agent-1",
+            provider: "prov-1",
+            modelId: "model-2", // only modelId differs
+            amountUsd: 0.6
+          })
+        ).toThrow(ReservationOwnershipMismatchError);
+
+        const recorded = guard.commit(reservation.id, {
+          taskId: "a",
+          projectId: "P",
+          agentId: "agent-1",
+          provider: "prov-1",
+          modelId: "model-1",
+          amountUsd: 0.6
+        });
+        expect(recorded.modelId).toBe("model-1");
+      });
+
+      it("the ownership-mismatch audit event identifies the reservation's authoritative owner across ALL dimensions, never the caller's rejected values", () => {
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 1 }, undefined, auditLog);
+        const reservation = guard.reserve({ taskId: "a", agentId: "owner-agent", provider: "authorized-provider", modelId: "authorized-model" }, 0.5);
+
+        expect(() =>
+          guard.commit(reservation.id, {
+            taskId: "a",
+            agentId: "attacker-agent",
+            provider: "attacker-provider",
+            modelId: "attacker-model",
+            amountUsd: 0.5
+          })
+        ).toThrow(ReservationOwnershipMismatchError);
+
+        const event = auditLog.all().find((e) => e.type === "BUDGET_RESERVATION_OWNERSHIP_MISMATCH");
+        expect(event).toBeDefined();
+        const payload = event!.payload as { reservedScope: { agentId?: string; provider?: string; modelId?: string } };
+        expect(payload.reservedScope.agentId).toBe("owner-agent");
+        expect(payload.reservedScope.provider).toBe("authorized-provider");
+        expect(payload.reservedScope.modelId).toBe("authorized-model");
+      });
+    }
+  );
 });

@@ -31,7 +31,7 @@ import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js"
 import type { ModelRegistry } from "../models/registry.js";
 import { CheapestCapableModelRouter, type RoutingDecision } from "../models/router.js";
 import { CostEngine } from "../cost/cost-engine.js";
-import { BudgetGuard, type BudgetLimits } from "../budget/budget.js";
+import { assertValidBudgetLimits, BudgetGuard, type BudgetLimits } from "../budget/budget.js";
 import { FileStateStore, type StateStore } from "../state/file-store.js";
 import type { TraceabilityIssue } from "../requirements-traceability/traceability.js";
 import { freezeRecord } from "../util/immutable.js";
@@ -127,6 +127,25 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   const risk = input.risk ?? 1;
   const budgetGuardLimits: BudgetLimits = budgetLimits ? freezeRecord({ ...budgetLimits }) : {};
 
+  // P2 fix (13th independent review round, "bootstrap validates budget
+  // limits after filesystem mutation"): Codex reproduced
+  // `perTaskUsd: NaN` ultimately being rejected (InvalidBudgetLimitError)
+  // — but only once `new BudgetGuard(costEngine, budgetGuardLimits)` ran,
+  // by which point `scaffoldProjectOs()` (below) had ALREADY created 24
+  // real directories on disk. Invalid security/cost configuration must
+  // fail BEFORE any external side effect (filesystem writes included),
+  // not merely before the first SPEND — discovering the ceiling is
+  // malformed after mutating the filesystem is itself a "no claim without
+  // evidence"/fail-closed violation, independent of whether any money was
+  // ever actually spent. Fixed: `budgetGuardLimits` is validated via the
+  // SAME rule `BudgetGuard`'s own constructor uses
+  // (`assertValidBudgetLimits`, exported from runtime/budget/budget.ts
+  // for exactly this purpose) immediately after it is captured — still
+  // before `parseProjectGenome()`/`assertFilesystemConfinement()`/
+  // `gateway.authorize(() => scaffoldProjectOs(...))`, i.e. before this
+  // function's FIRST filesystem mutation of any kind.
+  assertValidBudgetLimits(budgetGuardLimits);
+
   // PROJECT ID -> VALIDATE (parseProjectGenome, assertValidProjectId içinde
   // çağrılır) -> RESOLVE BASE DIRECTORY -> RESOLVE PROJECT DESTINATION ->
   // VERIFY DESTINATION IS INSIDE BASE -> POLICY / CAPABILITY CHECK -> ONLY
@@ -141,6 +160,34 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   assertFilesystemConfinement(baseDir, genome.project.id);
   const organization = composeOrganizationFromGenome(genome, risk);
 
+  // P2 fix (13th independent review round targeted audit, same class as
+  // the budgetGuardLimits validation-ordering fix above): `selectModel()`
+  // (a pure computation — no side effects, no policy dependency) and a
+  // non-mutating `assertWithinBudget()` pre-check both used to run AFTER
+  // `scaffoldProjectOs()` had already created real directories on disk —
+  // a registry with no "summarization"-capable model (NoCapableModelError)
+  // or a budget too tight for that specific model's real cost
+  // (BudgetExceededError) would still reject the WHOLE bootstrap, but only
+  // after wasting the scaffold. Neither check depends on the scaffold's
+  // own output, so both now run BEFORE it. The AUTHORITATIVE `budget.spend()`
+  // call deliberately stays AFTER the policy-gated scaffold (bkz. aşağıda)
+  // — this pre-check is a non-mutating, fail-fast OPTIMIZATION only; it
+  // does not reserve anything, so it does not change (and cannot weaken)
+  // the existing "a policy DENY blocks spend too" property that the real
+  // `spend()` call's position already provides.
+  const router = new CheapestCapableModelRouter(modelRegistry);
+  const modelDecision = router.selectModel({
+    taskId: `bootstrap:${genome.project.id}`,
+    risk: 0,
+    requiredCapabilities: ["summarization"]
+  });
+  const costEngine = callerCostEngine ?? new CostEngine();
+  const budget = new BudgetGuard(costEngine, budgetGuardLimits);
+  budget.assertWithinBudget(
+    { taskId: `bootstrap:${genome.project.id}`, projectId: genome.project.id },
+    modelDecision.model.costPerCall
+  );
+
   const gateway = new CapabilityGateway(policy);
   const scaffold = await gateway.authorize(
     {
@@ -151,15 +198,6 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     () => scaffoldProjectOs(baseDir, genome.project.id)
   );
 
-  const router = new CheapestCapableModelRouter(modelRegistry);
-  const modelDecision = router.selectModel({
-    taskId: `bootstrap:${genome.project.id}`,
-    risk: 0,
-    requiredCapabilities: ["summarization"]
-  });
-
-  const costEngine = callerCostEngine ?? new CostEngine();
-  const budget = new BudgetGuard(costEngine, budgetGuardLimits);
   budget.spend({
     taskId: `bootstrap:${genome.project.id}`,
     projectId: genome.project.id,

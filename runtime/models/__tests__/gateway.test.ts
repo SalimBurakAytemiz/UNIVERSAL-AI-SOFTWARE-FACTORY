@@ -31,15 +31,46 @@ class ControllableProvider implements ModelProvider {
   invocationCount = 0;
   /** A snapshot of exactly what `model` looked like AT THE MOMENT this provider was called, for each call. */
   receivedModels: ModelRecord[] = [];
+  /**
+   * A snapshot of exactly what `request` looked like AT RESOLVE TIME (not
+   * invocation time) — i.e. a LAZY read, deliberately mirroring how a real
+   * provider adapter might hold onto its `request` reference and read its
+   * fields only once its own internal (network) work completes, rather
+   * than copying it immediately when `invoke()` is first called. This is
+   * the ONLY timing that can actually observe a caller's mutation racing
+   * a pending call: a copy taken synchronously at invoke()-call time
+   * (before the test's own mutation line even runs) would trivially
+   * "pass" regardless of whether the gateway snapshots `request` or not,
+   * since JS guarantees `invoke()`'s synchronous prefix (up to its first
+   * genuine suspension point) always completes before a caller-scheduled
+   * mutation can run.
+   */
+  receivedRequests: ModelInvocationRequest[] = [];
+  /**
+   * P1 fix (13th independent review round, "provider/model identity can
+   * still change accounting and audit evidence"): when set, this
+   * simulates a misbehaving/compromised provider adapter whose RESPONSE
+   * carries a DIFFERENT modelId/provider than the model it was actually
+   * invoked with — used to prove the gateway never trusts a response's
+   * own identity fields for accounting.
+   */
+  forgedResponseIdentity?: { modelId?: string; provider?: string };
   private pending: Array<() => void> = [];
 
-  async invoke(model: ModelRecord, _request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+  async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
     this.invocationCount++;
     this.receivedModels.push({ ...model, capabilities: [...model.capabilities] });
     return new Promise((resolve) => {
-      this.pending.push(() =>
-        resolve({ modelId: model.modelId, provider: model.provider, costUsd: model.costPerCall, output: "controllable-output" })
-      );
+      this.pending.push(() => {
+        // LAZY read of `request` — see `receivedRequests`' doc comment.
+        this.receivedRequests.push({ ...request });
+        resolve({
+          modelId: this.forgedResponseIdentity?.modelId ?? model.modelId,
+          provider: this.forgedResponseIdentity?.provider ?? model.provider,
+          costUsd: model.costPerCall,
+          output: `controllable-output:${request.prompt}`
+        });
+      });
     });
   }
 
@@ -769,6 +800,208 @@ describe("ModelGateway + MockProvider", () => {
         expect(r2.modelId).toBe("second-model");
         expect(r2.costUsd).toBe(0.35);
         expect(provider.receivedModels.map((m) => m.modelId).sort()).toEqual(["first-model", "second-model"]);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (13th independent review round, 'provider/model identity can still change accounting and audit " +
+      "evidence'): commit() derives provider/modelId from the pre-authorized model snapshot, never from the " +
+      "provider's OWN response",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a provider whose RESPONSE claims a different modelId than the " +
+          "one it was actually invoked with does NOT redefine accounting — cost is recorded under the AUTHORIZED " +
+          "model id",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ControllableProvider();
+          provider.forgedResponseIdentity = { modelId: "forged-model" };
+          gateway.registerProvider(provider);
+          const costEngine = new CostEngine();
+          const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+          const model = mockModel({ provider: "controllable", modelId: "authorized-model", costPerCall: 0.4 });
+
+          const responsePromise = gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget,
+            risk: 0,
+            taskId: "t1"
+          });
+          provider.resolveAll();
+          const response = await responsePromise;
+
+          // The raw response the caller sees may still surface the
+          // provider's own claim...
+          expect(response.modelId).toBe("forged-model");
+          // ...but the durable, authoritative accounting record is keyed
+          // by the AUTHORIZED identity, never the provider's claim.
+          expect(costEngine.all()[0]!.modelId).toBe("authorized-model");
+          expect(costEngine.totalFor({})).toBe(0.4);
+        }
+      );
+
+      it("a provider whose RESPONSE claims a different provider id does NOT redefine accounting ownership", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        provider.forgedResponseIdentity = { provider: "forged-provider" };
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const model = mockModel({ provider: "controllable", modelId: "m1", costPerCall: 0.3 });
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" });
+        provider.resolveAll();
+        await responsePromise;
+
+        expect(costEngine.all()[0]!.provider).toBe("controllable");
+      });
+
+      it("reconciliation (commit) uses the authorized identity even when the response identity differs — no ReservationOwnershipMismatchError is ever raised by a forged response", async () => {
+        // The reservation is created with the AUTHORIZED model's own
+        // provider/modelId (gateway.ts passes authorizedModel.provider/
+        // .modelId to budget.reserve()) and commit() is likewise called
+        // with authorizedModel's identity — so a forged response identity
+        // never even reaches budget.ts's ownership-mismatch check; it is
+        // filtered out at the gateway boundary itself, which is the
+        // authoritative fix location per the review's required invariant.
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        provider.forgedResponseIdentity = { modelId: "forged-model", provider: "forged-provider" };
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const model = mockModel({ provider: "controllable", modelId: "m1", costPerCall: 0.3 });
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" });
+        provider.resolveAll();
+        await expect(responsePromise).resolves.toBeDefined();
+        expect(costEngine.all()).toHaveLength(1);
+        expect(costEngine.all()[0]!.modelId).toBe("m1");
+        expect(costEngine.all()[0]!.provider).toBe("controllable");
+      });
+
+      it("audit/policy evidence references the authorized identity, unaffected by a forged provider response", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        provider.forgedResponseIdentity = { modelId: "forged-model" };
+        gateway.registerProvider(provider);
+        const policy = permissivePolicy();
+        const budget = permissiveBudget();
+        const model = mockModel({ provider: "controllable", modelId: "audited-model", costPerCall: 0.1 });
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, { policy, budget, risk: 0, taskId: "t1" });
+        provider.resolveAll();
+        await responsePromise;
+
+        const policyEvent = policy.auditTrail.all().find((e) => e.type === "POLICY_DECISION");
+        expect(policyEvent).toBeDefined();
+        expect((policyEvent!.payload as { action: { description: string } }).action.description).toContain(
+          "audited-model"
+        );
+      });
+
+      it("concurrent invocations against the same provider each keep their OWN authorized identity, even when the provider forges the SAME response identity for both", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        provider.forgedResponseIdentity = { modelId: "forged-shared-model" };
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const policy = permissivePolicy();
+
+        const p1 = gateway.invoke(mockModel({ provider: "controllable", modelId: "model-a", costPerCall: 0.2 }), { prompt: "x" }, {
+          policy,
+          budget,
+          risk: 0,
+          taskId: "task-a"
+        });
+        const p2 = gateway.invoke(mockModel({ provider: "controllable", modelId: "model-b", costPerCall: 0.3 }), { prompt: "x" }, {
+          policy,
+          budget,
+          risk: 0,
+          taskId: "task-b"
+        });
+
+        provider.resolveAll();
+        await Promise.all([p1, p2]);
+
+        expect(costEngine.all().map((e) => e.modelId).sort()).toEqual(["model-a", "model-b"]);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (13th independent review round, 'invocation payload remains caller-mutable during execution'): " +
+      "invoke() passes a frozen, detached authorizedRequest snapshot into the provider boundary — never the " +
+      "caller-owned mutable request object",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: mutating request.prompt WHILE the provider call is pending has " +
+          "ZERO effect — the provider receives the ORIGINAL prompt",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ControllableProvider();
+          gateway.registerProvider(provider);
+          const budget = permissiveBudget();
+          const model = mockModel({ provider: "controllable" });
+
+          const mutableRequest: { prompt: string; taskType?: string } = { prompt: "original prompt" };
+          const responsePromise = gateway.invoke(model, mutableRequest, {
+            policy: permissivePolicy(),
+            budget,
+            risk: 0,
+            taskId: "t1"
+          });
+
+          mutableRequest.prompt = "attacker-controlled replacement prompt";
+
+          provider.resolveAll();
+          await responsePromise;
+
+          expect(provider.receivedRequests[0]!.prompt).toBe("original prompt");
+        }
+      );
+
+      it("mutating request.taskType WHILE pending has zero effect — the provider receives the ORIGINAL taskType", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const budget = permissiveBudget();
+        const model = mockModel({ provider: "controllable" });
+
+        const mutableRequest: { prompt: string; taskType?: string } = { prompt: "x", taskType: "original-type" };
+        const responsePromise = gateway.invoke(model, mutableRequest, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "t1"
+        });
+
+        mutableRequest.taskType = "swapped-type";
+
+        provider.resolveAll();
+        await responsePromise;
+
+        expect(provider.receivedRequests[0]!.taskType).toBe("original-type");
+      });
+
+      it("concurrent reuse of one caller-owned request object across two invocations cannot cross-contaminate their payloads", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const budget = permissiveBudget();
+        const policy = permissivePolicy();
+
+        const sharedRequest: { prompt: string } = { prompt: "first prompt" };
+        const p1 = gateway.invoke(mockModel({ provider: "controllable" }), sharedRequest, { policy, budget, risk: 0, taskId: "first" });
+        sharedRequest.prompt = "second prompt";
+        const p2 = gateway.invoke(mockModel({ provider: "controllable" }), sharedRequest, { policy, budget, risk: 0, taskId: "second" });
+
+        provider.resolveAll();
+        await Promise.all([p1, p2]);
+
+        expect(provider.receivedRequests.map((r) => r.prompt).sort()).toEqual(["first prompt", "second prompt"]);
       });
     }
   );

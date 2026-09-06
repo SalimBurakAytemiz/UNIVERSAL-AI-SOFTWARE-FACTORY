@@ -174,6 +174,34 @@ export class ModelGateway {
    * what gets passed to `#rawInvoke()`. `capabilities` is an array field;
    * `freezeRecord` freezes a COPY of it too, so `model.capabilities.push(...)`
    * afterward cannot even reach the snapshot's array.
+   *
+   * P1 fix (13th independent review round, "provider/model identity can
+   * still change accounting and audit evidence"): the 12th round's fix
+   * above closed the gap for the ACTUAL PROVIDER CALL (`#rawInvoke` now
+   * receives `authorizedModel`), but `commit()` (below) was STILL called
+   * with `provider: response.provider, modelId: response.modelId` — i.e.
+   * the IDENTITY FIELDS of the raw response the provider itself returned,
+   * not the authorized identity that was reserved. Since `response` comes
+   * from an external `ModelProvider.invoke()` implementation (untrusted
+   * from this class's point of view — a misbehaving or compromised
+   * provider adapter could return ANY `modelId`/`provider` string it
+   * likes), accounting/audit/reconciliation could be silently redefined
+   * by the PROVIDER'S OWN RETURN VALUE even with the model-mutation gap
+   * closed. The required invariant is: AUTHORIZE one identity -> INVOKE
+   * that identity -> ACCOUNT that SAME identity -> RECONCILE that SAME
+   * identity -> AUDIT that SAME identity — no response object may
+   * redefine it. Fixed: `commit()` is now called with
+   * `provider: authorizedModel.provider, modelId: authorizedModel.modelId`
+   * — the PRE-AUTHORIZED snapshot — never `response.provider`/
+   * `response.modelId`. `response.costUsd` is still used for the actual
+   * dollar AMOUNT (a provider legitimately reports what a call actually
+   * cost; that is not an identity field), but a provider can no longer
+   * redirect WHOSE ledger that amount lands on. `authorizedModel.provider`/
+   * `.modelId` are also now passed to `budget.reserve()` (see below), so
+   * `commit()`'s own ownership-mismatch check (runtime/budget/budget.ts)
+   * independently re-verifies this at the reservation layer too —
+   * defense in depth, not reliance on this call site alone getting it
+   * right.
    */
   async invoke(
     model: ModelRecord,
@@ -185,6 +213,20 @@ export class ModelGateway {
     // `model` parametresinin KENDİSİ bir daha ASLA okunmaz/geçirilmez;
     // sadece `authorizedModel` kullanılır.
     const authorizedModel: ModelRecord = freezeRecord({ ...model });
+
+    // P1 fix (13th independent review round, "invocation payload remains
+    // caller-mutable during execution"): Codex reproduced `request`
+    // (prompt/taskType) being passed DIRECTLY into `#rawInvoke(model,
+    // request)` with no snapshot of its own — a caller mutating
+    // `request.prompt`/`.taskType` WHILE the provider call was pending
+    // (the SAME microtask-ordering scenario proven for `model` above)
+    // could make a replacement payload execute under the authorization/
+    // budget already reserved for the ORIGINAL prompt. Fixed the same
+    // way: `request` is copied into a frozen, detached `authorizedRequest`
+    // in this same synchronous prefix, before any await, and
+    // `authorizedRequest` (never the original `request` parameter) is
+    // what gets passed to `#rawInvoke()`.
+    const authorizedRequest: ModelInvocationRequest = freezeRecord({ ...request });
 
     // Herhangi bir asenkron iş (hatta CapabilityGateway.authorize()'ın
     // KENDİSİ) başlamadan ÖNCE: yetkili sahiplik anlık görüntüsü.
@@ -230,14 +272,27 @@ export class ModelGateway {
         // olarak ayrılır — 10th independent review round fix, bkz.
         // runtime/budget/budget.ts'deki `reserve()` notu. Yetersiz bütçe,
         // hiçbir provider çağrısı yapılmadan reddeder (fail closed).
+        // P1 fix (13th independent review round, "reservation ownership
+        // checks omit agent identity" / "provider/model identity can
+        // still change accounting"): `provider`/`modelId` are now part of
+        // what's reserved too (from `authorizedModel`, the pre-authorized
+        // snapshot) — `budget.ts`'s `commit()` independently validates
+        // these against what is ACTUALLY committed, so even if this call
+        // site's own commit() call below were ever changed incorrectly,
+        // the reservation layer itself still fails closed.
         const reservation = budget.reserve(
-          { taskId: executionScope.taskId, projectId: executionScope.projectId },
+          {
+            taskId: executionScope.taskId,
+            projectId: executionScope.projectId,
+            provider: authorizedModel.provider,
+            modelId: authorizedModel.modelId
+          },
           executionScope.costPerCallUsd
         );
 
         let response: ModelInvocationResponse;
         try {
-          response = await this.#rawInvoke(authorizedModel, request);
+          response = await this.#rawInvoke(authorizedModel, authorizedRequest);
         } catch (err) {
           // Belgelenen mutabakat kuralı: provider hata fırlatırsa hiçbir
           // gerçek maliyet oluşmadığı varsayılır, rezervasyon TAMAMEN
@@ -253,12 +308,19 @@ export class ModelGateway {
         // anlık görüntüsünden okunur (bkz. yukarıdaki fix notu) — bu
         // await'ten SONRA çağıranın `context`'i mutasyona uğramış olsa
         // bile, mutabakat HER ZAMAN rezervasyonun sahibiyle AYNI kapsamı
-        // kullanır.
+        // kullanır. P1 fix (13th independent review round, "provider/model
+        // identity can still change accounting and audit evidence"):
+        // `provider`/`modelId` are now taken from `authorizedModel` (the
+        // PRE-AUTHORIZED identity snapshot), NOT from `response.provider`/
+        // `response.modelId` — a provider adapter's own return value can
+        // no longer redefine WHOSE ledger a cost lands on, even though its
+        // reported `costUsd` (a legitimate actual-amount value, not an
+        // identity field) is still used for the dollar amount recorded.
         budget.commit(reservation.id, {
           taskId: executionScope.taskId,
           projectId: executionScope.projectId,
-          provider: response.provider,
-          modelId: response.modelId,
+          provider: authorizedModel.provider,
+          modelId: authorizedModel.modelId,
           amountUsd: response.costUsd
         });
 

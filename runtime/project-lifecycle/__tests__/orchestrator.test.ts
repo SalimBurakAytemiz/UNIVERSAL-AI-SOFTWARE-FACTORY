@@ -11,7 +11,7 @@ import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
 import { FileStateStore, type StateStore } from "../../state/file-store.js";
 import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
 import { CostEngine } from "../../cost/cost-engine.js";
-import { BudgetExceededError, type BudgetLimits } from "../../budget/budget.js";
+import { BudgetExceededError, InvalidBudgetLimitError, type BudgetLimits } from "../../budget/budget.js";
 import type { TraceabilityIssue } from "../../requirements-traceability/traceability.js";
 
 function validGenome(id: string) {
@@ -737,6 +737,263 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
 
         rmSync(rootA, { recursive: true, force: true });
         rmSync(rootB, { recursive: true, force: true });
+      });
+    }
+  );
+
+  describe(
+    "P2 fix (13th independent review round, 'bootstrap validates budget limits after filesystem mutation'): " +
+      "budgetGuardLimits is validated via assertValidBudgetLimits() BEFORE parseProjectGenome()/" +
+      "assertFilesystemConfinement()/scaffoldProjectOs() — i.e. before this function's FIRST filesystem mutation",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: perTaskUsd: NaN is rejected with InvalidBudgetLimitError and " +
+          "creates ZERO filesystem mutations — no project directory is ever scaffolded",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-validate-first-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-nan-budget"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: createDefaultModelRegistry(),
+              budgetLimits: { perTaskUsd: NaN }
+            })
+          ).rejects.toThrow(InvalidBudgetLimitError);
+
+          // Zero filesystem mutations: the base temp directory remains
+          // completely empty — scaffoldProjectOs() never ran.
+          expect(readdirSync(tempRoot)).toHaveLength(0);
+          expect(existsSync(join(tempRoot, "proj-nan-budget"))).toBe(false);
+        }
+      );
+
+      it("Infinity perTaskUsd is rejected with InvalidBudgetLimitError and creates ZERO filesystem mutations", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-validate-first-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-inf-budget"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            budgetLimits: { perRunUsd: Infinity }
+          })
+        ).rejects.toThrow(InvalidBudgetLimitError);
+
+        expect(readdirSync(tempRoot)).toHaveLength(0);
+      });
+
+      it("a negative dailyUsd ceiling is rejected with InvalidBudgetLimitError and creates ZERO filesystem mutations", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-validate-first-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-negative-budget"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            budgetLimits: { dailyUsd: -1 }
+          })
+        ).rejects.toThrow(InvalidBudgetLimitError);
+
+        expect(readdirSync(tempRoot)).toHaveLength(0);
+      });
+
+      it("an invalid monthlyUsd ceiling among otherwise-valid ceilings is still rejected before any mutation", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-validate-first-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-mixed-budget"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            budgetLimits: { perTaskUsd: 5, perRunUsd: 10, monthlyUsd: NaN }
+          })
+        ).rejects.toThrow(InvalidBudgetLimitError);
+
+        expect(readdirSync(tempRoot)).toHaveLength(0);
+      });
+
+      it("a genuinely valid budgetLimits object still creates the FULL expected project structure (no regression)", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-validate-first-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome("proj-valid-budget"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          budgetLimits: { perTaskUsd: 10, perRunUsd: 10, dailyUsd: 10, monthlyUsd: 10 }
+        });
+
+        expect(existsSync(join(tempRoot, "proj-valid-budget"))).toBe(true);
+        expect(result.scaffold.createdDirectories.length).toBeGreaterThan(0);
+      });
+
+      it(
+        "a caller mutating budgetLimits from a genuinely VALID ceiling to an INVALID one WHILE bootstrap is " +
+          "pending has zero effect — validation already ran against the ORIGINAL, valid snapshot before the " +
+          "first filesystem mutation",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-budget-validate-first-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "mock",
+            modelId: "paid-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          const budgetLimits: { perTaskUsd?: number } = { perTaskUsd: 1 };
+          const input: BootstrapProjectInput = {
+            genomeCandidate: validGenome("proj-budget-validate-race"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry,
+            budgetLimits: budgetLimits as BudgetLimits
+          };
+          Promise.resolve().then(() => {
+            // If this were ever consulted by assertValidBudgetLimits(),
+            // an already-in-flight bootstrap would incorrectly fail.
+            budgetLimits.perTaskUsd = NaN;
+          });
+
+          const result = await bootstrapProject(input);
+          expect(result.totalCostUsd).toBe(0.6);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P2 fix (13th independent review round TARGETED AUDIT, same class as the budgetGuardLimits validation-" +
+      "ordering fix above): router.selectModel()/a non-mutating budget.assertWithinBudget() pre-check now both " +
+      "run BEFORE scaffoldProjectOs() — neither depends on the scaffold's own output, so a rejection they cause " +
+      "no longer wastes a real filesystem mutation",
+    () => {
+      it(
+        "AUDIT-FOUND regression: a modelRegistry with no capability-matching model is rejected with " +
+          "NoCapableModelError and creates ZERO filesystem mutations — no orphaned project directory",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-select-before-scaffold-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const emptyRegistry = new ModelRegistry(); // no "summarization" capability at all
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-no-capable-model"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: emptyRegistry
+            })
+          ).rejects.toThrow("No registered model satisfies capabilities");
+
+          expect(readdirSync(tempRoot)).toHaveLength(0);
+        }
+      );
+
+      it(
+        "AUDIT-FOUND regression, exact reproduction: a budget too tight for the selected model's REAL cost is " +
+          "rejected with BudgetExceededError and creates ZERO filesystem mutations",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-select-before-scaffold-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "mock",
+            modelId: "paid-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-too-tight-budget"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: paidRegistry,
+              budgetLimits: { perTaskUsd: 0.1 } // the actual model costs $0.6 — a VALID but insufficient ceiling
+            })
+          ).rejects.toThrow(BudgetExceededError);
+
+          expect(readdirSync(tempRoot)).toHaveLength(0);
+        }
+      );
+
+      it("a policy DENY still blocks BOTH the scaffold AND the spend — the pre-check does not weaken this property", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-select-before-scaffold-"));
+        const policy = new PolicyEngine(); // no rules -> default deny
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-summarizer",
+          tier: "MOCK",
+          costPerCall: 0.6,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+        const costEngine = new CostEngine();
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-deny-with-paid-model"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry,
+            costEngine,
+            budgetLimits: { perTaskUsd: 10 } // ceiling is generous — DENY, not budget, must be what blocks this
+          })
+        ).rejects.toThrow(CapabilityDeniedError);
+
+        expect(readdirSync(tempRoot)).toHaveLength(0);
+        // No spend was ever recorded for a bootstrap that never scaffolded anything.
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("a genuinely valid, sufficiently-budgeted bootstrap still creates the full expected structure (no regression)", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-select-before-scaffold-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-summarizer",
+          tier: "MOCK",
+          costPerCall: 0.6,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome("proj-select-before-scaffold-ok"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: paidRegistry,
+          budgetLimits: { perTaskUsd: 10 }
+        });
+
+        expect(existsSync(join(tempRoot, "proj-select-before-scaffold-ok"))).toBe(true);
+        expect(result.totalCostUsd).toBe(0.6);
       });
     }
   );

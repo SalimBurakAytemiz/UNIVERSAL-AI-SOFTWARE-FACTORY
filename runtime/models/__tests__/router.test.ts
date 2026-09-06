@@ -757,3 +757,207 @@ describe(
     });
   }
 );
+
+describe(
+  "P1 fix (13th independent review round, 'routing drops project ownership'): RoutingRequest.projectId is " +
+    "captured into routingScope and propagated into ModelInvocationContext.projectId on every candidate " +
+    "invocation — initial, every escalation step, and fallback",
+  () => {
+    it(
+      "BLOCKER regression, exact reproduction: a routed invocation for project P/task A, followed by a DIRECT " +
+        "gateway.invoke() for the SAME project/task, share ONE per-task ceiling — the direct call sees the " +
+        "budget the routed call already consumed",
+      async () => {
+        const registry = new ModelRegistry();
+        registry.register({
+          provider: "mock",
+          modelId: "paid-tagger",
+          tier: "MOCK",
+          costPerCall: 0.5,
+          capabilities: ["tagging"],
+          status: "ACTIVE"
+        });
+        const router = new CheapestCapableModelRouter(registry);
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const policy = permissivePolicy();
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perTaskUsd: 0.5 });
+
+        // Routed invocation, carrying project ownership via RoutingRequest.projectId.
+        await router.routeAndExecute(
+          { taskId: "task-A", projectId: "project-P", risk: 0, requiredCapabilities: ["tagging"] },
+          gateway,
+          { prompt: "x" },
+          () => true,
+          policy,
+          budget
+        );
+        expect(costEngine.totalFor({ taskId: "task-A", projectId: "project-P" })).toBe(0.5);
+
+        // A DIRECT (non-routed) invocation for the SAME project/task must
+        // see the ceiling ALREADY consumed by the routed call above — if
+        // routing had dropped project ownership (recording the first
+        // spend under taskId ALONE), this direct call's project+task-
+        // scoped check would wrongly see $0 already spent and let a
+        // SECOND $0.5 through against what should be a single shared
+        // $0.5 ceiling.
+        const model = registry.findCapable(["tagging"])[0]!;
+        await expect(
+          gateway.invoke(model, { prompt: "y" }, { policy, budget, risk: 0, taskId: "task-A", projectId: "project-P" })
+        ).rejects.toThrow(BudgetExceededError);
+      }
+    );
+
+    it(
+      "BLOCKER regression: two routed invocations for DIFFERENT projects sharing the SAME taskId use INDEPENDENT " +
+        "per-project ceilings — routing must not silently downgrade project+task ownership into task-only ownership",
+      async () => {
+        const registry = new ModelRegistry();
+        registry.register({
+          provider: "mock",
+          modelId: "shared-task-model",
+          tier: "MOCK",
+          costPerCall: 0.4,
+          capabilities: ["tagging"],
+          status: "ACTIVE"
+        });
+        const router = new CheapestCapableModelRouter(registry);
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const policy = permissivePolicy();
+        const costEngine = new CostEngine();
+        // Exactly enough for ONE $0.4 spend PER project+task — if project
+        // ownership were dropped, both calls would collapse onto the SAME
+        // task-only ceiling and the second would be wrongly rejected.
+        const budget = new BudgetGuard(costEngine, { perTaskUsd: 0.4 });
+
+        const resultA = await router.routeAndExecute(
+          { taskId: "shared-task", projectId: "project-A", risk: 0, requiredCapabilities: ["tagging"] },
+          gateway,
+          { prompt: "x" },
+          () => true,
+          policy,
+          budget
+        );
+        const resultB = await router.routeAndExecute(
+          { taskId: "shared-task", projectId: "project-B", risk: 0, requiredCapabilities: ["tagging"] },
+          gateway,
+          { prompt: "x" },
+          () => true,
+          policy,
+          budget
+        );
+
+        expect(resultA.response.costUsd).toBe(0.4);
+        expect(resultB.response.costUsd).toBe(0.4);
+        expect(costEngine.totalFor({ projectId: "project-A" })).toBe(0.4);
+        expect(costEngine.totalFor({ projectId: "project-B" })).toBe(0.4);
+      }
+    );
+
+    it("project identity survives escalation/retry/fallback — every candidate's cost, at every tier, is accounted under the SAME project", async () => {
+      const { router, gateway, policy } = setupThreeTierEscalationScenario();
+      const costEngine = new CostEngine();
+      const budget = new BudgetGuard(costEngine, { perRunUsd: 100 });
+      const validate = vi.fn(() => false); // escalate through every tier
+
+      await expect(
+        router.routeAndExecute(
+          { taskId: "t-project-escalation", projectId: "project-Q", risk: 0, requiredCapabilities: ["escalation-capability"] },
+          gateway,
+          { prompt: "x" },
+          validate,
+          policy,
+          budget,
+          { allowPremiumFallback: true }
+        )
+      ).rejects.toThrow(EscalationExhaustedError);
+
+      // tier-mock ($0) + tier-premium ($0.5) + tier-critical ($2), ALL under project-Q — including the two
+      // escalation/fallback steps that only ever run AFTER the initial candidate's own validation failure.
+      expect(costEngine.totalFor({ projectId: "project-Q" })).toBeCloseTo(2.5);
+    });
+
+    it("omitting projectId (the pre-existing, still-supported project-agnostic use case) continues to scope the ceiling by taskId alone — no regression for callers that never had a project", async () => {
+      const { router, gateway, policy, budget, costEngine } = setup();
+      const result = await router.routeAndExecute(
+        { taskId: "no-project-task", risk: 0, requiredCapabilities: ["tagging"] },
+        gateway,
+        { prompt: "x" },
+        () => true,
+        policy,
+        budget
+      );
+      expect(result.decision.model.modelId).toBe("mock-classifier");
+      expect(costEngine.totalFor({ taskId: "no-project-task" })).toBe(0);
+    });
+  }
+);
+
+describe(
+  "P1 fix (13th independent review round, 'invocation payload remains caller-mutable during execution'): " +
+    "routeAndExecute() snapshots invocationRequest into a frozen invocationScope BEFORE the first await, and " +
+    "every escalation/fallback step uses ONLY that snapshot",
+  () => {
+    it(
+      "BLOCKER regression: mutating invocationRequest.prompt WHILE the initial candidate is pending has no " +
+        "effect on a LATER escalation attempt — the escalated response reflects the ORIGINAL prompt",
+      async () => {
+        const { router, gateway, policy, budget } = setupThreeTierEscalationScenario();
+        const validate = vi.fn((response: ModelInvocationResponse) => response.modelId === "tier-premium");
+
+        const invocationRequest: { prompt: string } = { prompt: "original-prompt" };
+        // Scheduled BEFORE calling routeAndExecute() — by the time the
+        // escalation loop's SECOND invokeAuthorized() call runs (strictly
+        // after the FIRST candidate's own await has resolved), this
+        // microtask has already fired, so this is the ordering most
+        // favorable to a caller actually winning such a race.
+        Promise.resolve().then(() => {
+          invocationRequest.prompt = "attacker-controlled-replacement-prompt";
+        });
+
+        const result = await router.routeAndExecute(
+          { taskId: "t-payload-mutation", risk: 0, requiredCapabilities: ["escalation-capability"] },
+          gateway,
+          invocationRequest,
+          validate,
+          policy,
+          budget,
+          { allowPremiumFallback: true }
+        );
+
+        expect(result.decision.model.modelId).toBe("tier-premium");
+        expect(result.response.output).toContain("original-prompt");
+        expect(result.response.output).not.toContain("attacker-controlled-replacement-prompt");
+      }
+    );
+
+    it("concurrent routeAndExecute() calls sharing ONE caller-owned invocationRequest object cannot cross-contaminate their payloads", async () => {
+      const { router, gateway, policy, budget } = setup();
+
+      const sharedInvocationRequest: { prompt: string } = { prompt: "first-prompt" };
+      const p1 = router.routeAndExecute(
+        { taskId: "payload-shared-1", risk: 0, requiredCapabilities: ["tagging"] },
+        gateway,
+        sharedInvocationRequest,
+        () => true,
+        policy,
+        budget
+      );
+      sharedInvocationRequest.prompt = "second-prompt";
+      const p2 = router.routeAndExecute(
+        { taskId: "payload-shared-2", risk: 0, requiredCapabilities: ["tagging"] },
+        gateway,
+        sharedInvocationRequest,
+        () => true,
+        policy,
+        budget
+      );
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.response.output).toContain("first-prompt");
+      expect(r2.response.output).toContain("second-prompt");
+    });
+  }
+);

@@ -14,6 +14,28 @@ import { freezeRecord } from "../util/immutable.js";
 
 export interface RoutingRequest {
   readonly taskId: string;
+  /**
+   * P1 fix (13th independent review round, "routing drops project
+   * ownership"): `RoutingRequest` used to carry NO project identity field
+   * at all — only `taskId` — so a project-bearing invocation routed
+   * through `routeAndExecute()` was authorized/accounted under `taskId`
+   * ALONE, and `runtime/budget/budget.ts`'s `perTaskUsd` ceiling (whose
+   * documented scoping rule, bölüm 70-72, is `projectId + taskId` WHEN a
+   * projectId is present) silently degraded to task-only scoping for
+   * every routed invocation, regardless of whether the caller actually
+   * had a project in mind. Codex reproduced: a project-bearing invocation
+   * routed without its project, followed by a SECOND, direct invocation
+   * for the SAME project/task, both succeeding against what should have
+   * been a single shared per-task ceiling. `projectId` is now an optional
+   * field here, captured into the SAME frozen `routingScope` snapshot as
+   * every other routing field (bkz. `routeAndExecute()`'s fix note) and
+   * propagated into `ModelInvocationContext.projectId` on EVERY candidate
+   * invocation — initial, every escalation step, and fallback — so
+   * project ownership survives the entire routing/policy/reservation/
+   * invocation/reconciliation/audit path exactly the way `gateway.invoke()`
+   * already required it to for a DIRECT (non-routed) caller.
+   */
+  readonly projectId?: string;
   /** 0 = trivial, 5 = critical. Mirrors PolicyAction.risk in the policy engine. */
   readonly risk: 0 | 1 | 2 | 3 | 4 | 5;
   readonly requiredCapabilities: readonly string[];
@@ -148,6 +170,11 @@ export class CheapestCapableModelRouter {
       budget,
       risk: request.risk,
       taskId: request.taskId,
+      // P1 fix (13th independent review round, "routing drops project
+      // ownership"): this used to omit `projectId` entirely, even though
+      // `ModelInvocationContext` has always supported it — see
+      // `RoutingRequest.projectId`'s fix note above.
+      projectId: request.projectId,
       description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`
     });
   }
@@ -196,6 +223,26 @@ export class CheapestCapableModelRouter {
    * holds regardless of scheduling, because JS guarantees an async
    * function's synchronous prefix runs to completion before any
    * caller-scheduled microtask can interleave.
+   *
+   * P1 fix (13th independent review round, "invocation payload remains
+   * caller-mutable during execution"): Codex reproduced `invocationRequest`
+   * (the model prompt/taskType payload — a SEPARATE object from
+   * `request`/`routingScope`, which only carries routing METADATA) being
+   * passed, completely unsnapshotted, to EVERY `invokeAuthorized()` call
+   * this method makes — the initial candidate AND every escalation/
+   * fallback step. `gateway.invoke()` itself now protects a single call
+   * against a mutation racing its OWN pending provider call (bkz.
+   * gateway.ts's `authorizedRequest` fix), but that does not protect
+   * ACROSS retries: a caller mutating `invocationRequest.prompt` between
+   * this method's own sequential `await`ed escalation steps could make a
+   * LATER escalation attempt execute a different payload than the one the
+   * FIRST attempt (and this method's caller) actually authorized. Fixed:
+   * `invocationRequest` is captured into a frozen `invocationScope`
+   * snapshot in the SAME synchronous prefix as `routingScope`, before the
+   * first `selectModel()`/`invokeAuthorized()` call, and `invocationScope`
+   * (never the original `invocationRequest` parameter) is what every
+   * candidate — initial, every escalation step, and fallback — actually
+   * receives.
    */
   async routeAndExecute(
     request: RoutingRequest,
@@ -213,9 +260,14 @@ export class CheapestCapableModelRouter {
     // parametrelerinin KENDİLERİ bir daha ASLA okunmaz.
     const routingScope: RoutingRequest = freezeRecord({ ...request });
     const allowPremiumFallback = options.allowPremiumFallback ?? false;
+    // `invocationRequest`'in KENDİSİ de aynı şekilde, aynı senkron ön ekte
+    // donmuş bir anlık görüntüye alınır — bkz. yukarıdaki fix notu.
+    // Bundan sonra `invocationRequest` parametresinin KENDİSİ bir daha
+    // ASLA okunmaz; sadece `invocationScope` kullanılır.
+    const invocationScope: ModelInvocationRequest = freezeRecord({ ...invocationRequest });
 
     let decision = this.selectModel(routingScope);
-    let response = await this.invokeAuthorized(decision, routingScope, gateway, invocationRequest, policy, budget);
+    let response = await this.invokeAuthorized(decision, routingScope, gateway, invocationScope, policy, budget);
 
     if (validate(response)) {
       return { response, decision };
@@ -239,7 +291,7 @@ export class CheapestCapableModelRouter {
       }
 
       decision = this.selectModel(routingScope, nextTier);
-      response = await this.invokeAuthorized(decision, routingScope, gateway, invocationRequest, policy, budget);
+      response = await this.invokeAuthorized(decision, routingScope, gateway, invocationScope, policy, budget);
 
       if (validate(response)) {
         return { response, decision };
