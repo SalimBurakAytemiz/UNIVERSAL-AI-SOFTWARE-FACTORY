@@ -8,7 +8,6 @@
 
 import { ModelGateway, type ModelInvocationRequest, type ModelInvocationResponse } from "./gateway.js";
 import { ModelRegistry, TIER_ORDER, tierRank, type ModelRecord, type ModelTier } from "./registry.js";
-import { CapabilityGateway } from "../capability-gateway/gateway.js";
 import type { PolicyEngine } from "../policy-engine/policy-engine.js";
 import type { BudgetGuard } from "../budget/budget.js";
 
@@ -124,16 +123,22 @@ export class CheapestCapableModelRouter {
    * router-only wrapper could always be bypassed by any OTHER caller with
    * direct access to the gateway (exactly what the e2e proof did). This
    * method is now a thin adapter: it builds the `ModelInvocationContext`
-   * and calls the gateway's own guarded `invoke()`, reusing the SAME
-   * `CapabilityGateway` instance across every candidate in one logical
-   * routeAndExecute() call (object reuse only, not a behavior change).
+   * and calls the gateway's own guarded `invoke()`.
+   *
+   * P1 fix (11th independent review round, "supplied capability gateway
+   * can bypass authoritative policy"): this used to also pass a reused
+   * `capabilityGateway` instance through the context — that field has
+   * been REMOVED from `ModelInvocationContext` entirely (see
+   * gateway.ts), since it was a real policy-substitution vector for ANY
+   * caller, even though router.ts itself always built it from the same
+   * `policy` it also passed. `gateway.invoke()` now always constructs its
+   * own `CapabilityGateway` directly from `policy` on every call.
    */
   private async invokeAuthorized(
     decision: RoutingDecision,
     request: RoutingRequest,
     gateway: ModelGateway,
     invocationRequest: ModelInvocationRequest,
-    capabilityGateway: CapabilityGateway,
     policy: PolicyEngine,
     budget: BudgetGuard
   ): Promise<ModelInvocationResponse> {
@@ -142,8 +147,7 @@ export class CheapestCapableModelRouter {
       budget,
       risk: request.risk,
       taskId: request.taskId,
-      description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`,
-      capabilityGateway
+      description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`
     });
   }
 
@@ -173,18 +177,8 @@ export class CheapestCapableModelRouter {
     budget: BudgetGuard,
     options: RouteAndExecuteOptions = {}
   ): Promise<RouteAndExecuteResult> {
-    const capabilityGateway = new CapabilityGateway(policy);
-
     let decision = this.selectModel(request);
-    let response = await this.invokeAuthorized(
-      decision,
-      request,
-      gateway,
-      invocationRequest,
-      capabilityGateway,
-      policy,
-      budget
-    );
+    let response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, policy, budget);
 
     if (validate(response)) {
       return { response, decision };
@@ -208,15 +202,7 @@ export class CheapestCapableModelRouter {
       }
 
       decision = this.selectModel(request, nextTier);
-      response = await this.invokeAuthorized(
-        decision,
-        request,
-        gateway,
-        invocationRequest,
-        capabilityGateway,
-        policy,
-        budget
-      );
+      response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, policy, budget);
 
       if (validate(response)) {
         return { response, decision };

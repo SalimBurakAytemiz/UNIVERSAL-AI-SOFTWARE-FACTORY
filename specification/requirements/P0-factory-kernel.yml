@@ -988,6 +988,77 @@
     was updated to use this same guarded call instead of its previous
     direct gateway.invoke() + manual budget.spend().
 
+    P1 fix (11th independent review round, "supplied capability gateway
+    can bypass authoritative policy"): Codex reproduced `invoke()` PREFERRING
+    a caller-supplied `context.capabilityGateway` over `context.policy` —
+    `capabilityGateway ?? new CapabilityGateway(context.policy)` meant a
+    caller could supply an authoritative, default-DENY `policy` while ALSO
+    supplying a separate `capabilityGateway` backed by an ALLOW-everything
+    policy; `authorize()` used the latter, `context.policy` never ran
+    `evaluate()`, and zero audit events were produced. This is the SAME
+    "atlanabilir bir tasarım" class the original 10th-round fix set out to
+    close — an optional field IS the bypass. Fixed by DELETING the field:
+    `ModelInvocationContext` no longer has a `capabilityGateway` property
+    at all (previously a "reuse the same instance across escalation
+    candidates" optimization with zero behavioral upside, since
+    `CapabilityGateway` is a two-line stateless wrapper); `invoke()` now
+    UNCONDITIONALLY builds `new CapabilityGateway(context.policy)` on
+    every call — there is no code path, type-safe or otherwise, that reads
+    anything else. Regression tests prove: a default-DENY policy cannot be
+    bypassed (including via a `capabilityGateway` property smuggled onto
+    the context object with `as any` — the runtime code simply never
+    reads it, proving this is a genuine deletion of the vulnerable read,
+    not a type-level restriction alone), authoritative policy audit events
+    are always recorded, the happy path (matching, correctly-authorized
+    policy) is unaffected, Risk-5 approval semantics remain enforced, and
+    fallback/escalation execution uses the identical authoritative policy
+    path. Verified via a temporary bypass (reintroducing
+    `(context as unknown as {capabilityGateway?}).capabilityGateway ??
+    new CapabilityGateway(context.policy)`) — the malicious-context test
+    times out waiting for a rejection that the vulnerable code never
+    produces (the ALLOW-backed gateway lets the provider call proceed
+    instead), then reverted. A narrow audit confirmed no other production
+    call site (`runtime/project-lifecycle/orchestrator.ts`, the only other
+    `CapabilityGateway` construction site) accepts an injectable
+    alternative — orchestrator.ts always builds it directly from its own
+    `policy` field with no substitutable field in `BootstrapProjectInput`.
+
+    P1 fix (11th independent review round, "caller context mutation can
+    change cost ownership during invocation"): Codex reproduced
+    reserving cost for project A, then mutating `context.projectId` to B
+    WHILE the (real, awaited) provider call was still pending — because
+    `taskId`/`projectId` were read from `context` separately at reserve()
+    time AND again at commit() time (after the `await`), the mutation
+    landed cost under B despite A owning the reservation, letting a
+    caller silently bypass A's own budget ceiling via repeated calls.
+    Fixed: `invoke()` now captures EVERY ownership-relevant field
+    (taskId, projectId, risk, description, model identity) into a single
+    frozen `executionScope` snapshot (`freezeRecord`) as the FIRST thing
+    it does — before `CapabilityGateway.authorize()` is even constructed,
+    let alone awaited — and captures the `policy`/`budget` object
+    REFERENCES into local `const`s at the same time. Nothing after that
+    point ever reads `context.xxx` again; reservation, the provider call,
+    and reconciliation all use ONLY the snapshot. Because JS guarantees an
+    async function's synchronous prefix runs to completion before any
+    microtask (including one a caller schedules) can interleave, this
+    holds regardless of when or how the caller mutates or replaces its
+    `context` object afterward — even swapping the ENTIRE `policy`/
+    `budget` object references mid-flight has zero effect on the
+    already-running invocation. Regression tests prove: the exact
+    project-A/project-B reproduction now keeps accounting entirely under
+    A, mutating `taskId` mid-invocation doesn't move the reservation,
+    swapping the `policy`/`budget` REFERENCES mid-invocation has no
+    effect, two invocations sharing (and mutating) the SAME context
+    object cannot cross-contaminate each other's execution scope, and
+    policy/audit/budget/cost all reference one consistent scope for a
+    single call. Verified via a temporary bypass (reverting the commit()
+    call to read `context.taskId`/`context.projectId` directly instead of
+    `executionScope`'s) — confirmed exactly the 3 tests exercising this
+    property fail, then reverted. A narrow audit found ONE further
+    genuine instance of the same class in
+    `runtime/project-lifecycle/orchestrator.ts`'s `bootstrapProject()`
+    (see UASF-REQ-0042's notes) and fixed it the same way.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -1509,6 +1580,42 @@
     tests fail against the bypassed code, then reverted. See UASF-REQ-0024
     (Model gateway) for how ModelGateway.invoke() now uses this API as the
     ONLY way any real provider call happens.
+
+    P1 fix (11th independent review round, "failed reconciliation
+    releases reservation before cost is safely recorded"): Codex
+    reproduced `commit()` deleting the reservation FIRST, THEN validating
+    `entry.amountUsd` — a malformed actual amount (NaN, from e.g. a
+    corrupted provider response) failed validation AFTER the reservation
+    was already gone, so no cost was ever recorded, but the budget
+    capacity the reservation was protecting was ALSO silently restored:
+    another full-ceiling reservation could immediately succeed, even
+    though a real (or potentially real) provider call may already have
+    happened for the first one. Fixed by reversing the order:
+    `assertValidMonetaryAmount()` and `costEngine.record()` now run WHILE
+    the reservation is still open; the reservation is deleted ONLY after
+    both have genuinely succeeded. On failure, the reservation is
+    PRESERVED (so it keeps counting via `reservedTotal()` against every
+    ceiling — capacity is never silently freed), a new
+    `BUDGET_RESERVATION_COMMIT_FAILED` audit event is recorded (never
+    silent), and the error is re-thrown (fail closed). Because the
+    reservation stays open, a caller can safely retry `commit()` with a
+    corrected amount using the SAME reservation id — retry is safe by
+    construction, not by convention, since nothing was deleted to make it
+    unsafe. Regression tests prove: NaN/+Infinity/-Infinity/negative
+    actual amounts all fail to release the reservation, another
+    reservation cannot consume the still-protected capacity, retrying
+    commit() with a corrected amount after a failure completes
+    reconciliation exactly once, a commit-failure audit event is always
+    recorded, and concurrent reservations remain safe across a
+    failed-then-retried reconciliation. Verified via a temporary bypass
+    (restoring the old delete-before-validate order) — confirmed exactly
+    7 of 66 budget tests fail against the bypassed code (the ones
+    exercising this exact property), then reverted. A narrow audit of
+    every other `.delete()`/state-removal call site in `runtime/`
+    (`cache.ts`'s TTL eviction on read, `runtime/state/file-store.ts`'s
+    already-atomic write-then-rename) found no other instance of this
+    ordering bug — `approval.ts` mutates status fields in place and never
+    deletes a pending record at all, so it cannot exhibit this class.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -2204,7 +2311,41 @@
   test_refs:
     - "proofs/e2e-p0-kernel/proof.test.ts"
     - "proofs/p0-integrated-flow/proof.test.ts"
+    - "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
   proof_refs:
     - "proofs/e2e-p0-kernel/proof.test.ts"
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
+  notes: >
+    P1 fix (11th independent review round targeted audit, same class as
+    runtime/models/gateway.ts's "caller context mutation can change cost
+    ownership during invocation"): while auditing for other instances of
+    this class, found that `bootstrapProject()` reads
+    `input.modelRegistry`/`input.costEngine`/`input.budgetLimits`/
+    `input.stateStore` from its `input` parameter AFTER its own first
+    `await` (`gateway.authorize(...)`, which — even though the wrapped
+    `scaffoldProjectOs()` call is itself synchronous — still yields at
+    least one genuine microtask tick, per JS async-function semantics). A
+    caller retaining a reference to `input` and scheduling a mutation via
+    another microtask (e.g. `Promise.resolve().then(() => { input.costEngine
+    = attackerControlled })`) could redirect this bootstrap's accounting,
+    model routing, or persisted state to an entirely different,
+    caller-controlled object. Fixed the same way as gateway.ts: every
+    field `bootstrapProject()` needs (`genomeCandidate`, `baseDir`,
+    `policy`, `modelRegistry`, `budgetLimits`, `costEngine`, `stateStore`,
+    `risk`) is destructured into local `const`s as the very FIRST thing
+    the function does — before `parseProjectGenome()`, before anything —
+    and `input.xxx` is never read again afterward. Regression tests prove:
+    mutating `input.costEngine` (via a microtask scheduled BEFORE calling
+    `bootstrapProject()`, the ordering most favorable to a caller actually
+    winning such a race) has zero effect on which CostEngine records the
+    real, non-zero cost of a deliberately non-free test model; the same
+    holds for `input.modelRegistry` (an emptied swapped-in registry would
+    make routing fail entirely if it were ever consulted) and
+    `input.stateStore` (a swapped-in fake store that would have recorded
+    writes stays untouched). Verified via a temporary bypass (reverting
+    the three post-await reads to `input.modelRegistry`/`input.costEngine`/
+    `input.stateStore` directly) — confirmed exactly these 3 new tests
+    fail against the bypassed code (the modelRegistry one throwing
+    NoCapableModelError, the stateStore one recording 3 writes into the
+    fake store instead of 0), then reverted.

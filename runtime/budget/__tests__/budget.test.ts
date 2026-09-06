@@ -722,4 +722,154 @@ describe("BudgetGuard", () => {
       });
     }
   );
+
+  describe(
+    "commit() reconciliation failure handling (P1 fix, 11th independent review round, " +
+      "'failed reconciliation releases reservation before cost is safely recorded')",
+    () => {
+      it("BLOCKER regression, exact reproduction: a NaN actual amount cannot release the reservation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.6 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+
+        // The reservation must still be OPEN — proven by: (1) another
+        // reservation for the SAME protected capacity is still blocked,
+        // and (2) nothing was recorded.
+        expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError);
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("+Infinity actual amount cannot release the reservation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.6 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: Infinity })
+        ).toThrow(InvalidMonetaryAmountError);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError);
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("-Infinity actual amount cannot release the reservation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.6 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: -Infinity })
+        ).toThrow(InvalidMonetaryAmountError);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError);
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("a negative actual amount cannot release the reservation (no implicit credit/refund semantics)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.6 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: -0.1 })
+        ).toThrow(InvalidMonetaryAmountError);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError);
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("another reservation cannot consume the capacity a failed-reconciliation reservation is still protecting", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 1, perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "t1" }, 1.0); // uses the ENTIRE ceiling
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+
+        // A DIFFERENT task attempting to reserve ANY amount against the
+        // shared perRunUsd ceiling must still see the full $1.00 as
+        // occupied — the failed reconciliation must not have silently
+        // freed it.
+        expect(() => guard.reserve({ taskId: "t2" }, 0.01)).toThrow(BudgetExceededError);
+      });
+
+      it("retrying commit() with a corrected amount after a failed attempt safely completes reconciliation exactly once", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+
+        // First attempt fails (e.g. a transient malformed reading).
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+
+        // Retry with the corrected amount, using the SAME reservation id —
+        // this is safe/idempotent because the reservation was never deleted.
+        const recorded = guard.commit(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.6
+        });
+        expect(recorded.amountUsd).toBe(0.6);
+        expect(costEngine.total()).toBe(0.6); // exactly once
+
+        // The reservation is now genuinely closed — a second commit() attempt fails closed.
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(UnknownReservationError);
+        expect(costEngine.total()).toBe(0.6); // still exactly once
+      });
+
+      it("a successful commit() releases the reservation only AFTER cost is safely recorded, freeing capacity for a subsequent reservation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.6 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.01)).toThrow(BudgetExceededError); // fully reserved
+
+        guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        // Recorded cost now occupies the ceiling instead of the reservation
+        // — still fully occupied, but via a real recorded entry, not a
+        // dangling reservation.
+        expect(costEngine.total()).toBe(0.6);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.01)).toThrow(BudgetExceededError);
+      });
+
+      it("a commit-failure audit event is recorded (reconciliation failure is never silent)", () => {
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 1 }, undefined, auditLog);
+        const reservation = guard.reserve({ taskId: "t1" }, 0.5);
+
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+
+        const events = auditLog.all();
+        expect(events.some((e) => e.type === "BUDGET_RESERVATION_COMMIT_FAILED")).toBe(true);
+      });
+
+      it("concurrent reservations remain safe across a failed-then-retried reconciliation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1.2 });
+        const reservationA = guard.reserve({ taskId: "a" }, 0.6);
+        const reservationB = guard.reserve({ taskId: "b" }, 0.6); // exactly fills the ceiling alongside A
+
+        // B's reconciliation fails first.
+        expect(() =>
+          guard.commit(reservationB.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+        // A commits successfully — unaffected by B's still-open, failed reservation.
+        guard.commit(reservationA.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(costEngine.totalFor({ taskId: "a" })).toBe(0.6);
+
+        // B retries successfully afterward.
+        guard.commit(reservationB.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(costEngine.totalFor({ taskId: "b" })).toBe(0.6);
+        expect(costEngine.total()).toBe(1.2);
+      });
+    }
+  );
 });

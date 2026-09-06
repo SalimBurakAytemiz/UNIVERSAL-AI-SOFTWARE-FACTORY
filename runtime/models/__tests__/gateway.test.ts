@@ -3,7 +3,7 @@ import { ModelGateway, UnknownProviderError, type ModelInvocationResponse } from
 import { createDefaultModelRegistry } from "../registry.js";
 import { MockProvider } from "../providers/mock-provider.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
-import { CapabilityDeniedError, CapabilityApprovalRequiredError } from "../../capability-gateway/gateway.js";
+import { CapabilityGateway, CapabilityDeniedError, CapabilityApprovalRequiredError } from "../../capability-gateway/gateway.js";
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetGuard, BudgetExceededError } from "../../budget/budget.js";
 import type { ModelProvider, ModelInvocationRequest } from "../gateway.js";
@@ -289,6 +289,300 @@ describe("ModelGateway + MockProvider", () => {
         // structural, type-level guarantee, verified by `npm run typecheck`
         // failing if this invariant is ever weakened.
         expect(true).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (11th independent review round, 'supplied capability gateway can bypass authoritative policy'): " +
+      "invoke() always builds its OWN CapabilityGateway directly from context.policy — there is no way to " +
+      "inject an alternative one",
+    () => {
+      it("a default-DENY authoritative policy cannot be bypassed — ModelInvocationContext has no field for an alternative gateway/policy", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const denyPolicy = new PolicyEngine(); // no rules at all -> default deny
+
+        const context: { policy: PolicyEngine; budget: BudgetGuard; risk: 0; taskId: string } = {
+          policy: denyPolicy,
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        };
+        // There is no `capabilityGateway` (or any other) field left on
+        // ModelInvocationContext to inject an alternative, ALLOW-everything
+        // authorization object — TypeScript would reject an attempt to add
+        // one (`Object literal may only specify known properties`), and at
+        // the JS level there is no code path in invoke() that reads
+        // anything OTHER than `context.policy` to build its
+        // CapabilityGateway. This test proves the RUNTIME consequence:
+        // the default-DENY policy is genuinely, unconditionally enforced.
+        await expect(gateway.invoke(mockModel({ provider: "controllable" }), { prompt: "x" }, context)).rejects.toThrow(
+          CapabilityDeniedError
+        );
+        expect(provider.invocationCount).toBe(0);
+      });
+
+      it(
+        "no alternative capability gateway path bypasses policy, EVEN via a type-unsafe caller: an extra " +
+          "`capabilityGateway` property wrapping an ALLOW policy, smuggled onto the context object with `as any`, " +
+          "is never read by invoke() at all",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ControllableProvider();
+          gateway.registerProvider(provider);
+          const denyPolicy = new PolicyEngine(); // authoritative, no rules -> default deny
+          const allowPolicy = permissivePolicy();
+
+          // A caller bypassing the type system entirely (`as any`) to smuggle
+          // in exactly the shape the OLD, vulnerable code used to accept.
+          const maliciousContext = {
+            policy: denyPolicy,
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1",
+            capabilityGateway: new CapabilityGateway(allowPolicy)
+          } as unknown as { policy: PolicyEngine; budget: BudgetGuard; risk: 0; taskId: string };
+
+          // Even with the extra property physically present on the object at
+          // runtime, invoke() has no code path that ever reads a
+          // `capabilityGateway` property from its context — this proves the
+          // fix is a genuine deletion of the vulnerable read, not merely a
+          // type-level restriction a careless/malicious caller could evade.
+          await expect(
+            gateway.invoke(mockModel({ provider: "controllable" }), { prompt: "x" }, maliciousContext)
+          ).rejects.toThrow(CapabilityDeniedError);
+          expect(provider.invocationCount).toBe(0);
+          expect(denyPolicy.auditTrail.all().some((e) => e.type === "POLICY_DECISION")).toBe(true);
+        }
+      );
+
+      it("authoritative policy audit events are always recorded, even though invoke() constructs a fresh CapabilityGateway on every call", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const policy = permissivePolicy();
+        expect(policy.auditTrail.all()).toHaveLength(0);
+
+        await gateway.invoke(mockModel(), { prompt: "x" }, { policy, budget: permissiveBudget(), risk: 0, taskId: "t1" });
+
+        const events = policy.auditTrail.all();
+        expect(events.length).toBeGreaterThan(0);
+        expect(events.some((e) => e.type === "POLICY_DECISION")).toBe(true);
+      });
+
+      it("a matching, correctly-authorized policy still works exactly as before (no regression in the happy path)", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const response = await gateway.invoke(mockModel(), { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toContain("x");
+      });
+
+      it("Risk-5 approval semantics remain enforced (the PolicyEngine's own built-in floor, not something a caller-supplied gateway could ever have overridden)", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        await expect(
+          gateway.invoke(mockModel({ provider: "controllable" }), { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 5,
+            taskId: "t1"
+          })
+        ).rejects.toThrow(CapabilityApprovalRequiredError);
+        expect(provider.invocationCount).toBe(0);
+      });
+
+      it("fallback/escalation execution uses the same authoritative policy path — a DENY blocks a fallback candidate exactly like the initial one", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const policy = new PolicyEngine();
+        policy.addRule({ name: "deny-all", priority: 1, evaluate: () => "DENY" });
+
+        // Simulates what router.ts's escalation loop does: multiple
+        // sequential invoke() calls against the SAME policy/budget, no
+        // alternative gateway ever passed for any of them.
+        for (const taskId of ["fallback-1", "fallback-2"]) {
+          await expect(
+            gateway.invoke(mockModel({ provider: "controllable" }), { prompt: "x" }, {
+              policy,
+              budget: permissiveBudget(),
+              risk: 0,
+              taskId
+            })
+          ).rejects.toThrow(CapabilityDeniedError);
+        }
+        expect(provider.invocationCount).toBe(0);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (11th independent review round, 'caller context mutation can change cost ownership during invocation'): " +
+      "invoke() snapshots taskId/projectId/risk/description/model-identity into a frozen executionScope BEFORE any " +
+      "async work, and never re-reads the caller's context object afterward",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: mutating context.projectId from A to B WHILE the provider call " +
+          "is pending has ZERO effect — accounting stays entirely under project A",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ControllableProvider();
+          gateway.registerProvider(provider);
+          const costEngine = new CostEngine();
+          const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+          const model = mockModel({ provider: "controllable", costPerCall: 0.6 });
+
+          // A mutable, caller-owned context object — exactly the shape a
+          // careless (or malicious) caller might reuse/mutate.
+          const mutableContext: { policy: PolicyEngine; budget: BudgetGuard; risk: 0; taskId: string; projectId: string } = {
+            policy: permissivePolicy(),
+            budget,
+            risk: 0,
+            taskId: "shared-task",
+            projectId: "project-A"
+          };
+
+          const responsePromise = gateway.invoke(model, { prompt: "x" }, mutableContext);
+          // Provider call is now pending (ControllableProvider never
+          // resolves until told to) — mutate the SAME object the caller
+          // still holds a reference to.
+          mutableContext.projectId = "project-B";
+
+          provider.resolveAll();
+          await responsePromise;
+
+          expect(costEngine.totalFor({ projectId: "project-A" })).toBe(0.6);
+          expect(costEngine.totalFor({ projectId: "project-B" })).toBe(0);
+        }
+      );
+
+      it("mutating context.taskId during invocation does not affect the active reservation/reconciliation", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perTaskUsd: 10 });
+        const model = mockModel({ provider: "controllable", costPerCall: 0.3 });
+
+        const mutableContext: { policy: PolicyEngine; budget: BudgetGuard; risk: 0; taskId: string } = {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "task-A"
+        };
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, mutableContext);
+        mutableContext.taskId = "task-B";
+        provider.resolveAll();
+        await responsePromise;
+
+        expect(costEngine.totalFor({ taskId: "task-A" })).toBe(0.3);
+        expect(costEngine.totalFor({ taskId: "task-B" })).toBe(0);
+      });
+
+      it("mutating context.policy/context.budget references mid-invocation has no effect — the ORIGINAL instances remain authoritative for this call", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const originalCostEngine = new CostEngine();
+        const originalBudget = new BudgetGuard(originalCostEngine, { perRunUsd: 10 });
+        const originalPolicy = permissivePolicy();
+        const model = mockModel({ provider: "controllable", costPerCall: 0.2 });
+
+        const mutableContext: { policy: PolicyEngine; budget: BudgetGuard; risk: 0; taskId: string } = {
+          policy: originalPolicy,
+          budget: originalBudget,
+          risk: 0,
+          taskId: "t1"
+        };
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, mutableContext);
+
+        // Swap out BOTH the policy and budget object references entirely —
+        // a hostile "replacement" attempt, not just a field edit.
+        const otherCostEngine = new CostEngine();
+        mutableContext.policy = new PolicyEngine(); // default-deny, would throw if re-read
+        mutableContext.budget = new BudgetGuard(otherCostEngine, { perRunUsd: 10 });
+
+        provider.resolveAll();
+        const response = await responsePromise;
+
+        expect(response.costUsd).toBe(0.2);
+        // The cost landed in the ORIGINAL budget's cost engine, never the swapped-in one.
+        expect(originalCostEngine.total()).toBe(0.2);
+        expect(otherCostEngine.total()).toBe(0);
+      });
+
+      it("concurrent reuse of one caller-owned context object across two invocations cannot cross-contaminate their execution scopes", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const model = mockModel({ provider: "controllable", costPerCall: 0.25 });
+        const policy = permissivePolicy();
+
+        // The SAME mutable object is handed to two DIFFERENT invoke() calls
+        // (e.g. a naive caller reusing one "current request" object).
+        const sharedContext: { policy: PolicyEngine; budget: BudgetGuard; risk: 0; taskId: string; projectId?: string } = {
+          policy,
+          budget,
+          risk: 0,
+          taskId: "first",
+          projectId: "project-1"
+        };
+        const p1 = gateway.invoke(model, { prompt: "x" }, sharedContext);
+        // Mutate in place before issuing the second call — each call must
+        // still resolve to its OWN synchronous-prefix snapshot.
+        sharedContext.taskId = "second";
+        sharedContext.projectId = "project-2";
+        const p2 = gateway.invoke(model, { prompt: "x" }, sharedContext);
+
+        provider.resolveAll();
+        await Promise.all([p1, p2]);
+
+        expect(costEngine.totalFor({ taskId: "first", projectId: "project-1" })).toBe(0.25);
+        expect(costEngine.totalFor({ taskId: "second", projectId: "project-2" })).toBe(0.25);
+      });
+
+      it("policy/audit/budget/cost all reference ONE consistent execution scope for a single invocation", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perTaskUsd: 10 });
+        const policy = permissivePolicy();
+        const model = mockModel({ costPerCall: 0.15 });
+
+        await gateway.invoke(model, { prompt: "x" }, { policy, budget, risk: 0, taskId: "consistent-task", projectId: "consistent-project" });
+
+        const policyEvent = policy.auditTrail.all().find((e) => e.type === "POLICY_DECISION");
+        expect(policyEvent).toBeDefined();
+        expect((policyEvent!.payload as { action: { description: string } }).action.description).toContain(
+          "consistent-task"
+        );
+        expect(costEngine.totalFor({ taskId: "consistent-task", projectId: "consistent-project" })).toBe(0.15);
+      });
+
+      it("existing project/task budget isolation remains correct (no regression from the snapshotting change)", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perTaskUsd: 0.5 });
+        const policy = permissivePolicy();
+        const model = mockModel({ costPerCall: 0.5 });
+
+        await gateway.invoke(model, { prompt: "x" }, { policy, budget, risk: 0, taskId: "task-a" });
+        // A DIFFERENT task's own ceiling is untouched by task-a's spend.
+        await expect(
+          gateway.invoke(model, { prompt: "x" }, { policy, budget, risk: 0, taskId: "task-b" })
+        ).resolves.toBeDefined();
       });
     }
   );

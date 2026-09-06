@@ -11,7 +11,7 @@
 // gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
 import { assertValidMonetaryAmount, exceedsMonetaryAmount } from "../cost/cost-engine.js";
-import type { CostEngine, CostScope } from "../cost/cost-engine.js";
+import type { CostEngine, CostEntry, CostScope } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
 
@@ -402,18 +402,43 @@ export class BudgetGuard {
   }
 
   /**
-   * Provider çağrısı BAŞARIYLA tamamlandıktan sonra çağrılır — açık
-   * rezervasyonu SİLER ve GERÇEK (tahmini değil) maliyeti KOŞULSUZ olarak
-   * kaydeder. "Koşulsuz" kastidir: bir çıktının SONRADAN `validate()`'i
-   * geçememesi (ya da mutabakat anında bir tavanın kağıt üzerinde aşılmış
-   * görünmesi) zaten GERÇEKLEŞMİŞ bir maliyeti asla SİLEMEZ (bölüm 147,
-   * "sessiz harcama yok") — bu yüzden burada `assertWithinBudget`
-   * TEKRAR ÇAĞRILMAZ. Aşım yine de AuditLog'a `overages` olarak
-   * kaydedilir (görünürlük için), ama harcamanın kendisi HER ZAMAN
-   * kaydedilir. Rezervasyon zaten mevcut değilse (örn. `commit()`/
-   * `release()` daha önce çağrılmışsa) UnknownReservationError fırlatır —
-   * aynı rezervasyonun İKİ KEZ mutabakata varılması yapısal olarak
+   * Provider çağrısı BAŞARIYLA tamamlandıktan sonra çağrılır — GERÇEK
+   * (tahmini değil) maliyeti KOŞULSUZ olarak kaydeder ve YALNIZCA bu
+   * kayıt GÜVENLE tamamlandıktan SONRA açık rezervasyonu siler.
+   * "Koşulsuz" kastidir: bir çıktının SONRADAN `validate()`'i geçememesi
+   * (ya da mutabakat anında bir tavanın kağıt üzerinde aşılmış görünmesi)
+   * zaten GERÇEKLEŞMİŞ bir maliyeti asla SİLEMEZ (bölüm 147, "sessiz
+   * harcama yok") — bu yüzden burada `assertWithinBudget` TEKRAR
+   * ÇAĞRILMAZ. Aşım yine de AuditLog'a `overages` olarak kaydedilir
+   * (görünürlük için), ama harcamanın kendisi HER ZAMAN kaydedilir.
+   * Rezervasyon zaten mevcut değilse (örn. `commit()`/`release()` daha
+   * önce çağrılmışsa) UnknownReservationError fırlatır — aynı
+   * rezervasyonun İKİ KEZ mutabakata varılması yapısal olarak
    * imkânsızdır.
+   *
+   * P1 fix (11th independent review round, "failed reconciliation
+   * releases reservation before cost is safely recorded"): Codex
+   * reproduced: bir rezervasyon var, mutabakat BAŞLAR, rezervasyon ÖNCE
+   * SİLİNİR, ardından `entry.amountUsd` (ör. NaN) doğrulaması BAŞARISIZ
+   * OLUR — rezervasyon artık YOK, hiçbir maliyet KAYDEDİLMEDİ, ve
+   * korunan bütçe kapasitesi SESSİZCE geri gelir: başka (tam tavanlık)
+   * bir rezervasyon şimdi başarıyla oluşturulabilir, üstelik GERÇEK (ya
+   * da potansiyel olarak gerçek) bir provider çağrısı zaten olmuş
+   * olabilir. Kök neden: silme İŞLEMİ, doğrulama/kayıt BAŞARIYLA
+   * tamamlanmadan ÖNCE gerçekleşiyordu. Fix: sıra TERSİNE ÇEVRİLDİ —
+   * `assertValidMonetaryAmount` VE `costEngine.record()` artık
+   * rezervasyon HÂLÂ AÇIKKEN çalışır; rezervasyon SADECE bu ikisi
+   * GERÇEKTEN başarılı olduktan SONRA silinir. Doğrulama veya kayıt
+   * BAŞARISIZ olursa: rezervasyon KORUNUR (silinmez — bu yüzden
+   * `reservedTotal()` üzerinden HÂLÂ her tavana karşı sayılmaya devam
+   * eder, "korunan bütçe kapasitesi" asla sessizce serbest kalmaz),
+   * başarısızlık BUDGET_RESERVATION_COMMIT_FAILED olarak audit'e
+   * KAYDEDİLİR (sessiz değil — mutabakatın ÇÖZÜLMEMİŞ kaldığının
+   * kanıtı), ve hata YENİDEN fırlatılır (fail closed). Rezervasyon hâlâ
+   * açık olduğundan, çağıran DAHA SONRA (ör. gerçek tutar netleştiğinde)
+   * `commit()`'i AYNI `reservationId` ile GÜVENLE TEKRAR deneyebilir —
+   * yeniden deneme doğası gereği güvenlidir (idempotent), çünkü
+   * rezervasyon hâlâ oradadır.
    */
   commit(
     reservationId: string,
@@ -423,10 +448,33 @@ export class BudgetGuard {
     if (!reservation) {
       throw new UnknownReservationError(reservationId);
     }
-    this.reservations.delete(reservationId);
 
-    assertValidMonetaryAmount(entry.amountUsd, `BudgetGuard.commit(reservationId=${reservationId})`);
-    const recorded = this.costEngine.record(entry);
+    let recorded: CostEntry;
+    try {
+      assertValidMonetaryAmount(entry.amountUsd, `BudgetGuard.commit(reservationId=${reservationId})`);
+      recorded = this.costEngine.record(entry);
+    } catch (err) {
+      // Rezervasyon KASITLI OLARAK silinmez — mutabakat başarısız oldu,
+      // korunan kapasite açık/çözülmemiş kalmalıdır.
+      this.auditLog?.append({
+        type: "BUDGET_RESERVATION_COMMIT_FAILED",
+        actor: "budget-guard",
+        payload: {
+          reservationId,
+          reservedScope: reservation.scope,
+          reservedAmountUsd: reservation.amountUsd,
+          attemptedActualAmountUsd: entry.amountUsd,
+          reason: err instanceof Error ? err.message : String(err)
+        },
+        timestamp: this.now().toISOString()
+      });
+      throw err;
+    }
+
+    // Rezervasyon ANCAK ŞİMDİ, gerçek maliyet GÜVENLE ve KALICI olarak
+    // kaydedildikten SONRA silinir — "başarılı mutabakat, rezervasyonu
+    // TAM OLARAK BİR KEZ serbest bırakır/dönüştürür."
+    this.reservations.delete(reservationId);
 
     const overages = this.buildCeilingChecks({ taskId: entry.taskId, projectId: entry.projectId }, 0).filter((check) =>
       exceedsMonetaryAmount(check.projected, check.limit)

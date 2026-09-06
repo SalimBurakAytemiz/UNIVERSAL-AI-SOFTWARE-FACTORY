@@ -2,14 +2,15 @@ import { describe, expect, it, afterEach } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { bootstrapProject, PreflightTraceabilityFailedError } from "../orchestrator.js";
+import { bootstrapProject, PreflightTraceabilityFailedError, type BootstrapProjectInput } from "../orchestrator.js";
 import { scaffoldProjectOs } from "../../project-os/scaffold.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
 import { CapabilityDeniedError } from "../../capability-gateway/gateway.js";
-import { createDefaultModelRegistry } from "../../models/registry.js";
+import { createDefaultModelRegistry, ModelRegistry } from "../../models/registry.js";
 import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
-import { FileStateStore } from "../../state/file-store.js";
+import { FileStateStore, type StateStore } from "../../state/file-store.js";
 import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
+import { CostEngine } from "../../cost/cost-engine.js";
 import type { TraceabilityIssue } from "../../requirements-traceability/traceability.js";
 
 function validGenome(id: string) {
@@ -500,4 +501,112 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       expect(result.organization.rationale.security).toBe("Payments capability requires Security team involvement");
     });
   });
+
+  describe(
+    "P1 fix (11th independent review round targeted audit, same class as gateway.ts's 'caller context mutation " +
+      "can change cost ownership during invocation'): bootstrapProject() captures every field it needs from " +
+      "`input` before its own first `await`, so a caller mutating `input` afterward has no effect",
+    () => {
+      it("mutating input.costEngine before bootstrapProject's internal await resumes has no effect — accounting stays on the ORIGINALLY-supplied CostEngine", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-cost-race-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const originalCostEngine = new CostEngine();
+        const evilCostEngine = new CostEngine();
+
+        // A registry whose ONLY summarization-capable model is NOT free —
+        // the default registry's mock-classifier is $0/call, which would
+        // make "original vs. evil costEngine" indistinguishable (both
+        // total $0 regardless of which one is actually used).
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-summarizer",
+          tier: "MOCK",
+          costPerCall: 0.05,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+
+        const input: BootstrapProjectInput & { costEngine?: CostEngine } = {
+          genomeCandidate: validGenome("proj-cost-race"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: paidRegistry,
+          costEngine: originalCostEngine
+        };
+
+        // Scheduled BEFORE calling bootstrapProject(), to land in the
+        // earliest possible microtask slot relative to bootstrapProject's
+        // own internal await-driven resumption — the scenario most
+        // favorable to the caller actually winning a race, if one existed.
+        Promise.resolve().then(() => {
+          (input as { costEngine?: CostEngine }).costEngine = evilCostEngine;
+        });
+
+        const result = await bootstrapProject(input);
+
+        expect(result.totalCostUsd).toBe(0.05); // the paid model's real cost
+        expect(originalCostEngine.totalFor({ projectId: "proj-cost-race" })).toBe(0.05);
+        expect(evilCostEngine.total()).toBe(0); // nothing was ever recorded into the swapped-in engine
+      });
+
+      it("mutating input.modelRegistry before bootstrapProject's internal await resumes has no effect — routing stays on the ORIGINALLY-supplied registry", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-registry-race-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const originalRegistry = createDefaultModelRegistry();
+        const evilRegistry = new ModelRegistry(); // empty — would make routing fail entirely if it were ever consulted
+
+        const input: BootstrapProjectInput = {
+          genomeCandidate: validGenome("proj-registry-race"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: originalRegistry
+        };
+
+        Promise.resolve().then(() => {
+          (input as { modelRegistry: ModelRegistry }).modelRegistry = evilRegistry;
+        });
+
+        // If the swapped-in (empty) registry were ever consulted, this
+        // would throw NoCapableModelError instead of succeeding.
+        const result = await bootstrapProject(input);
+        expect(result.modelDecision.model.modelId).toBeTruthy();
+      });
+
+      it("mutating input.stateStore before bootstrapProject's internal await resumes has no effect — persistence stays on the ORIGINALLY-supplied store", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-statestore-race-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const writes: Array<{ path: string }> = [];
+        const originalStore = new FileStateStore();
+        const evilStore: StateStore = {
+          write: (path: string) => {
+            writes.push({ path });
+          },
+          read: () => undefined,
+          exists: () => false
+        };
+
+        const input: BootstrapProjectInput = {
+          genomeCandidate: validGenome("proj-store-race"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          stateStore: originalStore
+        };
+
+        Promise.resolve().then(() => {
+          (input as { stateStore: StateStore }).stateStore = evilStore;
+        });
+
+        const result = await bootstrapProject(input);
+
+        // Everything was persisted via the ORIGINAL FileStateStore, never the swapped-in one.
+        expect(writes).toHaveLength(0);
+        expect(existsSync(result.statePath)).toBe(true);
+      });
+    }
+  );
 });

@@ -28,6 +28,7 @@ import type { ModelRecord } from "./registry.js";
 import { CapabilityGateway } from "../capability-gateway/gateway.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
 import type { BudgetGuard } from "../budget/budget.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export interface ModelInvocationRequest {
   readonly prompt: string;
@@ -51,6 +52,32 @@ export interface ModelProvider {
  * bağlamı. `policy`/`budget` isteğe bağlı DEĞİLDİR — bölüm 147'nin gereği
  * budur: gerçek bir provider çağrısına giden HİÇBİR yol, bu ikisi olmadan
  * DERLENEMEZ bile.
+ *
+ * P1 fix (11th independent review round, "supplied capability gateway can
+ * bypass authoritative policy"): bu arayüz eskiden isteğe bağlı bir
+ * `capabilityGateway?: CapabilityGateway` alanı içeriyordu ("zaten bir
+ * örneğe sahip çağıranlar onu yeniden kullanabilir" amacıyla, saf bir
+ * nesne-yeniden-kullanım optimizasyonu). Codex, bunun GERÇEK bir politika
+ * atlatma vektörü olduğunu gösterdi: `authorize()` çağrısı
+ * `context.capabilityGateway ?? new CapabilityGateway(context.policy)`
+ * şeklindeydi — yani BİR çağıran, YETKİLİ (authoritative,
+ * default-DENY olabilecek) bir `policy` sağlarken, AYNI ANDA bunu
+ * TAMAMEN görmezden gelen, ALLOW-her-şeyi bir politikayla kurulmuş bir
+ * `capabilityGateway` da sağlayabilirdi — `authorize()` ikincisini
+ * kullanır, `context.policy` hiçbir zaman `evaluate()` çağırmaz, ve HİÇBİR
+ * audit kaydı üretilmez. `CapabilityGateway` (runtime/capability-gateway/
+ * gateway.ts) durumsuz, iki satırlık bir sarmalayıcıdır (`policy`
+ * referansını tutmaktan başka hiçbir şey yapmaz) — yeniden kullanmanın
+ * TEK faydası önemsiz bir nesne ayırma maliyetinden kaçınmaktı, bu da
+ * "yetkili politikanın asla atlatılamaması" gereksiniminin yanında hiçbir
+ * ağırlığı olmayan bir optimizasyondu. Fix: bu alan TAMAMEN KALDIRILDI —
+ * artık `capabilityGateway` diye bir şey enjekte ETMENİN YOLU YOK; TEK
+ * yetkilendirme yolu, `invoke()`'in KENDİSİNİN, HER ÇAĞRIDA, doğrudan
+ * `context.policy`'den TAZE bir `CapabilityGateway` inşa etmesidir (bkz.
+ * aşağıdaki `invoke()`). Bu, "bir boolean bayrak eklemek" veya "çağıranın
+ * doğru gateway'i kullanmasını belgelemek" DEĞİLDİR — atlatma vektörünün
+ * kendisi (enjekte edilebilir alternatif bir CapabilityGateway) tipten
+ * SİLİNDİ.
  */
 export interface ModelInvocationContext {
   readonly policy: PolicyEngine;
@@ -59,14 +86,6 @@ export interface ModelInvocationContext {
   readonly taskId: string;
   readonly projectId?: string;
   readonly description?: string;
-  /**
-   * Zaten bir `CapabilityGateway` örneğine sahip çağıranlar (ör.
-   * router.ts, tek bir mantıksal işlem boyunca birden fazla adayı
-   * yetkilendirirken) onu yeniden kullanabilir; verilmezse `policy`'den
-   * yeni bir tane oluşturulur. Bu, davranışı DEĞİL yalnızca nesne
-   * yeniden kullanımını etkiler.
-   */
-  readonly capabilityGateway?: CapabilityGateway;
 }
 
 export class UnknownProviderError extends Error {
@@ -104,21 +123,77 @@ export class ModelGateway {
    * ayrılır) -> provider çağrısı -> mutabakat (`commit()` başarıda,
    * `release()` provider hata fırlatırsa). Bu ikisi arasına HİÇBİR
    * "kısayol" eklenemez çünkü hepsi AYNI fonksiyon gövdesinde yaşar.
+   *
+   * P1 fix (11th independent review round, "caller context mutation can
+   * change cost ownership during invocation"): Codex reproduced: bir
+   * çağıran $0.60'ı proje A için rezerve eder, provider çağrısı
+   * BAŞLAR, çağıran `await` SÜRERKEN `context.projectId`'yi B'ye
+   * MUTASYONA UĞRATIR, ve mutabakat (commit) daha sonra ORİJİNAL
+   * `context` nesnesini TEKRAR OKUDUĞU için maliyet B'ye kaydedilir —
+   * A'nın rezervasyonu A'nın hiçbir zaman gerçek bir harcamayla
+   * eşleşmediği, ve tekrarlanan çağrılarla A'nın görev tavanının
+   * TAMAMEN atlatılabileceği anlamına gelir. Kök neden: `context`
+   * çağıranın hâlâ bir referansını tuttuğu, sıradan (donmamış) bir
+   * nesnedir, ve eski kod `context.taskId`/`context.projectId`'yi HEM
+   * rezervasyon anında HEM DE (bir `await`den SONRA) mutabakat anında
+   * AYRI AYRI okuyordu — ikisi arasında farklı değerler görebilirdi.
+   * Fix: TÜM yetkili "sahiplik" alanları (taskId, projectId, risk,
+   * description, model kimliği) herhangi bir asenkron iş BAŞLAMADAN
+   * ÖNCE, donmuş/ayrık bir `executionScope` anlık görüntüsüne
+   * KOPYALANIR (`freezeRecord`); `policy`/`budget` REFERANSLARI da aynı
+   * anda yerel `const`'lara yakalanır (bir JS referansı yakalandıktan
+   * SONRA, `context.policy = ...` gibi bir mutasyon o yerel değişkeni
+   * ETKİLEMEZ). Bundan sonra kodun HİÇBİR YERİNDE `context.xxx`
+   * DOĞRUDAN tekrar okunmaz — rezervasyon, provider çağrısı VE mutabakat
+   * SADECE bu anlık görüntüyü kullanır. Çağıranın `context`'i
+   * (paylaşılan/tekrar kullanılan bir nesne olsa bile) invoke() bu
+   * anlık görüntüyü aldıktan SONRA yaptığı hiçbir mutasyon, bu ÇALIŞAN
+   * invocation'ı ASLA etkileyemez — eşzamanlı iki invoke() çağrısı AYNI
+   * paylaşılan `context` nesnesini kullansa bile, her biri KENDİ
+   * senkron ön ekinde (herhangi bir await'ten önce) kendi bağımsız anlık
+   * görüntüsünü alır, bu yüzden birbirlerini kirletemezler.
    */
   async invoke(
     model: ModelRecord,
     request: ModelInvocationRequest,
     context: ModelInvocationContext
   ): Promise<ModelInvocationResponse> {
-    const capabilityGateway = context.capabilityGateway ?? new CapabilityGateway(context.policy);
+    // Herhangi bir asenkron iş (hatta CapabilityGateway.authorize()'ın
+    // KENDİSİ) başlamadan ÖNCE: yetkili sahiplik anlık görüntüsü.
+    const executionScope = freezeRecord({
+      taskId: context.taskId,
+      projectId: context.projectId,
+      risk: context.risk,
+      description:
+        context.description ?? `Invoke model '${model.modelId}' (${model.tier}) for task ${context.taskId}`,
+      modelId: model.modelId,
+      provider: model.provider,
+      costPerCallUsd: model.costPerCall
+    });
+    // `policy`/`budget` REFERANSLARI da hemen yakalanır — bkz. yukarıdaki
+    // fix notu. `context.policy`/`context.budget`'a bundan sonra ASLA
+    // tekrar erişilmez.
+    const budget = context.budget;
+    // P1 fix (11th independent review round, "supplied capability gateway
+    // can bypass authoritative policy"): eskiden `context.capabilityGateway
+    // ?? new CapabilityGateway(context.policy)` idi — bir çağıran YETKİLİ
+    // (ör. default-DENY) bir `policy` sağlarken AYNI ZAMANDA bunu
+    // TAMAMEN görmezden gelen, ALLOW-her-şeyi bir politikayla kurulmuş
+    // ayrı bir `capabilityGateway` da sağlayabilir ve `authorize()`
+    // ikincisini kullanırdı — `context.policy` HİÇBİR ZAMAN
+    // `evaluate()` çağırmaz, sıfır audit kaydı üretilirdi. Enjekte
+    // edilebilir bir `capabilityGateway` artık TİPTE BİLE YOK (bkz.
+    // `ModelInvocationContext`) — TEK yetkilendirme yolu, HER ÇAĞRIDA
+    // doğrudan `context.policy`'den TAZE inşa edilen BU
+    // `CapabilityGateway`'dir.
+    const capabilityGateway = new CapabilityGateway(context.policy);
 
     return capabilityGateway.authorize(
       {
         actionType: "model.invoke",
-        risk: context.risk,
-        description:
-          context.description ?? `Invoke model '${model.modelId}' (${model.tier}) for task ${context.taskId}`,
-        costUsd: model.costPerCall
+        risk: executionScope.risk,
+        description: executionScope.description,
+        costUsd: executionScope.costPerCallUsd
       },
       async () => {
         // Provider ÇAĞRILMADAN ÖNCE, tahmini maliyet (costPerCall) TÜM
@@ -126,9 +201,9 @@ export class ModelGateway {
         // olarak ayrılır — 10th independent review round fix, bkz.
         // runtime/budget/budget.ts'deki `reserve()` notu. Yetersiz bütçe,
         // hiçbir provider çağrısı yapılmadan reddeder (fail closed).
-        const reservation = context.budget.reserve(
-          { taskId: context.taskId, projectId: context.projectId },
-          model.costPerCall
+        const reservation = budget.reserve(
+          { taskId: executionScope.taskId, projectId: executionScope.projectId },
+          executionScope.costPerCallUsd
         );
 
         let response: ModelInvocationResponse;
@@ -138,16 +213,21 @@ export class ModelGateway {
           // Belgelenen mutabakat kuralı: provider hata fırlatırsa hiçbir
           // gerçek maliyet oluşmadığı varsayılır, rezervasyon TAMAMEN
           // serbest bırakılır (bkz. budget.ts release() notu).
-          context.budget.release(reservation.id);
+          budget.release(reservation.id);
           throw err;
         }
 
         // Gerçek maliyet, validate() çağrılmadan ÖNCE ve KOŞULSUZ olarak
         // kaydedilir — bir çıktının sonradan geçersiz sayılması, zaten
         // gerçekleşmiş harcamanın kayıtlardan düşmesine ASLA yol açmaz.
-        context.budget.commit(reservation.id, {
-          taskId: context.taskId,
-          projectId: context.projectId,
+        // taskId/projectId, `context`'ten DEĞİL, `executionScope`
+        // anlık görüntüsünden okunur (bkz. yukarıdaki fix notu) — bu
+        // await'ten SONRA çağıranın `context`'i mutasyona uğramış olsa
+        // bile, mutabakat HER ZAMAN rezervasyonun sahibiyle AYNI kapsamı
+        // kullanır.
+        budget.commit(reservation.id, {
+          taskId: executionScope.taskId,
+          projectId: executionScope.projectId,
           provider: response.provider,
           modelId: response.modelId,
           amountUsd: response.costUsd

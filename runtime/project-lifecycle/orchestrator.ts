@@ -68,10 +68,41 @@ export interface BootstrapProjectResult {
   readonly totalCostUsd: number;
 }
 
+/**
+ * P1 fix (11th independent review round targeted audit, same class as
+ * "caller context mutation can change cost ownership during invocation" —
+ * runtime/models/gateway.ts): `bootstrapProject()` awaits
+ * `gateway.authorize(...)` (line below) before reading
+ * `input.modelRegistry`/`input.costEngine`/`input.budgetLimits`/
+ * `input.stateStore` — even though the wrapped `scaffoldProjectOs()` call
+ * itself is synchronous, an `await` on an async function's result ALWAYS
+ * yields at least one microtask tick (JS semantics), during which a
+ * caller who still holds a reference to the SAME `input` object (and has
+ * scheduled a mutation via another microtask, e.g. `Promise.resolve().
+ * then(() => { input.costEngine = attackerControlledCostEngine })`) could
+ * redirect this bootstrap's accounting to an entirely different,
+ * uncontrolled CostEngine/BudgetGuard/ModelRegistry/StateStore — the
+ * SAME "reread caller-owned mutable execution context after async work
+ * begins" bug class Codex found in gateway.ts, just with `bootstrapProject`'s
+ * own `input` playing the role `context` played there. Fixed the same
+ * way: every field this function needs is captured into local `const`s
+ * BEFORE the function's own first `await`, and `input.xxx` is never read
+ * again afterward — capturing an object REFERENCE (registry/costEngine/
+ * stateStore are class instances) is sufficient, since a later
+ * `input.costEngine = ...` reassignment cannot change what an
+ * already-captured local variable points to.
+ */
 export async function bootstrapProject(input: BootstrapProjectInput): Promise<BootstrapProjectResult> {
   if (input.preflightTraceabilityIssues && input.preflightTraceabilityIssues.length > 0) {
     throw new PreflightTraceabilityFailedError(input.preflightTraceabilityIssues);
   }
+
+  // Herhangi bir `await`den ÖNCE: bu çağrının kullanacağı HER alan yerel
+  // `const`'lara yakalanır — bkz. yukarıdaki fix notu. Bundan sonra
+  // `input.xxx` bir daha ASLA okunmaz.
+  const { genomeCandidate, baseDir, policy, modelRegistry, budgetLimits, costEngine: callerCostEngine, stateStore: callerStateStore } =
+    input;
+  const risk = input.risk ?? 1;
 
   // PROJECT ID -> VALIDATE (parseProjectGenome, assertValidProjectId içinde
   // çağrılır) -> RESOLVE BASE DIRECTORY -> RESOLVE PROJECT DESTINATION ->
@@ -83,30 +114,29 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // farkındalıklı) kullanılır çünkü `baseDir` içine yerleştirilmiş,
   // `baseDir` dışına işaret eden bir symlink de aynı şekilde reddedilmelidir
   // (4th independent review round fix).
-  const genome = parseProjectGenome(input.genomeCandidate);
-  assertFilesystemConfinement(input.baseDir, genome.project.id);
-  const risk = input.risk ?? 1;
+  const genome = parseProjectGenome(genomeCandidate);
+  assertFilesystemConfinement(baseDir, genome.project.id);
   const organization = composeOrganizationFromGenome(genome, risk);
 
-  const gateway = new CapabilityGateway(input.policy);
+  const gateway = new CapabilityGateway(policy);
   const scaffold = await gateway.authorize(
     {
       actionType: "project.scaffold",
       risk,
       description: `Scaffold Project OS for '${genome.project.id}'`
     },
-    () => scaffoldProjectOs(input.baseDir, genome.project.id)
+    () => scaffoldProjectOs(baseDir, genome.project.id)
   );
 
-  const router = new CheapestCapableModelRouter(input.modelRegistry);
+  const router = new CheapestCapableModelRouter(modelRegistry);
   const modelDecision = router.selectModel({
     taskId: `bootstrap:${genome.project.id}`,
     risk: 0,
     requiredCapabilities: ["summarization"]
   });
 
-  const costEngine = input.costEngine ?? new CostEngine();
-  const budget = new BudgetGuard(costEngine, input.budgetLimits ?? {});
+  const costEngine = callerCostEngine ?? new CostEngine();
+  const budget = new BudgetGuard(costEngine, budgetLimits ?? {});
   budget.spend({
     taskId: `bootstrap:${genome.project.id}`,
     projectId: genome.project.id,
@@ -125,7 +155,7 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // eder ve dosyayı GERÇEKTEN symlink'in işaret ettiği (baseDir dışı)
   // konumda oluşturur. Artık her nihai dosya yolu, gerçek yazmadan HEMEN
   // önce assertFilesystemConfinement() ile ayrıca doğrulanır.
-  const stateStore = input.stateStore ?? new FileStateStore();
+  const stateStore = callerStateStore ?? new FileStateStore();
   stateStore.write(
     assertFilesystemConfinement(scaffold.projectRoot, join("project-genome", "genome.json")),
     genome

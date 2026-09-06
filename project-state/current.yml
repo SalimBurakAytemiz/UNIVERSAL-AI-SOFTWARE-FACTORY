@@ -131,6 +131,32 @@ factory:
     genuine instances, fully verified, and pushed for the eleventh
     independent review. P0 remains open.
 
+    Eleventh independent Codex P0 closure review reproduced 3 NEW P1
+    findings on the pushed branch: (1) "supplied capability gateway can
+    bypass authoritative policy" — `ModelGateway.invoke()`'s
+    `ModelInvocationContext` accepted an OPTIONAL `capabilityGateway`
+    field that, if supplied, was preferred over `context.policy` for the
+    actual authorization decision — a caller could pass an authoritative
+    default-DENY `policy` while ALSO passing a `capabilityGateway` backed
+    by an ALLOW-everything policy, and the latter would win with zero
+    audit events from the authoritative one; (2) "caller context mutation
+    can change cost ownership during invocation" — `context.taskId`/
+    `context.projectId` were read separately at reservation time and
+    again at commit time (after an `await`), so a caller mutating
+    `context.projectId` while a provider call was pending could redirect
+    the recorded cost to a different project than the one that was
+    reserved against; (3) "failed reconciliation releases reservation
+    before cost is safely recorded" — `BudgetGuard.commit()` deleted the
+    reservation BEFORE validating the actual amount, so a malformed
+    (NaN/Infinity/negative) actual cost failed validation AFTER the
+    reservation was already gone, silently restoring the protected budget
+    capacity even though a real provider call may already have happened.
+    All 3 fixed this session (see below); a targeted audit for these
+    exact classes found ONE further genuine instance of finding #2 in
+    `runtime/project-lifecycle/orchestrator.ts`'s `bootstrapProject()`
+    (also fixed); fully verified (515/515 tests); pushed for a twelfth
+    independent review. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -1316,6 +1342,89 @@ completed_milestones:
       491/491 tests (464 + 27 new), validate:requirements, history-aware
       secret-scan, all P0 proofs, full CLI smoke test (doctor/baseline
       status/routing explain/trace requirement) — all clean.
+  - |-
+    ELEVENTH INDEPENDENT REVIEW (3 new P1 findings, all fixed this session):
+    - "Supplied capability gateway can bypass authoritative policy":
+      `ModelInvocationContext.capabilityGateway` (an optional field added
+      purely as an object-reuse micro-optimization) let a caller supply
+      an ALLOW-backed `CapabilityGateway` alongside an authoritative
+      default-DENY `policy` — `invoke()` used
+      `context.capabilityGateway ?? new CapabilityGateway(context.policy)`,
+      so the supplied gateway always won when present, and
+      `context.policy` never ran `evaluate()`. Fixed by DELETING the
+      field entirely (not adding a boolean/convention) — `invoke()` now
+      unconditionally builds `new CapabilityGateway(context.policy)` on
+      every call; there is no code path, type-safe or otherwise, that
+      reads anything else. Verified with the strongest test available: a
+      context object with an extra `capabilityGateway` property smuggled
+      on via `as any` still gets DENY-blocked, because the runtime code
+      simply never reads that property — proving a genuine deletion, not
+      a type-level restriction alone.
+    - "Caller context mutation can change cost ownership during
+      invocation": `context.taskId`/`context.projectId` were read
+      separately at `budget.reserve()` time and again at `budget.commit()`
+      time (after the internal `await this.#rawInvoke(...)`) — a caller
+      mutating `context.projectId` while the provider call was pending
+      could redirect the recorded cost to a different project than the
+      one the reservation actually protected, letting repeated calls
+      bypass a project's own ceiling entirely. Fixed: `invoke()` now
+      captures every ownership field (taskId, projectId, risk,
+      description, model identity) into ONE frozen `executionScope`
+      snapshot (`freezeRecord`) as the very first thing it does, and
+      captures the `policy`/`budget` object references into local
+      `const`s at the same time — nothing after that point ever reads
+      `context.xxx` again. This holds regardless of scheduling, because
+      JS guarantees an async function's synchronous prefix completes
+      before any caller-scheduled microtask can interleave.
+    - "Failed reconciliation releases reservation before cost is safely
+      recorded": `BudgetGuard.commit()` deleted the reservation FIRST,
+      then validated `entry.amountUsd` — a malformed (NaN/Infinity/
+      negative) actual amount failed validation AFTER the reservation was
+      already gone, silently restoring the protected budget capacity even
+      though a real (or potentially real) provider call may already have
+      incurred cost. Fixed by reversing the order: validation and
+      `costEngine.record()` now run WHILE the reservation is still open;
+      it is deleted ONLY after both succeed. On failure the reservation
+      is preserved (still counted via `reservedTotal()`), a new
+      `BUDGET_RESERVATION_COMMIT_FAILED` audit event is recorded, and the
+      error is re-thrown — retrying `commit()` with a corrected amount on
+      the SAME reservation id is now safe by construction.
+    - 24 new regression tests (14 in gateway.test.ts, 7 in budget.test.ts,
+      3 in orchestrator.test.ts). Every fix verified via a temporary
+      in-place bypass confirmed to reproduce the exact reported failure,
+      then reverted: gateway.ts's policy-substitution bypass (the
+      malicious-context test times out instead of rejecting, since the
+      vulnerable code lets the provider call proceed), gateway.ts's
+      mutable-context bypass (exactly 3 of 24 tests fail when commit()
+      re-reads `context.taskId`/`context.projectId` instead of
+      `executionScope`'s), budget.ts's reordering (exactly 7 of 66 tests
+      fail when the reservation is deleted before validation, restored to
+      the ordering fix).
+    - Targeted audit for these 3 exact classes: confirmed
+      `runtime/project-lifecycle/orchestrator.ts` is the only OTHER
+      `CapabilityGateway` construction site in production code, and it
+      has no injectable-alternative field (no instance of finding #1
+      elsewhere); found ONE genuine instance of finding #2's class in
+      `bootstrapProject()` itself (`input.modelRegistry`/`input.costEngine`/
+      `input.budgetLimits`/`input.stateStore` read after its own
+      `await gateway.authorize(...)`) and fixed it the same way
+      (destructure every needed field into local `const`s as the
+      function's first statement); confirmed no other `.delete()`/
+      state-removal call site in `runtime/` exhibits finding #3's
+      ordering bug (`cache.ts`'s TTL eviction and
+      `runtime/state/file-store.ts`'s already-atomic write-then-rename are
+      both unaffected; `approval.ts` mutates status in place and never
+      deletes a pending record, so it cannot exhibit this class).
+    - Requirement registry updated: UASF-REQ-0024 (Model gateway — full
+      notes on both gateway.ts fixes and their regression tests),
+      UASF-REQ-0030 (Budget engine — full notes on the commit() reorder),
+      UASF-REQ-0042 (P0 end-to-end proof — notes on the orchestrator.ts
+      audit-found instance, plus orchestrator.test.ts added to
+      test_refs). No status field was raised on any requirement beyond
+      what real evidence supports.
+    - Re-ran the full required sequence: lint, typecheck, build,
+      515/515 tests (491 + 24 new), validate:requirements, history-aware
+      secret-scan, all P0 proofs, full CLI smoke test — all clean.
 
 known_limitations:
   - >-
@@ -1377,11 +1486,30 @@ blockers:
     `^22.13.0 || ^24.0.0 || >=26.0.0` and extending `factory doctor` to
     scan the entire locked dependency tree, not just Vitest). All 3 fixed,
     tested (491/491 tests, +27 net new), and verified per the full
-    required sequence — see completed_milestones for full detail. Now
-    awaiting an ELEVENTH independent review. Per explicit instruction:
-    "stop at the independent-review boundary" — do not push further P0
-    feature work, and do not declare P0 complete, until that re-review
-    confirms no blocking finding remains.
+    required sequence — see completed_milestones for full detail.
+
+    An ELEVENTH independent Codex review then reproduced 3 NEW P1
+    findings: a caller-supplied `capabilityGateway` could override the
+    authoritative `policy` in ModelGateway.invoke() (fixed by deleting
+    the injectable field entirely — invoke() now always builds its own
+    CapabilityGateway directly from context.policy); mutating
+    context.taskId/projectId while a provider call was pending could
+    redirect recorded cost to a different task/project than the one that
+    reserved it (fixed by snapshotting every ownership field into a
+    frozen executionScope before any await, never re-reading context
+    afterward); and BudgetGuard.commit() deleted a reservation before
+    validating the actual amount, so a malformed (NaN/Infinity/negative)
+    amount silently freed the protected budget capacity (fixed by
+    validating and recording BEFORE deleting the reservation, preserving
+    it on failure). All 3 fixed, tested (515/515 tests, +24 net new), and
+    verified per the full required sequence — see completed_milestones
+    for full detail. A targeted audit found one further genuine instance
+    of the context-mutation class in
+    runtime/project-lifecycle/orchestrator.ts's bootstrapProject(), also
+    fixed. Now awaiting a TWELFTH independent review. Per explicit
+    instruction: "stop at the independent-review boundary" — do not push
+    further P0 feature work, and do not declare P0 complete, until that
+    re-review confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -1526,6 +1654,88 @@ exact_next_action: >
   Requirement registry updated (UASF-REQ-0024, UASF-REQ-0027,
   UASF-REQ-0028 re-checked, UASF-REQ-0030, UASF-REQ-0040) from this real
   evidence only — no status raised beyond what is genuinely supported.
+
+  An ELEVENTH independent Codex review then reproduced 3 NEW P1 findings,
+  now also fixed, tested, and pushed this session:
+
+  (1) "supplied capability gateway can bypass authoritative policy" —
+  `ModelInvocationContext.capabilityGateway` (an optional field, added
+  purely as an object-reuse optimization) let `invoke()` prefer a
+  caller-supplied `CapabilityGateway` over one built from `context.policy`
+  — a caller could supply an authoritative default-DENY `policy` while
+  ALSO supplying a `capabilityGateway` backed by an ALLOW-everything
+  policy, and the latter always won, with zero audit events from the
+  authoritative policy. Fixed by DELETING the field entirely — not adding
+  a boolean or documenting correct usage — `invoke()` now unconditionally
+  builds `new CapabilityGateway(context.policy)` on every call; router.ts
+  updated to match (it never actually exploited this itself, but the
+  vulnerable field was reachable by any OTHER caller). Verified with the
+  strongest available test: a context object with an extra
+  `capabilityGateway` property smuggled on via `as any` still gets
+  DENY-blocked, because invoke()'s code literally never reads that
+  property — proving a genuine deletion, not merely a type restriction a
+  careless/malicious caller could evade.
+
+  (2) "caller context mutation can change cost ownership during
+  invocation" — `context.taskId`/`context.projectId` were read separately
+  at `budget.reserve()` time and again at `budget.commit()` time (after
+  the internal `await this.#rawInvoke(...)`) — mutating
+  `context.projectId` from A to B while the provider call was pending
+  moved the recorded cost to B despite A owning the reservation, letting
+  repeated calls bypass A's own budget ceiling entirely. Fixed:
+  `invoke()` now captures every ownership field (taskId, projectId, risk,
+  description, model identity) into ONE frozen `executionScope` snapshot
+  (`freezeRecord`) as the FIRST thing it does, and captures the
+  `policy`/`budget` object references into local `const`s at the same
+  time — nothing after that point ever reads `context.xxx` again. This
+  holds regardless of scheduling, because JS guarantees an async
+  function's synchronous prefix completes before any caller-scheduled
+  microtask can interleave — proven with tests that schedule the mutation
+  via `Promise.resolve().then()` BEFORE calling `invoke()`, the ordering
+  most favorable to a caller actually winning such a race.
+
+  (3) "failed reconciliation releases reservation before cost is safely
+  recorded" — `BudgetGuard.commit()` deleted the reservation FIRST, then
+  validated `entry.amountUsd` — a malformed (NaN/Infinity/negative)
+  actual amount failed validation AFTER the reservation was already gone,
+  silently restoring the protected budget capacity even though a real (or
+  potentially real) provider call may already have incurred cost. Fixed
+  by reversing the order: `assertValidMonetaryAmount()` and
+  `costEngine.record()` now run WHILE the reservation is still open; it
+  is deleted ONLY after both genuinely succeed. On failure the
+  reservation is preserved (still counted via `reservedTotal()` against
+  every ceiling), a new `BUDGET_RESERVATION_COMMIT_FAILED` audit event is
+  recorded (never silent), and the error is re-thrown (fail closed) —
+  retrying `commit()` with a corrected amount on the SAME reservation id
+  is now safe by construction, since nothing was deleted to make it
+  unsafe.
+
+  24 new tests added (14 in gateway.test.ts, 7 in budget.test.ts, 3 in
+  orchestrator.test.ts). 515/515 tests passing. Every fix individually
+  verified via a temporary in-place bypass confirmed to reproduce the
+  exact reported failure, then reverted: gateway.ts's policy-substitution
+  bypass (the malicious-context test times out waiting for a rejection
+  the vulnerable code never produces), gateway.ts's mutable-context
+  bypass (exactly 3 of 24 tests fail when commit() re-reads
+  `context.taskId`/`context.projectId` instead of `executionScope`'s),
+  budget.ts's reordering (exactly 7 of 66 tests fail when the reservation
+  is deleted before validation). A narrow targeted audit for these exact
+  3 classes found ONE further genuine instance: finding #2's class also
+  applied to `runtime/project-lifecycle/orchestrator.ts`'s
+  `bootstrapProject()` (`input.modelRegistry`/`input.costEngine`/
+  `input.budgetLimits`/`input.stateStore` read after its own
+  `await gateway.authorize(...)`) — fixed the same way (every needed
+  field destructured into local `const`s as the function's first
+  statement), with 3 new regression tests verified via the same
+  temporary-bypass methodology (2 of 3 failed against the reverted-order
+  code immediately; the third needed a non-free test model to distinguish
+  "original" from "swapped" CostEngine, since the default free MOCK-tier
+  model made both read $0 regardless of which engine was actually used).
+  Full required sequence re-run clean: lint, typecheck, build, 515/515
+  tests, validate:requirements, history-aware secret-scan, all 9 P0
+  proofs, full CLI smoke test. Requirement registry updated
+  (UASF-REQ-0024, UASF-REQ-0030, UASF-REQ-0042) from this real evidence
+  only — no status raised beyond what is genuinely supported.
 
   Do not proceed to further P0 feature work or declare P0 complete until
   an independent (Codex) re-review of this diff confirms no blocking P0
