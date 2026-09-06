@@ -290,6 +290,32 @@ factory:
     review's own framing, potentially final) independent review closure
     candidate. P0 remains open.
 
+    Fifteenth independent Codex P0 closure review (all required
+    verification — lint, typecheck, build, 590/590 tests, requirement
+    validation, secret scanning, required P0 checks — confirmed passing
+    beforehand) reproduced ONE remaining P2 finding: "filesystem root
+    containment incorrectly rejects valid descendants" —
+    `assertWithinRoot()`'s containment check was a naive string-prefix
+    test, `!resolvedTarget.startsWith(resolvedRoot + sep)`; when the
+    configured sandbox root is ITSELF already a filesystem root (POSIX
+    `/`, a Windows drive root), concatenating another separator produces
+    a doubled separator (`"/" + "/" = "//"`) that no genuine descendant
+    can ever match, so `assertWithinRoot("/", "/tmp")` wrongly threw
+    `PathEscapeError` even though `/tmp` is a completely legitimate
+    descendant of `/`. Fixed this session (see below) by reasoning over
+    `path.relative(root, target)`'s result instead of prefix
+    concatenation — a strict correctness fix that is exactly as correct
+    for an ordinary root as the old check, and additionally handles the
+    root-is-itself-a-filesystem-root case the old check could never
+    handle by construction. A narrow audit (grepped every
+    `.startsWith(...+sep)`-shaped check across `runtime/`) confirmed this
+    was the ONLY instance of this exact class — `assertFilesystemConfinement()`'s
+    own lexical-vs-real check already used `path.relative()` equality,
+    never prefix concatenation, so it was never susceptible. Fully
+    verified (610/610 tests); pushed for a sixteenth independent review —
+    per the fifteenth review's own framing, a potential final P0 closure
+    candidate. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -1999,6 +2025,85 @@ completed_milestones:
     tests (580 + 10 new), validate:requirements, history-aware
     secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
     (13 assertions) — all clean.
+  - |-
+    THIS SESSION (round 16) — a fifteenth independent Codex review
+    (confirmed the full required sequence passing BEFORE listing the
+    finding) reproduced ONE remaining P2 finding, now fixed:
+    - [P2] "Filesystem root containment incorrectly rejects valid
+      descendants": `runtime/sandbox/sandbox.ts`'s `assertWithinRoot()`
+      used a naive string-prefix test —
+      `!resolvedTarget.startsWith(resolvedRoot + sep)`. When the
+      configured sandbox root is ITSELF already a filesystem root (POSIX
+      `/`, a Windows drive root like `C:\`), appending another separator
+      produces a DOUBLED separator (`"/" + "/" = "//"`) that no genuine
+      descendant can ever match as a prefix — Codex reproduced
+      `assertWithinRoot("/", "/tmp")` wrongly throwing `PathEscapeError`
+      even though `/tmp` is a completely legitimate descendant of `/`.
+      The root cause was the prefix CONCATENATION itself, not a narrow
+      edge case. Fixed: containment is now decided by reasoning over
+      `path.relative(root, target)`'s result — empty string means
+      `target` IS `root`; `".."` or a `".." + sep`-prefixed result means
+      `target` is OUTSIDE `root` (covers parent traversal, sibling
+      directories, AND prefix-collision paths like `/safe` vs.
+      `/safe-evil` uniformly, since `path.relative` expresses all of
+      these as a leading `".."` without ever needing separator
+      concatenation); an ABSOLUTE relative-path result means no common
+      base exists at all (e.g. different Windows drive letters). This
+      logic is extracted into a new exported pure predicate,
+      `isContainedRelativePath(relativePath, pathOps?)`, parameterized by
+      `{ sep, isAbsolute }` and defaulting to the actual runtime
+      platform's `node:path` — a strict correctness fix, exactly as
+      correct for an ordinary non-root root as the old check, that
+      additionally handles the root-is-itself-a-filesystem-root case the
+      old check could never handle by construction. Regression tests
+      (sandbox.test.ts, new describe block) prove, on POSIX (this CI's
+      actual platform): the exact reproduction now accepted,
+      `assertWithinRoot("/", "/")` accepted, an ordinary root with a
+      nested candidate unaffected, `/safe` vs `/safe-evil` still
+      rejected, traversal above a normal root still rejected, traversal
+      "above" `/` correctly normalizes to `/` itself (accepted, since
+      there is nothing above the filesystem root to escape to), a
+      sibling directory still rejected, trailing-separator root variants
+      normalize correctly, and a deeply nested descendant of `/` is
+      accepted. Since this CI's `node:path` is always POSIX regardless of
+      the path STRINGS passed to it, genuine Windows semantics are
+      verified by feeding `path.win32`'s own `relative`/`sep`/
+      `isAbsolute` directly into the SAME exported
+      `isContainedRelativePath` predicate `assertWithinRoot()` uses
+      internally — proving a drive-root descendant, the drive root
+      itself, and a nested non-root-drive descendant are all accepted,
+      while a different drive letter, a prefix-collision sibling, and
+      parent traversal above a non-root drive path are all rejected.
+      Confirmed via a temporary bypass (reverting to the old
+      `startsWith(resolvedRoot + sep)` prefix check) that exactly the 2
+      tests exercising root-is-`/` behavior fail with the EXACT
+      `PathEscapeError` reproduction Codex described (all other new
+      tests, including the pure-predicate and Windows-semantics ones,
+      correctly stayed green), then reverted.
+    - Narrow audit (as explicitly requested, scoped to exactly this one
+      class — "valid descendant -> rejected due to root/trailing-
+      separator normalization" — within the sandbox/path-containment
+      code): grepped every `.startsWith(...)` call combined with a `sep`
+      concatenation across `runtime/`; confirmed `assertWithinRoot()` was
+      the ONLY instance of this exact class in the entire codebase —
+      `assertFilesystemConfinement()`'s own lexical-vs-real containment
+      check (used for the identical purpose) already compares two
+      `path.relative()` results for EQUALITY rather than concatenating a
+      separator onto a prefix, so it was never susceptible to this bug in
+      the first place.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0033 (Sandbox (foundation) — the
+    isContainedRelativePath fix, its POSIX and win32-semantics
+    regression tests, and the narrow-audit note confirming no other
+    instance of this class exists). No status field was raised on any
+    requirement beyond what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ deletion and rebuild), 610/610
+    tests (590 + 20 new), validate:requirements, history-aware
+    secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
+    (13 assertions) — all clean.
 
 known_limitations:
   - >-
@@ -2198,6 +2303,35 @@ blockers:
     not push further P0 feature work, and do not declare P0 complete,
     until that re-review confirms no blocking finding remains.
 
+    A FIFTEENTH independent Codex review (all required verification —
+    lint, typecheck, build, 590/590 tests, requirement validation, secret
+    scan, required P0 checks — confirmed passing BEFORE the finding was
+    listed) reproduced ONE remaining P2 finding:
+    `runtime/sandbox/sandbox.ts`'s `assertWithinRoot()` used a naive
+    string-prefix check (`!resolvedTarget.startsWith(resolvedRoot + sep)`)
+    that wrongly rejected valid descendants whenever the configured
+    sandbox root was ITSELF already a filesystem root (POSIX `/`, a
+    Windows drive root) — appending a separator to an already-rooted path
+    produces a doubled separator no genuine descendant can ever match as
+    a prefix (`assertWithinRoot("/", "/tmp")` wrongly threw
+    `PathEscapeError`). Fixed this session: containment is now decided
+    over `path.relative(root, target)`'s result via a new exported pure
+    predicate, `isContainedRelativePath()`, parameterized by the actual
+    runtime platform's path semantics — correct for both an ordinary root
+    and a root that is itself a filesystem root, and independently
+    verified against genuine POSIX and Windows (`path.win32`) semantics.
+    Tested (610/610 tests, +20 net new) and verified per the full
+    required sequence — see completed_milestones for full detail. A
+    narrow audit confirmed this was the ONLY instance of this exact class
+    in the codebase (`assertFilesystemConfinement()`'s own containment
+    check already used `path.relative()` equality, never prefix
+    concatenation). Now awaiting a SIXTEENTH independent review — per the
+    fifteenth review's own framing, a potential final P0 closure
+    candidate. Per explicit instruction: "stop at the independent-review
+    boundary" — do not push further P0 feature work, and do not declare
+    P0 complete, until that re-review confirms no blocking finding
+    remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -2214,6 +2348,53 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fix for the fifteenth independent Codex review's ONE remaining P2
+  finding is implemented, tested, and pushed to
+  claude/ai-factory-baseline-v1-seawq7, with the full required
+  verification sequence run clean (lint, typecheck, a REAL `npm run
+  build` emission — confirmed via a clean `dist/` deletion and rebuild —
+  610/610 tests, validate:requirements, history-aware secret-scan,
+  Factory Doctor READY, all 9 P0 proofs). Summary of the fix:
+  `runtime/sandbox/sandbox.ts`'s `assertWithinRoot()` used a naive
+  string-prefix containment check
+  (`!resolvedTarget.startsWith(resolvedRoot + sep)`) that wrongly
+  rejected valid descendants whenever the configured sandbox root was
+  ITSELF already a filesystem root (POSIX `/`, a Windows drive root) —
+  appending a separator to an already-rooted path doubles it
+  (`"/" + "/" = "//"`), which no genuine descendant can ever match as a
+  prefix. Fixed: containment is now decided over
+  `path.relative(root, target)`'s result via a new exported pure
+  predicate, `isContainedRelativePath(relativePath, pathOps?)`,
+  parameterized by `{ sep, isAbsolute }` and defaulting to the actual
+  runtime platform's `node:path` — correct for both an ordinary
+  non-root root (no regression) and a root that is itself a filesystem
+  root (the bug this round closes), and independently verified against
+  genuine Windows semantics via `path.win32` even though this CI runs on
+  POSIX. A narrow audit (grepped every `.startsWith(...)` call combined
+  with a `sep` concatenation across `runtime/`) confirmed this was the
+  ONLY instance of this exact class — `assertFilesystemConfinement()`'s
+  own containment check already compared two `path.relative()` results
+  for equality, never prefix concatenation, so it was never susceptible.
+  This fix was individually verified via a temporary in-place bypass
+  confirmed to reproduce the exact predicted regression-test failures (2
+  of 20 new tests — the two exercising root-is-`/` behavior specifically
+  — with the exact `PathEscapeError` message Codex described), then
+  reverted. Requirement registry updated (UASF-REQ-0033) from this real
+  evidence only — no status raised beyond what is genuinely supported.
+  Do not proceed to further P0 feature work or declare P0 complete until
+  a SIXTEENTH independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains — per that review's own framing, this may
+  be the final P0 closure candidate. If/when that comes back clean,
+  resume from the prior exact_next_action (below): wire the remaining
+  foundation modules (Discovery, Decisions, Assumptions, Technology/
+  Business-Capability registries) into the same integrated pipeline,
+  consider a SQLite-backed StateStore, get a Founder decision on
+  P0-sufficiency and licensing (section 206). The autonomous-merge
+  governance question stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fix for the fourteenth independent Codex review's ONE remaining P2
   finding is implemented, tested, and pushed to

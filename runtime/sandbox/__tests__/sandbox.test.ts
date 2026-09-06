@@ -1,7 +1,7 @@
 import { describe, expect, it, afterEach } from "vitest";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import {
   HardLinkAliasError,
   InvalidProjectIdError,
@@ -10,6 +10,7 @@ import {
   assertFilesystemConfinement,
   assertValidProjectId,
   assertWithinRoot,
+  isContainedRelativePath,
   withTimeout
 } from "../sandbox.js";
 
@@ -71,6 +72,123 @@ describe("assertWithinRoot", () => {
     expect(() => assertWithinRoot("/sandbox/project-a", "../project-a-evil")).toThrow(PathEscapeError);
   });
 });
+
+describe(
+  "P2 fix (15th independent review round, 'filesystem root containment incorrectly rejects valid " +
+    "descendants'): assertWithinRoot() now reasons over path.relative()'s result instead of a naive " +
+    "string-prefix concatenation, so a configured root that is ITSELF a filesystem root (POSIX '/', a " +
+    "Windows drive root) no longer wrongly rejects its own genuine descendants",
+  () => {
+    describe("POSIX", () => {
+      it(
+        "BLOCKER regression, exact reproduction: assertWithinRoot('/', '/tmp') is ACCEPTED — the old " +
+          "'/' + sep === '//' double-separator prefix check wrongly rejected this",
+        () => {
+          expect(() => assertWithinRoot("/", "/tmp")).not.toThrow();
+          expect(assertWithinRoot("/", "/tmp")).toBe("/tmp");
+        }
+      );
+
+      it("assertWithinRoot('/', '/') accepts the root itself", () => {
+        expect(() => assertWithinRoot("/", "/")).not.toThrow();
+        expect(assertWithinRoot("/", "/")).toBe("/");
+      });
+
+      it("a normal (non-root) root with a nested candidate still works — no regression", () => {
+        expect(assertWithinRoot("/safe", "/safe/file")).toBe("/safe/file");
+      });
+
+      it("'/safe' vs '/safe-evil' (prefix collision) is still REJECTED", () => {
+        expect(() => assertWithinRoot("/safe", "/safe-evil")).toThrow(PathEscapeError);
+      });
+
+      it("traversal outside a root that is itself '/' is still REJECTED (there is nothing above '/' to escape to, but a relative '..' must not resolve to something outside)", () => {
+        // resolve("/", "..") normalizes back to "/" itself on POSIX (there is
+        // no parent of the filesystem root) — this must remain ACCEPTED
+        // (it resolves to root itself), not conflated with a genuine escape.
+        expect(() => assertWithinRoot("/", "..")).not.toThrow();
+        expect(assertWithinRoot("/", "..")).toBe("/");
+      });
+
+      it("traversal outside a normal root is still REJECTED", () => {
+        expect(() => assertWithinRoot("/safe", "..")).toThrow(PathEscapeError);
+        expect(() => assertWithinRoot("/safe", "../etc/passwd")).toThrow(PathEscapeError);
+      });
+
+      it("a sibling directory (not a descendant) is still REJECTED", () => {
+        expect(() => assertWithinRoot("/safe/project-a", "/safe/project-b")).toThrow(PathEscapeError);
+      });
+
+      it("trailing-separator variants of the root normalize correctly and still accept genuine descendants", () => {
+        expect(() => assertWithinRoot("/safe/", "/safe/file")).not.toThrow();
+        expect(() => assertWithinRoot("/safe//", "/safe/file")).not.toThrow();
+      });
+
+      it("a deeply nested descendant of the root '/' is accepted", () => {
+        expect(assertWithinRoot("/", "/a/b/c")).toBe("/a/b/c");
+      });
+    });
+
+    describe("Windows semantics (verified via the exported, path-module-agnostic isContainedRelativePath predicate — this CI runs on POSIX, so node:path's own resolve()/relative() are always POSIX regardless of the path STRINGS passed in; path.win32 lets the exact same containment predicate assertWithinRoot() uses be verified under genuine win32 rules on any host OS)", () => {
+      it("a drive-root descendant is ACCEPTED", () => {
+        const rel = pathWin32.relative("C:\\", "C:\\foo");
+        expect(isContainedRelativePath(rel, { sep: pathWin32.sep, isAbsolute: pathWin32.isAbsolute })).toBe(true);
+      });
+
+      it("the drive root itself is ACCEPTED", () => {
+        const rel = pathWin32.relative("C:\\", "C:\\");
+        expect(isContainedRelativePath(rel, { sep: pathWin32.sep, isAbsolute: pathWin32.isAbsolute })).toBe(true);
+      });
+
+      it("a different drive (sibling root) is REJECTED", () => {
+        const rel = pathWin32.relative("C:\\", "D:\\foo");
+        expect(isContainedRelativePath(rel, { sep: pathWin32.sep, isAbsolute: pathWin32.isAbsolute })).toBe(false);
+      });
+
+      it("a prefix-collision sibling directory is REJECTED", () => {
+        const rel = pathWin32.relative("C:\\safe", "C:\\safe-evil");
+        expect(isContainedRelativePath(rel, { sep: pathWin32.sep, isAbsolute: pathWin32.isAbsolute })).toBe(false);
+      });
+
+      it("a genuine nested descendant under a non-root drive path is ACCEPTED", () => {
+        const rel = pathWin32.relative("C:\\safe", "C:\\safe\\nested\\file.txt");
+        expect(isContainedRelativePath(rel, { sep: pathWin32.sep, isAbsolute: pathWin32.isAbsolute })).toBe(true);
+      });
+
+      it("parent traversal above a non-root drive path is REJECTED", () => {
+        const rel = pathWin32.relative("C:\\safe", "C:\\");
+        expect(isContainedRelativePath(rel, { sep: pathWin32.sep, isAbsolute: pathWin32.isAbsolute })).toBe(false);
+      });
+    });
+
+    describe("isContainedRelativePath (the pure predicate itself, exercised directly for both POSIX and Windows path modules)", () => {
+      it("empty string (root itself) is contained", () => {
+        expect(isContainedRelativePath("")).toBe(true);
+      });
+
+      it("'..' alone is not contained", () => {
+        expect(isContainedRelativePath("..")).toBe(false);
+      });
+
+      it("a path starting with '../' is not contained (POSIX default sep)", () => {
+        expect(isContainedRelativePath("../evil")).toBe(false);
+      });
+
+      it("an ordinary relative descendant is contained (POSIX default sep)", () => {
+        expect(isContainedRelativePath("nested/file.txt")).toBe(true);
+      });
+
+      it("an absolute relative-path result (no common base) is not contained, using explicit posix path ops", () => {
+        // path.posix.relative() essentially never returns an absolute
+        // result for two absolute inputs, but the predicate must still
+        // correctly reject one if ever fed one (e.g. by a future caller).
+        expect(isContainedRelativePath("/elsewhere", { sep: pathPosix.sep, isAbsolute: pathPosix.isAbsolute })).toBe(
+          false
+        );
+      });
+    });
+  }
+);
 
 describe("assertValidProjectId (P1 fix: reject unsafe project ids before they reach any filesystem path)", () => {
   it("accepts a normal project id", () => {

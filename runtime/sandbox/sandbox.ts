@@ -4,7 +4,7 @@
 // sonsuza kadar çalışır bırakmasını engelleyen minimum korumadır.
 
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export class PathEscapeError extends Error {
   constructor(root: string, target: string) {
@@ -15,6 +15,56 @@ export class PathEscapeError extends Error {
     );
     this.name = "PathEscapeError";
   }
+}
+
+/**
+ * `relativePath` (`path.relative(root, target)`'in sonucu) `root`'un
+ * KENDİSİNİ veya GERÇEK bir ALT YOLUNU mu ifade ediyor, saf/platform
+ * bağımsız bir yardımcı olarak karar verir.
+ *
+ * P2 fix (15th independent review round, "filesystem root containment
+ * incorrectly rejects valid descendants"): eskiden `assertWithinRoot()`
+ * SAF BİR ÖN EK (prefix) testi kullanıyordu —
+ * `!resolvedTarget.startsWith(resolvedRoot + sep)`. `resolvedRoot`
+ * ZATEN bir dosya sistemi kökü ise (POSIX'te `/`, Windows'ta `C:\\`),
+ * `resolvedRoot + sep` bu ayırıcıyı İKİNCİ KEZ ekler
+ * (`"/" + "/" = "//"`), ve HİÇBİR gerçek alt yol (ör. `/tmp`) bu ÇİFT
+ * ayırıcılı önekle asla eşleşmez — `assertWithinRoot("/", "/tmp")` GEÇERLİ
+ * bir soy olduğu halde yanlışlıkla `PathEscapeError` fırlatırdı. Kök
+ * neden, ÖN EK BİRLEŞTİRMENİN kendisiydi, sadece bir kenar durumu değil.
+ * Fix: artık `path.relative(root, target)`'in SONUCU üzerinde akıl
+ * yürütülüyor — bu, ne `root`'un KENDİSİ bir dosya sistemi kökü olsun ne
+ * olmasın, DOĞRU (relative path semantics), platformun (`node:path`'in
+ * çalıştığı GERÇEK işletim sistemine göre otomatik POSIX/Windows seçen)
+ * KENDİ ayırıcı/mutlaklık kurallarını izler. `isContainedRelativePath`
+ * saf bir işlev olarak dışa aktarılır ki hem GERÇEK çalışma zamanı
+ * platformunun (`node:path`) davranışı hem de Windows'un KENDİ
+ * semantiği (`path.win32` ile beslenerek, bir POSIX CI makinesinde bile)
+ * doğrudan test edilebilsin.
+ *
+ * Karar mantığı:
+ *  - `relativePath === ""` -> `target` `root`'un TAM OLARAK KENDİSİ (kabul).
+ *  - `relativePath === ".."` veya `".." + sep` ile BAŞLIYORSA -> `target`
+ *    `root`'un DIŞINA çıkıyor (ör. bir üst dizin, bir kardeş dizin, ya da
+ *    `/safe` vs `/safe-evil` gibi bir ÖN EK ÇAKIŞMASI — `path.relative`
+ *    bunların HEPSİNİ doğal olarak `".." + ...`  ile ifade eder, elle
+ *    kontrol edilen bir ayırıcı birleştirmesine asla ihtiyaç duymadan).
+ *  - `relativePath` MUTLAK bir yolsa (`path.isAbsolute`) -> `root` ile
+ *    `target` arasında GÖRECELİ olarak ifade edilebilecek ortak bir temel
+ *    yok demektir (ör. Windows'ta farklı sürücü harfleri, `C:\\` vs
+ *    `D:\\foo` — `path.win32.relative` bu durumda `to` yolunu OLDUĞU GİBİ,
+ *    yani mutlak olarak döndürür) -> reddedilir.
+ *  - Bunların HİÇBİRİ değilse -> gerçek, göreli bir alt yoldur (kabul).
+ */
+export function isContainedRelativePath(
+  relativePath: string,
+  pathOps: { readonly sep: string; readonly isAbsolute: (p: string) => boolean } = { sep, isAbsolute }
+): boolean {
+  if (relativePath === "") return true;
+  if (relativePath === "..") return false;
+  if (relativePath.startsWith(`..${pathOps.sep}`)) return false;
+  if (pathOps.isAbsolute(relativePath)) return false;
+  return true;
 }
 
 /**
@@ -34,7 +84,7 @@ export function assertWithinRoot(root: string, target: string): string {
   const resolvedRoot = resolve(root);
   const resolvedTarget = resolve(root, target);
 
-  if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(resolvedRoot + sep)) {
+  if (!isContainedRelativePath(relative(resolvedRoot, resolvedTarget))) {
     throw new PathEscapeError(resolvedRoot, target);
   }
   return resolvedTarget;

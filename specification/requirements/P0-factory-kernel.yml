@@ -2268,6 +2268,74 @@
     Confirmed via git-stash that 4 of these tests fail against the pre-fix
     code with exactly the cross-project overwrite Codex described.
 
+    P2 fix (15th independent review round, "filesystem root containment
+    incorrectly rejects valid descendants"): `assertWithinRoot()` used a
+    NAIVE STRING-PREFIX check —
+    `!resolvedTarget.startsWith(resolvedRoot + sep)`. When `resolvedRoot`
+    is ITSELF already a filesystem root (POSIX `/`, a Windows drive root
+    like `C:\`), `resolvedRoot + sep` appends the separator a SECOND time
+    (`"/" + "/" = "//"`), and NO genuine descendant (e.g. `/tmp`) can ever
+    match that doubled-separator prefix — Codex reproduced
+    `assertWithinRoot("/", "/tmp")` wrongly throwing `PathEscapeError`
+    even though `/tmp` is a completely legitimate descendant of `/`. The
+    root cause was the PREFIX CONCATENATION ITSELF, not merely an edge
+    case to special-case around. Fixed: containment is now decided by
+    reasoning over `path.relative(root, target)`'s RESULT instead —
+    `relativePath === ""` means `target` IS `root`; `relativePath === ".."`
+    or starting with `".." + sep` means `target` is OUTSIDE `root`
+    (a parent, a sibling, or a prefix-collision path like `/safe` vs.
+    `/safe-evil` — `path.relative` expresses ALL of these as a leading
+    `".."` naturally, with no separator concatenation ever needed); an
+    ABSOLUTE relative-path result (checked via `path.isAbsolute`) means no
+    common base could be expressed relatively at all (e.g. different
+    Windows drive letters — `path.win32.relative("C:\\", "D:\\foo")`
+    returns the `to` path unchanged, which is absolute). This logic is
+    extracted into a new exported pure predicate,
+    `isContainedRelativePath(relativePath, pathOps?)`, parameterized by
+    `{ sep, isAbsolute }` (defaulting to the actual runtime platform's
+    `node:path` — i.e. genuinely POSIX or genuinely Windows semantics
+    depending on what OS this code actually runs on) — this is a STRICT
+    correctness fix, not a special case for `/`: it is exactly as correct
+    for an ordinary non-root root as the old prefix check was, and
+    correctly handles the root-is-itself-a-filesystem-root case the old
+    check could never handle by construction. Regression tests
+    (sandbox.test.ts, new describe block) prove, on POSIX (this CI's
+    actual runtime platform): the exact reproduction
+    (`assertWithinRoot("/", "/tmp")` now ACCEPTED), `assertWithinRoot("/",
+    "/")` accepted, an ordinary non-root root with a nested candidate is
+    unaffected, `/safe` vs `/safe-evil` is still REJECTED, traversal
+    above a normal root is still REJECTED (`assertWithinRoot("/safe",
+    "..")` throws), traversal "above" the root `/` correctly normalizes
+    to `/` itself via `path.resolve` and is ACCEPTED (there is nothing
+    above the filesystem root to escape to), a sibling directory is still
+    REJECTED, trailing-separator variants of the root (`/safe/`,
+    `/safe//`) normalize correctly, and a deeply nested descendant of `/`
+    is accepted. Since a POSIX CI machine's `node:path` (`resolve`/
+    `relative`/`sep`/`isAbsolute`) is ALWAYS the POSIX implementation
+    regardless of the path STRINGS passed to it, genuine Windows
+    semantics are verified by feeding `path.win32`'s own
+    `relative`/`sep`/`isAbsolute` directly into the exported
+    `isContainedRelativePath` predicate (the EXACT same function
+    `assertWithinRoot()` uses internally) — proving a drive-root
+    descendant, the drive root itself, and a nested non-root-drive
+    descendant are all ACCEPTED, while a different drive letter, a
+    prefix-collision sibling, and parent traversal above a non-root drive
+    path are all REJECTED. Verified via a temporary bypass (reverting to
+    the old `startsWith(resolvedRoot + sep)` prefix check) — confirmed
+    exactly the 2 tests exercising root-is-`/` behavior fail with the
+    EXACT `PathEscapeError` reproduction Codex described (all other new
+    tests, including the pure-predicate and Windows-semantics tests,
+    correctly stayed green since they don't exercise `assertWithinRoot()`
+    itself or don't depend on this specific edge case), then reverted. A
+    narrow audit (grepped every `.startsWith(` call combined with a `sep`
+    concatenation across `runtime/`) confirmed this was the ONLY instance
+    of this exact class in the entire codebase —
+    `assertFilesystemConfinement()`'s own lexical-vs-real containment
+    check (used for the SAME purpose) already compared two
+    `path.relative()` results for EQUALITY rather than concatenating a
+    separator onto a prefix, so it was never susceptible to this bug in
+    the first place.
+
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
   description: Cross-project default-deny isolation of filesystem/state/budget/artifacts.
