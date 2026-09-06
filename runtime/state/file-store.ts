@@ -17,6 +17,36 @@ export interface StateStore {
 }
 
 /**
+ * P2 fix (14th independent review round, "reject unserializable state
+ * before replacing valid durable state"): Codex reproduced
+ * `JSON.stringify(data, null, 2)` returning `undefined` (WITHOUT
+ * throwing) for `data === undefined` itself, a function, a symbol, or an
+ * object whose own `toJSON()` returns `undefined` — the old code
+ * interpolated that `undefined` return value directly into a template
+ * literal (`` `${JSON.stringify(...)}\n` ``), which JS silently coerces
+ * to the FOUR-CHARACTER TEXT STRING `"undefined"`. That text is not
+ * valid JSON, but the old code wrote it to the temp file and
+ * `renameSync`'d it over the destination anyway — atomically replacing a
+ * previously VALID durable state file with unparseable garbage. A
+ * subsequent `read()` then throws a `SyntaxError` with NO way to recover
+ * the prior state, a direct violation of "invalid new state must never
+ * destroy previously valid durable state" (bölüm 277).
+ */
+export class UnserializableStateError extends Error {
+  constructor(path: string, cause?: unknown) {
+    super(
+      `Refusing to write state to '${path}': the provided value does not serialize to valid JSON ` +
+        `(this happens for 'undefined' itself, a function, a symbol, an object whose toJSON() returns ` +
+        `undefined, a circular reference, or a value JSON cannot represent such as a BigInt). The ` +
+        `previous durable state at this path, if any, was left completely untouched — nothing was ever ` +
+        `written or renamed.`,
+      { cause }
+    );
+    this.name = "UnserializableStateError";
+  }
+}
+
+/**
  * JSON dosyalarına yazan basit, senkron, bağımlılıksız bir StateStore
  * uygulaması. Sadece in-memory tutmanın aksine, süreç yeniden başlasa
  * bile veri kaybolmaz (bölüm 277, "Durable State / Resume").
@@ -45,11 +75,41 @@ export interface StateStore {
  */
 export class FileStateStore implements StateStore {
   write(path: string, data: unknown): void {
+    // Herhangi bir dosya sistemi eylemi (dizin oluşturma dahil) başlamadan
+    // ÖNCE: yeni durumun GERÇEKTEN geçerli JSON'a serileştirilebildiği
+    // doğrulanır — bkz. `UnserializableStateError`'ın üstündeki fix notu.
+    // `JSON.stringify` fırlatabilir (döngüsel referans, BigInt) VEYA
+    // sessizce `undefined` DÖNDÜREBİLİR (fırlatmadan) — ikisi de burada
+    // AYNI, tipli hataya sarılır ve hedef dosyaya HİÇ dokunulmadan
+    // fırlatılır.
+    let serialized: string;
+    try {
+      const result = JSON.stringify(data, null, 2);
+      if (typeof result !== "string") {
+        throw new UnserializableStateError(path);
+      }
+      serialized = result;
+    } catch (err) {
+      if (err instanceof UnserializableStateError) throw err;
+      throw new UnserializableStateError(path, err);
+    }
+
+    // Savunma derinliği (defense in depth): bir replacer/reviver
+    // KULLANILMADIĞI için `JSON.stringify`'ın bir dize DÖNDÜRMESİ zaten
+    // dil düzeyinde "bu dize geçerli JSON'dur" garantisidir — ama
+    // gelecekte bir replacer eklenirse bile bu round-trip doğrulaması
+    // koruma sağlar, ve maliyeti ihmal edilebilir düzeydedir.
+    try {
+      JSON.parse(serialized);
+    } catch (err) {
+      throw new UnserializableStateError(path, err);
+    }
+
     const dir = dirname(path);
     mkdirSync(dir, { recursive: true });
     const tempPath = join(dir, `.${basename(path)}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
     try {
-      writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+      writeFileSync(tempPath, `${serialized}\n`, "utf8");
       renameSync(tempPath, path);
     } catch (err) {
       try {

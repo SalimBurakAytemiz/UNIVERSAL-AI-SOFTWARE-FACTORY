@@ -2,6 +2,7 @@ import { describe, expect, it, afterEach, vi } from "vitest";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { UnserializableStateError } from "../file-store.js";
 
 // P2 fix (8th independent review round, "failed state writes destroy
 // previous recoverable state"): to prove FileStateStore.write()'s atomic
@@ -174,4 +175,137 @@ describe("FileStateStore", () => {
       expect(store.read(path)).toEqual([["key1", { value: "v1", computedAt: expect.any(Number) }]]);
     });
   });
+
+  describe(
+    "P2 fix (14th independent review round, 'reject unserializable state before replacing valid durable " +
+      "state'): write() validates that the new value GENUINELY serializes to JSON before touching the " +
+      "destination at all — JSON.stringify() returning undefined (without throwing) is no longer silently " +
+      "coerced into the literal text \"undefined\" and promoted over previously valid state",
+    () => {
+      it("BLOCKER regression, exact reproduction: valid state A -> write(undefined) is REJECTED -> A remains readable and unchanged", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+        const beforeRaw = readFileSync(path, "utf8");
+
+        expect(() => store.write(path, undefined)).toThrow(UnserializableStateError);
+
+        expect(readFileSync(path, "utf8")).toBe(beforeRaw);
+        expect(store.read<{ version: number }>(path)).toEqual({ version: 1 });
+      });
+
+      it("valid state A -> write(a function) is REJECTED -> A remains intact", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+
+        expect(() => store.write(path, () => "not data")).toThrow(UnserializableStateError);
+
+        expect(store.read<{ version: number }>(path)).toEqual({ version: 1 });
+      });
+
+      it("valid state A -> write(object with toJSON() returning undefined) is REJECTED -> A remains intact", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+
+        const poisoned = { toJSON: () => undefined };
+        expect(() => store.write(path, poisoned)).toThrow(UnserializableStateError);
+
+        expect(store.read<{ version: number }>(path)).toEqual({ version: 1 });
+      });
+
+      it("a value that makes JSON.stringify THROW (circular reference) is also rejected without touching the destination", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+
+        const circular: Record<string, unknown> = { version: 2 };
+        circular.self = circular;
+
+        expect(() => store.write(path, circular)).toThrow(UnserializableStateError);
+        expect(store.read<{ version: number }>(path)).toEqual({ version: 1 });
+      });
+
+      it("a value containing an unrepresentable BigInt is also rejected without touching the destination", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+
+        expect(() => store.write(path, { amount: 10n })).toThrow(UnserializableStateError);
+        expect(store.read<{ version: number }>(path)).toEqual({ version: 1 });
+      });
+
+      it("a genuinely valid, serializable state B still atomically replaces A", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+        store.write(path, { version: 2, ok: true });
+
+        expect(store.read(path)).toEqual({ version: 2, ok: true });
+      });
+
+      it("a rejected write leaves no corrupt temporary artifact behind — the destination directory contains only the original valid file", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1 });
+
+        expect(() => store.write(path, undefined)).toThrow(UnserializableStateError);
+
+        // No ".tmp-" file was ever created — validation happens BEFORE any
+        // filesystem write, not merely cleaned up afterward.
+        const entries = readdirSync(tempRoot);
+        expect(entries).toEqual(["state.json"]);
+      });
+
+      it("a fresh store instance (simulated restart) still recovers the previous valid state after a rejected write", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { version: 1, important: "original data" });
+
+        expect(() => store.write(path, undefined)).toThrow(UnserializableStateError);
+
+        const freshStore = new FileStateStore();
+        expect(freshStore.read<{ version: number; important: string }>(path)).toEqual({
+          version: 1,
+          important: "original data"
+        });
+      });
+
+      it("rejecting an unserializable write does NOT create the destination's parent directory when it didn't already exist", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "brand-new-nested-dir", "state.json");
+        const store = new FileStateStore();
+
+        expect(() => store.write(path, undefined)).toThrow(UnserializableStateError);
+        expect(store.exists(path)).toBe(false);
+      });
+
+      it("the UnserializableStateError names the rejected path and preserves the underlying cause for a thrown serialization failure", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-unserializable-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+
+        try {
+          store.write(path, circular);
+          expect.unreachable("write() should have thrown");
+        } catch (err) {
+          expect(err).toBeInstanceOf(UnserializableStateError);
+          expect((err as Error).message).toContain(path);
+          expect((err as UnserializableStateError).cause).toBeDefined();
+        }
+      });
+    }
+  );
 });

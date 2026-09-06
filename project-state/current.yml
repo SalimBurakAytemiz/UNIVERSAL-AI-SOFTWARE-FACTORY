@@ -261,6 +261,35 @@ factory:
     run build` re-confirmed); pushed for a fourteenth independent review.
     P0 remains open.
 
+    Fourteenth independent Codex P0 closure review (all required
+    verification confirmed passing beforehand — lint, typecheck, build,
+    580/580 tests, requirement validation, secret scan, Factory Doctor)
+    reproduced ONE remaining P2 finding: "reject unserializable state
+    before replacing valid durable state" —
+    `FileStateStore.write()` called `JSON.stringify(data, null, 2)` and
+    interpolated its result directly into a template literal; for
+    `data === undefined` itself, a function, a symbol, or an object whose
+    own `toJSON()` returns `undefined`, `JSON.stringify` returns
+    `undefined` WITHOUT throwing, which JS silently coerces to the
+    four-character text string `"undefined"` — not valid JSON, but a
+    perfectly normal string that the old code happily wrote to the temp
+    file and atomically `renameSync`'d over a PREVIOUSLY VALID
+    destination file. Codex reproduced: `write(path, {version:1})`
+    succeeds, `write(path, undefined)` ALSO succeeds (silently), the
+    valid state is destroyed, and a subsequent `read()` throws a
+    `SyntaxError` with the prior state completely unrecoverable — the
+    identical "kalıcı durum" (bölüm 277) violation the 8th round's
+    atomic-write fix already closed for an INTERRUPTED write, just
+    triggered by an unserializable VALUE instead. Fixed this session (see
+    below); a narrow audit of the durable-state write/persistence path
+    confirmed `file-store.ts` is the ONLY production `writeFileSync` call
+    site in the P0 kernel (the only other durable-persistence consumer,
+    `runtime/cache/file-cache.ts`, delegates to this same `write()` and
+    is automatically protected) — no other genuine instance found. Fully
+    verified (590/590 tests); pushed for a fifteenth (and, per the
+    review's own framing, potentially final) independent review closure
+    candidate. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -1897,6 +1926,79 @@ completed_milestones:
     tests (545 + 35 new), validate:requirements, history-aware
     secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
     (13 assertions) — all clean.
+  - |-
+    THIS SESSION (round 15) — a fourteenth independent Codex review
+    (confirmed the full required sequence passing BEFORE listing the
+    finding) reproduced ONE remaining P2 finding, now fixed:
+    - [P2] "Reject unserializable state before replacing valid durable
+      state": `FileStateStore.write()` called
+      `JSON.stringify(data, null, 2)` and interpolated the result
+      directly into a template literal — for `data === undefined`
+      itself, a function, a symbol, or an object whose own `toJSON()`
+      returns `undefined`, `JSON.stringify` returns `undefined` WITHOUT
+      throwing, and JS silently coerces that into the four-character
+      text string `"undefined"`. That string is not valid JSON, but the
+      old code wrote it to the temp file and atomically `renameSync`'d
+      it over a PREVIOUSLY VALID destination file anyway. Codex
+      reproduced: `write(path, {version:1})` succeeds, `write(path,
+      undefined)` ALSO succeeds silently, the valid state is destroyed,
+      and a subsequent `read()` throws a `SyntaxError` with the prior
+      state completely unrecoverable — the same "kalıcı durum" (bölüm
+      277) violation the 8th round's atomic-write fix already closed for
+      an INTERRUPTED write, just triggered by an unserializable VALUE
+      instead. Fixed in runtime/state/file-store.ts: a new exported
+      `UnserializableStateError` is thrown, and `write()` now validates
+      BEFORE any filesystem action (not even `mkdirSync`) that
+      `JSON.stringify(data, null, 2)` genuinely returns a string —
+      `typeof result !== "string"` is rejected explicitly (covers the
+      silent-`undefined` case), and a THROWING `JSON.stringify`
+      (circular reference, BigInt) is caught and wrapped into the same
+      typed error, so both failure modes share one clear outcome. As
+      defense in depth, the produced string is also round-tripped
+      through `JSON.parse()` before being accepted (protects against a
+      future custom replacer, at negligible cost). Regression tests
+      (file-store.test.ts, new describe block) prove: the exact
+      reproduction (valid state A, `write(undefined)` REJECTED, A
+      remains byte-identical), the same for a function value and an
+      object whose `toJSON()` returns `undefined`, a circular-reference
+      value and a BigInt-containing value (both make `JSON.stringify`
+      THROW) are likewise rejected without touching the destination, a
+      genuinely valid state B still atomically replaces A (no regression
+      in the happy path), a rejected write leaves NO temp-file artifact
+      at all (validation happens before one is even created, not merely
+      before promotion), a rejected write does not even create a
+      brand-new parent directory, a fresh store instance (simulated
+      restart) still recovers the previous valid state, and the thrown
+      error names the rejected path and preserves the underlying
+      serialization failure as its `cause`. Confirmed via a temporary
+      bypass (reverting to the old direct template-literal
+      interpolation with no validation) that exactly 9 of the 10 new
+      tests fail — the valid-state-B-still-replaces-A happy-path test
+      correctly stayed green — then reverted.
+    - Narrow audit (as explicitly requested, scoped to exactly this one
+      class — "serialization failure -> destination replaced/corrupted"
+      — within the durable state write/persistence path): confirmed
+      `runtime/state/file-store.ts` is the ONLY production
+      `writeFileSync` call site in the entire P0 kernel (grepped every
+      `writeFileSync` reference in `runtime/`; every other hit is a
+      test-only helper writing to an unrelated scratch file, or a
+      documentation comment). `runtime/cache/file-cache.ts`, the only
+      other durable-persistence consumer, delegates to this SAME
+      `write()` and is automatically protected by the fix. No other
+      genuine instance of this class was found.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0021 (Durable state / resume — the new
+    UnserializableStateError fix and its regression tests, plus the
+    narrow-audit note confirming no other durable-write instance of this
+    class exists). No status field was raised on any requirement beyond
+    what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ deletion and rebuild), 590/590
+    tests (580 + 10 new), validate:requirements, history-aware
+    secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
+    (13 assertions) — all clean.
 
 known_limitations:
   - >-
@@ -2070,6 +2172,32 @@ blockers:
     and do not declare P0 complete, until that re-review confirms no
     blocking finding remains.
 
+    A FOURTEENTH independent Codex review (all required verification —
+    lint, typecheck, build, 580/580 tests, requirement validation,
+    secret scan, Factory Doctor — confirmed passing BEFORE the finding
+    was listed) reproduced ONE remaining P2 finding:
+    `FileStateStore.write()` accepted values for which
+    `JSON.stringify()` silently returns `undefined` (rather than
+    throwing) — `undefined` itself, a function, a symbol, or an object
+    whose `toJSON()` returns `undefined` — and interpolated that into the
+    literal text `"undefined"`, atomically promoting it over a
+    previously VALID durable state file; a subsequent `read()` then
+    threw an unrecoverable `SyntaxError`. Fixed this session: `write()`
+    now validates, BEFORE any filesystem action, that
+    `JSON.stringify(data, null, 2)` genuinely returns a string (a new
+    `UnserializableStateError` is thrown otherwise, also covering a
+    THROWING `JSON.stringify` for circular references/BigInts), with a
+    round-trip `JSON.parse()` check as defense in depth. Tested
+    (590/590 tests, +10 net new) and verified per the full required
+    sequence — see completed_milestones for full detail. A narrow audit
+    confirmed `file-store.ts` is the ONLY production `writeFileSync`
+    call site in the P0 kernel; no other genuine instance of this class
+    exists. Now awaiting a FIFTEENTH independent review — per the
+    review's own framing, a potential final P0 closure candidate. Per
+    explicit instruction: "stop at the independent-review boundary" — do
+    not push further P0 feature work, and do not declare P0 complete,
+    until that re-review confirms no blocking finding remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -2086,6 +2214,49 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fix for the fourteenth independent Codex review's ONE remaining P2
+  finding is implemented, tested, and pushed to
+  claude/ai-factory-baseline-v1-seawq7, with the full required
+  verification sequence run clean (lint, typecheck, a REAL `npm run
+  build` emission — confirmed via a clean `dist/` deletion and rebuild —
+  590/590 tests, validate:requirements, history-aware secret-scan,
+  Factory Doctor READY, all 9 P0 proofs). Summary of the fix:
+  `runtime/state/file-store.ts`'s `FileStateStore.write()` now validates,
+  BEFORE any filesystem action (not even directory creation), that
+  `JSON.stringify(data, null, 2)` genuinely returns a string — the old
+  code let `JSON.stringify` silently return `undefined` (for
+  `data === undefined` itself, a function, a symbol, or an object whose
+  `toJSON()` returns `undefined`) and interpolated that into the literal
+  text `"undefined"`, atomically promoting it over a previously VALID
+  durable state file. A new `UnserializableStateError` is now thrown for
+  both this silent-`undefined` case AND a THROWING `JSON.stringify`
+  (circular reference, BigInt), with a round-trip `JSON.parse()` check
+  as defense in depth; a rejected write leaves the destination
+  byte-identical and creates no filesystem artifact of any kind. A
+  narrow audit confirmed `file-store.ts` is the ONLY production
+  `writeFileSync` call site in the P0 kernel (the only other
+  durable-persistence consumer, `runtime/cache/file-cache.ts`, delegates
+  to this same `write()` and is automatically protected) — no other
+  genuine instance of this class exists. This fix was individually
+  verified via a temporary in-place bypass confirmed to reproduce the
+  exact predicted regression-test failures (9 of 10 new tests, with the
+  happy-path test correctly unaffected), then reverted. Requirement
+  registry updated (UASF-REQ-0021) from this real evidence only — no
+  status raised beyond what is genuinely supported. Do not proceed to
+  further P0 feature work or declare P0 complete until a FIFTEENTH
+  independent (Codex) re-review of this diff confirms no blocking P0
+  finding remains — per that review's own framing, this may be the final
+  P0 closure candidate. If/when that comes back clean, resume from the
+  prior exact_next_action (below): wire the remaining foundation modules
+  (Discovery, Decisions, Assumptions, Technology/Business-Capability
+  registries) into the same integrated pipeline, consider a
+  SQLite-backed StateStore, get a Founder decision on P0-sufficiency and
+  licensing (section 206). The autonomous-merge governance question
+  stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fixes for the thirteenth independent Codex review's 6 findings are
   implemented, tested, and pushed to claude/ai-factory-baseline-v1-seawq7,

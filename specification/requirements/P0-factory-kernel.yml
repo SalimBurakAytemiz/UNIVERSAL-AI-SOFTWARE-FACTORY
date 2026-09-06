@@ -836,6 +836,69 @@
     against the pre-fix code with exactly the truncated-JSON/SyntaxError
     corruption Codex described.
 
+    P2 fix (14th independent review round, "reject unserializable state
+    before replacing valid durable state"): the 8th round's atomic-write
+    fix above protects against a write that STARTS and then fails
+    partway through, but did not protect against a value that
+    `JSON.stringify(data, null, 2)` SILENTLY turns into `undefined`
+    (WITHOUT throwing) — this happens for `data === undefined` itself, a
+    function, a symbol, or an object whose own `toJSON()` returns
+    `undefined`. The old code interpolated that `undefined` return value
+    directly into a template literal (`` `${JSON.stringify(...)}\n` ``),
+    which JS coerces to the four-character TEXT STRING `"undefined"` —
+    not valid JSON, but a perfectly normal string as far as
+    `writeFileSync`/`renameSync` are concerned, so it was written to the
+    temp file and atomically promoted over a PREVIOUSLY VALID destination
+    file anyway. Codex reproduced: `write(path, {version:1})` succeeds,
+    `write(path, undefined)` ALSO succeeds (silently), the valid state is
+    replaced, and a subsequent `read(path)` then throws a `SyntaxError`
+    with the original state completely unrecoverable — the same class of
+    "kalıcı durum" (bölüm 277) violation as the 8th round's finding, just
+    triggered by an unserializable VALUE instead of an interrupted write.
+    Fixed: a new exported `UnserializableStateError` is thrown, and
+    `write()` now validates that `JSON.stringify(data, null, 2)`
+    genuinely returns a string BEFORE any filesystem action at all (not
+    merely before the atomic rename) — `typeof result !== "string"`
+    (covers the silent-`undefined` case) is rejected explicitly; a
+    THROWING `JSON.stringify` (circular reference, BigInt) is also caught
+    and wrapped into the same typed error, so both failure MODES of
+    serialization share one clear, documented outcome. As defense in
+    depth (per the review's explicit "prefer validating round-trip
+    parseability" ask), the produced string is also round-tripped through
+    `JSON.parse()` before being accepted, protecting against a future
+    custom replacer even though `JSON.stringify` without one is already
+    guaranteed by the language to produce valid JSON when it returns a
+    string at all. Since validation now happens BEFORE `mkdirSync`/the
+    temp file is even created, a rejected write leaves genuinely ZERO
+    filesystem footprint — not just "no corruption," but no artifact of
+    any kind. Regression tests (file-store.test.ts, new describe block)
+    prove: the exact reproduction (valid state A, `write(undefined)` is
+    REJECTED, A remains byte-identical and readable), the same for a
+    function value and for an object whose `toJSON()` returns `undefined`,
+    a circular-reference value and a BigInt-containing value (both of
+    which make `JSON.stringify` THROW rather than return `undefined`) are
+    likewise rejected without touching the destination, a genuinely valid
+    state B still atomically replaces A (no regression in the happy
+    path), a rejected write creates no temp-file artifact at all (not
+    merely one that gets cleaned up), a rejected write does not even
+    create a brand-new parent directory that didn't already exist, a
+    fresh store instance (simulated restart) still recovers the previous
+    valid state after a rejected write, and the thrown error names the
+    rejected path and preserves the underlying serialization failure as
+    its `cause` for a thrown (not silently-undefined) case. Confirmed via
+    a temporary bypass (reverting to the old direct
+    `` `${JSON.stringify(data, null, 2)}\n` `` interpolation with no
+    validation) that exactly 9 of the 10 new tests fail (the
+    valid-state-B-still-replaces-A happy-path test correctly stayed
+    green, since it exercises behavior this fix does not change), then
+    reverted. A narrow audit of the durable state write/persistence path
+    confirmed `runtime/state/file-store.ts` is the ONLY production
+    `writeFileSync` call site in the entire P0 kernel — `runtime/cache/
+    file-cache.ts` (the other durable-persistence consumer) delegates to
+    this SAME `write()` and is automatically protected; no other genuine
+    instance of "serialization failure -> destination replaced/corrupted"
+    was found.
+
 - id: UASF-REQ-0022
   title: Audit (foundation)
   description: Append-only audit log for policy/approval/budget decisions.
