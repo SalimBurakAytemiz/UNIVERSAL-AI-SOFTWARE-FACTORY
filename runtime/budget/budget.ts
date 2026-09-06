@@ -61,6 +61,39 @@ interface CeilingCheck {
   readonly projected: number;
 }
 
+export interface Reservation {
+  readonly id: string;
+  readonly scope: Readonly<CostScope>;
+  readonly amountUsd: number;
+}
+
+export class UnknownReservationError extends Error {
+  constructor(reservationId: string) {
+    super(
+      `No open reservation '${reservationId}' — it may have already been committed/released, ` +
+        `or never existed. commit()/release() must be called at most once per reserve() call.`
+    );
+    this.name = "UnknownReservationError";
+  }
+}
+
+/**
+ * İki AYRI CostScope'un aynı "sorguyu" karşılayıp karşılamadığını
+ * kontrol eder — cost-engine.ts'nin `matchesScope`'u ile AYNI alan-eşleme
+ * mantığı (taskId/agentId/projectId), ama bir CostEntry yerine bekleyen
+ * bir rezervasyonun KENDİ kapsamına karşı çalışır. Tavan hesaplamalarının
+ * (buildCeilingChecks) hem GERÇEKLEŞMİŞ harcamaları (CostEngine) hem de
+ * HENÜZ gerçekleşmemiş ama zaten "ayrılmış" tutarları (reservations) AYNI
+ * kapsam kuralıyla toplayabilmesi için tek kaynak.
+ */
+function scopeMatches(record: CostScope, query: CostScope): boolean {
+  return (
+    (query.taskId === undefined || record.taskId === query.taskId) &&
+    (query.agentId === undefined || record.agentId === query.agentId) &&
+    (query.projectId === undefined || record.projectId === query.projectId)
+  );
+}
+
 /** Verilen anın ait olduğu UTC takvim gününün başlangıcını (00:00:00.000Z) döndürür. */
 function startOfUtcDay(date: Date): string {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())).toISOString();
@@ -85,6 +118,47 @@ export class BudgetGuard {
    * durumu etkileyemez.
    */
   private readonly limits: Readonly<BudgetLimits>;
+
+  /**
+   * P1 fix (10th independent review round, "concurrent model invocations
+   * can exceed budgets"): Codex reproduced two concurrent $0.60 provider
+   * calls against a $1.00 ceiling BOTH executing — each independently
+   * called `assertWithinBudget()` (a pure read of ALREADY-recorded totals)
+   * BEFORE either had recorded anything, so both passed; the actual
+   * `spend()` call only happened AFTER an `await`ed provider round-trip,
+   * by which point BOTH providers had already been invoked and BOTH real
+   * costs had already been incurred — `spend()` itself is atomic
+   * (no `await` between its own check and its own record), so it correctly
+   * rejected the SECOND `spend()` call, but that rejection happened AFTER
+   * the second $0.60 was already spent for real, silently losing track of
+   * $0.60 of genuinely incurred cost. The root cause is a classic
+   * check-then-(async-gap)-then-act race: `assertWithinBudget()` alone
+   * checks but never RESERVES anything, so nothing stops a second
+   * concurrent caller from also passing the same check during that gap.
+   * Fixed with a reservation/reconciliation model: `reserve()` atomically
+   * (synchronously, no `await` inside it — JS's single-threaded run-to-
+   * completion semantics make "check its ceilings" and "record the
+   * reservation" a single indivisible step, exactly like the existing
+   * `spend()`) evaluates ALL ceilings INCLUDING every other currently-open
+   * reservation, and only if none would be exceeded does it add a new
+   * reservation and return an opaque handle — this must happen and
+   * complete BEFORE any provider is ever invoked. After the (awaited,
+   * genuinely concurrent-safe) provider call, `commit()` deletes the
+   * reservation and records the ACTUAL incurred cost unconditionally
+   * (never re-checked against ceilings, and never dropped, even if that
+   * pushes a ceiling into overage on paper — bölüm 147, "sessiz harcama
+   * yok" means an already-incurred real-world cost may NEVER be silently
+   * discarded just because accounting it would look bad); an overage is
+   * still detected and logged to the audit trail for visibility, but the
+   * cost itself is always recorded. `release()` is the documented
+   * reconciliation rule for a provider call that THROWS (P0's providers
+   * are assumed not to partially bill on failure — a real provider
+   * adapter that CAN incur a partial cost on failure must report that
+   * partial cost via `commit()` with the partial amount, not `release()`,
+   * which is out of scope for the MockProvider this repository ships).
+   */
+  private readonly reservations = new Map<string, { scope: Readonly<CostScope>; amountUsd: number }>();
+  private reservationSeq = 0;
 
   constructor(
     private readonly costEngine: CostEngine,
@@ -128,6 +202,26 @@ export class BudgetGuard {
    * (`spend()` her zaman `projectId` geçmek ZORUNDA değildir) desteklediği
    * meşru bir kullanım şeklidir.
    */
+  /** Verilen sorguyla eşleşen TÜM açık rezervasyonların toplamı (bkz. scopeMatches). */
+  private reservedTotal(query: CostScope): number {
+    let total = 0;
+    for (const reservation of this.reservations.values()) {
+      if (scopeMatches(reservation.scope, query)) {
+        total += reservation.amountUsd;
+      }
+    }
+    return total;
+  }
+
+  /**
+   * Her tavan kontrolü artık ÜÇ bileşenin toplamına karşı değerlendirilir:
+   * (1) CostEngine'e zaten KAYDEDİLMİŞ gerçek harcamalar, (2) henüz
+   * mutabakata varılmamış ama zaten AYRILMIŞ (`reserve()` ile açılmış,
+   * henüz `commit()`/`release()` edilmemiş) tutarlar, (3) bu ÇAĞRININ
+   * kendi projeksiyonu. (2)'nin dahil edilmesi, tam olarak 10th
+   * independent review round'un eşzamanlılık düzeltmesidir — onsuz, iki
+   * eşzamanlı `reserve()` çağrısı yine birbirini GÖRMEZ ve ikisi de geçer.
+   */
   private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {
     const checks: CeilingCheck[] = [];
 
@@ -137,7 +231,7 @@ export class BudgetGuard {
       checks.push({
         ceiling: "perTaskUsd",
         limit: this.limits.perTaskUsd,
-        projected: this.costEngine.totalFor(taskScope) + projectedAmountUsd
+        projected: this.costEngine.totalFor(taskScope) + this.reservedTotal(taskScope) + projectedAmountUsd
       });
     }
 
@@ -145,7 +239,7 @@ export class BudgetGuard {
       checks.push({
         ceiling: "perRunUsd",
         limit: this.limits.perRunUsd,
-        projected: this.costEngine.total() + projectedAmountUsd
+        projected: this.costEngine.total() + this.reservedTotal({}) + projectedAmountUsd
       });
     }
 
@@ -158,7 +252,10 @@ export class BudgetGuard {
       checks.push({
         ceiling: "dailyUsd",
         limit: this.limits.dailyUsd,
-        projected: this.costEngine.totalInWindow(periodScope, startOfUtcDay(this.now())) + projectedAmountUsd
+        projected:
+          this.costEngine.totalInWindow(periodScope, startOfUtcDay(this.now())) +
+          this.reservedTotal(periodScope) +
+          projectedAmountUsd
       });
     }
 
@@ -166,7 +263,10 @@ export class BudgetGuard {
       checks.push({
         ceiling: "monthlyUsd",
         limit: this.limits.monthlyUsd,
-        projected: this.costEngine.totalInWindow(periodScope, startOfUtcMonth(this.now())) + projectedAmountUsd
+        projected:
+          this.costEngine.totalInWindow(periodScope, startOfUtcMonth(this.now())) +
+          this.reservedTotal(periodScope) +
+          projectedAmountUsd
       });
     }
 
@@ -246,5 +346,130 @@ export class BudgetGuard {
   }) {
     this.assertWithinBudget({ taskId: entry.taskId, projectId: entry.projectId }, entry.amountUsd);
     return this.costEngine.record(entry);
+  }
+
+  /**
+   * Bir provider/model çağrısı yapılmadan ÖNCE çağrılır — `spend()`'in
+   * "kontrol et + kaydet" atomikliğinin AYNISINI, ama gerçek maliyet henüz
+   * bilinmezken (yalnızca TAHMİNİ maliyet bilinirken) sağlar. `reserve()`
+   * içinde HİÇBİR `await` yoktur; kontrol VE yeni rezervasyonun eklenmesi
+   * tek bir senkron JS "tick"inde gerçekleşir, bu yüzden eşzamanlı iki
+   * `reserve()` çağrısı arasında ARADA KALAN bir an OLAMAZ — biri
+   * tamamlanmadan diğeri BAŞLAYAMAZ (10th independent review round fix,
+   * bkz. `reservations` alanının üstündeki not). Tavan aşılıyorsa (mevcut
+   * kayıtlı harcamalar + TÜM diğer açık rezervasyonlar + bu tahmini tutar),
+   * fail-closed olunur ve HİÇBİR rezervasyon oluşturulmaz — çağıran,
+   * provider'ı ASLA çağırmamalıdır.
+   */
+  reserve(scope: CostScope, amountUsd: number): Reservation {
+    try {
+      assertValidMonetaryAmount(amountUsd, "BudgetGuard.reserve");
+    } catch (err) {
+      this.auditLog?.append({
+        type: "BUDGET_INVALID_AMOUNT_REJECTED",
+        actor: "budget-guard",
+        payload: { scope, amountUsd, reason: err instanceof Error ? err.message : String(err) },
+        timestamp: this.now().toISOString()
+      });
+      throw err;
+    }
+
+    const checks = this.buildCeilingChecks(scope, amountUsd);
+    for (const check of checks) {
+      if (exceedsMonetaryAmount(check.projected, check.limit)) {
+        this.auditLog?.append({
+          type: "BUDGET_RESERVATION_BLOCKED",
+          actor: "budget-guard",
+          payload: { scope, amountUsd, ...check },
+          timestamp: this.now().toISOString()
+        });
+        throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
+      }
+    }
+
+    const id = `res-${++this.reservationSeq}`;
+    const frozenScope = freezeRecord({ ...scope });
+    this.reservations.set(id, { scope: frozenScope, amountUsd });
+
+    this.auditLog?.append({
+      type: "BUDGET_RESERVATION_CREATED",
+      actor: "budget-guard",
+      payload: { reservationId: id, scope, amountUsd, checks },
+      timestamp: this.now().toISOString()
+    });
+
+    return freezeRecord({ id, scope: frozenScope, amountUsd });
+  }
+
+  /**
+   * Provider çağrısı BAŞARIYLA tamamlandıktan sonra çağrılır — açık
+   * rezervasyonu SİLER ve GERÇEK (tahmini değil) maliyeti KOŞULSUZ olarak
+   * kaydeder. "Koşulsuz" kastidir: bir çıktının SONRADAN `validate()`'i
+   * geçememesi (ya da mutabakat anında bir tavanın kağıt üzerinde aşılmış
+   * görünmesi) zaten GERÇEKLEŞMİŞ bir maliyeti asla SİLEMEZ (bölüm 147,
+   * "sessiz harcama yok") — bu yüzden burada `assertWithinBudget`
+   * TEKRAR ÇAĞRILMAZ. Aşım yine de AuditLog'a `overages` olarak
+   * kaydedilir (görünürlük için), ama harcamanın kendisi HER ZAMAN
+   * kaydedilir. Rezervasyon zaten mevcut değilse (örn. `commit()`/
+   * `release()` daha önce çağrılmışsa) UnknownReservationError fırlatır —
+   * aynı rezervasyonun İKİ KEZ mutabakata varılması yapısal olarak
+   * imkânsızdır.
+   */
+  commit(
+    reservationId: string,
+    entry: { taskId: string; agentId?: string; projectId?: string; provider: string; modelId: string; amountUsd: number }
+  ) {
+    const reservation = this.reservations.get(reservationId);
+    if (!reservation) {
+      throw new UnknownReservationError(reservationId);
+    }
+    this.reservations.delete(reservationId);
+
+    assertValidMonetaryAmount(entry.amountUsd, `BudgetGuard.commit(reservationId=${reservationId})`);
+    const recorded = this.costEngine.record(entry);
+
+    const overages = this.buildCeilingChecks({ taskId: entry.taskId, projectId: entry.projectId }, 0).filter((check) =>
+      exceedsMonetaryAmount(check.projected, check.limit)
+    );
+
+    this.auditLog?.append({
+      type: "BUDGET_RESERVATION_COMMITTED",
+      actor: "budget-guard",
+      payload: {
+        reservationId,
+        reservedScope: reservation.scope,
+        reservedAmountUsd: reservation.amountUsd,
+        actualAmountUsd: entry.amountUsd,
+        entry: recorded,
+        overages
+      },
+      timestamp: this.now().toISOString()
+    });
+
+    return recorded;
+  }
+
+  /**
+   * Provider çağrısı BAŞARISIZ olduğunda (istisna fırlattığında) çağrılır
+   * — belgelenen mutabakat kuralı budur: HİÇBİR gerçek maliyet
+   * OLUŞMADIĞI varsayılır (bu depodaki MockProvider için doğru olan
+   * varsayım), bu yüzden rezervasyon hiçbir kayıt oluşturmadan tamamen
+   * SERBEST BIRAKILIR. Kısmi faturalandırma yapabilen GERÇEK bir provider
+   * adaptörü bunun yerine `commit()`'i KISMİ gerçek tutarla çağırmalıdır
+   * — bu P0 kapsamının dışındadır.
+   */
+  release(reservationId: string): void {
+    const reservation = this.reservations.get(reservationId);
+    if (!reservation) {
+      throw new UnknownReservationError(reservationId);
+    }
+    this.reservations.delete(reservationId);
+
+    this.auditLog?.append({
+      type: "BUDGET_RESERVATION_RELEASED",
+      actor: "budget-guard",
+      payload: { reservationId, scope: reservation.scope, amountUsd: reservation.amountUsd },
+      timestamp: this.now().toISOString()
+    });
   }
 }

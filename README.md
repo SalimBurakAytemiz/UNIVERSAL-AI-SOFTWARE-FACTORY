@@ -86,12 +86,15 @@ live, computed answer. As of this writing:
 
 **Node.js 24.x (LTS) is this repository's canonical, CI-tested runtime** —
 that's what CI (`.github/workflows/ci.yml`) and this session's development
-environment run. The locked Vitest 5 test toolchain also genuinely supports
-Node 22.12+ and Node 26+; the exact accepted range is declared in
-`package.json`'s `engines.node` and validated automatically (not just
-presence-checked) by `node dist/runtime/cli/index.js doctor` below — that
-check fails closed (non-zero exit) if your Node version falls outside the
-declared range, so it can't silently drift from what's documented here.
+environment run. The locked test AND lint toolchain (Vitest 5, the
+`@typescript-eslint` chain) also genuinely supports Node 22.13+ and Node
+26+; the exact accepted range is declared in `package.json`'s
+`engines.node` and validated automatically (not just presence-checked, and
+not just against Vitest — the COMPLETE locked toolchain) by
+`node dist/runtime/cli/index.js doctor` below — that check fails closed
+(non-zero exit) if your Node version falls outside the declared range or
+outside any individual locked dependency's own requirement, so it can't
+silently drift from what's documented here.
 
 ```bash
 npm install

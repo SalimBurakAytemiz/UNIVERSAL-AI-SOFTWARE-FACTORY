@@ -16,7 +16,7 @@ import { CheapestCapableModelRouter } from "../../runtime/models/router.js";
 import { CostEngine } from "../../runtime/cost/cost-engine.js";
 import { BudgetGuard } from "../../runtime/budget/budget.js";
 import { Cache, computeWithCache } from "../../runtime/cache/cache.js";
-import { PolicyEngine } from "../../runtime/policy-engine/policy-engine.js";
+import { PolicyEngine, lowRiskAllowRule } from "../../runtime/policy-engine/policy-engine.js";
 import { ApprovalRequiredError, ApprovalWorkflow } from "../../runtime/policy-engine/approval.js";
 
 describe("Proof: P0 kernel end-to-end scenario", () => {
@@ -28,6 +28,16 @@ describe("Proof: P0 kernel end-to-end scenario", () => {
     const router = new CheapestCapableModelRouter(registry);
     const costEngine = new CostEngine();
     const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+    // P1 fix (10th independent review round, "public ModelGateway.invoke()
+    // bypasses enforcement"): this proof previously called `gateway.invoke()`
+    // directly and recorded cost via a separate, manual `budget.spend()`
+    // call — a real, uncontested demonstration of the exact unguarded path
+    // Codex reproduced, since it never consulted PolicyEngine at all. It
+    // now goes through the SAME guarded `gateway.invoke(model, request,
+    // context)` boundary as router.ts — there is no other path to a real
+    // provider (see runtime/models/gateway.ts).
+    const policy = new PolicyEngine();
+    policy.addRule(lowRiskAllowRule(2));
     const summaryCache = new Cache<string>();
 
     const summarize = vi.fn(async (prNumber: number) => {
@@ -36,12 +46,11 @@ describe("Proof: P0 kernel end-to-end scenario", () => {
         risk: 0,
         requiredCapabilities: ["summarization"]
       });
-      const response = await gateway.invoke(decision.model, { prompt: `Summarize PR #${prNumber}` });
-      budget.spend({
-        taskId: `summarize-pr-${prNumber}`,
-        provider: response.provider,
-        modelId: response.modelId,
-        amountUsd: response.costUsd
+      const response = await gateway.invoke(decision.model, { prompt: `Summarize PR #${prNumber}` }, {
+        policy,
+        budget,
+        risk: 0,
+        taskId: `summarize-pr-${prNumber}`
       });
       return response.output;
     });

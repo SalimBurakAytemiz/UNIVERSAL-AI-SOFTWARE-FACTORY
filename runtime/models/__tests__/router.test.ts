@@ -268,11 +268,12 @@ function setupThreeTierEscalationScenario() {
   });
 
   const gateway = new ModelGateway();
-  gateway.registerProvider(new MockProvider());
+  const provider = new MockProvider();
+  gateway.registerProvider(provider);
   const router = new CheapestCapableModelRouter(registry);
   const policy = permissivePolicy();
   const budget = permissiveBudget();
-  return { registry, gateway, router, policy, budget };
+  return { registry, gateway, provider, router, policy, budget };
 }
 
 describe("CheapestCapableModelRouter fallback output validation", () => {
@@ -383,7 +384,7 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
 
 describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent review round: 'fallback execution bypasses policy and budget enforcement')", () => {
   it("a fallback candidate that policy DENYs is never invoked — the provider is never called for it", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, provider } = setupThreeTierEscalationScenario();
     const policy = new PolicyEngine();
     policy.addRule(lowRiskAllowRule(5)); // would otherwise allow everything
     policy.addRule({
@@ -392,7 +393,11 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       evaluate: (action) => (action.description.includes("tier-premium") ? "DENY" : null)
     });
     const budget = permissiveBudget();
-    const invokeSpy = vi.spyOn(gateway, "invoke");
+    // Spy on the underlying PROVIDER (not gateway.invoke, which is now the
+    // guarded boundary itself and is legitimately called for every
+    // candidate attempt) — this is the thing that must never be reached
+    // for a denied candidate.
+    const providerInvokeSpy = vi.spyOn(provider, "invoke");
     const validate = vi.fn(() => false); // primary fails -> triggers an escalation attempt
 
     await expect(
@@ -407,12 +412,12 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       )
     ).rejects.toThrow(CapabilityDeniedError);
 
-    // tier-mock (initial, allowed) WAS invoked; tier-premium (denied) was NEVER invoked.
-    expect(invokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+    // tier-mock (initial, allowed) WAS invoked; tier-premium (denied) never reached the provider.
+    expect(providerInvokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
   });
 
   it("a fallback candidate requiring approval is not invoked without a valid approval", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, provider } = setupThreeTierEscalationScenario();
     const policy = new PolicyEngine();
     policy.addRule(lowRiskAllowRule(5));
     // Higher priority than the catch-all ALLOW above: both are non-DENY, so
@@ -425,7 +430,7 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       evaluate: (action) => (action.description.includes("tier-premium") ? "APPROVAL_REQUIRED" : null)
     });
     const budget = permissiveBudget();
-    const invokeSpy = vi.spyOn(gateway, "invoke");
+    const providerInvokeSpy = vi.spyOn(provider, "invoke");
     const validate = vi.fn(() => false);
 
     await expect(
@@ -440,15 +445,15 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       )
     ).rejects.toThrow(CapabilityApprovalRequiredError);
 
-    expect(invokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+    expect(providerInvokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
   });
 
   it("insufficient budget blocks a fallback candidate BEFORE any provider call occurs", async () => {
-    const { router, gateway, policy } = setupThreeTierEscalationScenario();
+    const { router, gateway, provider, policy } = setupThreeTierEscalationScenario();
     const costEngine = new CostEngine();
     // Enough for the free initial (tier-mock, $0) but not the $0.5 premium fallback.
     const budget = new BudgetGuard(costEngine, { perRunUsd: 0.1 });
-    const invokeSpy = vi.spyOn(gateway, "invoke");
+    const providerInvokeSpy = vi.spyOn(provider, "invoke");
     const validate = vi.fn(() => false);
 
     await expect(
@@ -463,8 +468,8 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       )
     ).rejects.toThrow(BudgetExceededError);
 
-    // tier-mock (free, within budget) WAS invoked; tier-premium ($0.5, over budget) was NEVER invoked.
-    expect(invokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
+    // tier-mock (free, within budget) WAS invoked; tier-premium ($0.5, over budget) never reached the provider.
+    expect(providerInvokeSpy.mock.calls.map((call) => call[0].modelId)).toEqual(["tier-mock"]);
     expect(costEngine.total()).toBe(0);
   });
 
@@ -516,10 +521,10 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
   });
 
   it("allowPremiumFallback=true is not itself an authorization — a default-deny policy blocks even the initial candidate", async () => {
-    const { router, gateway } = setupThreeTierEscalationScenario();
+    const { router, gateway, provider } = setupThreeTierEscalationScenario();
     const policy = new PolicyEngine(); // no rules at all -> default deny
     const budget = permissiveBudget();
-    const invokeSpy = vi.spyOn(gateway, "invoke");
+    const providerInvokeSpy = vi.spyOn(provider, "invoke");
 
     await expect(
       router.routeAndExecute(
@@ -533,8 +538,9 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       )
     ).rejects.toThrow(CapabilityDeniedError);
 
-    // Not even the INITIAL candidate was invoked — routing permission
-    // (allowPremiumFallback) is never a substitute for policy authorization.
-    expect(invokeSpy).not.toHaveBeenCalled();
+    // Not even the INITIAL candidate ever reached the provider — routing
+    // permission (allowPremiumFallback) is never a substitute for policy
+    // authorization.
+    expect(providerInvokeSpy).not.toHaveBeenCalled();
   });
 });

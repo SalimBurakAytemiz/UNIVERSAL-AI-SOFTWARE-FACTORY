@@ -940,6 +940,53 @@
   proof_refs:
     - "proofs/cheapest-capable-model"
   security_refs: []
+  notes: >
+    P1 fix (10th independent review round, "public ModelGateway.invoke()
+    bypasses enforcement"): Codex reproduced a direct `gateway.invoke()`
+    call reaching a provider with NO PolicyEngine, approval enforcement,
+    BudgetGuard, reservation, or cost accounting at all — router.ts's own
+    guard (UASF-REQ-0027's fix) could always be bypassed by any OTHER
+    caller with a reference to the same gateway, and the e2e-p0-kernel
+    proof (proofs/e2e-p0-kernel/proof.test.ts) was a live, uncontested
+    example of exactly this. This is a genuinely different, more severe
+    class than "one caller forgot to check policy" — it means NO amount
+    of fixing router.ts alone can ever establish "every real invocation is
+    authorized" as a system-wide invariant, since gateway.invoke() itself
+    was the actual boundary that needed to enforce it. Fixed by moving the
+    ENTIRE guard into ModelGateway.invoke() itself (Option A+B+C from the
+    review: raw invocation made structurally private AND an authoritative
+    context made non-optional AND one centralized boundary used by every
+    caller) — `invoke(model, request, context: ModelInvocationContext)`
+    requires `context.policy`/`context.budget` (no optional flag exists to
+    skip them; this is a compile error, not a runtime toggle), evaluates
+    the SAME CapabilityGateway/PolicyEngine used everywhere else in the
+    Factory, reserves the projected cost via BudgetGuard.reserve() BEFORE
+    ever touching a provider, invokes the provider only after a successful
+    reservation, then commits the actual cost (or releases the reservation
+    on provider failure — bkz. UASF-REQ-0030). The raw provider call moved
+    to a genuine ECMAScript private method (`#rawInvoke`, using `#`, not
+    TypeScript's `private` keyword which is compile-time-only and still a
+    real, callable property in the emitted JS) — this is enforced by the
+    JavaScript runtime itself, not a naming convention a determined caller
+    (or `as any`) could talk its way past. Regression tests
+    (gateway.test.ts) prove: DENY blocks invocation with zero provider
+    calls, the PolicyEngine's own risk-5 APPROVAL_REQUIRED floor blocks
+    invocation with zero provider calls, insufficient budget blocks
+    invocation with zero provider calls, the reservation happens before
+    the provider ever resolves, a successful invocation is accounted for
+    exactly once, a later validation failure (which lives in router.ts,
+    downstream of this commit) cannot erase the already-recorded cost, a
+    failing provider call releases its reservation rather than recording a
+    phantom cost, fallback/escalation candidates go through this exact
+    same boundary (no parallel "fast path"), and omitting policy/budget is
+    a compile-time error by construction (no runtime branch to test).
+    Verified via a temporary in-place bypass (an early `return
+    this.#rawInvoke(...)` before the guard, keeping the real signature) —
+    confirmed exactly 7 of the 12 gateway tests fail against the bypassed
+    code (the ones exercising DENY/approval/budget/reservation/commit/
+    release/concurrency), then reverted. proofs/e2e-p0-kernel/proof.test.ts
+    was updated to use this same guarded call instead of its previous
+    direct gateway.invoke() + manual budget.spend().
 
 - id: UASF-REQ-0025
   title: Model registry
@@ -1130,6 +1177,34 @@
     arguments) that all 6 new tests fail with exactly the bypass Codex
     described, then restored.
 
+    P1 fix (10th independent review round, "public ModelGateway.invoke()
+    bypasses enforcement"): Codex showed that protecting routeAndExecute()
+    alone does not guarantee the system-wide invariant — `gateway.invoke()`
+    itself was still a PUBLIC method with no policy/budget awareness at
+    all, reachable directly by any caller (the e2e-p0-kernel proof did
+    exactly this, calling gateway.invoke() and a separate manual
+    budget.spend()). Fixed at the architecture level, not by adding
+    another optional parameter: the entire guard (PolicyEngine ->
+    BudgetGuard reservation -> provider call -> commit/release
+    reconciliation) now lives INSIDE `ModelGateway.invoke()` itself, which
+    REQUIRES a `ModelInvocationContext` (policy + budget, both
+    non-optional — this does not compile without them). The raw provider
+    call was moved to a true ECMAScript private method (`#rawInvoke`, not
+    TypeScript's compile-time-only `private`) so it is genuinely
+    inaccessible from outside the class at runtime, not just discouraged
+    by convention. router.ts's `invokeAuthorized()` is now a thin adapter
+    delegating to this same gateway.invoke() — there is exactly ONE path
+    to a real provider in this codebase. See UASF-REQ-0024 (Model gateway)
+    for the gateway-side notes and regression test list.
+
+    P1 fix (10th independent review round, "concurrent model invocations
+    can exceed budgets"): see UASF-REQ-0030 (Budget engine / cost
+    ceilings)'s notes for the reservation/reconciliation model this
+    router now relies on via gateway.invoke() — routeAndExecute() itself
+    required no code change beyond what the paragraph above already
+    describes, since the atomicity fix lives entirely in
+    BudgetGuard.reserve()/commit()/release().
+
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
   description: >
@@ -1166,6 +1241,19 @@
     escalation step, per baseline section 294 ("no unsupported upgrades"
     also implies no unsupported non-corrections once real evidence exists)
     — but this gap is recorded honestly rather than silently closed.
+
+    Re-checked per explicit instruction (10th independent review round):
+    proofs/premium-fallback-block/proof.test.ts still passes unchanged and
+    still constructs a genuine PolicyEngine + BudgetGuard, confirming this
+    requirement's own "policy/budget approval" guarantee is unaffected by
+    this round's fixes (the guard logic moved INTO gateway.invoke() itself
+    — see UASF-REQ-0024 — but router.ts's routeAndExecute() still requires
+    the same non-optional `policy`/`budget` parameters this proof already
+    exercised; the fallback classes fixed this round were "concurrent
+    invocations can race past a budget ceiling" and "a caller can bypass
+    the gateway's guard entirely," neither of which this requirement's own
+    proof scenario exercises). PROOF_VERIFIED remains genuinely supported;
+    no status change.
 
 - id: UASF-REQ-0029
   title: Cost engine
@@ -1367,6 +1455,60 @@
     (correct at the Factory's own documented precision) — the proof's
     actual claim (a runaway loop is stopped by the ceiling) is unchanged
     and still verified.
+
+    P1 fix (10th independent review round, "concurrent model invocations
+    can exceed budgets"): Codex reproduced two CONCURRENT $0.60 provider
+    calls against a $1.00 ceiling both executing — each independently
+    called the pre-check (`assertWithinBudget()`, a pure read of
+    already-recorded totals) BEFORE either had recorded anything, so both
+    passed; the actual `spend()` call only happened AFTER an `await`ed
+    provider round-trip, by which point both providers had ALREADY been
+    invoked and both real costs had ALREADY been incurred. `spend()`
+    itself IS atomic (no `await` between its own check and record — see
+    the note above), so it correctly rejected the SECOND `spend()` call,
+    but that rejection happened AFTER the $0.60 was already spent for
+    real — silently losing track of genuinely incurred cost. The root
+    cause: a pre-check-only pattern (`assertWithinBudget()` alone) checks
+    but never RESERVES anything, so nothing stops a second concurrent
+    caller from ALSO passing the same check during the gap before either
+    has recorded. Fixed with a reservation/reconciliation model, three new
+    methods: `reserve(scope, amountUsd): Reservation` — evaluates ALL
+    ceilings INCLUDING every other currently-open reservation and, only if
+    none would be exceeded, atomically (synchronously, no `await` inside
+    it, exactly like `spend()`) adds the reservation and returns an opaque
+    handle; this MUST happen and complete before any provider is invoked.
+    `commit(reservationId, entry)` — deletes the reservation and records
+    the ACTUAL incurred cost UNCONDITIONALLY (never re-checked against
+    ceilings, and never dropped even if that pushes a ceiling into overage
+    on paper — "never silently discard an incurred cost because a ceiling
+    was exceeded after execution"; an overage is still logged to the audit
+    trail for visibility). `release(reservationId)` — the documented
+    reconciliation rule for a provider call that throws: no real cost is
+    assumed to have occurred, so the reservation is freed with nothing
+    recorded (a real provider adapter that CAN partially bill on failure
+    must instead call `commit()` with the partial amount — out of scope
+    for this repository's MockProvider). Regression tests prove: two
+    reservations that would jointly exceed a ceiling cannot both succeed
+    (the exact reproduction), reservations are included in every ceiling's
+    available-budget calculation (perTaskUsd/perRunUsd/dailyUsd/
+    monthlyUsd), incurred cost is never lost, commit() records the actual
+    amount even when it differs from (including exceeding) the reserved
+    estimate, commit()/release() on an unknown or already-resolved
+    reservation id fails closed (UnknownReservationError) rather than
+    double-recording or double-releasing, release() frees budget back up
+    without recording any cost, task/project isolation is preserved (one
+    task's/project's reservation does not block a DIFFERENT task's/
+    project's own ceiling), daily/monthly rollover remains correct with
+    reservations in flight, a returned Reservation is a frozen/detached
+    snapshot (same ownership-boundary pattern as every other returned
+    record in this codebase), and invalid reservation amounts are rejected
+    before any reservation is created. Verified via a temporary bypass
+    (dropping the new `reservedTotal()` terms from every ceiling
+    calculation, keeping reserve()/commit()/release()'s own bookkeeping
+    intact) — confirmed exactly the 5 reservation-awareness-dependent
+    tests fail against the bypassed code, then reverted. See UASF-REQ-0024
+    (Model gateway) for how ModelGateway.invoke() now uses this API as the
+    ONLY way any real provider call happens.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -1943,6 +2085,60 @@
     make any claim about which Node version the Factory runs under, so
     bumping it is a dependency-upgrade decision outside this bug class's
     scope, not a contradiction to fix.
+
+    P2 fix (10th independent review round, "declared Node support still
+    conflicts with the complete required toolchain"): the 9th round's fix
+    above validated the running Node version against Vitest's OWN
+    `engines.node` ONLY. Codex then reproduced a DIFFERENT locked
+    dependency — a nested `eslint-visitor-keys@5.0.1` (pulled in
+    transitively by `@typescript-eslint/visitor-keys`, itself required by
+    `@typescript-eslint/eslint-plugin`/`parser`, i.e. the LINT half of
+    `npm run lint`) — declaring `engines.node: "^20.19.0 || ^22.13.0 ||
+    >=24"`, which REJECTS Node 22.12.x even though package.json's
+    `engines.node` at the time still advertised `^22.12.0` support (having
+    only ever been checked against Vitest). Checking one hand-picked
+    dependency can never catch a DIFFERENT dependency tightening its own
+    requirement — exactly the same "declared vs. actually required" gap
+    as the 9th round's bug, one dependency over. Fixed two ways: (1)
+    package.json's `engines.node` narrowed from `^22.12.0` to `^22.13.0`
+    (the genuine intersection of Vitest's and the lint toolchain's actual
+    requirements — Node 24.x/26.x+ were already unaffected), regenerated
+    into package-lock.json via `npm install`; (2) a new
+    `findToolchainEngineViolations(nodeVersion)` walks the ENTIRE locked
+    dependency tree (`package-lock.json`'s `packages` map, not one
+    hand-picked package), skipping any package pinned to a DIFFERENT OS/
+    CPU than the one currently running (it will never actually install/
+    load here, e.g. `@rolldown/binding-android-arm-eabi` on this Linux x64
+    machine), and returns every remaining locked package whose OWN
+    `engines.node` rejects the given Node version. `factory doctor`'s
+    Node.js check now runs this AFTER confirming the Factory's own
+    declared range is satisfied — BOTH must pass for READY. Along the way,
+    `satisfiesEngineRange()` gained a real bug fix: several innocuous
+    locked packages declare the bare wildcard `engines.node: "*"` (e.g.
+    some nested `minimatch` copies), which is standard semver for "any
+    version accepted" and is NOT a parseable version number — without
+    handling it explicitly, the toolchain-wide scan crashed on
+    `parseVersion("*")` on a package that imposes no real constraint at
+    all. Regression tests prove: `findToolchainEngineViolations("v22.12.0")`
+    reproduces the exact Codex finding (flags the nested
+    eslint-visitor-keys package), the currently-declared baseline's own
+    accepted boundary versions have zero toolchain violations, a version
+    genuinely outside every clause still surfaces the known lint-toolchain
+    violation, the REAL running environment has zero locked-toolchain
+    violations (cross-checked independently of `runDoctor()`'s own
+    internals), and a package pinned to a mismatched OS/CPU never
+    surfaces as a violation regardless of Node version. Confirmed via a
+    temporary revert of package.json's `engines.node` back to `^22.12.0`
+    (keeping the new doctor.ts logic) that the boundary-range test
+    correctly fails (v22.12.0 now expected to fail but the reverted range
+    still accepted it), while the fixed-version-string reproduction test
+    (`findToolchainEngineViolations("v22.12.0")`) already caught the
+    underlying gap independent of whatever package.json currently
+    declares — then restored the corrected value and re-ran `npm install`
+    to keep package-lock.json in sync (avoiding the exact stale-lockfile
+    bug found and fixed in the 10th round's earlier follow-up pass).
+    README.md/AGENTS.md/CLAUDE.md's "22.12+" prose updated to "22.13+" to
+    match.
 
 - id: UASF-REQ-0041
   title: Baseline status command

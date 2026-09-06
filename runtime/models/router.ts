@@ -111,24 +111,22 @@ export class CheapestCapableModelRouter {
    * policy and budget enforcement"): Codex reproduced routeAndExecute()
    * invoking every candidate — initial AND every escalation/fallback
    * step — via a DIRECT `gateway.invoke()` call, with NO PolicyEngine or
-   * BudgetGuard consultation anywhere in the loop, and no cost recorded
-   * for a candidate whose invocation succeeded but whose OUTPUT later
-   * failed `validate()`. `allowPremiumFallback` is a routing-level
-   * PERMISSION FLAG ("fallback may be considered at all"), never an
-   * AUTHORIZATION — it must never substitute for the same policy/budget
-   * gate every other risky Factory action passes through (bölüm 147,
-   * "capability gateway'in policy engine'i atlayan bir yolu olmamalı").
-   * Fixed: every candidate invocation — the initial one and each
-   * escalation step — now goes through `invokeAuthorized()` below, which
-   * (1) evaluates the SAME `CapabilityGateway`/`PolicyEngine` used
-   * elsewhere in the Factory (ALLOW required; DENY/APPROVAL_REQUIRED
-   * throw and the provider is never called), (2) checks the projected
-   * cost against `BudgetGuard` BEFORE invoking (insufficient budget
-   * blocks the call, no provider invocation occurs), and (3) records the
-   * ACTUAL incurred cost via `BudgetGuard.spend()` immediately after a
-   * successful invocation — BEFORE `validate()` runs — so a candidate
-   * whose output later fails validation is still correctly accounted for
-   * (bölüm 147, "sessiz harcama yok" applies even to failed attempts).
+   * BudgetGuard consultation anywhere in the loop. `allowPremiumFallback`
+   * is a routing-level PERMISSION FLAG ("fallback may be considered at
+   * all"), never an AUTHORIZATION — it must never substitute for the same
+   * policy/budget gate every other risky Factory action passes through
+   * (bölüm 147).
+   *
+   * P1 fix (10th independent review round, "public ModelGateway.invoke()
+   * bypasses enforcement"): the guard logic that USED to live here
+   * (evaluate policy, pre-check budget, invoke, record cost) has moved
+   * INTO `ModelGateway.invoke()` itself (runtime/models/gateway.ts) — a
+   * router-only wrapper could always be bypassed by any OTHER caller with
+   * direct access to the gateway (exactly what the e2e proof did). This
+   * method is now a thin adapter: it builds the `ModelInvocationContext`
+   * and calls the gateway's own guarded `invoke()`, reusing the SAME
+   * `CapabilityGateway` instance across every candidate in one logical
+   * routeAndExecute() call (object reuse only, not a behavior change).
    */
   private async invokeAuthorized(
     decision: RoutingDecision,
@@ -136,33 +134,17 @@ export class CheapestCapableModelRouter {
     gateway: ModelGateway,
     invocationRequest: ModelInvocationRequest,
     capabilityGateway: CapabilityGateway,
+    policy: PolicyEngine,
     budget: BudgetGuard
   ): Promise<ModelInvocationResponse> {
-    return capabilityGateway.authorize(
-      {
-        actionType: "model.invoke",
-        risk: request.risk,
-        description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`,
-        costUsd: decision.model.costPerCall
-      },
-      async () => {
-        // Sağlayıcı ÇAĞRILMADAN ÖNCE, tahmini maliyet (costPerCall) tavana
-        // karşı kontrol edilir — yetersiz bütçe, hiçbir provider çağrısı
-        // yapılmadan reddeder.
-        budget.assertWithinBudget({ taskId: request.taskId }, decision.model.costPerCall);
-        const response = await gateway.invoke(decision.model, invocationRequest);
-        // Gerçek maliyet, validate() çağrılmadan ÖNCE kaydedilir — bir
-        // çıktının sonradan geçersiz sayılması, zaten gerçekleşmiş
-        // harcamanın kayıtlardan düşmesine ASLA yol açmaz.
-        budget.spend({
-          taskId: request.taskId,
-          provider: response.provider,
-          modelId: response.modelId,
-          amountUsd: response.costUsd
-        });
-        return response;
-      }
-    );
+    return gateway.invoke(decision.model, invocationRequest, {
+      policy,
+      budget,
+      risk: request.risk,
+      taskId: request.taskId,
+      description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`,
+      capabilityGateway
+    });
   }
 
   /**
@@ -194,7 +176,15 @@ export class CheapestCapableModelRouter {
     const capabilityGateway = new CapabilityGateway(policy);
 
     let decision = this.selectModel(request);
-    let response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, capabilityGateway, budget);
+    let response = await this.invokeAuthorized(
+      decision,
+      request,
+      gateway,
+      invocationRequest,
+      capabilityGateway,
+      policy,
+      budget
+    );
 
     if (validate(response)) {
       return { response, decision };
@@ -218,7 +208,15 @@ export class CheapestCapableModelRouter {
       }
 
       decision = this.selectModel(request, nextTier);
-      response = await this.invokeAuthorized(decision, request, gateway, invocationRequest, capabilityGateway, budget);
+      response = await this.invokeAuthorized(
+        decision,
+        request,
+        gateway,
+        invocationRequest,
+        capabilityGateway,
+        policy,
+        budget
+      );
 
       if (validate(response)) {
         return { response, decision };

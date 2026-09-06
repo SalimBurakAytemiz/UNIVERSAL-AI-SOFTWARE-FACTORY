@@ -50,10 +50,12 @@ overrides policy (baseline sections 150–151, "Prompt Injection Defense" /
 
 Node.js 24.x (LTS) is this repository's canonical, CI-tested runtime
 (`.github/workflows/ci.yml`). The full accepted range (also covering the
-Vitest 5 toolchain's genuine Node 22.12+/26+ support) is declared in
-`package.json`'s `engines.node` and enforced by `factory doctor`
-(`runtime/cli/commands/doctor.ts`) — run it after `npm run build` rather
-than assuming your local Node version is fine.
+locked test/lint toolchain's — Vitest 5 and the `@typescript-eslint`
+chain — genuine Node 22.13+/26+ support) is declared in `package.json`'s
+`engines.node` and enforced by `factory doctor`
+(`runtime/cli/commands/doctor.ts`), which checks the COMPLETE locked
+dependency tree, not just one package — run it after `npm run build`
+rather than assuming your local Node version is fine.
 
 ## Required checks before finishing a change
 

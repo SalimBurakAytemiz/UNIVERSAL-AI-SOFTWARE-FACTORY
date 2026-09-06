@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CostEngine, InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
-import { BudgetExceededError, BudgetGuard, InvalidBudgetLimitError } from "../budget.js";
+import { BudgetExceededError, BudgetGuard, InvalidBudgetLimitError, UnknownReservationError } from "../budget.js";
 import { AuditLog } from "../../audit/audit-log.js";
 
 /**
@@ -571,4 +571,155 @@ describe("BudgetGuard", () => {
       );
     });
   });
+
+  describe(
+    "reserve()/commit()/release() (P1 fix, 10th independent review round, " +
+      "'concurrent model invocations can exceed budgets')",
+    () => {
+      it("BLOCKER regression: two reservations for $0.60 each against a $1.00 ceiling cannot both succeed", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 1.0 });
+        const first = guard.reserve({ taskId: "a" }, 0.6);
+        expect(first.amountUsd).toBe(0.6);
+        // The SECOND reservation must see the FIRST's outstanding amount —
+        // this is the exact mechanism that closes the race Codex reproduced
+        // (two concurrent pre-checks that neither saw the other).
+        expect(() => guard.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+      });
+
+      it("reservations are included in available-budget calculations (perTaskUsd, perRunUsd, dailyUsd, monthlyUsd)", () => {
+        const clock = makeClock("2026-05-01T00:00:00.000Z");
+        const costEngine = new CostEngine(clock.now);
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 1, perRunUsd: 1, dailyUsd: 1, monthlyUsd: 1 }, clock.now);
+        guard.reserve({ taskId: "t1" }, 0.7);
+        // A second reservation against ANY of the four ceilings must see the
+        // first reservation's $0.70 as already-committed exposure.
+        expect(() => guard.reserve({ taskId: "t1" }, 0.4)).toThrow(BudgetExceededError); // perTaskUsd
+        expect(() => guard.reserve({ taskId: "t2" }, 0.4)).toThrow(BudgetExceededError); // perRunUsd (global)
+      });
+
+      it("incurred cost is never lost: commit() records the ACTUAL amount, matching what was really spent", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.5);
+        const recorded = guard.commit(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.5
+        });
+        expect(recorded.amountUsd).toBe(0.5);
+        expect(costEngine.totalFor({ taskId: "t1" })).toBe(0.5);
+      });
+
+      it("commit() records the actual cost even when it differs from the reserved estimate, and never discards it for exceeding a ceiling", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.5 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.5); // exactly at the ceiling
+        // The REAL provider call turned out to cost more than estimated —
+        // this can genuinely happen (e.g. token-metered pricing). The
+        // already-incurred cost must still be recorded in full, even though
+        // it now exceeds perRunUsd on paper — "never silently discard an
+        // incurred cost because a ceiling was exceeded after execution."
+        const recorded = guard.commit(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.9
+        });
+        expect(recorded.amountUsd).toBe(0.9);
+        expect(costEngine.total()).toBe(0.9);
+      });
+
+      it("commit() on an unknown/already-resolved reservation id fails closed instead of silently recording a phantom cost", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        expect(() =>
+          guard.commit("never-reserved", { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 })
+        ).toThrow(UnknownReservationError);
+        expect(costEngine.total()).toBe(0);
+      });
+
+      it("a committed reservation cannot be committed or released a second time", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.3);
+        guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.3 });
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.3 })
+        ).toThrow(UnknownReservationError);
+        expect(() => guard.release(reservation.id)).toThrow(UnknownReservationError);
+        // Exactly one commit's worth of cost was ever recorded.
+        expect(costEngine.total()).toBe(0.3);
+      });
+
+      it("release() frees a reservation's budget back up without recording any cost (provider-failure reconciliation rule)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 0.6 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError); // fully reserved
+
+        guard.release(reservation.id);
+        expect(costEngine.total()).toBe(0); // nothing was ever recorded
+
+        // The released amount is available again for a subsequent reservation.
+        expect(() => guard.reserve({ taskId: "t2" }, 0.6)).not.toThrow();
+      });
+
+      it("release() on an unknown/already-resolved reservation id fails closed", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 10 });
+        expect(() => guard.release("never-reserved")).toThrow(UnknownReservationError);
+      });
+
+      it("task/project isolation remains correct: a reservation for one task does not block a DIFFERENT task's own perTaskUsd ceiling", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 0.5, perRunUsd: 100 });
+        guard.reserve({ taskId: "task-a" }, 0.5); // uses all of task-a's own ceiling
+        // task-b's OWN perTaskUsd ceiling is untouched by task-a's reservation.
+        expect(() => guard.reserve({ taskId: "task-b" }, 0.5)).not.toThrow();
+      });
+
+      it("task/project isolation remains correct: a reservation for one project does not block a DIFFERENT project's dailyUsd ceiling", () => {
+        const clock = makeClock("2026-05-01T00:00:00.000Z");
+        const guard = new BudgetGuard(new CostEngine(clock.now), { dailyUsd: 0.5 }, clock.now);
+        guard.reserve({ taskId: "t1", projectId: "project-a" }, 0.5);
+        expect(() => guard.reserve({ taskId: "t2", projectId: "project-b" }, 0.5)).not.toThrow();
+      });
+
+      it("daily/monthly enforcement remains correct with reservations: a reservation counts toward the current period, and rolls over correctly", () => {
+        const clock = makeClock("2026-06-30T23:00:00.000Z");
+        const costEngine = new CostEngine(clock.now);
+        const guard = new BudgetGuard(costEngine, { dailyUsd: 0.3 }, clock.now);
+        const reservation = guard.reserve({ taskId: "t1" }, 0.3);
+        expect(() => guard.reserve({ taskId: "t2" }, 0.01)).toThrow(BudgetExceededError);
+
+        guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.3 });
+        clock.advanceTo("2026-07-01T00:00:00.001Z"); // new UTC day -> resets
+        expect(() => guard.reserve({ taskId: "t3" }, 0.3)).not.toThrow();
+      });
+
+      it("CostEngine/BudgetGuard ownership protections remain intact: a returned Reservation is a frozen, detached snapshot", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 10 });
+        const reservation = guard.reserve({ taskId: "t1" }, 0.3);
+        expect(() => {
+          (reservation as { amountUsd: number }).amountUsd = 0;
+        }).toThrow(TypeError);
+        // Mutating the returned snapshot cannot affect the authoritative
+        // outstanding reservation used by subsequent ceiling checks.
+        const guardWithTightCeiling = new BudgetGuard(new CostEngine(), { perRunUsd: 0.3 });
+        const r = guardWithTightCeiling.reserve({ taskId: "t1" }, 0.3);
+        expect(() => {
+          (r as { amountUsd: number }).amountUsd = 0;
+        }).toThrow(TypeError);
+        expect(() => guardWithTightCeiling.reserve({ taskId: "t2" }, 0.01)).toThrow(BudgetExceededError);
+      });
+
+      it("invalid reservation amounts (NaN/Infinity/negative) are rejected before any reservation is created", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 10 });
+        expect(() => guard.reserve({ taskId: "t1" }, NaN)).toThrow(InvalidMonetaryAmountError);
+        expect(() => guard.reserve({ taskId: "t1" }, Infinity)).toThrow(InvalidMonetaryAmountError);
+        expect(() => guard.reserve({ taskId: "t1" }, -0.01)).toThrow(InvalidMonetaryAmountError);
+        // No phantom reservation was left behind by any of the rejected attempts.
+        expect(() => guard.reserve({ taskId: "t1" }, 10)).not.toThrow();
+      });
+    }
+  );
 });

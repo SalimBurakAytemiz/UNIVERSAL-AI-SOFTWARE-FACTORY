@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { runDoctor, satisfiesEngineRange, type DoctorCheck } from "../commands/doctor.js";
+import { runDoctor, satisfiesEngineRange, findToolchainEngineViolations, type DoctorCheck } from "../commands/doctor.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
@@ -61,8 +61,9 @@ describe("factory doctor", () => {
       // but the deliberately-out-of-range assertions below prove the
       // matching logic itself stays correct for caret/>= clause semantics.
       expect(satisfiesEngineRange("v20.11.0", declaredNodeEngineRange)).toBe(false);
-      expect(satisfiesEngineRange("v22.11.0", declaredNodeEngineRange)).toBe(false); // just below ^22.12.0
-      expect(satisfiesEngineRange("v22.12.0", declaredNodeEngineRange)).toBe(true);
+      expect(satisfiesEngineRange("v22.11.0", declaredNodeEngineRange)).toBe(false); // just below ^22.13.0
+      expect(satisfiesEngineRange("v22.12.0", declaredNodeEngineRange)).toBe(false); // 10th round fix: no longer claimed (see below)
+      expect(satisfiesEngineRange("v22.13.0", declaredNodeEngineRange)).toBe(true);
       expect(satisfiesEngineRange("v22.99.0", declaredNodeEngineRange)).toBe(true);
       expect(satisfiesEngineRange("v24.0.0", declaredNodeEngineRange)).toBe(true);
       expect(satisfiesEngineRange("v24.9.9", declaredNodeEngineRange)).toBe(true);
@@ -97,11 +98,57 @@ describe("factory doctor", () => {
       const vitestRange = vitestPkg.engines?.node;
       expect(vitestRange).toBeTruthy();
       // Every representative version the Factory's range accepts must also satisfy Vitest's.
-      for (const v of ["v20.0.0", "v20.11.0", "v22.0.0", "v22.11.0", "v22.12.0", "v22.99.0", "v24.0.0", "v26.0.0", "v100.0.0"]) {
+      for (const v of ["v20.0.0", "v20.11.0", "v22.0.0", "v22.11.0", "v22.13.0", "v22.99.0", "v24.0.0", "v26.0.0", "v100.0.0"]) {
         if (satisfiesEngineRange(v, declaredNodeEngineRange)) {
           expect(satisfiesEngineRange(v, vitestRange!)).toBe(true);
         }
       }
     });
   });
+
+  describe(
+    "P2 fix (10th independent review round, 'declared Node support still conflicts with the complete required " +
+      "toolchain'): the compatibility check now covers every locked package, not only Vitest",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: v22.12.0 satisfied the OLD declared range and Vitest, but a " +
+          "locked LINT dependency (a nested eslint-visitor-keys pulled in by @typescript-eslint/visitor-keys) " +
+          "genuinely rejects it — findToolchainEngineViolations() catches this even though satisfiesEngineRange() " +
+          "against the Factory's own declared range alone would not",
+        () => {
+          const violations = findToolchainEngineViolations("v22.12.0");
+          expect(violations.some((v) => v.packagePath.includes("eslint-visitor-keys"))).toBe(true);
+        }
+      );
+
+      it("the currently-declared Node baseline has zero toolchain violations for its own accepted boundary versions", () => {
+        for (const v of ["v22.13.0", "v22.99.0", "v24.0.0", "v24.9.9", "v26.0.0", "v100.0.0"]) {
+          expect(satisfiesEngineRange(v, declaredNodeEngineRange)).toBe(true); // sanity: these ARE in-range
+          expect(findToolchainEngineViolations(v)).toEqual([]);
+        }
+      });
+
+      it("a Node version genuinely outside every clause has at least the known lint-toolchain violation", () => {
+        const violations = findToolchainEngineViolations("v20.0.0");
+        expect(violations.length).toBeGreaterThan(0);
+      });
+
+      it("the real running environment's Node version has zero locked-toolchain violations (this is what CI actually checks)", () => {
+        const [node] = runDoctor().filter((r) => r.name === "Node.js");
+        expect(node!.status).toBe("READY");
+        // Cross-check independently of runDoctor()'s own internals.
+        const actualVersion = process.version;
+        expect(findToolchainEngineViolations(actualVersion)).toEqual([]);
+      });
+
+      it("a package pinned to a different OS/CPU than this machine is not treated as a toolchain constraint", () => {
+        // @rolldown/binding-android-arm-eabi (os: ["android"], cpu: ["arm"])
+        // declares an engines.node range too, but it is optional/platform-
+        // gated and never actually installs/loads on this machine — it must
+        // never surface as a "violation" regardless of Node version.
+        const violations = findToolchainEngineViolations("v20.0.0");
+        expect(violations.some((v) => v.packagePath.includes("@rolldown/binding-android-arm-eabi"))).toBe(false);
+      });
+    }
+  );
 });

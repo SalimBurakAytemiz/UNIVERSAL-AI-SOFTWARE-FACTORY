@@ -103,6 +103,34 @@ factory:
     own Node v22.22.2 sandbox). Fully re-verified and pushed; P0 remains
     open, awaiting the same tenth independent re-review.
 
+    Tenth independent Codex P0 closure review (labeled "Tenth" by the
+    review itself, distinct from the two prior messages both labeled
+    "Ninth" that this file's narrative already covers above) reproduced 3
+    NEW blocking findings on the pushed branch: (1) `[P1] concurrent model
+    invocations can exceed budgets` — two concurrent $0.60 provider calls
+    against a $1.00 ceiling could BOTH execute, because
+    `assertWithinBudget()` was a pure pre-check with no reservation, so a
+    second concurrent caller could pass the same check before the first
+    had recorded anything, and the resulting `spend()` rejection happened
+    only AFTER the real cost was already incurred, silently losing track
+    of it; (2) `[P1] public ModelGateway.invoke() bypasses enforcement` —
+    Codex reproduced a direct `gateway.invoke()` call (the SAME direct
+    path the e2e-p0-kernel proof used) reaching a provider with NO
+    PolicyEngine/BudgetGuard/approval/accounting at all, proving that
+    fixing router.ts alone can never establish "every real invocation is
+    authorized" as a genuine system-wide invariant; (3) `[P2] Node support
+    claim still conflicts with the complete required toolchain` — Node
+    22.12.x satisfied the Factory's OWN declared range and Vitest, but a
+    DIFFERENT locked dependency (a nested `eslint-visitor-keys@5.0.1`
+    pulled in by `@typescript-eslint/visitor-keys`, i.e. the lint
+    toolchain `npm run lint` needs) genuinely requires `^22.13.0` within
+    the 22.x line, rejecting 22.12.x — the 9th round's Vitest-only
+    compatibility check could never have caught a different dependency's
+    own tightened requirement. All 3 fixed this session (see below), a
+    narrow targeted audit for these exact 3 classes found no further
+    genuine instances, fully verified, and pushed for the eleventh
+    independent review. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -1179,6 +1207,115 @@ completed_milestones:
     - Re-ran the full required sequence: lint, typecheck, build,
       464/464 tests (462 + 2 new), validate:requirements, history-aware
       secret-scan, all P0 proofs — all clean.
+  - |-
+    TENTH INDEPENDENT REVIEW (3 new findings, all fixed this session):
+    - [P1] Concurrent model invocations could exceed budgets:
+      `runtime/budget/budget.ts` gained a reservation/reconciliation API
+      — `reserve(scope, amountUsd): Reservation` (atomic, synchronous
+      check-and-add against ALL ceilings INCLUDING every other open
+      reservation — must complete before any provider is invoked),
+      `commit(reservationId, entry)` (deletes the reservation, records
+      the ACTUAL cost unconditionally — never re-checked, never dropped,
+      even on paper-overage), and `release(reservationId)` (the
+      documented rule for a provider call that throws: no cost assumed,
+      reservation freed with nothing recorded). 13 new tests in
+      budget.test.ts prove the exact $0.60-vs-$0.60-against-$1.00
+      reproduction can no longer both succeed, reservations count toward
+      every ceiling, incurred cost is never lost, commit()/release() on
+      an unknown/resolved reservation id fails closed, task/project
+      isolation holds, daily/monthly rollover remains correct, and
+      returned Reservations are frozen/detached (ownership-boundary
+      pattern). Confirmed via a temporary bypass (dropping the new
+      `reservedTotal()` terms from ceiling math) that exactly 5 tests
+      fail, then reverted.
+    - [P1] Public ModelGateway.invoke() bypassed enforcement entirely:
+      protecting router.ts alone could never guarantee "every real
+      invocation is authorized" as a system-wide invariant, since
+      `gateway.invoke()` itself was a public, unguarded method — Codex
+      reproduced this via a direct call, and the e2e-p0-kernel proof was
+      a live example of the same bypass. Fixed architecturally:
+      `ModelGateway.invoke(model, request, context)` now REQUIRES a
+      `ModelInvocationContext` (policy + budget, non-optional — omitting
+      them is a compile error, not a runtime toggle) and performs the
+      ENTIRE guard (PolicyEngine -> BudgetGuard.reserve() -> provider
+      call -> commit()/release()) inside itself; the raw provider call
+      moved to a genuine ECMAScript private method (`#rawInvoke`, real
+      runtime privacy via `#`, not TypeScript's compile-time-only
+      `private`) with the provider map (`#providers`) private the same
+      way. router.ts's `invokeAuthorized()` is now a thin adapter to this
+      same gateway.invoke() — one path to a real provider in the whole
+      codebase. 9 new tests in gateway.test.ts (DENY/risk-5-approval/
+      insufficient-budget all block with zero provider calls, reservation
+      precedes invocation, cost recorded exactly once, validation failure
+      cannot erase recorded cost, a failing provider releases its
+      reservation, fallback candidates share the same guarded boundary,
+      and the exact concurrent-$0.60-calls reproduction is caught at this
+      layer too) plus 4 updated router.test.ts tests (now spying on the
+      underlying MockProvider instance directly, since gateway.invoke()
+      itself is now legitimately called for every candidate — the
+      invariant that matters is whether the PROVIDER was ever reached).
+      proofs/e2e-p0-kernel/proof.test.ts updated to use this guarded call
+      instead of its previous direct gateway.invoke() + manual
+      budget.spend(). Confirmed via a temporary bypass (an early `return
+      this.#rawInvoke(...)` before the guard) that exactly 7 of 12
+      gateway tests fail, then reverted.
+    - [P2] Node support still conflicted with the COMPLETE required
+      toolchain: the 9th round's fix checked the running Node version
+      against Vitest's OWN engines.node only. Codex found a DIFFERENT
+      locked dependency — a nested `eslint-visitor-keys@5.0.1` (pulled in
+      by `@typescript-eslint/visitor-keys`, needed by the ESLint plugin/
+      parser, i.e. `npm run lint`'s own toolchain) — declaring
+      `^20.19.0 || ^22.13.0 || >=24`, rejecting Node 22.12.x even though
+      package.json still claimed `^22.12.0`. Fixed: `engines.node`
+      narrowed to `^22.13.0 || ^24.0.0 || >=26.0.0` (package-lock.json
+      regenerated via `npm install`, confirmed single-line diff); a new
+      `findToolchainEngineViolations(nodeVersion)` in doctor.ts walks the
+      ENTIRE locked dependency tree (not one hand-picked package),
+      correctly skipping packages pinned to a different OS/CPU than the
+      one running (they never actually install here); `factory doctor`'s
+      Node check now requires BOTH the Factory's own declared range AND
+      zero toolchain violations for READY. Along the way, fixed a real
+      bug in `satisfiesEngineRange()`: several harmless locked packages
+      declare the bare wildcard `engines.node: "*"`, which crashed
+      `parseVersion()` before this round (that package imposes no real
+      constraint and is not a parseable version). 5 new tests in
+      doctor.test.ts prove the exact reproduction
+      (`findToolchainEngineViolations("v22.12.0")` flags the nested
+      eslint-visitor-keys package), zero violations for the corrected
+      baseline's own boundary versions, a genuinely-out-of-range version
+      still surfaces the known violation, the REAL running environment
+      has zero violations, and a mismatched-platform package never
+      surfaces as a violation. README.md/AGENTS.md/CLAUDE.md's "22.12+"
+      prose corrected to "22.13+" to match. Confirmed via a temporary
+      revert of package.json's engines.node back to `^22.12.0` that the
+      live boundary-range test fails as expected (the fixed-version-
+      string reproduction test needed no such revert, since it exercises
+      `findToolchainEngineViolations()` directly against a hardcoded
+      version).
+    - Requirement registry updated: UASF-REQ-0027 (router — notes on
+      delegating to the new guarded gateway.invoke() and on the
+      reservation model it now relies on), UASF-REQ-0024 (Model gateway —
+      full notes on the architectural fix and its regression tests),
+      UASF-REQ-0030 (Budget engine — full notes on reserve()/commit()/
+      release()), UASF-REQ-0040 (Factory Doctor — full notes on the
+      toolchain-wide scan), UASF-REQ-0028 (Premium fallback policy —
+      re-checked per explicit instruction; PROOF_VERIFIED remains
+      genuinely supported, no status change). No status field was raised
+      on any requirement beyond what real evidence supports.
+    - Targeted audit for these 3 exact classes: confirmed no other
+      production code path does a check-then-await-then-spend sequence
+      (orchestrator.ts's own `budget.spend()` call has no `await` in
+      between and is not reachable concurrently against a shared,
+      long-lived BudgetGuard); confirmed the only `ModelProvider`
+      implementation in production code is MockProvider, and the only
+      caller of `provider.invoke()` anywhere is gateway.ts's own
+      `#rawInvoke`; confirmed no Dockerfile/devcontainer exists to need
+      Node-version alignment, and no other files reference "22.12"/
+      "22.13" needing correction. No further genuine instances found.
+    - Re-ran the full required sequence: lint, typecheck, build,
+      491/491 tests (464 + 27 new), validate:requirements, history-aware
+      secret-scan, all P0 proofs, full CLI smoke test (doctor/baseline
+      status/routing explain/trace requirement) — all clean.
 
 known_limitations:
   - >-
@@ -1225,10 +1362,26 @@ blockers:
     ninth review was then received and fully addressed as a follow-up
     (see completed_milestones): a missing ownership-boundary regression
     test per registry, an audit-found stale package-lock.json engines
-    field, and Node-24 documentation/CI alignment. Per explicit
-    instruction: "stop at the independent-review boundary" — do not push
-    further P0 feature work, and do not declare P0 complete, until that
-    re-review confirms no blocking finding remains.
+    field, and Node-24 documentation/CI alignment.
+
+    A genuine TENTH independent Codex review then arrived (labeled
+    "Tenth" by the review itself) and reproduced 3 NEW blocking findings:
+    concurrent model invocations racing past a budget ceiling (fixed via
+    BudgetGuard.reserve()/commit()/release()); ModelGateway.invoke()
+    itself being a public, unguarded path to a real provider (fixed by
+    moving the entire policy/budget guard into gateway.invoke() and
+    making the raw provider call a true ECMAScript private method); and
+    package.json's engines.node still conflicting with the COMPLETE
+    required toolchain, specifically a nested eslint-visitor-keys
+    dependency the lint toolchain needs (fixed by narrowing to
+    `^22.13.0 || ^24.0.0 || >=26.0.0` and extending `factory doctor` to
+    scan the entire locked dependency tree, not just Vitest). All 3 fixed,
+    tested (491/491 tests, +27 net new), and verified per the full
+    required sequence — see completed_milestones for full detail. Now
+    awaiting an ELEVENTH independent review. Per explicit instruction:
+    "stop at the independent-review boundary" — do not push further P0
+    feature work, and do not declare P0 complete, until that re-review
+    confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -1304,14 +1457,84 @@ exact_next_action: >
   typecheck, build, 464/464 tests, validate:requirements,
   history-aware secret-scan, all P0 proofs.
 
-  Do not proceed to further P0 feature work or declare
-  P0 complete until an independent (Codex) re-review of this diff
-  confirms no blocking P0 finding remains. If/when that comes back clean,
-  resume from the prior exact_next_action: wire the remaining foundation
-  modules (Discovery, Decisions, Assumptions, Technology/
-  Business-Capability registries) into the same integrated pipeline
-  (including, per this round's finding, ACTUALLY invoking models via
-  routeAndExecute() rather than only selecting them), consider a
+  A genuine TENTH independent Codex review (labeled "Tenth" by the review
+  itself) then reproduced 3 NEW findings on the pushed branch, now also
+  fixed, tested, and pushed this session:
+
+  (1) [P1] "concurrent model invocations can exceed budgets" —
+  runtime/budget/budget.ts gained `reserve(scope, amountUsd): Reservation`
+  (atomic: evaluates every ceiling INCLUDING all other currently-open
+  reservations, synchronously with no `await` inside it, and only then
+  adds the reservation — this must complete before any provider is ever
+  invoked), `commit(reservationId, entry)` (deletes the reservation,
+  records the ACTUAL cost unconditionally — never re-checked, never
+  dropped even on paper-overage), and `release(reservationId)` (a
+  provider call that throws: no cost assumed, reservation freed with
+  nothing recorded). `ModelGateway.invoke()` (see next point) is the only
+  caller of this new API in production code.
+
+  (2) [P1] "public ModelGateway.invoke() bypasses enforcement" — the
+  ENTIRE guard (PolicyEngine -> BudgetGuard.reserve() -> provider call ->
+  commit()/release()) moved INTO `ModelGateway.invoke()` itself, which
+  now REQUIRES a `ModelInvocationContext` (policy + budget, non-optional
+  — omitting them is a compile error). The raw provider call moved to a
+  true ECMAScript private method (`#rawInvoke`, real runtime privacy via
+  `#`, not TypeScript's compile-time-only `private`) with the provider
+  map (`#providers`) private the same way — there is now exactly ONE path
+  to a real provider in this codebase, and it cannot be bypassed even by
+  a type-unsafe (`as any`) caller. router.ts's `invokeAuthorized()` is now
+  a thin adapter to this same gateway.invoke(). proofs/e2e-p0-kernel/
+  proof.test.ts (which previously called gateway.invoke() directly plus a
+  separate manual budget.spend(), a live example of the exact bypass
+  Codex reproduced) was updated to use this guarded call.
+
+  (3) [P2] "Node support claim still conflicts with the complete required
+  toolchain" — package.json's engines.node narrowed from `^22.12.0` to
+  `^22.13.0` (within the `^22.13.0 || ^24.0.0 || >=26.0.0` range;
+  package-lock.json regenerated via `npm install`), because a nested
+  `eslint-visitor-keys@5.0.1` (pulled in by `@typescript-eslint/
+  visitor-keys`, needed by the ESLint plugin/parser — i.e. `npm run
+  lint`'s own toolchain) genuinely requires `^22.13.0` and rejects
+  22.12.x. `runtime/cli/commands/doctor.ts` gained
+  `findToolchainEngineViolations(nodeVersion)`, which walks the ENTIRE
+  locked dependency tree (package-lock.json's `packages` map), not one
+  hand-picked package, correctly skipping packages pinned to a different
+  OS/CPU than the one running; `factory doctor`'s Node.js check now
+  requires BOTH the Factory's own declared range AND zero toolchain
+  violations for READY. `satisfiesEngineRange()` also gained a real bug
+  fix for the bare wildcard `engines.node: "*"` clause (several harmless
+  locked packages declare it; it previously crashed `parseVersion()`).
+  README.md/AGENTS.md/CLAUDE.md's "22.12+" prose corrected to "22.13+".
+
+  27 new tests added (13 in budget.test.ts, 9 in gateway.test.ts, 5 in
+  doctor.test.ts), 4 existing router.test.ts tests updated to spy on the
+  underlying MockProvider instance directly (since gateway.invoke() is
+  now legitimately called for every candidate — the invariant that
+  matters is whether the PROVIDER was ever reached, not whether
+  gateway.invoke() was called). 491/491 tests passing. Every fix
+  individually verified via a temporary in-place bypass confirmed to make
+  the exact intended regression tests fail, then reverted: budget.ts (5
+  tests fail when `reservedTotal()` terms are dropped from ceiling math),
+  gateway.ts (7 of 12 tests fail when the guard is bypassed with an early
+  `return this.#rawInvoke(...)`), doctor.ts/package.json (the live
+  boundary-range test fails when engines.node is temporarily reverted to
+  `^22.12.0`; the fixed-version-string reproduction test needed no
+  revert, since it exercises `findToolchainEngineViolations()` directly
+  against a hardcoded version). Full required sequence re-run clean:
+  lint, typecheck, build, 491/491 tests, validate:requirements,
+  history-aware secret-scan, all 9 P0 proofs, full CLI smoke test.
+  Requirement registry updated (UASF-REQ-0024, UASF-REQ-0027,
+  UASF-REQ-0028 re-checked, UASF-REQ-0030, UASF-REQ-0040) from this real
+  evidence only — no status raised beyond what is genuinely supported.
+
+  Do not proceed to further P0 feature work or declare P0 complete until
+  an independent (Codex) re-review of this diff confirms no blocking P0
+  finding remains. If/when that comes back clean, resume from the prior
+  exact_next_action: wire the remaining foundation modules (Discovery,
+  Decisions, Assumptions, Technology/Business-Capability registries) into
+  the same integrated pipeline (including, per an earlier round's
+  finding, ACTUALLY invoking models via routeAndExecute()/
+  gateway.invoke() rather than only selecting them), consider a
   SQLite-backed StateStore, get a Founder decision on P0-sufficiency and
   licensing (section 206). The autonomous-merge governance question stays
   closed absent new Founder-initiated context.

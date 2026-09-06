@@ -80,6 +80,18 @@ export function satisfiesEngineRange(actualVersion: string, range: string): bool
   const version = parseVersion(actualVersion);
   return range.split("||").some((clauseRaw) => {
     const clause = clauseRaw.trim();
+    // P2 fix (10th independent review round, "declared Node support still
+    // conflicts with the complete required toolchain"): scanning the FULL
+    // locked dependency tree (findToolchainEngineViolations, below) surfaces
+    // packages whose `engines.node` is the bare wildcard `"*"` (e.g. some
+    // nested `minimatch` copies) — standard semver/npm semantics treat `*`
+    // (and an empty range) as "any version accepted," and it is NOT a
+    // parseable version number itself. Without this case,
+    // `parseVersion("*")` throws, which would make the toolchain-wide scan
+    // crash on a package that imposes NO real constraint at all.
+    if (clause === "*" || clause === "") {
+      return true;
+    }
     if (clause.startsWith("^")) {
       const base = parseVersion(clause.slice(1));
       return version[0] === base[0] && compareVersions(version, base) >= 0;
@@ -123,6 +135,85 @@ function readDeclaredNodeEngineRange(): string {
   return range;
 }
 
+/** Same upward-walk strategy as `findNearestPackageJson` — correct from source or from `dist/`. */
+function findNearestPackageLock(startDir: string): string {
+  let dir = startDir;
+  for (;;) {
+    const candidate = join(dir, "package-lock.json");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) {
+      throw new Error(`Could not locate package-lock.json walking up from '${startDir}'`);
+    }
+    dir = parent;
+  }
+}
+
+export interface ToolchainEngineViolation {
+  readonly packagePath: string;
+  readonly requiredRange: string;
+}
+
+interface LockedPackageMeta {
+  readonly engines?: { readonly node?: string };
+  readonly os?: readonly string[];
+  readonly cpu?: readonly string[];
+}
+
+/**
+ * P2 fix (10th independent review round, "declared Node support still
+ * conflicts with the complete required toolchain"): the PREVIOUS round's
+ * fix (see the note above on `satisfiesEngineRange`) only checked the
+ * running Node version against Vitest's OWN `engines.node` — Codex then
+ * reproduced a DIFFERENT, narrower locked dependency (a nested
+ * `eslint-visitor-keys@5.0.1`, pulled in transitively by
+ * `@typescript-eslint/visitor-keys`, itself required by
+ * `@typescript-eslint/eslint-plugin`/`parser` — i.e. the LINT half of the
+ * toolchain `npm run lint` genuinely needs) declaring
+ * `^20.19.0 || ^22.13.0 || >=24`, which REJECTS Node 22.12.x even though
+ * package.json's `engines.node` (at the time) still claimed `^22.12.0`
+ * support. Checking one single dependency (Vitest) can never catch a
+ * DIFFERENT dependency tightening its own requirement — the Factory
+ * advertised support for a Node line its own required LINT toolchain
+ * would refuse to run under, exactly the same class of "declared vs.
+ * actually required" gap as the 9th round's Vitest-only version of this
+ * bug, just one dependency over. Fixed: this function walks the ENTIRE
+ * locked dependency tree (`package-lock.json`'s `packages` map — not
+ * just one hand-picked package) and returns every locked package whose
+ * OWN `engines.node` rejects the given Node version. A package pinned to
+ * a DIFFERENT platform than the one currently running (`os`/`cpu` fields
+ * that exclude `process.platform`/`process.arch`) is skipped — it will
+ * never actually be installed/loaded here, so its `engines.node` cannot
+ * genuinely constrain THIS machine's required Node version (ör.
+ * `@rolldown/binding-android-arm-eabi` never applies on Linux x64).
+ */
+export function findToolchainEngineViolations(
+  nodeVersion: string,
+  lockPathOverride?: string
+): readonly ToolchainEngineViolation[] {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const lockPath = lockPathOverride ?? findNearestPackageLock(here);
+  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+    readonly packages?: Readonly<Record<string, LockedPackageMeta>>;
+  };
+
+  const violations: ToolchainEngineViolation[] = [];
+  for (const [packagePath, meta] of Object.entries(lock.packages ?? {})) {
+    // "" is the Factory's OWN root package entry (package.json itself,
+    // mirrored into the lockfile) — that is the DECLARATION being
+    // verified, not one of the "locked dependencies" it must satisfy.
+    if (packagePath === "") continue;
+    const range = meta.engines?.node;
+    if (!range) continue;
+    if (meta.os && !meta.os.includes(process.platform)) continue;
+    if (meta.cpu && !meta.cpu.includes(process.arch)) continue;
+    if (!satisfiesEngineRange(nodeVersion, range)) {
+      violations.push({ packagePath, requiredRange: range });
+    }
+  }
+  return violations;
+}
+
 function nodeVersionCheck(): DoctorCheck {
   return {
     name: "Node.js",
@@ -138,10 +229,31 @@ function nodeVersionCheck(): DoctorCheck {
           name: "Node.js",
           status: "BLOCKING",
           detail: `${version} does not satisfy the Factory's declared engines.node range '${declaredRange}' ` +
-            `(this range matches the locked Vitest 5 test toolchain requirement — see package.json).`
+            `(this range matches the locked test/lint toolchain requirement — see package.json).`
         };
       }
-      return { name: "Node.js", status: "READY", detail: `${version} (satisfies '${declaredRange}')` };
+
+      // Satisfying the Factory's OWN declared range is necessary but not
+      // sufficient — see findToolchainEngineViolations()'s note above.
+      const violations = findToolchainEngineViolations(version);
+      if (violations.length > 0) {
+        const [first] = violations;
+        return {
+          name: "Node.js",
+          status: "BLOCKING",
+          detail:
+            `${version} satisfies the Factory's declared engines.node range ('${declaredRange}') but NOT the ` +
+            `locked dependency '${first!.packagePath}' (requires '${first!.requiredRange}')` +
+            (violations.length > 1 ? ` and ${violations.length - 1} other locked package(s)` : "") +
+            ` — the declared range and the actually-required toolchain have silently diverged.`
+        };
+      }
+
+      return {
+        name: "Node.js",
+        status: "READY",
+        detail: `${version} (satisfies '${declaredRange}' and the complete locked toolchain)`
+      };
     }
   };
 }
