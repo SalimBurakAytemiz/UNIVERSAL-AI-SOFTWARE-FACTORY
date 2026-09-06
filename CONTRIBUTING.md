@@ -34,7 +34,10 @@ CONTRIBUTION
 Concretely:
 
 1. Fork and branch from `main`.
-2. `npm install`
+2. Use Node.js 24.x (LTS) — the canonical, CI-tested runtime (see
+   `package.json`'s `engines.node` for the full accepted range, and run
+   `node dist/runtime/cli/index.js doctor` after building to verify your
+   local Node version). Then `npm install`.
 3. Make your change, with tests. If you touch `runtime/`, prefer adding or
    extending a test under the matching `__tests__/` directory. If your
    change affects a baseline-mandated invariant (cost routing, budget

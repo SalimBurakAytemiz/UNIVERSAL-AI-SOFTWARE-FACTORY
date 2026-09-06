@@ -80,6 +80,29 @@ factory:
     (see below), fully verified, and pushed for a tenth re-review. P0
     remains open until that re-review comes back clean.
 
+    A second message, also labeled "Ninth independent Codex P0 closure
+    review completed," restated the SAME 3 round-9 bug classes but with
+    more detailed required-test lists and an explicit request to
+    establish Node 24 as the documented canonical runtime baseline. This
+    is treated as a follow-up deepening of round 9, not a fabricated
+    independently-numbered round: re-verification confirmed all 3 round-9
+    code fixes (router.ts, workers/registry.ts, package.json) were
+    already genuinely correct and unchanged; the gap was ONE missing
+    regression test per registry (updateStatus()'s returned record itself
+    being a frozen, detached snapshot — the existing tests only checked
+    all()/findCapable()), now added and verified via a temporary in-place
+    bypass for each; plus one further audit-found instance of the Node/
+    toolchain-metadata-contradiction class (package-lock.json's own
+    engines.node had gone stale relative to package.json after a direct
+    edit that skipped `npm install`); plus documentation/CI alignment
+    establishing Node 24 as the one canonical, consistently-stated
+    baseline across CI, README, CONTRIBUTING, AGENTS.md, CLAUDE.md, and
+    the beginner repository map, without narrowing the actually-enforced
+    `engines.node` range (which stays inclusive of the genuinely
+    Vitest-5-compatible 22.12+/26+ environments, including this session's
+    own Node v22.22.2 sandbox). Fully re-verified and pushed; P0 remains
+    open, awaiting the same tenth independent re-review.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -1109,6 +1132,53 @@ completed_milestones:
     temporary in-place bypass of only the new gating logic) to have
     failing regression tests against its pre-fix behavior, then passing
     again with the fix restored.
+  - |-
+    ROUND 9 FOLLOW-UP (same 3 bug classes, deepened per a second, more
+    detailed restatement of the ninth review):
+    - Confirmed all 3 round-9 code fixes unchanged and still correct on
+      re-read (router.ts's invokeAuthorized() gate, workers/registry.ts's
+      duplicate-id rejection + updateStatus(), package.json's
+      engines.node) — no code regression had occurred.
+    - Added the one genuinely missing regression test per registry:
+      updateStatus()'s OWN returned record (not just all()/findCapable())
+      is a frozen, detached snapshot whose mutation attempts throw
+      TypeError and never reach the authoritative record, and which is
+      never the same reference as all()'s. Verified meaningful for BOTH
+      runtime/workers/registry.ts and runtime/models/registry.ts via a
+      temporary in-place bypass (returning the pre-freeze object instead
+      of freezeRecord()'s result) — confirmed exactly 1 test failed per
+      file, then reverted.
+    - Audit-found: package-lock.json's `packages[""].engines.node` was
+      stale (still ">=20") because the round-9 package.json edit never
+      ran `npm install`. Fixed via `npm install` (confirmed via
+      `git diff --stat` that only the 1-line engines field changed).
+    - Documentation/CI alignment: `.github/workflows/ci.yml` now sets
+      `node-version: "24"` in both jobs (was "22"); README.md,
+      CONTRIBUTING.md, AGENTS.md, CLAUDE.md, and
+      docs/beginner/repository-map-tr.md each now state Node 24.x LTS as
+      the canonical, CI-tested runtime while accurately describing the
+      broader Vitest-5-compatible `engines.node` range enforced by
+      `factory doctor`; added `.nvmrc` (`24`) for local tooling.
+      `engines.node` itself was deliberately left as
+      `^22.12.0 || ^24.0.0 || >=26.0.0` (not narrowed to 24-only) since
+      there is no `.npmrc`/engine-strict enforcement and narrowing it
+      would falsely exclude genuinely-compatible Node 22.12+/26+
+      environments, including this session's own Node v22.22.2 sandbox —
+      narrowing would create a NEW false claim to close an old one.
+    - Reviewed and deliberately left unchanged: `@types/node`
+      (`^22.10.2`) — a `tsc` typings devDependency, not a runtime-support
+      declaration, so it is outside this bug class's scope.
+    - Requirement registry updated again: UASF-REQ-0025 and UASF-REQ-0031
+      each got a note on the test-coverage-gap closure (implementation
+      was already correct; only a missing test was added); UASF-REQ-0040
+      got a note on the package-lock.json audit-found fix and the
+      documentation/CI alignment, plus why `engines.node` itself was not
+      narrowed and why `@types/node` was left alone. No status field was
+      raised on any requirement — all three already correctly reflect
+      real evidence.
+    - Re-ran the full required sequence: lint, typecheck, build,
+      464/464 tests (462 + 2 new), validate:requirements, history-aware
+      secret-scan, all P0 proofs — all clean.
 
 known_limitations:
   - >-
@@ -1151,10 +1221,14 @@ blockers:
     history-aware secret-scan, all 9 P0 proofs; a narrow targeted audit
     for those same 3 bug classes found and fixed one more genuine
     instance, the identical duplicate-id/stale-record bug in
-    models/registry.ts). Per explicit instruction: "stop at the
-    independent-review boundary" — do not push further P0 feature work,
-    and do not declare P0 complete, until that re-review confirms no
-    blocking finding remains.
+    models/registry.ts). A second, more detailed restatement of the same
+    ninth review was then received and fully addressed as a follow-up
+    (see completed_milestones): a missing ownership-boundary regression
+    test per registry, an audit-found stale package-lock.json engines
+    field, and Node-24 documentation/CI alignment. Per explicit
+    instruction: "stop at the independent-review boundary" — do not push
+    further P0 feature work, and do not declare P0 complete, until that
+    re-review confirms no blocking finding remains.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -1210,7 +1284,27 @@ exact_next_action: >
   to '>=20' (keeping the new doctor.ts validation logic), confirming the
   new range-boundary and no-silent-contradiction tests correctly fail,
   reproducing the exact historical inconsistency, then restoring the
-  corrected value. Do not proceed to further P0 feature work or declare
+  corrected value.
+
+  A follow-up pass (a second, more detailed restatement of the same
+  ninth review) then: (1) added the one genuinely missing regression
+  test per registry — that updateStatus()'s OWN returned record, not
+  just all()/findCapable(), is a frozen, detached snapshot — verified
+  meaningful via a temporary in-place bypass for both
+  workers/registry.ts and models/registry.ts (exactly 1 test failed per
+  file, then reverted); (2) fixed an audit-found stale
+  package-lock.json engines.node field via `npm install`; (3) aligned
+  CI (`node-version: "24"`) and documentation (README, CONTRIBUTING,
+  AGENTS.md, CLAUDE.md, beginner repo map, new `.nvmrc`) on Node 24.x
+  LTS as the one canonical, consistently-stated baseline, while
+  deliberately NOT narrowing the actually-enforced `engines.node` range
+  (no `.npmrc`/engine-strict exists, so narrowing would falsely exclude
+  genuinely Vitest-5-compatible Node 22.12+/26+ environments, including
+  this session's own Node v22.22.2 sandbox). Re-verified clean: lint,
+  typecheck, build, 464/464 tests, validate:requirements,
+  history-aware secret-scan, all P0 proofs.
+
+  Do not proceed to further P0 feature work or declare
   P0 complete until an independent (Codex) re-review of this diff
   confirms no blocking P0 finding remains. If/when that comes back clean,
   resume from the prior exact_next_action: wire the remaining foundation

@@ -47,6 +47,15 @@ in `specification/requirements/P0-factory-kernel.yml` — but only to a
 status your actual change supports (baseline section 294: "no unsupported
 upgrades"). Validate with `npm run validate:requirements`.
 
+## Runtime baseline
+
+Node.js 24.x (LTS) is this repository's canonical, CI-tested runtime
+(`.github/workflows/ci.yml`). The full accepted range (also covering the
+Vitest 5 toolchain's genuine Node 22.12+/26+ support) is declared in
+`package.json`'s `engines.node` and enforced by `factory doctor`
+(`runtime/cli/commands/doctor.ts`) — run it after `npm run build` rather
+than assuming your local Node version is fine.
+
 ## Before proposing a PR from an agent session
 
 Run, and don't skip on time pressure:

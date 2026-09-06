@@ -205,6 +205,25 @@ describe("ModelRegistry", () => {
       expect(registry.all()).toHaveLength(1);
     });
 
+    it("BLOCKER regression (10th independent review round, same test item as WorkerRegistry's 'ownership boundaries' requirement): the record returned by updateStatus() is a frozen, detached snapshot", () => {
+      const registry = new ModelRegistry();
+      registry.register(baseModel({ modelId: "m1", status: "ACTIVE", capabilities: ["classification"] }));
+      const updated = registry.updateStatus("m1", "DEPRECATED");
+
+      expect(() => {
+        (updated as { status: string }).status = "ACTIVE";
+      }).toThrow(TypeError);
+      expect(() => {
+        (updated.capabilities as string[]).push("critical-architecture");
+      }).toThrow(TypeError);
+
+      // Mutation attempts on the returned snapshot never reach the authoritative record.
+      expect(registry.all()[0]!.status).toBe("DEPRECATED");
+      expect(registry.findCapable(["classification"])).toHaveLength(0);
+      // updateStatus() never hands back the SAME reference stored internally either.
+      expect(updated).not.toBe(registry.all()[0]);
+    });
+
     it("a model deprecated via updateStatus() is never returned by findCapable()", () => {
       const registry = new ModelRegistry();
       registry.register(baseModel({ modelId: "m1", status: "ACTIVE", capabilities: ["classification"] }));

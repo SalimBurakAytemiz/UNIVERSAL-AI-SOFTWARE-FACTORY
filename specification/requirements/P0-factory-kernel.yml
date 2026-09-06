@@ -1013,6 +1013,22 @@
     Confirmed via git-stash that 5 of these tests fail against the
     pre-fix code.
 
+    Test-coverage gap closed (10th independent review round follow-up,
+    same "ownership boundaries" requirement raised for
+    workers/registry.ts's updateStatus()): the previous round's tests for
+    updateStatus() checked the *authoritative* record's state but never
+    checked that the *returned* record from updateStatus() itself is a
+    frozen, detached snapshot (as opposed to all()/findCapable(), which
+    were already covered). The underlying implementation
+    (`freezeRecord(updated)` in updateStatus()) was already correct — this
+    was a missing test, not a missing fix. Added a regression test
+    asserting the returned record throws TypeError on mutation attempts,
+    that such attempts never reach the authoritative record, and that the
+    returned reference is never the same object as `all()`'s. Verified
+    meaningful via a temporary in-place bypass (returning the pre-freeze
+    object instead of `freezeRecord(updated)`) — confirmed exactly this 1
+    test fails against the bypassed code, then the bypass was reverted.
+
 - id: UASF-REQ-0026
   title: MockProvider
   description: Deterministic, free, no-network model provider so the kernel's core tests are self-contained.
@@ -1424,6 +1440,22 @@
     cycles. Confirmed via git-stash that 8 of these tests fail against the
     pre-fix code with exactly the stale-record reproduction Codex
     described.
+
+    Test-coverage gap closed (10th independent review round follow-up,
+    "ownership boundaries" preserved by updateStatus()): the prior
+    round's tests never directly asserted that the record RETURNED by
+    updateStatus() itself is a frozen, detached snapshot — only that
+    all()/findCapable() are. The implementation
+    (`return freezeRecord(worker);` in updateStatus()) was already
+    correct; this closes a test-coverage gap, not a code defect. Added a
+    regression test asserting the returned record throws TypeError on a
+    status/capabilities mutation attempt, that such an attempt never
+    reaches the authoritative record (verified via all()/findCapable()
+    immediately after), and that the returned reference is not the same
+    object as all()'s. Verified meaningful via a temporary in-place
+    bypass (`return worker;` instead of `return freezeRecord(worker);`)
+    — confirmed exactly this 1 test fails against the bypassed code,
+    then the bypass was reverted and the full suite re-confirmed green.
 
 - id: UASF-REQ-0032
   title: Scheduler (foundation)
@@ -1863,6 +1895,54 @@
     (keeping the new doctor.ts logic) that both the range-boundary test
     and the no-silent-contradiction test correctly fail, reproducing the
     exact historical inconsistency Codex found; restored afterward.
+
+    P2 audit-found fix (10th independent review round follow-up, same
+    "declared Node support conflicts" class): package-lock.json's root
+    package entry (`packages[""].engines.node`) still carried the OLD
+    ">=20" value — the 9th round's package.json edit was made directly
+    without ever running `npm install` to regenerate the lockfile, so the
+    lockfile itself silently contradicted package.json (a second,
+    independent instance of the same bug class, this time between two
+    dependency-metadata files rather than between package.json and a
+    dependency's own declared range). Fixed by running `npm install`
+    (added 2 already-satisfied transitive/optional entries incidentally;
+    confirmed via `git diff --stat` that the only meaningful change was
+    the 1-line `engines.node` fix in package-lock.json). Re-ran the full
+    test suite afterward with no regressions.
+
+    Documentation/CI alignment (10th independent review round,
+    establishing Node 24 as the canonical documented baseline): Codex
+    asked for ONE canonical Node support policy stated consistently
+    across specification/docs/package/CI/test toolchain, preferring Node
+    24 as the primary documented recommendation. `.github/workflows/ci.yml`
+    changed from `node-version: "22"` to `"24"` in both jobs; README.md,
+    CONTRIBUTING.md, AGENTS.md, CLAUDE.md, and
+    docs/beginner/repository-map-tr.md now each state "Node.js 24.x
+    (LTS) is this repository's canonical, CI-tested runtime" while
+    accurately noting the broader Vitest-5-compatible range enforced by
+    `engines.node` and validated by `factory doctor`; a new `.nvmrc`
+    (`24`) was added for local tooling. `engines.node` itself was
+    deliberately NOT narrowed to "24 only": there is no `.npmrc`/
+    `engine-strict` in this repo, so it stays advisory-only regardless;
+    narrowing it would falsely exclude genuinely Vitest-5-compatible
+    Node 22.12+/26+ environments (including this session's own sandbox,
+    Node v22.22.2, which `factory doctor` already reports READY against)
+    and would make the Factory's own enforcement mechanism reject an
+    environment its own locked test toolchain accepts — the opposite of
+    the "no unsupported/false claim" goal this fix serves. The
+    already-existing `factory doctor` Node-range check plus its CI wiring
+    (`node dist/runtime/cli/index.js doctor` in the "Smoke-test CLI" step,
+    non-zero exit on BLOCKING) is the deterministic compatibility
+    validation Codex asked for — it already fails a future dependency
+    upgrade that silently narrows/widens the genuinely-required Node
+    range without a matching `engines.node` update; no additional
+    parallel check was added, to avoid a second, divergent source of
+    truth for the same fact. Reviewed and deliberately left unchanged:
+    `@types/node` (devDependency, pinned `^22.10.2`) — this is a typings
+    package for `tsc`, not a runtime-support declaration; it does not
+    make any claim about which Node version the Factory runs under, so
+    bumping it is a dependency-upgrade decision outside this bug class's
+    scope, not a contradiction to fix.
 
 - id: UASF-REQ-0041
   title: Baseline status command

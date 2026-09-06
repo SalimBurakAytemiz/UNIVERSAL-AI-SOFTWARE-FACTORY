@@ -8,6 +8,13 @@ değiştirilirse ne etkilenebilir?**
 
 Bu harita, yapı önemli ölçüde değiştiğinde güncel tutulmalıdır (bölüm 282).
 
+**Node.js sürümü:** Bu depo Node.js 24.x (LTS) sürümünü resmi, CI'da
+test edilen çalışma zamanı olarak kabul eder. Kabul edilen tam sürüm
+aralığı `package.json` dosyasındaki `engines.node` alanında tanımlıdır ve
+`node dist/runtime/cli/index.js doctor` komutu bunu otomatik olarak
+doğrular (yalnızca varlığını değil, gerçekten uyumlu olup olmadığını
+kontrol eder).
+
 ---
 
 ## `specification/`

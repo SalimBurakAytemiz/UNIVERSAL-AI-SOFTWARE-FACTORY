@@ -149,6 +149,25 @@ describe("WorkerRegistry", () => {
       expect(registry.all()).toHaveLength(1); // still exactly one authoritative record
     });
 
+    it("BLOCKER regression (10th independent review round, test item 10): the record returned by updateStatus() is a frozen, detached snapshot — ownership boundaries are preserved on this new path too", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      const updated = registry.updateStatus("w1", "QUARANTINED");
+
+      expect(() => {
+        (updated as { status: string }).status = "IDLE";
+      }).toThrow(TypeError);
+      expect(() => {
+        (updated.capabilities as string[]).push("gpu");
+      }).toThrow(TypeError);
+
+      // Mutation attempts on the returned snapshot never reach the authoritative record.
+      expect(registry.all()[0]!.status).toBe("QUARANTINED");
+      expect(registry.findCapable(["cpu"])).toHaveLength(0);
+      // updateStatus() never hands back the SAME reference stored internally either.
+      expect(updated).not.toBe(registry.all()[0]);
+    });
+
     it("BLOCKER regression: a quarantined worker (via updateStatus) is never returned by findCapable() — no stale IDLE record survives", () => {
       const registry = new WorkerRegistry();
       registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
