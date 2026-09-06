@@ -24,7 +24,7 @@ describe("Logger", () => {
     } as never);
 
     const line = sink.mock.calls[0]![0] as string;
-    expect(line).not.toContain("sk-live-should-never-appear");
+    expect(line).not.toContain("sk-live-should-never-appear"); // secret-scan:allow (fake fixture value, not a real key)
     expect(line).not.toContain("should-also-be-redacted");
     expect(line).toContain("[REDACTED]");
     expect(line).toContain("ok"); // non-sensitive nested field is preserved

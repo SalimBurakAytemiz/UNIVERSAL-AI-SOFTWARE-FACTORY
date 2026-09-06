@@ -47,6 +47,82 @@ describe("secret-scan: findSecretsInText", () => {
   });
 });
 
+describe(
+  "secret-scan: P2 fix (18th independent review round, 'secret scanner misses project-scoped OpenAI keys " +
+    "in JSON') — a project-scoped OpenAI key (sk-proj-...) must be detected regardless of surrounding syntax",
+  () => {
+    const syntheticProjectKey =
+      "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // secret-scan:allow (fake fixture value, tests detection itself)
+
+    it("detects a project-scoped OpenAI key inside quoted JSON syntax (single line)", () => {
+      const findings = findSecretsInText(`{"apiKey":"${syntheticProjectKey}"}`, "config.json"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "OpenAI API key")).toBe(true);
+    });
+
+    it("detects a project-scoped OpenAI key inside pretty-printed (multi-line, indented) JSON", () => {
+      const json = [
+        "{",
+        `  "apiKey": "${syntheticProjectKey}"`, // secret-scan:allow (fake fixture value, tests detection itself)
+        "}"
+      ].join("\n");
+      const findings = findSecretsInText(json, "config.json");
+      expect(findings.some((f) => f.pattern === "OpenAI API key")).toBe(true);
+    });
+
+    it("detects a project-scoped OpenAI key in .env-style assignment syntax", () => {
+      const findings = findSecretsInText(`OPENAI_API_KEY=${syntheticProjectKey}`, ".env"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "OpenAI API key")).toBe(true);
+    });
+
+    it("detects a project-scoped OpenAI key in YAML-style assignment syntax", () => {
+      const findings = findSecretsInText(`openai_api_key: ${syntheticProjectKey}`, "config.yaml"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "OpenAI API key")).toBe(true);
+    });
+
+    it("detects a project-scoped OpenAI key in TOML-style assignment syntax", () => {
+      const findings = findSecretsInText(`openai_api_key = "${syntheticProjectKey}"`, "config.toml"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "OpenAI API key")).toBe(true);
+    });
+
+    it("detects a project-scoped OpenAI key in a TypeScript/JavaScript string assignment", () => {
+      const findings = findSecretsInText(`const apiKey = "${syntheticProjectKey}";`, "config.ts"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "OpenAI API key")).toBe(true);
+    });
+
+    it("does not double-count an Anthropic key as a duplicate OpenAI finding", () => {
+      const findings = findSecretsInText(
+        'const apiKey = "sk-ant-abcdefghijklmnopqrstuvwxyz0123456789";', // secret-scan:allow (fake fixture value, tests detection itself)
+        "config.ts"
+      );
+      expect(findings.filter((f) => f.pattern === "Anthropic API key")).toHaveLength(1);
+      expect(findings.filter((f) => f.pattern === "OpenAI API key")).toHaveLength(0);
+    });
+
+    it("does not flag a quoted JSON property with an obviously non-secret, short value (no broad false positive)", () => {
+      const findings = findSecretsInText('{"apiKey": "true", "password": "no"}', "settings.json");
+      expect(findings).toHaveLength(0);
+    });
+
+    it("does not flag unrelated harmless strings that merely start with 'sk-' (no broad false positive)", () => {
+      const findings = findSecretsInText('const flag = "sk-off";', "flags.ts");
+      expect(findings).toHaveLength(0);
+    });
+
+    it("detects an AWS temporary/STS access key id (ASIA prefix), a genuine variant AKIA-only detection missed", () => {
+      const findings = findSecretsInText("const key = 'ASIAABCDEFGHIJKLMNOP';", "example.ts"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "AWS Access Key ID")).toBe(true);
+    });
+
+    it("detects a GitHub fine-grained personal access token (github_pat_ prefix), a genuine variant the old pattern missed", () => {
+      const findings = findSecretsInText(
+        "const token = 'github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop';", // secret-scan:allow (fake fixture value, tests detection itself)
+        "example.ts"
+      );
+      expect(findings.some((f) => f.pattern === "GitHub token")).toBe(true);
+    });
+  }
+);
+
 describe("secret-scan: no whole-file allowlist (regression for the P2 finding)", () => {
   let tempRoot;
 
@@ -198,6 +274,46 @@ describe("secret-scan: git-history-aware scanning", () => {
     const findings = scanGitHistory(tempRepo);
     expect(findings).toHaveLength(1); // one unique blob -> one finding, not two
   });
+
+  it(
+    "P2 fix (18th independent review round): a synthetic project-scoped OpenAI key (sk-proj-) committed " +
+      "to history is detected by the history scan",
+    () => {
+      tempRepo = initTempRepo();
+      writeFileSync(
+        join(tempRepo, "config.json"),
+        '{"apiKey":"sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}\n' // secret-scan:allow (fake fixture value written into a temp repo)
+      );
+      git(["add", "config.json"]);
+      git(["commit", "-m", "oops: add config with a credential"]);
+
+      const findings = scanGitHistory(tempRepo);
+      expect(findings.some((f) => f.pattern === "OpenAI API key" && f.file.includes("config.json"))).toBe(true);
+    }
+  );
+
+  it(
+    "P2 fix (18th independent review round): a synthetic project-scoped OpenAI key deleted from the " +
+      "current tree remains detected via history scanning",
+    () => {
+      tempRepo = initTempRepo();
+      writeFileSync(
+        join(tempRepo, "config.json"),
+        '{"apiKey":"sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}\n' // secret-scan:allow (fake fixture value written into a temp repo)
+      );
+      git(["add", "config.json"]);
+      git(["commit", "-m", "oops: add config with a credential"]);
+
+      execFileSync("git", ["rm", "config.json"], { cwd: tempRepo });
+      git(["commit", "-m", "remove config"]);
+
+      const trackedNow = execFileSync("git", ["ls-files"], { cwd: tempRepo, encoding: "utf8" });
+      expect(trackedNow).not.toContain("config.json");
+
+      const findings = scanGitHistory(tempRepo);
+      expect(findings.some((f) => f.pattern === "OpenAI API key" && f.file.includes("config.json"))).toBe(true);
+    }
+  );
 });
 
 describe("secret-scan: this repository's own known-historical baseline", () => {
@@ -227,4 +343,14 @@ describe("secret-scan: .env.example placeholder checks", () => {
     expect(findings).toHaveLength(1);
     expect(findings[0].pattern).toContain("LEAKED");
   });
+
+  it(
+    "P2 fix (18th independent review round): a safe, explicit placeholder for an OpenAI project-scoped " +
+      "key variable is still allowed in .env.example (the widened OpenAI pattern does not turn a legitimate " +
+      "empty/placeholder value into a false positive)",
+    () => {
+      const findings = findNonPlaceholderEnvLines("OPENAI_API_KEY=\nOPENAI_PROJECT_API_KEY=<your-openai-project-key>");
+      expect(findings).toHaveLength(0);
+    }
+  );
 });

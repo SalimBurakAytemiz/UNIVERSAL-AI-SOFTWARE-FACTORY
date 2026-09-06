@@ -420,6 +420,32 @@ factory:
     seventeenth review's own framing, this remains the P0 closure
     re-review. P0 remains open.
 
+    An EIGHTEENTH independent Codex review found ONE remaining P2
+    blocker, entirely outside the runtime kernel: `scripts/secret-scan.mjs`
+    missed a project-scoped OpenAI credential (`sk-proj-...`) stored in
+    JSON configuration, due to two independent gaps — the "OpenAI API key"
+    pattern required 20+ consecutive alphanumeric characters right after
+    `sk-` (no allowance for the hyphenated `proj-` segment), and the
+    generic key/value pattern couldn't match a quoted JSON property name's
+    closing quote sitting between the key and the colon. Both fixed this
+    session; while verifying the fix against the real repository (not a
+    reproduction), a genuine self-caught false positive surfaced (the
+    widened pattern matching "sk-" as the tail of an ordinary hyphenated
+    English word, e.g. inside this very file's own prose) and was fixed
+    with a left word-boundary guard. Fourteen new regression tests added
+    (JSON/YAML/TOML/.env/TS-JS syntax, git-history detection, delete-then-
+    history-detect, no-double-count, no-broad-false-positive, safe
+    .env.example placeholders); a narrow audit of the same root class
+    (provider-format missed due to prefix variant) found and fixed two
+    more genuine instances (AWS's ASIA temporary-credential prefix,
+    GitHub's github_pat_ fine-grained-token prefix). Fully verified (lint,
+    typecheck, a real `rm -rf dist && npm run build`, 647/647 tests,
+    requirement validation, secret scan — genuinely PASS against this
+    repository's real current tree and history, not just its own unit
+    tests — Factory Doctor, all 9 P0 proofs); pushed for a nineteenth
+    independent review — the eighteenth review's own framing calls this
+    the P0 closure re-review. P0 remains open.
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -2449,6 +2475,96 @@ completed_milestones:
     tests (630 + 3 net new), validate:requirements, history-aware
     secret-scan, Factory Doctor (READY on all checks), all 9 P0 proofs
     (13 assertions) — all clean.
+  - |-
+    THIS SESSION (round 19) — an eighteenth independent Codex review
+    (all required verification, including 633/633 tests, confirmed
+    passing BEFORE the finding was listed) reproduced ONE remaining P2
+    finding, now fixed:
+    - [P2] "Secret scanner misses project-scoped OpenAI keys in JSON":
+      `scripts/secret-scan.mjs`'s "OpenAI API key" pattern
+      (`sk-[A-Za-z0-9]{20,}`) required 20+ CONSECUTIVE alphanumeric
+      characters immediately after `sk-`, so a project-scoped OpenAI key
+      (`sk-proj-<...>`) — which embeds a hyphen right after `sk-` — broke
+      the match at the very first hyphen and evaded detection entirely,
+      even though it is a fully supported, real credential format.
+      Separately, the "Generic API key/secret assignment" pattern
+      required the key name to be followed DIRECTLY by `\s*[:=]`, which
+      cannot match across a quoted JSON property name's own closing
+      quote (`"apiKey": "..."`), so it silently failed on ordinary JSON
+      while still working for unquoted-key syntax. Fixed: the OpenAI
+      pattern's trailing character class was widened to match hyphens/
+      underscores too (identical to the sibling "Anthropic API key"
+      pattern's own class — a consistency fix, not a new allowance),
+      with `(?!ant-)` added so it never double-counts an Anthropic key as
+      a duplicate OpenAI finding; the generic pattern gained an optional
+      `['"]?` immediately after the key-name group, absorbing a JSON
+      property name's closing quote without requiring one.
+    - SELF-CAUGHT regression during this fix's own verification (a real
+      `npm run secret-scan` run against this repository, not a Codex
+      reproduction): the widened OpenAI pattern also newly matched "sk-"
+      as the TAIL of an ordinary hyphenated English word immediately
+      followed by more hyphenated text (e.g. "ri" + "sk-5-never-
+      weakens-..." inside this very requirement registry's own prose) —
+      something the OLD, pure-alphanumeric trailing class could never
+      trigger, since any hyphen anywhere in the run broke it immediately.
+      Fixed with a negative lookbehind, `(?<![A-Za-z0-9])`, requiring the
+      character immediately before `sk-` to not itself be a letter or
+      digit — ruling out "risk-"/"desk-"/"task-" while every genuine
+      credential-shaped occurrence (always preceded by a quote/`=`/`:`/
+      whitespace/start-of-line/value) remains completely unaffected.
+    - Fourteen new regression tests added (tests/secret-scan.test.mjs)
+      prove: detection inside single-line and pretty-printed (multi-line,
+      indented) quoted JSON, .env-style assignment, YAML-style
+      assignment, TOML-style assignment, a TypeScript/JavaScript string
+      assignment, a synthetic `sk-proj-` credential committed to git
+      history AND remaining detected after being deleted from the current
+      tree, an Anthropic key never double-counted as a duplicate OpenAI
+      finding, a quoted JSON property with an obviously non-secret short
+      value producing no finding, an unrelated "sk-"-prefixed string
+      below the length/shape threshold producing no finding, and a safe
+      `.env.example`-style placeholder for an OpenAI project key variable
+      remaining allowed. Confirmed via a temporary bypass (reverting all
+      three regex changes to their pre-fix form) that exactly the 10
+      tests exercising these specific fixes failed with the predicted
+      "expected true, got false" symptom, all other tests (including the
+      pre-existing historical-baseline precision test) stayed green, then
+      reverted. The self-caught false positive was independently verified
+      the same way: with the lookbehind removed, a real `npm run
+      secret-scan` run reproduced the exact spurious finding at the
+      registry's own prose before the lookbehind was restored.
+    - Narrow audit (scoped to exactly this one root class: "supported
+      provider credential format missed due to prefix/syntax variant"):
+      reviewed every other pattern in `PATTERNS`. Found and fixed two
+      more genuine instances: AWS's "AWS Access Key ID" pattern covered
+      only the long-term `AKIA` prefix, missing `ASIA` (AWS's equally
+      real, currently-issued temporary/STS credential prefix); GitHub's
+      "GitHub token" pattern covered classic PAT/OAuth/app-token prefixes
+      but missed `github_pat_`, GitHub's newer, now-RECOMMENDED
+      fine-grained personal access token format. Both broadened with two
+      more regression tests. Also fixed: widening the OpenAI pattern
+      newly and correctly surfaced three PRE-EXISTING historical blobs of
+      `runtime/telemetry/__tests__/logger.test.ts` containing the same
+      deliberately-fake fixture value already documented as fake on an
+      adjacent, previously-marked line in those same historical commits —
+      added to `KNOWN_HISTORICAL_FIXTURE_FINDINGS` following the exact
+      established exact-match (blob sha + line + pattern) baseline
+      pattern, content verified via `git cat-file`, not a real secret and
+      not resolved via any broader exclusion.
+  - >-
+    Requirement registry updated a further time from this round's real
+    evidence: UASF-REQ-0002 (Public secret / hygiene audit — both regex
+    fixes, the self-caught false-positive fix, the 14 new regression
+    tests, the temp-bypass verification results, the narrow-audit note
+    for AWS/GitHub prefix variants, and the three new historical-baseline
+    entries). No status field was raised on any requirement beyond what
+    real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, build (real `tsc`
+    emission confirmed via a fresh dist/ deletion and rebuild), 647/647
+    tests (633 + 14 new), validate:requirements, history-aware
+    secret-scan (genuinely PASS against this repository's real current
+    tree and history), Factory Doctor (READY on all checks), all 9 P0
+    proofs (13 assertions) — all clean.
 
 known_limitations:
   - >-
@@ -2738,6 +2854,30 @@ blockers:
     work, and do not declare P0 complete, until that re-review confirms
     no blocking finding remains.
 
+    An EIGHTEENTH independent Codex review found ONE remaining P2
+    finding, entirely outside the runtime kernel: `scripts/secret-
+    scan.mjs`'s "OpenAI API key" pattern missed a project-scoped OpenAI
+    credential (`sk-proj-...`) because it required 20+ consecutive
+    alphanumeric characters right after `sk-` with no allowance for the
+    hyphenated `proj-` segment, and the generic key/value pattern
+    couldn't match a quoted JSON property name's closing quote sitting
+    between the key and the colon. Both fixed this session; while
+    verifying against the real repository, a genuine self-caught false
+    positive surfaced (the widened pattern matching "sk-" as the tail of
+    an ordinary hyphenated English word) and was fixed with a left
+    word-boundary guard. Fourteen new regression tests added; both
+    verified via temporary bypasses reproducing the exact predicted
+    symptoms, then reverted. A narrow audit of the same root class found
+    and fixed two more genuine instances (AWS's ASIA prefix, GitHub's
+    github_pat_ prefix). Tested (647/647 tests, +14 net new) and verified
+    per the full required sequence — see completed_milestones for full
+    detail. Now awaiting a NINETEENTH independent review — per the
+    eighteenth review's own framing, this remains the P0 closure
+    re-review. Per explicit instruction: "stop at the independent-review
+    boundary" — do not push further P0 feature work, and do not declare
+    P0 complete, until that re-review confirms no blocking finding
+    remains.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -2754,6 +2894,71 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  STOP at the independent-review boundary, per explicit instruction: the
+  fix for the eighteenth independent Codex review's ONE remaining P2
+  finding is implemented, tested, and pushed to
+  claude/ai-factory-baseline-v1-seawq7, with the full required
+  verification sequence run clean (lint, typecheck, a REAL `npm run
+  build` emission — confirmed via a clean `dist/` deletion and rebuild —
+  647/647 tests, validate:requirements, history-aware secret-scan
+  genuinely PASSing against this repository's real current tree and
+  history, Factory Doctor READY, all 9 P0 proofs). The finding was
+  scoped entirely to `scripts/secret-scan.mjs` (outside the runtime
+  kernel; the 18th review did not reproduce any new runtime-kernel
+  finding). Summary of the fix:
+
+  [P2] The "OpenAI API key" pattern (`sk-[A-Za-z0-9]{20,}`) required 20+
+  consecutive alphanumeric characters immediately after `sk-`, so a
+  project-scoped OpenAI key (`sk-proj-<...>`) — which embeds a hyphen
+  right after `sk-` — evaded detection entirely. Separately, the
+  "Generic API key/secret assignment" pattern required the key name to
+  be followed directly by `\s*[:=]`, which cannot match across a quoted
+  JSON property name's own closing quote (`"apiKey": "..."`). Fixed: the
+  OpenAI pattern's trailing class was widened to match hyphens/
+  underscores (matching the sibling Anthropic pattern's own class) with
+  `(?!ant-)` to avoid double-counting an Anthropic key; the generic
+  pattern gained an optional `['"]?` after the key name to absorb a JSON
+  property name's closing quote. While verifying this against the real
+  repository (not a reproduction), a genuine self-caught false positive
+  surfaced: the widened OpenAI pattern also matched "sk-" as the tail of
+  an ordinary hyphenated English word (e.g. inside this very registry's
+  own prose). Fixed with a negative lookbehind, `(?<![A-Za-z0-9])`,
+  requiring the character before `sk-` to not be a letter/digit.
+
+  Fourteen new regression tests added (tests/secret-scan.test.mjs)
+  covering JSON/YAML/TOML/.env/TS-JS syntax, git-history detection
+  (including delete-then-still-detected), no-double-count, no-broad-
+  false-positive, and safe `.env.example` placeholders. Verified via a
+  temporary bypass (reverting all three regex changes) confirming
+  exactly the 10 targeted tests failed with the predicted symptom, then
+  reverted; the self-caught false positive was independently verified
+  the same way (removing the lookbehind reproduced the exact spurious
+  finding via a real `npm run secret-scan` run). A narrow audit of the
+  same root class found and fixed two more genuine instances: AWS's
+  ASIA temporary-credential prefix and GitHub's github_pat_ fine-grained-
+  token prefix, both missing from their respective patterns. Widening
+  the OpenAI pattern also correctly surfaced three pre-existing
+  historical blobs of `runtime/telemetry/__tests__/logger.test.ts`
+  containing an already-documented-fake fixture value on an unmarked
+  line — added to `KNOWN_HISTORICAL_FIXTURE_FINDINGS` following the
+  established exact-match (blob sha + line + pattern) baseline pattern,
+  content verified via `git cat-file`.
+
+  Requirement registry updated (UASF-REQ-0002) from this real evidence
+  only — no status raised beyond what is genuinely supported. Do not
+  proceed to further P0 feature work or declare P0 complete until a
+  NINETEENTH independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains — per the eighteenth review's own framing,
+  this remains the P0 closure re-review. If/when that comes back clean,
+  resume from the prior exact_next_action (below): wire the remaining
+  foundation modules (Discovery, Decisions, Assumptions, Technology/
+  Business-Capability registries) into the same integrated pipeline,
+  consider a SQLite-backed StateStore, get a Founder decision on
+  P0-sufficiency and licensing (section 206). The autonomous-merge
+  governance question stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fixes for the seventeenth independent Codex review's TWO remaining
   findings are implemented, tested, and pushed to

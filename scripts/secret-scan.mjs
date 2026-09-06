@@ -25,14 +25,67 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const PATTERNS = [
-  { name: "AWS Access Key ID", regex: /AKIA[0-9A-Z]{16}/g },
+  // P2 fix (18th independent review round targeted audit, same root class
+  // as the OpenAI finding below: "supported provider credential format
+  // missed due to prefix variant"): `AKIA` is only AWS's LONG-TERM access
+  // key ID prefix; `ASIA` (temporary/STS credentials — arguably the more
+  // commonly LEAKED variant, since they're minted and pasted around far
+  // more often in CI/session contexts) is an equally real, currently-
+  // issued AWS access key ID format that the old pattern silently missed.
+  { name: "AWS Access Key ID", regex: /(AKIA|ASIA)[0-9A-Z]{16}/g },
   { name: "AWS Secret Access Key (assignment)", regex: /aws_secret_access_key\s*=\s*['"]?[A-Za-z0-9/+=]{40}['"]?/gi },
   { name: "Private key block", regex: /-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g },
-  { name: "GitHub token", regex: /gh[pousr]_[A-Za-z0-9]{20,}/g },
+  // P2 fix (18th independent review round targeted audit, same root
+  // class): `gh[pousr]_` covers the classic PAT/OAuth/app-token prefixes
+  // but misses `github_pat_` — GitHub's newer, now-RECOMMENDED
+  // fine-grained personal access token format, which uses an entirely
+  // different, non-single-character prefix.
+  { name: "GitHub token", regex: /(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g },
   { name: "Slack token", regex: /xox[baprs]-[A-Za-z0-9-]{10,}/g },
-  { name: "Generic API key/secret assignment with a real-looking value", regex: /(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*['"][A-Za-z0-9_\-/.+]{12,}['"]/gi },
+  // P2 fix (18th independent review round, "secret scanner misses
+  // project-scoped OpenAI keys in JSON"): a quoted JSON property NAME
+  // (`"apiKey": "..."`) has a closing quote sitting directly between the
+  // key name and the `:`/`=` — the old pattern went straight from the key
+  // name to `\s*[:=]`, which cannot match across that quote character, so
+  // it silently failed on ordinary JSON while still working for
+  // unquoted-key syntax (YAML, TOML, shell/env, plain JS object
+  // literals). `['"]?` absorbs that optional closing quote without
+  // requiring one, so every previously-supported syntax keeps matching.
+  { name: "Generic API key/secret assignment with a real-looking value", regex: /(api[_-]?key|secret|password|access[_-]?token)['"]?\s*[:=]\s*['"][A-Za-z0-9_\-/.+]{12,}['"]/gi },
   { name: "Anthropic API key", regex: /sk-ant-[A-Za-z0-9\-_]{20,}/g },
-  { name: "OpenAI API key", regex: /sk-[A-Za-z0-9]{20,}/g }
+  // P2 fix (18th independent review round, same finding): the old pattern
+  // required 20+ CONSECUTIVE alphanumeric characters immediately after
+  // "sk-", with no allowance for a hyphen or underscore anywhere in that
+  // run. A project-scoped OpenAI key (`sk-proj-<...>`) — and OpenAI's
+  // other documented "sk-"-prefixed variants (service-account, admin
+  // keys, etc.) — all embed a hyphenated segment right after "sk-", which
+  // broke the match at the very first hyphen, evading detection entirely
+  // despite being a fully supported, real credential format. Fixed by
+  // widening the trailing character class to match hyphens/underscores
+  // too — exactly the same class the sibling "Anthropic API key" pattern
+  // above already uses, so this is a consistency fix, not a new
+  // allowance. `(?!ant-)` keeps this pattern from ALSO re-matching an
+  // Anthropic key as a duplicate, lower-precision "OpenAI API key"
+  // finding on the same line (Anthropic's own dedicated pattern already
+  // covers it).
+  //
+  // Self-caught false-positive during THIS fix's own verification (real
+  // secret-scan run against this repository, not a reproduction Codex
+  // gave): allowing hyphens in the trailing run means "sk-" occurring as
+  // the tail of an ORDINARY English word immediately followed by a
+  // hyphenated phrase now also matches — e.g. prose reading "...the
+  // ri`sk-5`-never-weakens-an-explicit-DENY logic..." — which the OLD,
+  // narrower (pure-alphanumeric-only) trailing class could never trigger
+  // (any hyphen anywhere in the run broke it immediately). The credential
+  // prefix "sk-" is always its OWN token (start of string/value, or
+  // preceded by a quote/`=`/`:`/whitespace/BOL) — never the tail of a
+  // longer alphanumeric word — so `(?<![A-Za-z0-9])` requires the
+  // character immediately before "sk-" to NOT itself be a letter or
+  // digit, ruling out "risk-"/"desk-"/"task-"/... while every genuine
+  // credential-shaped occurrence (JSON/YAML/TOML/.env/JS string — always
+  // preceded by a quote, `=`, `:`, whitespace, or the very start of the
+  // line/value) is completely unaffected.
+  { name: "OpenAI API key", regex: /(?<![A-Za-z0-9])sk-(?!ant-)[A-Za-z0-9_-]{20,}/g }
 ];
 
 // Path-level allowlisting is DELIBERATELY not used for files that contain
@@ -65,7 +118,26 @@ const KNOWN_HISTORICAL_FIXTURE_FINDINGS = [
     sha: "0f3959557c676f3b8d02e1ac7210d79876e9c34a",
     line: 16,
     pattern: "Generic API key/secret assignment with a real-looking value"
-  }
+  },
+  // P2 fix (18th independent review round, "secret scanner misses
+  // project-scoped OpenAI keys in JSON"): widening the "OpenAI API key"
+  // pattern's trailing character class newly surfaced these three
+  // PRE-EXISTING historical blobs of
+  // runtime/telemetry/__tests__/logger.test.ts — each contains, at line
+  // 27, a `not.toContain(...)` assertion on the SAME deliberately-fake
+  // fixture value that line 22 of these same historical blobs already
+  // documents as fake via its own `secret-scan:allow` marker (only line
+  // 27's OWN marker, added in this round's fix to the CURRENT file,
+  // postdates these commits). Content verified via
+  // `git cat-file -p <sha> | sed -n '25,29p'` — byte-for-byte identical
+  // across all three blobs and to the current file's marked line before
+  // the marker was added. These commits are reachable from already-
+  // merged history and cannot be edited without rewriting PUBLIC git
+  // history (forbidden without Founder approval, same constraint as the
+  // pre-existing baseline entries above).
+  { sha: "d0dab64660912c9ebf4c631a1c0bae21d677da16", line: 27, pattern: "OpenAI API key" },
+  { sha: "1d6b2318c001af032e791ba8e1c353240d598ba8", line: 27, pattern: "OpenAI API key" },
+  { sha: "89068682805a085196632186a84c6cf2ee6d30bc", line: 27, pattern: "OpenAI API key" }
 ];
 
 function gitTrackedFiles(cwd = process.cwd()) {

@@ -57,6 +57,99 @@
     tests proving an unmarked credential anywhere in those files is still
     detected.
 
+    P2 fix (18th independent review round, "secret scanner misses
+    project-scoped OpenAI keys in JSON"): Codex reproduced a project-
+    scoped OpenAI credential (`sk-proj-<...>`) stored in JSON
+    configuration (`{"apiKey": "sk-proj-..."}`) evading both current-tree
+    and git-history scanning. Two independent root causes: (1) the
+    "OpenAI API key" pattern (`sk-[A-Za-z0-9]{20,}`) required 20+
+    CONSECUTIVE alphanumeric characters immediately after `sk-`, with no
+    allowance for a hyphen anywhere in that run — `sk-proj-<...>` (and
+    OpenAI's other `sk-`-prefixed variants: service-account, admin keys)
+    embed a hyphenated segment right after `sk-`, breaking the match at
+    the very first hyphen; (2) the "Generic API key/secret assignment"
+    pattern required the key name to be followed DIRECTLY by `\s*[:=]`,
+    which cannot match across a quoted JSON property name's own closing
+    quote (`"apiKey": "..."` has a `"` sitting between the key and the
+    `:`), so it silently failed on ordinary JSON while still working for
+    unquoted-key syntax (YAML, TOML, shell/.env, plain JS object
+    literals). Required invariant: supported secret formats must be
+    detected regardless of surrounding syntax (.env, shell/config
+    assignment, JSON, YAML, TOML, TS/JS strings), in both current-tree and
+    git-history scanning. Fixed: (1) the OpenAI pattern's trailing
+    character class was widened to include hyphens/underscores —
+    identical to the sibling "Anthropic API key" pattern's own class,
+    making this a consistency fix rather than a new allowance — with
+    `(?!ant-)` added so it never also re-matches an Anthropic key as a
+    duplicate, lower-precision finding on the same line; (2) a SELF-
+    CAUGHT false positive during this fix's own verification (a real
+    `npm run secret-scan` run against this repository, not a Codex
+    reproduction) showed the widened OpenAI pattern now also matched
+    ordinary hyphenated English prose where "sk-" appears as the tail of
+    a longer word (e.g. "ri" + "sk-5-never-weakens-..." inside this very
+    registry's own prose) — something the OLD, pure-alphanumeric trailing
+    class could never trigger. Fixed with a negative lookbehind,
+    `(?<![A-Za-z0-9])`, requiring the character immediately before `sk-`
+    to not itself be a letter/digit — ruling out "risk-"/"desk-"/"task-"
+    while leaving every genuine credential-shaped occurrence (always
+    preceded by a quote/`=`/`:`/whitespace/start-of-line) completely
+    unaffected; (3) the generic pattern gained an optional `['"]?`
+    immediately after the key-name group, absorbing a JSON property
+    name's optional closing quote without requiring one, so every
+    previously-supported unquoted-key syntax keeps matching unchanged.
+    Fourteen new regression tests added (tests/secret-scan.test.mjs, new
+    describe block plus two git-history cases) prove: detection inside
+    single-line and pretty-printed (multi-line, indented) quoted JSON,
+    .env-style assignment, YAML-style assignment, TOML-style assignment,
+    a TypeScript/JavaScript string assignment, a synthetic `sk-proj-`
+    credential committed to git history, that same credential remaining
+    detected via history scanning after being deleted from the current
+    tree, an Anthropic key never being double-counted as a duplicate
+    OpenAI finding, a quoted JSON property with an obviously non-secret
+    short value producing no finding, an unrelated string merely starting
+    with "sk-" (below the length/shape threshold) producing no finding,
+    and a safe `.env.example`-style placeholder for an OpenAI project key
+    variable remaining allowed. Verified via a temporary bypass (reverting
+    all three regex changes to their pre-fix form) — confirmed exactly the
+    10 tests exercising these specific fixes failed with the predicted
+    "expected true, got false" symptom, while all other tests (including
+    the pre-existing historical-baseline precision test) stayed green,
+    then reverted and re-confirmed all tests passing. The self-caught
+    false positive above was itself independently verified the same way:
+    with the lookbehind removed, a real `npm run secret-scan` run
+    reproduced the exact spurious finding at
+    `specification/requirements/P0-factory-kernel.yml`'s own prose before
+    the lookbehind was restored.
+
+    Narrow audit (18th independent review round, same root class:
+    "supported provider credential format missed due to prefix/syntax
+    variant"): reviewed every OTHER pattern in `PATTERNS` for the same
+    class of gap. Found and fixed two more genuine instances: AWS's
+    "AWS Access Key ID" pattern (`AKIA[0-9A-Z]{16}`) covered only the
+    long-term access-key-ID prefix, missing `ASIA` — AWS's equally real,
+    currently-issued temporary/STS credential prefix (arguably more
+    commonly leaked, since STS credentials are minted and pasted around
+    far more often in CI/session contexts); GitHub's "GitHub token"
+    pattern (`gh[pousr]_[A-Za-z0-9]{20,}`) covered the classic PAT/OAuth/
+    app-token prefixes but missed `github_pat_` — GitHub's newer, now-
+    RECOMMENDED fine-grained personal access token format, which uses an
+    entirely different, non-single-character prefix. Both broadened
+    (`(AKIA|ASIA)[0-9A-Z]{16}` and an alternation adding
+    `github_pat_[A-Za-z0-9_]{20,}` respectively) with two more regression
+    tests proving detection of each new variant. Slack's token pattern's
+    own minor legacy gap (missing the deprecated `xoxo` prefix) was
+    deliberately NOT touched — a legacy, rarely-issued format, out of
+    scope for this narrowly-targeted audit. `secret-scan:allow` continues
+    to be the ONLY suppression mechanism (no new allowlist entries added);
+    `KNOWN_HISTORICAL_FIXTURE_FINDINGS` gained three new, individually-
+    verified (exact blob sha + line + pattern, content confirmed via
+    `git cat-file`) entries for pre-existing historical blobs of
+    `runtime/telemetry/__tests__/logger.test.ts` that the widened OpenAI
+    pattern newly and correctly surfaced — a genuinely fake fixture value
+    already documented as fake on an adjacent, previously-marked line in
+    those same historical commits, not a real secret and not reachable
+    through any broader exclusion.
+
 - id: UASF-REQ-0003
   title: Baseline specification preservation
   description: >
