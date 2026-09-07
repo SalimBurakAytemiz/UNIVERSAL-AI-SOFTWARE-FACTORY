@@ -171,13 +171,32 @@ function isLockStale(lockDirPath: string, metaPath: string, staleMs: number): bo
  * birkaç senkron syscall'dan oluşup neredeyse anında biter; kapıyı ALAN
  * process'in KENDİSİ reclaim SIRASINDA çökerse, kapı `staleMs` sonra yine
  * kurtarılabilir hale gelir, böylece kalıcı bir kilitlenme oluşmaz.
- * Döndürülen `true`, kaldırmanın (silmenin) fiilen denendiği (ve
- * `lockDirPath`'in artık boş olması BEKLENDİĞİ) anlamına gelir — çağıran
- * döngü bu durumda HEMEN `mkdirSync(lockDirPath)`'i yeniden dener; `false`,
- * ya kapının kaybedildiği ya da son kontrolün kilidi artık stale
- * BULMADIĞI (canlı bir sahip tarafından meşru şekilde yenilendiği)
- * anlamına gelir — çağıran normal zaman aşımı/bekleme yoluna döner
+ * Döndürülen `true`, kaldırmanın (silmenin) GERÇEKTEN başarılı olduğu
+ * (ve `lockDirPath`'in artık boş olduğu KANITLANDIĞI) anlamına gelir —
+ * çağıran döngü bu durumda HEMEN `mkdirSync(lockDirPath)`'i yeniden
+ * dener; `false`, kapının kaybedildiği, son kontrolün kilidi artık stale
+ * BULMADIĞI (canlı bir sahip tarafından meşru şekilde yenilendiği), YA
+ * DA kaldırmanın (silmenin) GERÇEKTEN BAŞARISIZ olduğu anlamına gelir —
+ * her üç durumda da çağıran normal zaman aşımı/bekleme yoluna döner
  * (gereksiz sıkı döngüden -busy loop- kaçınmak için).
+ *
+ * P2 fix (21st independent review round, "stale-lock removal failure
+ * bypasses acquisition timeout"): eskiden `rmSync(lockDirPath)`
+ * BAŞARISIZ olsa bile (ör. kalıcı bir izin hatası, meşgul/silinemeyen
+ * bir dizin) bu hata YUTULUYOR ve fonksiyon KOŞULSUZ `true` DÖNDÜRÜYORDU
+ * — "kaldırma denendi" ile "kaldırma GERÇEKTEN başarılı oldu" arasındaki
+ * farkı çağırana ASLA bildirmeden. Codex, bu durumda `acquireFileLock`'ın
+ * döngüsünün `continue` ile HİÇBİR zaman aşımı kontrolüne uğramadan bir
+ * sonraki `mkdirSync(lockDirPath)` denemesine geçtiğini, bu denemenin de
+ * (dizin hâlâ orada olduğundan) yine EEXIST ile başarısız olacağını, ve
+ * bu döngünün SONSUZA DEK (uyku/backoff OLMADAN, sıkı bir şekilde -busy
+ * loop-) tekrarlanabileceğini gösterdi — 50ms gibi küçük bir
+ * `timeoutMs` yapılandırılmış olsa bile, harici bir süreç sonlandırması
+ * olmadan ASLA dönmüyordu. Fixed: `rmSync` başarısız olursa artık `false`
+ * döndürülür (silme GERÇEKTEN denenip başarısız olduğu, "reclaim
+ * başarılı" OLARAK ASLA raporlanmaz) — bu, çağıran döngüde (bkz.
+ * `acquireFileLock`) HER ZAMAN normal zaman aşımı kontrolüne VE
+ * uyku/backoff'a uğrayan tek, koşulsuz bir yola yönlendirir.
  */
 function tryReclaimStaleLock(lockDirPath: string, metaPath: string, staleMs: number): boolean {
   const claimPath = `${lockDirPath}.reclaim`;
@@ -194,8 +213,12 @@ function tryReclaimStaleLock(lockDirPath: string, metaPath: string, staleMs: num
     try {
       rmSync(lockDirPath, { recursive: true, force: true });
     } catch {
-      // En iyi çaba: kaldırma başarısız olsa bile, çağıran döngü zaten
-      // `mkdirSync`'i yeniden deneyip gerçek durumu gözlemleyecek.
+      // Kaldırma GERÇEKTEN başarısız oldu (force:true zaten ENOENT'i
+      // yutar — buraya düşen HERHANGİ bir hata kalıcı/gerçek bir hatadır:
+      // izin, meşgul dizin, vb.). ASLA "reclaim başarılı" olarak
+      // raporlanmaz — çağıran döngünün normal zaman aşımı/bekleme yoluna
+      // düşmesi için `false` döndürülür.
+      return false;
     }
     return true;
   } finally {
@@ -369,6 +392,32 @@ function acquireRecoveryGate(recoveryGatePath: string, staleMs: number): boolean
  * kimlik-doğrulamalı, tek-kazananlı protokolü ÜZERİNDEN kaldırır — asla
  * koşulsuz/doğrudan bir `rmSync` ile değil.
  *
+ * P2 fix (21st independent review round, "stale-lock removal failure
+ * bypasses acquisition timeout"): eskiden `EEXIST` yakalama bloğu şu
+ * satırı içeriyordu: `if (isLockStale(...) && tryReclaimStaleLock(...))
+ * { continue; }` — Codex, `tryReclaimStaleLock()` (o zamanki hatalı
+ * haliyle) kalıcı bir kaldırma hatasında bile KOŞULSUZ `true`
+ * döndürdüğünde, bu `continue`'nün HİÇBİR ZAMAN aşağıdaki
+ * `Date.now() >= deadline` kontrolüne UĞRAMADIĞINI, döngünün bir sonraki
+ * `mkdirSync` denemesinin de (dizin hâlâ orada olduğundan) yine EEXIST
+ * ile başarısız olacağını, ve bu döngünün UYKU/backoff OLMADAN sonsuza
+ * dek (sıkı bir -busy- döngü olarak) tekrarlanabileceğini gösterdi — 50ms
+ * gibi küçük bir `timeoutMs` yapılandırılmış olsa bile harici bir süreç
+ * sonlandırması olmadan ASLA dönmüyordu. `tryReclaimStaleLock()`'ın
+ * kendisi de artık kaldırma GERÇEKTEN başarısız olduğunda `false`
+ * döndürüyor (bkz. o fonksiyonun üstündeki fix notu), ama bu TEK BAŞINA
+ * yeterli değildi — çağıran döngünün KENDİSİ de, reclaim denemesinin
+ * SONUCU ne olursa olsun (başarılı, başarısız, kapı kaybedildi, sahip
+ * hâlâ canlı), zaman aşımı kontrolünü ASLA atlamayacak şekilde yeniden
+ * yapılandırıldı: artık `continue` YOKTUR — döngünün gövdesi her
+ * yinelemede, hangi dala girerse girsin, TEK VE KOŞULSUZ bir
+ * `Date.now() >= deadline` kontrolünden geçer; yalnızca reclaim GERÇEKTEN
+ * başarılı olduğunda (dizin kanıtlanmış şekilde boşaltıldığında) uyku
+ * ATLANIR (ilerleme kaydedildiği için gecikmesiz yeniden deneme meşrudur)
+ * — reclaim başarısız/uygulanamaz olan HER durumda (dahil: kaldırma
+ * hatası, kapı kaybı, sahip hâlâ canlı, `isLockStale` false) döngü HER
+ * ZAMAN `pollIntervalMs` kadar uyur, ASLA sıkı döngüye girmez.
+ *
  * Bilinen, kasıtlı sınırlama (P0 kapsamı): sahiplik kimliği yalnızca PID +
  * rastgele bir token ile belirlenir; işletim sisteminin PID'leri yeniden
  * kullanabilmesi (PID reuse) teorik olarak ÇOK dar bir pencerede yanlış-
@@ -411,12 +460,27 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (isLockStale(lockDirPath, metaPath, staleMs) && tryReclaimStaleLock(lockDirPath, metaPath, staleMs)) {
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new FileLockTimeoutError(lockDirPath, timeoutMs);
-      }
+    }
+
+    // Buraya SADECE EEXIST üzerinden ulaşılır. Reclaim denemesinin SONUCU
+    // ne olursa olsun (başarılı, başarısız, kapı kaybedildi, sahip hâlâ
+    // canlı) — bu satırdan SONRA, döngünün başına dönmeden ÖNCE, TEK VE
+    // KOŞULSUZ bir zaman aşımı kontrolünden geçilir; hiçbir dal bunu
+    // atlayamaz (bkz. yukarıdaki fonksiyon-seviyesi fix notu).
+    const reclaimed = isLockStale(lockDirPath, metaPath, staleMs)
+      ? tryReclaimStaleLock(lockDirPath, metaPath, staleMs)
+      : false;
+
+    if (Date.now() >= deadline) {
+      throw new FileLockTimeoutError(lockDirPath, timeoutMs);
+    }
+
+    if (!reclaimed) {
+      // Reclaim GERÇEKTEN başarılı olmadıysa (uygulanamadı, kapı
+      // kaybedildi, sahip hâlâ canlı, YA DA kaldırma başarısız oldu) HER
+      // ZAMAN uyu — asla sıkı (busy) döngüye girme. Reclaim GERÇEKTEN
+      // başarılıysa (dizin kanıtlanmış şekilde boşaltıldıysa) uyku
+      // atlanır — gecikmesiz yeniden deneme meşru bir ilerlemedir.
       sleepSync(pollIntervalMs);
     }
   }

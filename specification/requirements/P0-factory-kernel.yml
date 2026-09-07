@@ -2894,6 +2894,109 @@
     round did not touch or need to touch `file-store.ts`/`scaffold.ts`
     (already cleared by the 18th round's identical audit).
 
+    P2 fix (21st independent review round, "stale-lock removal failure
+    bypasses acquisition timeout"): a twenty-first independent Codex
+    review reopened P0 after its twentieth round's CLEAN result by
+    reproducing a genuine fail-open/liveness defect, one level below the
+    17th/19th rounds' reclaim-serialization fixes, in the actual removal
+    step itself. `tryReclaimStaleLock()` attempted `rmSync(lockDirPath,
+    {recursive: true, force: true})` and, if that call genuinely THREW
+    (its `force: true` option already silently tolerates ENOENT, so
+    anything reaching the `catch` is a real failure — permission denial,
+    a busy/non-removable directory entry, etc.), swallowed the error in a
+    bare `catch` block and still fell through to `return true` — reporting
+    a FAILED removal as a SUCCESSFUL reclaim. The caller,
+    `acquireFileLock()`'s retry loop, was structured as
+    `if (isLockStale(...) && tryReclaimStaleLock(...)) { continue; }`
+    BEFORE its own `if (Date.now() >= deadline) throw new
+    FileLockTimeoutError(...)` check — so whenever `tryReclaimStaleLock()`
+    falsely reported success, the loop `continue`d straight past the
+    deadline check entirely. With a persistently unremovable lock-
+    directory entry, this produced a genuine unbounded busy-loop: the
+    same stale lock was re-detected and the same doomed removal
+    re-attempted on every iteration, with the deadline never once
+    consulted. Codex reproduced this concretely — a configured
+    `timeoutMs: 50` still required external process termination after
+    roughly 2 seconds, instead of the promised `FileLockTimeoutError` at
+    ~50ms — proving `FileCache.set()` itself could hang indefinitely
+    despite a small configured timeout, defeating the lock's own
+    bounded-wait contract. Required invariant: EVERY lock-acquisition
+    retry path must honor the configured acquisition deadline, and no
+    error/reclaim-failure path may bypass deadline checking, bounded
+    retry, or backoff. Fixed with two coordinated changes (confirmed via
+    bypass testing that BOTH are genuinely necessary — a partial,
+    one-half-only bypass did not reproduce the hang): (1)
+    `tryReclaimStaleLock()`'s `catch` block now `return`s `false` instead
+    of falling through to `return true`, so a real removal failure is
+    NEVER reported as a successful reclaim; (2) `acquireFileLock()`'s
+    loop was restructured to eliminate the `continue` statement entirely
+    — the deadline check (`if (Date.now() >= deadline) throw
+    FileLockTimeoutError`) is now the single, unconditional next step
+    after every EEXIST-triggered contention attempt, executed on EVERY
+    iteration regardless of whether staleness was detected or reclaim was
+    attempted, succeeded, or failed; the poll-interval backoff
+    (`sleepSync(pollIntervalMs)`) is skipped ONLY in the one case where
+    reclamation is PROVEN to have genuinely succeeded (the real
+    `rmSync()` call did not throw), so a genuinely successful reclaim can
+    retry immediately while every other path — no staleness, a live
+    contended lock, or a failed reclaim — is both deadline-checked and,
+    if not yet expired, paced by the poll interval rather than
+    busy-spinning the event loop. Three new regression tests added to
+    `runtime/cache/__tests__/file-cache.cross-process.test.ts` (16 tests
+    total in that file now, up from 13), using REAL, separately-spawned
+    Node.js child processes and a genuine, deterministic filesystem
+    failure mechanism: this sandbox environment runs as root, which
+    bypasses ordinary Unix permission-bit tricks for forcing `rmSync` to
+    fail, so the tests instead use the Linux immutable file attribute
+    (`chattr +i`), one of the few mechanisms that blocks even root from
+    removing a file (empirically confirmed in this exact environment).
+    Tests prove: (a) a fabricated dead-owner lock whose directory
+    contains an immutable, unremovable file still causes acquisition to
+    throw `FileLockTimeoutError` within its configured deadline (bounded
+    tolerance, well under the old ~2-second hang) rather than requiring
+    external termination, and the guarded write never lands; (b) with a
+    longer `pollIntervalMs`, repeated retry attempts are measurably paced
+    by that interval rather than busy-spinning; (c) once the immutable
+    attribute is cleared (removal becomes possible again), normal
+    reclamation and acquisition succeed on the very next attempt,
+    confirming the fix does not weaken genuine dead-owner recovery. All
+    three tests are gated behind a defensive
+    `immutableAttributeSupported()` probe (`it.skipIf`) so they skip
+    gracefully rather than fail unpredictably on a filesystem without
+    `chattr` support. Verified via a temporary in-place bypass reinstating
+    BOTH halves of the original defect simultaneously (the swallow-as-
+    success return in `tryReclaimStaleLock()` AND the old
+    `continue`-before-deadline-check loop structure in
+    `acquireFileLock()`) — a partial bypass restoring only the function-
+    level swallow, with the already-restructured unconditional deadline
+    check left in place, did NOT reproduce a hang (confirming the loop
+    restructuring alone was already sufficient defense-in-depth, and that
+    reproducing the ORIGINAL reported bug genuinely required both halves
+    together); under the full, both-halves bypass, the raw worker
+    process — run outside any test harness via a direct `tsx` invocation
+    with an external `timeout -s KILL` wrapper — required `SIGKILL` to
+    terminate, an unambiguous real hang consistent with Codex's own
+    description. Both bypasses were then fully reverted (confirmed via
+    `grep -n "TEMP-BYPASS" runtime/cache/file-lock.ts` returning empty)
+    and all 16 tests in the cross-process cache test file re-confirmed
+    passing across 3 repeated runs. A targeted audit, scoped explicitly
+    and only to this same root class (a `continue`/loop-restart before a
+    deadline check, a swallowed filesystem error reported as success, or
+    a retry path that can busy-spin or otherwise bypass bounded-wait
+    semantics) across every OTHER `for (;;)`/`while (true)` loop in
+    `runtime/` — `sandbox.ts`'s `canonicalizeNearestExisting()` (an
+    upward directory-hierarchy walk terminating structurally when
+    `parent === current`), `router.ts`'s `routeAndExecute()` tier-
+    escalation loop (terminating structurally when `TIER_ORDER` is
+    exhausted, throwing `EscalationExhaustedError`), and `doctor.ts`'s
+    `findNearestPackageJson()`/`findNearestPackageLock()` (the same
+    upward-walk pattern, terminating when `parent === dir`) — found NO
+    further genuine instance: none of those three loops has any
+    configured deadline/timeout concept, retry/backoff semantics, or a
+    swallowed-error-treated-as-success pattern in the first place; each
+    terminates via a simple structural condition, not a time-based
+    deadline, so this specific bug class does not apply to any of them.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).

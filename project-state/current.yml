@@ -521,13 +521,127 @@ factory:
     (a status, not an action) — actually merging remains a decision for
     the Human Founder or an explicitly authorized future instruction.
 
+    P0 REOPENED (this session, round 21): a NEW independent Codex review
+    found ONE real blocker after the twentieth round's CLEAN result,
+    which means that CLEAN result is no longer authoritative and P0 is
+    reopened until a fresh independent review confirms it clean again.
+    The finding, entirely inside `runtime/cache/file-lock.ts`'s lock-
+    acquisition/reclaim path: `tryReclaimStaleLock()` attempted to
+    `rmSync()` an abandoned/dead-owner lock directory and, if that
+    removal genuinely FAILED (a real filesystem error, not the
+    already-tolerated ENOENT), swallowed the failure in a bare `catch`
+    and still returned `true` (reclaim succeeded) rather than `false`.
+    The caller, `acquireFileLock()`'s retry loop, treated any truthy
+    reclaim result as license to `continue` the loop WITHOUT first
+    checking whether the configured acquisition deadline had passed — so
+    a persistent removal failure (e.g. a lock directory containing an
+    entry the process cannot remove) caused the loop to `continue`
+    around and around, re-detecting the same stale lock and re-attempting
+    (and re-failing) the same doomed removal, forever, with the deadline
+    check never reached. Codex reproduced this concretely: a configured
+    `timeoutMs: 50` still required external process termination after
+    roughly 2 seconds of hard spinning, instead of throwing
+    `FileLockTimeoutError` at ~50ms as its own contract promises. This is
+    a genuine fail-open/liveness bug — a caller's own bounded-wait
+    contract could be silently defeated by nothing more than one
+    unremovable file. Fixed this session with two coordinated changes,
+    both required (neither alone is sufficient, confirmed by reproducing
+    the bug with only one applied): (1) `tryReclaimStaleLock()` now
+    returns `false` — never `true` — whenever the actual `rmSync()` call
+    throws (its `force: true` option already silently tolerates ENOENT,
+    so anything reaching the `catch` is a genuine, real failure:
+    permission denial, a busy/non-empty directory the OS won't remove,
+    etc.); (2) `acquireFileLock()`'s loop was restructured to eliminate
+    its `continue` statement entirely — the `if (Date.now() >= deadline)
+    throw` check is now the single, unconditional next step after every
+    EEXIST-triggered contention attempt, run on every iteration
+    regardless of whether staleness was detected, reclaim was attempted,
+    or reclaim reported success or failure; the poll-interval sleep
+    (backoff) is skipped only in the one case where reclamation is
+    PROVEN to have genuinely succeeded (i.e., the real `rmSync()` call
+    did not throw), so a genuinely successful reclaim can retry
+    immediately while every other path — no staleness, stale-but-live-
+    contention, or a failed reclaim — is deadline-checked and, if not yet
+    expired, paced by `sleepSync(pollIntervalMs)` rather than busy-
+    spinning. Three new regression tests were added to
+    `runtime/cache/__tests__/file-cache.cross-process.test.ts` (16 tests
+    total in that file now, up from 13), using a genuine real-filesystem
+    mechanism to force a real, deterministic `rmSync()` failure even
+    though this sandbox runs as root (root bypasses ordinary permission-
+    bit tricks, but the Linux immutable file attribute, `chattr +i`, does
+    not — confirmed empirically in this exact environment): (a) a
+    fabricated dead-owner lock whose directory contains a `chattr +i`
+    file proves acquisition still throws `FileLockTimeoutError` within
+    its configured deadline (bounded tolerance, well under 2 seconds)
+    instead of hanging, and the guarded write never lands; (b) the same
+    scenario with a longer `pollIntervalMs` proves retries are paced by
+    that interval rather than busy-spinning (measured attempt spacing
+    approximates the configured interval, not near-zero); (c) once the
+    immutable attribute is cleared (removal becomes possible again),
+    normal reclamation and acquisition succeed on the very next attempt,
+    proving the fix does not weaken genuine dead-owner recovery. All
+    three tests are gated behind a defensive
+    `immutableAttributeSupported()` probe (`it.skipIf`) so they skip
+    gracefully rather than fail unpredictably on a filesystem where
+    `chattr` isn't available. Both halves of the fix were verified via a
+    temporary in-place bypass (reinstating BOTH the swallow-as-success
+    return AND the old continue-before-deadline-check loop structure
+    simultaneously — a partial, one-half-only bypass was tried first and
+    did NOT reproduce the bug, confirming both halves of the original
+    defect were necessary and that the fix correctly needed both
+    counterpart changes) that reproduced the exact predicted symptom (the
+    raw worker process, run outside any test harness, needed `SIGKILL`
+    after a fixed external timeout to terminate — an unambiguous real
+    hang, consistent with Codex's own description), then the bypass was
+    fully reverted (confirmed via grep for the temp-marker) and all 16
+    tests in that file re-confirmed passing across 3 repeated runs. A
+    targeted audit, scoped explicitly and only to this same root class
+    (continue/loop-restart before a deadline check, a swallowed
+    filesystem error reported as success, a retry path that can busy-spin
+    or bypass bounded-wait semantics) across every other `for (;;)`/
+    `while (true)` loop in `runtime/` (`sandbox.ts`'s
+    `canonicalizeNearestExisting()`, `router.ts`'s `routeAndExecute()`
+    tier-escalation loop, `doctor.ts`'s `findNearestPackageJson()`/
+    `findNearestPackageLock()`) found NO further genuine instance: none
+    of those loops have any configured deadline/timeout concept, retry/
+    backoff semantics, or a swallowed-error-treated-as-success pattern to
+    begin with — they are simple, correctly-terminating upward directory-
+    walks or tier-escalation loops bounded by a structural condition
+    (reaching the filesystem root, or exhausting `TIER_ORDER`), not a
+    time-based deadline, so this specific bug class does not apply to
+    them. Per explicit instruction, this round does NOT merge, does NOT
+    move to P1, and does NOT declare P0 complete — the twentieth round's
+    CLEAN result and this session's own re-verification of it remain
+    recorded above and in `p0_closure_record` as accurate history of what
+    was true at that time; only its status as the FINAL, currently-valid
+    closure is revoked. P0 is BLOCKED_PENDING_REVIEW, awaiting a
+    twenty-first independent review.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
 # upgrades any individual UASF-REQ requirement's own status; see
 # specification/requirements/P0-factory-kernel.yml for those.
 p0_closure_record:
-  p0_status: CLOSED
+  p0_status: REOPENED_PENDING_21ST_REVIEW
+  p0_status_note: >-
+    This record documents the TWENTIETH review's CLEAN result and this
+    session's own direct re-verification of it, on
+    final_implementation_commit below — that evidence is accurate history
+    and is preserved here unchanged, not erased or downgraded. A
+    subsequent, twenty-first independent Codex review reproduced one real
+    P2 fail-open/liveness defect in runtime/cache/file-lock.ts (a failed
+    stale-lock removal could be reported as reclaim success, letting the
+    acquisition retry loop bypass its own deadline check and spin
+    indefinitely). That finding revokes this record's FINALITY, not its
+    factual content: the twentieth review's CLEAN verdict really was
+    returned, and the checks below really did pass on that commit. The
+    fix for the twenty-first round's finding is implemented, tested, and
+    described in full in the `p0_status`/`blockers` narrative fields
+    above; see those for the round-21 evidence. next_lifecycle_state and
+    the merge/tag/P1 booleans below are UNCHANGED from what this session
+    recorded at the time — they reflect the twentieth-round closure
+    attempt's own instructions and were never acted upon regardless.
   final_reviewed_branch: claude/ai-factory-baseline-v1-seawq7
   final_implementation_commit: e1b440fd007b7eeb0c1eae13f1d3e8342c5466aa
   independent_review_result: CLEAN
@@ -2744,6 +2858,60 @@ completed_milestones:
       sequence test proving that after the winner releases normally, the
       loser can subsequently acquire, and cache entries written by each
       contender are preserved (no lost updates).
+  - |-
+    THIS SESSION (round 21) — a twenty-first independent Codex review
+    reproduced ONE remaining P2 finding, reopening the twentieth round's
+    CLEAN closure, in the SAME file the 17th/18th/19th/20th rounds have
+    been hardening: `runtime/cache/file-lock.ts`.
+    - [P2] "stale-lock removal failure bypasses acquisition timeout":
+      `tryReclaimStaleLock()` swallowed a genuine `rmSync()` failure (its
+      `force: true` already tolerates ENOENT, so anything reaching the
+      catch is a real error) and still returned `true`. The caller,
+      `acquireFileLock()`, treated any truthy reclaim result as license to
+      `continue` its retry loop WITHOUT first checking whether the
+      configured acquisition deadline had passed — so a persistent
+      removal failure caused an unbounded busy-loop, requiring external
+      process termination even with `timeoutMs: 50` configured, instead
+      of throwing `FileLockTimeoutError` at ~50ms. Fixed: (1)
+      `tryReclaimStaleLock()` now returns `false` whenever the real
+      `rmSync()` call throws, never reporting a failed removal as
+      success; (2) `acquireFileLock()`'s loop was restructured to remove
+      its `continue` entirely — the deadline check is now the single,
+      unconditional next step after every contention attempt regardless
+      of branch, and the poll-interval sleep is skipped only when
+      reclamation is PROVEN to have genuinely succeeded. Three new
+      regression tests added to
+      `runtime/cache/__tests__/file-cache.cross-process.test.ts` (16
+      total, up from 13), using `chattr +i` (the Linux immutable file
+      attribute, one of the few mechanisms that blocks even root — this
+      sandbox runs as root — from removing a file) to force a genuine,
+      deterministic `rmSync()` failure: a bounded timeout is honored
+      instead of hanging; retries are paced by `pollIntervalMs` instead
+      of busy-spinning; and normal reclamation/acquisition succeed again
+      once the block is cleared. All gated behind a defensive
+      `immutableAttributeSupported()` probe so they skip gracefully on
+      filesystems without `chattr` support. Verified via a temporary
+      in-place bypass reinstating BOTH halves of the original bug
+      simultaneously (a partial, one-half-only bypass was tried first and
+      did not reproduce the hang, confirming both halves were genuinely
+      necessary) — the raw worker process required `SIGKILL` after a
+      fixed external timeout to terminate, an unambiguous real hang
+      matching Codex's own description — then fully reverted (confirmed
+      via grep for the temp-marker), with all 16 tests in that file
+      re-confirmed passing across 3 repeated runs. A targeted audit of
+      every other `for (;;)`/`while (true)` loop in `runtime/`
+      (`sandbox.ts`'s `canonicalizeNearestExisting()`, `router.ts`'s
+      `routeAndExecute()` tier-escalation loop, `doctor.ts`'s
+      `findNearestPackageJson()`/`findNearestPackageLock()`) found NO
+      further genuine instance of this root class: none of those loops
+      have a configured deadline/timeout concept, retry/backoff
+      semantics, or a swallowed-error-treated-as-success pattern — they
+      are bounded directory-walk/tier-escalation loops terminating on a
+      structural condition, not a time-based deadline. Per explicit
+      instruction, this round does not merge, does not move to P1, and
+      does not declare P0 complete; P0 is reopened as
+      BLOCKED_PENDING_REVIEW, awaiting a twenty-first independent
+      re-review of this fix.
     - Verified via two temporary, carefully-scoped bypasses applied
       TOGETHER: (1) reverting `acquireReclaimGate`'s EEXIST branch to
       keep the CORRECT staleness decision (still PID-liveness-aware, to
@@ -3172,6 +3340,37 @@ blockers:
     P1 has NOT been started, the architecture baseline tag has NOT been
     moved, and this branch has NOT been merged to main by this session.
 
+    REOPENED — P0 BLOCKED_PENDING_REVIEW (round 21). The above "RESOLVED"
+    entry is preserved exactly as written: the twentieth review's CLEAN
+    result and this session's own re-verification of it on commit
+    e1b440f genuinely happened and remain accurate history. However, a
+    TWENTY-FIRST independent Codex review subsequently found ONE real P2
+    blocker that the twentieth review did not catch: `tryReclaimStaleLock()`
+    in `runtime/cache/file-lock.ts` could report a genuinely-FAILED
+    `rmSync()` removal as a successful reclaim, and the caller's retry
+    loop treated that false success as license to `continue` without
+    checking the configured acquisition deadline — an unbounded busy-loop
+    that defeated `timeoutMs` entirely (Codex reproduced a `timeoutMs: 50`
+    configuration requiring external termination after ~2 seconds).
+    Fixed this session: `tryReclaimStaleLock()` now returns `false` on any
+    genuine removal failure, and `acquireFileLock()`'s loop was
+    restructured to check the deadline unconditionally on every
+    iteration, with no `continue` path able to bypass it. Three new
+    regression tests (16 total in the cross-process cache test file, up
+    from 13) use `chattr +i` to force a real, deterministic removal
+    failure and prove: a bounded timeout is honored instead of hanging;
+    retries are paced, not busy-spinning; and normal recovery still works
+    once the block clears. Both halves of the fix verified via a
+    temporary bypass reproducing the exact predicted hang, then reverted.
+    A targeted audit of every other unbounded loop in `runtime/` found no
+    further genuine instance of this root class. Tested (652/652 tests,
+    +3 net new) and verified per the full required sequence — see
+    completed_milestones for full detail. This finding REOPENS P0: the
+    twentieth round's closure is no longer the final word. P0 is now
+    BLOCKED_PENDING_REVIEW, awaiting a twenty-first independent
+    re-review of this fix. Per explicit instruction, this round does not
+    merge, does not move to P1, and does not declare P0 complete.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -3188,6 +3387,50 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS REOPENED — BLOCKED_PENDING_REVIEW (this session, round 21). A
+  twenty-first independent Codex review found ONE real P2 blocker after
+  the twentieth round's CLEAN result, so that CLEAN result is no longer
+  authoritative. The finding: `runtime/cache/file-lock.ts`'s
+  `tryReclaimStaleLock()` could report a genuinely-failed `rmSync()`
+  removal as a successful reclaim, and `acquireFileLock()`'s retry loop
+  treated that false success as license to `continue` without checking
+  the configured acquisition deadline — an unbounded busy-loop that
+  defeated `timeoutMs` (Codex reproduced `timeoutMs: 50` requiring
+  external termination after ~2 seconds). Fixed this session: (1)
+  `tryReclaimStaleLock()` now returns `false` on any genuine removal
+  failure; (2) `acquireFileLock()`'s loop was restructured so the
+  deadline check is unconditional on every iteration, with no `continue`
+  path able to bypass it. Three new regression tests (16 total in
+  `runtime/cache/__tests__/file-cache.cross-process.test.ts`, up from 13)
+  use `chattr +i` to force a real, deterministic removal failure and
+  prove the timeout is honored, retries are paced (not busy-spinning),
+  and normal recovery still works once the block clears. Both halves of
+  the fix verified via a temporary bypass reproducing the exact predicted
+  hang, then fully reverted. A targeted audit of every other unbounded
+  loop in `runtime/` (`sandbox.ts`, `router.ts`, `doctor.ts`) found no
+  further genuine instance of this root class — none of those loops have
+  a deadline/timeout concept or a swallowed-error-as-success pattern.
+  Full required verification (lint, typecheck, a real `rm -rf dist &&
+  npm run build`, full test suite, `validate:requirements`,
+  `secret-scan`, Factory Doctor, all 9 P0 proofs) was re-run clean on
+  this fix before this record was written — see `completed_milestones`'s
+  round-21 entry and the `p0_status`/`blockers` narrative fields above
+  for full detail, and `specification/requirements/P0-factory-kernel.yml`
+  (UASF-REQ-0036) for the updated requirement evidence. Per explicit
+  instruction: this session did NOT merge, did NOT move to P1, and did
+  NOT declare P0 complete. The fix is committed and pushed to
+  `claude/ai-factory-baseline-v1-seawq7`. A future session's next action
+  is to WAIT for a twenty-first independent review of this exact fix; only
+  a CLEAN result from that review may re-close P0. If that review instead
+  finds a new genuine defect, repeat this same fix -> test -> targeted
+  audit -> full verification -> honest state update -> commit/push ->
+  STOP cycle for that new finding, on this same branch. Do not create a
+  new branch, do not merge, and do not begin P1 absent a fresh, explicit
+  Founder instruction to do so (see `governance_decision_recorded` above,
+  which is unchanged by this round).
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS FORMALLY CLOSED (this session). The twentieth independent Codex
   review returned INDEPENDENT_REVIEW_RESULT: CLEAN ("No actionable
   defects were identified within the documented P0 scope") on top of

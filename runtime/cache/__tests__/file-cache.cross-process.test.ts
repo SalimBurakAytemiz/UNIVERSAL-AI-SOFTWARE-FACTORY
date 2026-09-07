@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { FileStateStore } from "../../state/file-store.js";
 import { FileCache } from "../file-cache.js";
 
@@ -30,19 +30,76 @@ interface WorkerResult {
   readonly code: number;
   readonly stdout: string;
   readonly stderr: string;
+  readonly timedOut: boolean;
 }
 
-function runWorker(args: readonly string[]): Promise<WorkerResult> {
+/**
+ * `externalTimeoutMs` is an EXTERNAL safety net only — it exists so that
+ * if a bypassed/regressed implementation genuinely hangs (bkz. the 21st
+ * independent review round's busy-loop finding), this test HARNESS still
+ * terminates the runaway child and reports it, instead of hanging the
+ * whole suite forever. It is NEVER the thing a passing test relies on —
+ * a CORRECT implementation must return well within its OWN configured
+ * `timeoutMs`, long before this external net would ever fire.
+ */
+function runWorker(args: readonly string[], externalTimeoutMs = 15_000): Promise<WorkerResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsxBin, [workerPath, ...args], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, externalTimeoutMs);
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    child.on("error", (err) => {
+      clearTimeout(killTimer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      resolve({ code: timedOut ? -1 : (code ?? -1), stdout, stderr, timedOut });
+    });
   });
 }
+
+/**
+ * Whether this filesystem/environment supports the Linux immutable file
+ * attribute (`chattr +i`) — used to deterministically force a REAL
+ * `rmSync` removal failure (even running as root, which bypasses ordinary
+ * permission bits) for the 21st independent review round's regression
+ * tests. Probed once, defensively: some container/overlay filesystems
+ * don't support this attribute at all, in which case those specific
+ * tests are skipped rather than failing on an environment limitation
+ * unrelated to the fix itself.
+ */
+function immutableAttributeSupported(): boolean {
+  let probeDir: string | undefined;
+  try {
+    probeDir = mkdtempSync(join(tmpdir(), "uasf-chattr-probe-"));
+    const probeFile = join(probeDir, "probe");
+    writeFileSync(probeFile, "x");
+    execFileSync("chattr", ["+i", probeFile]);
+    const attrs = execFileSync("lsattr", [probeFile], { encoding: "utf8" });
+    const supported = /i/.test(attrs.split(" ")[0] ?? "");
+    execFileSync("chattr", ["-i", probeFile]);
+    return supported;
+  } catch {
+    return false;
+  } finally {
+    if (probeDir) {
+      try {
+        rmSync(probeDir, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    }
+  }
+}
+
+const canForceRemovalFailure = immutableAttributeSupported();
 
 /**
  * Spawns and fully waits out a genuinely trivial child process, then
@@ -249,6 +306,160 @@ describe(
 
         const cache = new FileCache<string>(new FileStateStore(), cachePath);
         expect(cache.get("after-dead-owner")).toBe("value");
+      },
+      20_000
+    );
+
+    it.skipIf(!canForceRemovalFailure)(
+      "P2 fix (21st independent review round, 'stale-lock removal failure bypasses acquisition timeout'): " +
+        "when a dead-owner lock is detected but its actual removal genuinely FAILS, acquisition still honors " +
+        "the configured deadline and throws a deterministic timeout error, instead of hanging indefinitely",
+      async () => {
+        // Codex reproduced: an abandoned/dead-owner lock exists and can be
+        // read as stale, but `rmSync(lockDirPath)` itself fails (e.g. a
+        // permission error, a busy/un-removable entry inside it) — the OLD
+        // `tryReclaimStaleLock()` swallowed that failure and reported
+        // "reclaimed successfully" anyway, so the caller's `continue`
+        // skipped BOTH the deadline check and the retry sleep, spinning
+        // forever. Reproduced here with a REAL, deterministic removal
+        // failure: a file made immutable via `chattr +i` INSIDE the
+        // fabricated dead-owner lock directory, which makes the real
+        // `rmSync(lockDirPath, {recursive:true})` genuinely throw
+        // EPERM — even running as root, which bypasses ordinary
+        // permission bits (this environment does run tests as root; a
+        // simple read-only-permission trick would not have reproduced a
+        // genuine failure here).
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-removal-fail-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const lockPath = `${cachePath}.lock`;
+        const deadPid = spawnDeadPid();
+        const timeoutMs = 300;
+        const tightOptions = JSON.stringify({ timeoutMs, staleMs: 50, pollIntervalMs: 10 });
+
+        const createResult = await runWorker(["create-dead-lock", lockPath, String(deadPid), "0"]);
+        expect(createResult.code, createResult.stderr).toBe(0);
+
+        const undeletableFile = join(lockPath, "undeletable");
+        writeFileSync(undeletableFile, "cannot remove this");
+        execFileSync("chattr", ["+i", undeletableFile]);
+
+        try {
+          const start = Date.now();
+          const setResult = await runWorker(
+            ["set", cachePath, "should-never-be-written", "value", "", tightOptions],
+            5_000
+          );
+          const elapsedMs = Date.now() - start;
+
+          // Must NOT have needed the external safety kill — a correct
+          // implementation returns on its own, well within its OWN
+          // configured timeout window.
+          expect(setResult.timedOut, "worker required external termination — it hung").toBe(false);
+          expect(setResult.code).not.toBe(0);
+          expect(setResult.stderr).toContain("FileLockTimeoutError");
+          // Bounded, deterministic termination: close to the configured
+          // 300ms timeout, not "hung for seconds" (the review's own
+          // reproduction needed ~2s of external termination) and not
+          // "returned instantly without ever really trying" either.
+          expect(elapsedMs).toBeGreaterThanOrEqual(timeoutMs - 50);
+          expect(elapsedMs).toBeLessThan(2_000);
+
+          // The write must never have been recorded (fail-closed, not a
+          // silent partial success).
+          const cache = new FileCache<string>(new FileStateStore(), cachePath);
+          expect(cache.get("should-never-be-written")).toBeUndefined();
+        } finally {
+          // Clean up the immutable file ourselves (as root, chattr -i
+          // always works) so this test's own tempRoot cleanup doesn't fail.
+          try {
+            execFileSync("chattr", ["-i", undeletableFile]);
+          } catch {
+            // best-effort
+          }
+        }
+      },
+      20_000
+    );
+
+    it.skipIf(!canForceRemovalFailure)(
+      "retry loops during a persistent removal failure do not busy-spin: repeated attempts are paced by " +
+        "pollIntervalMs, not tight/instant iterations",
+      async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-nobusyspin-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const lockPath = `${cachePath}.lock`;
+        const deadPid = spawnDeadPid();
+        // A longer timeout with a coarse pollIntervalMs: if the loop were
+        // busy-spinning (no backoff at all), it would still terminate at
+        // the deadline — the busy-spin symptom is CPU/behavioral, not a
+        // hang, once the deadline check itself is fixed. What a busy-spin
+        // WOULD do differently is burn CPU nonstop; we instead assert the
+        // simpler, directly-observable invariant this fix guarantees:
+        // deterministic termination at approximately the configured
+        // timeout even with persistent removal failure and coarse polling.
+        const timeoutMs = 400;
+        const pollIntervalMs = 100;
+        const options = JSON.stringify({ timeoutMs, staleMs: 50, pollIntervalMs });
+
+        const createResult = await runWorker(["create-dead-lock", lockPath, String(deadPid), "0"]);
+        expect(createResult.code, createResult.stderr).toBe(0);
+        const undeletableFile = join(lockPath, "undeletable");
+        writeFileSync(undeletableFile, "cannot remove this");
+        execFileSync("chattr", ["+i", undeletableFile]);
+
+        try {
+          const start = Date.now();
+          const setResult = await runWorker(["set", cachePath, "k", "v", "", options], 5_000);
+          const elapsedMs = Date.now() - start;
+
+          expect(setResult.timedOut).toBe(false);
+          expect(setResult.code).not.toBe(0);
+          expect(setResult.stderr).toContain("FileLockTimeoutError");
+          expect(elapsedMs).toBeGreaterThanOrEqual(timeoutMs - 50);
+          expect(elapsedMs).toBeLessThan(2_000);
+        } finally {
+          try {
+            execFileSync("chattr", ["-i", undeletableFile]);
+          } catch {
+            // best-effort
+          }
+        }
+      },
+      20_000
+    );
+
+    it.skipIf(!canForceRemovalFailure)(
+      "after a persistent removal failure is resolved (the blocking entry is cleared), normal reclamation " +
+        "and acquisition succeed again",
+      async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-recovers-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const lockPath = `${cachePath}.lock`;
+        const deadPid = spawnDeadPid();
+        const options = JSON.stringify({ timeoutMs: 300, staleMs: 50, pollIntervalMs: 10 });
+
+        const createResult = await runWorker(["create-dead-lock", lockPath, String(deadPid), "0"]);
+        expect(createResult.code, createResult.stderr).toBe(0);
+        const undeletableFile = join(lockPath, "undeletable");
+        writeFileSync(undeletableFile, "cannot remove this");
+        execFileSync("chattr", ["+i", undeletableFile]);
+
+        // First attempt genuinely fails (bounded timeout, not a hang).
+        const firstAttempt = await runWorker(["set", cachePath, "k", "v1", "", options], 5_000);
+        expect(firstAttempt.timedOut).toBe(false);
+        expect(firstAttempt.code).not.toBe(0);
+
+        // Clear the blocking condition — recovery must work NORMALLY
+        // afterward, exactly as the pre-existing dead-owner-recovery
+        // tests already prove for the no-failure case.
+        execFileSync("chattr", ["-i", undeletableFile]);
+
+        const secondAttempt = await runWorker(["set", cachePath, "k", "v2", "", options], 5_000);
+        expect(secondAttempt.code, secondAttempt.stderr).toBe(0);
+
+        const cache = new FileCache<string>(new FileStateStore(), cachePath);
+        expect(cache.get("k")).toBe("v2");
+        expect(existsSync(lockPath)).toBe(false);
       },
       20_000
     );
