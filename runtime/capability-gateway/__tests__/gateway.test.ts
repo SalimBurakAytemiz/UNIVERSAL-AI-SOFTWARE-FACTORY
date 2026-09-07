@@ -304,4 +304,258 @@ describe("CapabilityGateway", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (27th independent review round, finding 3, 'make gateway dependencies runtime-private'): the " +
+      "internal policy/approvals fields now use genuine ECMAScript #private fields, not TypeScript's " +
+      "compile-time-only `private`",
+    () => {
+      it("neither the policy nor the approvals dependency is reachable as an ordinary JS property", () => {
+        const policy = new PolicyEngine();
+        const approvals = new ApprovalWorkflow();
+        const gateway = new CapabilityGateway(policy, approvals);
+
+        expect((gateway as unknown as Record<string, unknown>).policy).toBeUndefined();
+        expect((gateway as unknown as Record<string, unknown>).approvals).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private dependencies", () => {
+        const gateway = new CapabilityGateway(new PolicyEngine(), new ApprovalWorkflow());
+
+        expect(Object.getOwnPropertyNames(gateway)).toEqual([]);
+        expect(Reflect.ownKeys(gateway)).toEqual([]);
+      });
+
+      it(
+        "REGRESSION: a plain JS consumer cannot swap in a forged, always-ALLOW policy engine via property " +
+          "access, bypassing default-deny",
+        () => {
+          const policy = new PolicyEngine(); // no rules registered -> default-deny
+          const gateway = new CapabilityGateway(policy);
+
+          const forgedAlwaysAllow = new PolicyEngine();
+          forgedAlwaysAllow.addRule({ name: "always-allow", priority: 1, evaluate: () => "ALLOW" });
+
+          // This assignment merely creates a NEW, ordinary, inert own
+          // property named "policy" on the instance — it does not touch
+          // the genuine `#policy` private field at all (there is no
+          // ordinary property of that name to overwrite in the first
+          // place), so the class's own internal logic never sees it.
+          (gateway as unknown as Record<string, unknown>).policy = forgedAlwaysAllow;
+          const spread: Record<string, unknown> = { ...gateway };
+          expect(spread.policy).toBe(forgedAlwaysAllow); // the inert stray property really was set...
+
+          // ...yet the gateway still consults its ORIGINAL, default-deny policy engine.
+          return expect(
+            gateway.authorize({ actionType: "x", risk: 3, description: "d" }, () => "should never run")
+          ).rejects.toThrow(CapabilityDeniedError);
+        }
+      );
+
+      it(
+        "REGRESSION: a plain JS consumer cannot swap in a forged, always-approved approvals workflow via " +
+          "property access",
+        () => {
+          const policy = new PolicyEngine();
+          const gateway = new CapabilityGateway(policy, new ApprovalWorkflow());
+
+          const forgedApprovals = new ApprovalWorkflow();
+          const forgedAction = { actionType: "production-deploy", risk: 5 as const, description: "deploy" };
+          forgedApprovals.requestFor("forged-1", forgedAction);
+          forgedApprovals.approve("forged-1", "attacker@example.com");
+
+          (gateway as unknown as Record<string, unknown>).approvals = forgedApprovals;
+
+          return expect(
+            gateway.authorize(forgedAction, () => "should never run", { approvalId: "forged-1" })
+          ).rejects.toThrow(ApprovalEvidenceMismatchError);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P1 fix (27th independent review round, finding 4, 'bind approval to the policy-evaluated action'): every " +
+      "reference inside authorize() uses the SAME authoritative action policy.evaluate() returned, never a " +
+      "second read of the caller's own (possibly getter/Proxy-backed) action object",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a risk getter answering differently on a second read cannot " +
+          "desynchronize the APPROVAL_REQUIRED decision from the identity later checked against approval evidence",
+        async () => {
+          let reads = 0;
+          const action = {
+            actionType: "production-deploy",
+            description: "deploy to prod",
+            get risk() {
+              reads += 1;
+              // If authorize() ever re-read `risk` after policy.evaluate(),
+              // this would return a DIFFERENT value than the one policy
+              // actually decided APPROVAL_REQUIRED for.
+              return reads === 1 ? 5 : 1;
+            }
+          };
+          const policy = new PolicyEngine();
+          const approvals = new ApprovalWorkflow();
+          // Bind the approval to risk 5 — the value policy.evaluate() saw.
+          approvals.requestFor("gtr-1", { actionType: "production-deploy", risk: 5, description: "deploy to prod" });
+          approvals.approve("gtr-1", "founder@example.com");
+          const gateway = new CapabilityGateway(policy, approvals);
+          const execute = vi.fn(() => "deployed");
+
+          const result = await gateway.authorize(
+            action as unknown as { actionType: string; risk: 5; description: string },
+            execute,
+            { approvalId: "gtr-1" }
+          );
+
+          expect(reads).toBe(1); // the getter is consulted exactly once, by policy.evaluate() alone
+          expect(result).toBe("deployed");
+          expect(execute).toHaveBeenCalledTimes(1);
+        }
+      );
+
+      it("thrown error objects (DENY / APPROVAL_REQUIRED / mismatch) carry the authoritative action's identity, not a possibly-different re-read", async () => {
+        let reads = 0;
+        const action = {
+          actionType: "x",
+          description: "d",
+          get risk() {
+            reads += 1;
+            return 3; // stable value here — this test is about WHICH object is used, not a race
+          }
+        };
+        const policy = new PolicyEngine(); // default-deny
+        const gateway = new CapabilityGateway(policy);
+
+        let thrown: unknown;
+        try {
+          await gateway.authorize(action as unknown as { actionType: string; risk: 3; description: string }, () => "never");
+        } catch (err) {
+          thrown = err;
+        }
+        expect(thrown).toBeInstanceOf(CapabilityDeniedError);
+        expect(reads).toBe(1); // risk read exactly once (by policy.evaluate()), never again to build the error
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (27th independent review round, finding 5, 'finalize approval only after successful execution'): " +
+      "the approval only reaches EXECUTED after the real work genuinely succeeds; a thrown callback is recorded " +
+      "as an explicit failure, never a false success",
+    () => {
+      const action = {
+        actionType: "production-deploy",
+        risk: 5 as const,
+        description: "deploy to prod",
+        costUsd: 0,
+        projectId: "proj-x"
+      };
+
+      function approvedGateway(id: string) {
+        const policy = new PolicyEngine();
+        const approvals = new ApprovalWorkflow();
+        approvals.requestFor(id, action);
+        approvals.approve(id, "founder@example.com");
+        const gateway = new CapabilityGateway(policy, approvals);
+        return { gateway, approvals };
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: a callback that throws leaves the approval EXECUTION_FAILED, " +
+          "never falsely EXECUTED",
+        async () => {
+          const { gateway, approvals } = approvedGateway("fail-1");
+          const boom = new Error("provider call failed");
+          const execute = vi.fn(() => {
+            throw boom;
+          });
+
+          await expect(gateway.authorize(action, execute, { approvalId: "fail-1" })).rejects.toThrow(boom);
+
+          const finalStatus = approvals.get("fail-1")!.status;
+          expect(finalStatus).toBe("EXECUTION_FAILED");
+          expect(finalStatus).not.toBe("EXECUTED");
+        }
+      );
+
+      it("a callback that throws asynchronously (a rejected Promise) is handled the same way as a synchronous throw", async () => {
+        const { gateway, approvals } = approvedGateway("fail-2");
+        const boom = new Error("async provider call failed");
+        const execute = vi.fn(async () => {
+          throw boom;
+        });
+
+        await expect(gateway.authorize(action, execute, { approvalId: "fail-2" })).rejects.toThrow(boom);
+        expect(approvals.get("fail-2")!.status).toBe("EXECUTION_FAILED");
+      });
+
+      it("the original error is re-thrown to the caller unchanged, never swallowed by the failure bookkeeping", async () => {
+        const { gateway } = approvedGateway("fail-3");
+        const boom = new Error("very specific failure reason");
+        const execute = () => {
+          throw boom;
+        };
+
+        await expect(gateway.authorize(action, execute, { approvalId: "fail-3" })).rejects.toBe(boom);
+      });
+
+      it("the approval's failure reason records the thrown error's message", async () => {
+        const { gateway, approvals } = approvedGateway("fail-4");
+        const execute = () => {
+          throw new Error("disk full during deploy");
+        };
+
+        await expect(gateway.authorize(action, execute, { approvalId: "fail-4" })).rejects.toThrow();
+
+        const record = approvals.get("fail-4") as unknown as { failureReason?: string };
+        expect(record.failureReason).toBe("disk full during deploy");
+      });
+
+      it(
+        "REGRESSION: after a failed attempt, the SAME approval id cannot be replayed to authorize a second, " +
+          "successful attempt (EXECUTION_FAILED is terminal, not a retryable APPROVED-equivalent)",
+        async () => {
+          const { gateway, approvals } = approvedGateway("fail-5");
+          const failingExecute = () => {
+            throw new Error("boom");
+          };
+          await expect(gateway.authorize(action, failingExecute, { approvalId: "fail-5" })).rejects.toThrow();
+          expect(approvals.get("fail-5")!.status).toBe("EXECUTION_FAILED");
+
+          const succeedingExecute = vi.fn(() => "deployed");
+          await expect(gateway.authorize(action, succeedingExecute, { approvalId: "fail-5" })).rejects.toThrow(
+            ApprovalEvidenceMismatchError
+          );
+          expect(succeedingExecute).not.toHaveBeenCalled();
+        }
+      );
+
+      it(
+        "REGRESSION: two concurrent authorize() calls on the same approval — one destined to fail — never let " +
+          "the failing one's bookkeeping corrupt the successful one's EXECUTED status",
+        async () => {
+          const { gateway, approvals } = approvedGateway("fail-6");
+          const execute = vi.fn(() => "deployed");
+
+          const results = await Promise.allSettled([
+            gateway.authorize(action, execute, { approvalId: "fail-6" }),
+            gateway.authorize(action, execute, { approvalId: "fail-6" })
+          ]);
+
+          const fulfilled = results.filter((r) => r.status === "fulfilled");
+          const rejected = results.filter((r) => r.status === "rejected");
+          expect(fulfilled).toHaveLength(1);
+          expect(rejected).toHaveLength(1);
+          expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(ApprovalEvidenceMismatchError);
+          // The one that genuinely ran ends EXECUTED, not EXECUTION_FAILED —
+          // the SECOND caller's rejection happens at the MATCH step (before
+          // beginExecution() is ever reached for it), never touching the
+          // first caller's already-claimed EXECUTING/EXECUTED record.
+          expect(approvals.get("fail-6")!.status).toBe("EXECUTED");
+        }
+      );
+    }
+  );
 });

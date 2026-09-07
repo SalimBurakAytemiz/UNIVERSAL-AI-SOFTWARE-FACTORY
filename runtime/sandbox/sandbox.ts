@@ -332,19 +332,76 @@ export class SandboxTimeoutError extends Error {
 }
 
 /**
- * Verilen promise, `ms` milisaniye içinde tamamlanmazsa
- * SandboxTimeoutError ile reddedilir. Sonsuz döngüye giren veya asılı
- * kalan bir işlemi kalıcı olarak kaynak tüketmekten alıkoyar (bölüm 87).
+ * P1 fix (27th independent review round, finding 9, "timeout must
+ * actually cancel sandbox work"): `withTimeout` used to accept an
+ * ALREADY-STARTED, opaque `Promise<T>` and race it against a timer via
+ * `Promise.race()`. `Promise.race()` only ever stops THIS function from
+ * WAITING on the loser — it has no way to reach into an arbitrary Promise
+ * and stop whatever produced it. Codex reproduced exactly this: a
+ * "timed-out" filesystem write, network call, or spawned process kept
+ * running to completion in the background, fully unobserved, after
+ * `withTimeout` had already told its caller the operation was over —
+ * every side effect that operation was ever going to have (writing a
+ * file, calling an external service, spending real provider cost) still
+ * happened, just silently, with nobody watching for it and no way to
+ * undo it. Bölüm 87's "bir işlemi sonsuza kadar çalışır bırakmasını
+ * engelleyen minimum koruma" promise was therefore never actually kept —
+ * it only ever protected the CALLER's own wait, never the sandboxed work
+ * itself.
+ *
+ * Fixed by changing the contract entirely, rather than pretending an
+ * arbitrary already-running `Promise<T>` can be retrofitted with
+ * cancellation (it structurally cannot — JS Promises have no `cancel()`):
+ * `withTimeout` now takes an `operation` FACTORY, `(signal: AbortSignal)
+ * => Promise<T>`, and constructs its own `AbortController` internally.
+ * The factory is only ever invoked WITH that controller's `signal`
+ * already in hand, before any work starts — so a genuinely cancellable
+ * operation (anything built on Node's `AbortSignal` support: `fs/promises`
+ * calls accepting `{ signal }`, `fetch()`, `child_process.spawn(..., {
+ * signal })`, or code that manually checks `signal.aborted`/listens for
+ * `"abort"`) can ACTUALLY stop the underlying work — not merely stop this
+ * function from waiting on it — the instant the deadline is reached.
+ * `withTimeout` calls `controller.abort()` when the timer fires and then
+ * `await`s the SAME `operation(...)` promise directly (never a
+ * `Promise.race` against a second, independent timer promise) — so this
+ * function does not return control to ITS OWN caller until the real
+ * operation has genuinely settled (whether normally, or via the abort it
+ * was just asked to honor). A `SandboxTimeoutError` is thrown only once
+ * that settlement has actually happened, so "timeout" here always means
+ * "the operation is over," never "we simply stopped listening for it."
+ *
+ * This deliberately does NOT retrofit cancellation onto a plain,
+ * non-cooperative Promise — bölüm 87 çözümü budur: yapısal olarak
+ * iptal edilemeyen keyfi bir Promise'i iptal edilebilirmiş gibi
+ * GÖSTERMEK yerine, iptal edilebilirliği çağıranın sorumluluğuna açıkça
+ * taşımak (operation'ın `signal`'i GERÇEKTEN kullanması gerekir) —
+ * "Do NOT pretend arbitrary Promises are cancellable." An `operation`
+ * that ignores its `signal` entirely will, as before this fix and as
+ * inherent to JavaScript itself, keep running in the background — the
+ * difference is that `withTimeout` no longer LIES about that by
+ * returning early anyway; it keeps waiting for the real settlement rather
+ * than reporting a termination that never happened.
  */
-export async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new SandboxTimeoutError(ms)), ms);
-  });
+export async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new SandboxTimeoutError(ms));
+  }, ms);
 
   try {
-    return await Promise.race([promise, timeout]);
+    return await operation(controller.signal);
+  } catch (err) {
+    // The operation settled (rejected) as a DIRECT, observed consequence
+    // of the abort this function itself issued — genuine termination, not
+    // abandoned waiting. Any OTHER rejection (the operation failing for
+    // its own, unrelated reasons) is never masked as a timeout.
+    if (timedOut) {
+      throw new SandboxTimeoutError(ms);
+    }
+    throw err;
   } finally {
-    clearTimeout(timer!);
+    clearTimeout(timer);
   }
 }

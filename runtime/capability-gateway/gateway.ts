@@ -104,10 +104,34 @@ function isBoundToExactAction(request: ApprovalRequest, action: PolicyAction): b
 }
 
 export class CapabilityGateway {
-  constructor(
-    private readonly policy: PolicyEngine,
-    private readonly approvals: ApprovalWorkflow = new ApprovalWorkflow()
-  ) {}
+  /**
+   * P1 fix (27th independent review round, finding 3, "make gateway
+   * dependencies runtime-private"): `policy`/`approvals` used to be
+   * declared with TypeScript's compile-time-only `private readonly`
+   * constructor-parameter properties — in the emitted JS they are
+   * ordinary, enumerable instance properties. This class's ENTIRE purpose
+   * (bölüm 147: "capability gateway'in policy engine'i atlayan bir yolu
+   * olmamalı") depends on `authorize()` always consulting the SAME,
+   * originally-wired `PolicyEngine`/`ApprovalWorkflow` it was constructed
+   * with — `(gateway as any).policy = fakeAlwaysAllowEngine` or
+   * `(gateway as any).approvals = attackerControlledWorkflow` from any
+   * caller holding a `CapabilityGateway` reference would silently swap out
+   * the authoritative trust boundary established at construction time for
+   * one the attacker fully controls, defeating default-deny and forged-
+   * approval protection alike with no trace anywhere in `authorize()`
+   * itself. Fixed: genuine ECMAScript private fields (`#policy`/
+   * `#approvals`), assigned once in the constructor body — `as any`,
+   * bracket access, and every reflection API fail to reach them, and any
+   * code outside this class body attempting `gateway.#policy = x` is a
+   * `SyntaxError` at PARSE time, not merely a runtime rejection.
+   */
+  #policy: PolicyEngine;
+  #approvals: ApprovalWorkflow;
+
+  constructor(policy: PolicyEngine, approvals: ApprovalWorkflow = new ApprovalWorkflow()) {
+    this.#policy = policy;
+    this.#approvals = approvals;
+  }
 
   /**
    * Bir eylemi çalıştırmadan ÖNCE politika motorundan geçirir. ALLOW
@@ -143,25 +167,63 @@ export class CapabilityGateway {
    * `ApprovalEvidenceMismatchError` instead of ALSO proceeding.
    */
   async authorize<T>(action: PolicyAction, execute: () => Promise<T> | T, approval?: ApprovalReference): Promise<T> {
-    const result = this.policy.evaluate(action);
+    const result = this.#policy.evaluate(action);
+    // P1 fix (27th independent review round, finding 4, "bind approval to
+    // the policy-evaluated action"): every reference below uses
+    // `authoritativeAction` (the EXACT frozen snapshot `this.#policy`
+    // itself evaluated and decided about — `result.action`), never the
+    // original `action` PARAMETER again. The old code kept re-reading the
+    // caller-owned `action` parameter for the DENY/APPROVAL_REQUIRED error
+    // messages AND, critically, for `isBoundToExactAction(request,
+    // action)`'s identity match — a SEPARATE read of `action`'s properties
+    // from the one `policy.evaluate()` performed internally to build ITS
+    // OWN snapshot. If `action` is a getter/Proxy-backed object, nothing
+    // guarantees that second read returns the SAME values the policy
+    // engine actually reasoned about: it could answer with a materially
+    // different identity for the approval-matching check than the one
+    // that produced the APPROVAL_REQUIRED decision in the first place —
+    // an approval bound to one action's identity could then be matched
+    // against a DIFFERENT apparent identity for the same call. Using
+    // `result.action` everywhere closes this: it is a plain, frozen,
+    // already-copied object — reading it again can never re-invoke a
+    // getter/Proxy trap, so it is guaranteed to be the exact same values
+    // in every reference below.
+    const authoritativeAction = result.action;
 
     if (result.decision === "DENY") {
-      throw new CapabilityDeniedError(action);
+      throw new CapabilityDeniedError(authoritativeAction);
     }
     if (result.decision === "APPROVAL_REQUIRED") {
       if (!approval) {
-        throw new CapabilityApprovalRequiredError(action);
+        throw new CapabilityApprovalRequiredError(authoritativeAction);
       }
-      const request = this.approvals.get(approval.approvalId);
-      if (!request || !isBoundToExactAction(request, action)) {
-        throw new ApprovalEvidenceMismatchError(action, approval.approvalId, request);
+      const request = this.#approvals.get(approval.approvalId);
+      if (!request || !isBoundToExactAction(request, authoritativeAction)) {
+        throw new ApprovalEvidenceMismatchError(authoritativeAction, approval.approvalId, request);
       }
-      // Atomically consume the approval — APPROVED -> EXECUTED — before
-      // the risky callback runs. See the fix note above: this happens in
-      // the SAME synchronous prefix as the match check above, so a
-      // concurrent replay attempt can never also pass.
-      this.approvals.execute(approval.approvalId);
-      return execute();
+      // P1 fix (27th independent review round, finding 5, "finalize
+      // approval only after successful execution"): `execute()` used to
+      // be called AFTER an unconditional APPROVED -> EXECUTED transition
+      // — if the risky callback below threw, the approval record already,
+      // permanently claimed a successful execution that never happened.
+      // Fixed: `beginExecution()` atomically claims APPROVED -> EXECUTING
+      // FIRST (the SAME synchronous-prefix atomicity as before — see
+      // `ApprovalWorkflow.beginExecution()`'s own fix note for why this
+      // still blocks a concurrent replay just as completely), the
+      // callback runs, and ONLY on genuine success does
+      // `completeExecution()` transition EXECUTING -> EXECUTED; a thrown
+      // error is captured via `failExecution()` (EXECUTING ->
+      // EXECUTION_FAILED, an honest, terminal failure record) and
+      // RE-THROWN, never swallowed.
+      this.#approvals.beginExecution(approval.approvalId);
+      try {
+        const value = await execute();
+        this.#approvals.completeExecution(approval.approvalId);
+        return value;
+      } catch (err) {
+        this.#approvals.failExecution(approval.approvalId, err instanceof Error ? err.message : String(err));
+        throw err;
+      }
     }
 
     return execute();

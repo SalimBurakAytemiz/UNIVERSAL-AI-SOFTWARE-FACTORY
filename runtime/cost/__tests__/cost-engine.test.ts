@@ -535,4 +535,76 @@ describe("CostEngine", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (27th independent review round, finding 8, 'require unforgeable reservation ownership'): the " +
+      "reservation id itself is now the unguessable capability — a genuine randomBytes(16) suffix, not a " +
+      "predictable sequential counter",
+    () => {
+      it("reservation ids are not sequential/predictable — they embed a genuinely random, high-entropy component", () => {
+        const engine = new CostEngine();
+        const ids = new Set<string>();
+        for (let i = 0; i < 20; i++) {
+          ids.add(engine.createReservation({ taskId: `t${i}` }, 0.01).id);
+        }
+        // 20 genuinely distinct ids, and none of them is merely "res-N" —
+        // each carries a long random-hex suffix no attacker could predict
+        // from having seen any other id.
+        expect(ids.size).toBe(20);
+        for (const id of ids) {
+          expect(id).toMatch(/^res-\d+-[0-9a-f]{32}$/);
+        }
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: an unrelated caller who correctly guesses the SEQUENTIAL " +
+          "portion of a reservation id (what the old id scheme was) still cannot construct the REAL id, and so " +
+          "cannot operate a reservation it was never handed",
+        () => {
+          const engine = new CostEngine();
+          const real = engine.createReservation({ taskId: "victim-task", projectId: "victim-project" }, 1);
+
+          // The attacker knows (or predicts) the old, purely-sequential
+          // scheme's equivalent — a small guess space of plausible ids —
+          // and even correctly guesses the reservation's OWN scope (task/
+          // project names are not secrets). None of these guesses is the
+          // real, randomized id, so every one of them is rejected as
+          // unknown before any ownership/scope comparison even applies.
+          const guessedIds = ["res-1", "res-2", "res-3", `res-${real.id.split("-")[1]}`];
+          for (const guess of guessedIds) {
+            expect(guess).not.toBe(real.id);
+            expect(() =>
+              engine.commitReservation(guess, {
+                taskId: "victim-task",
+                projectId: "victim-project",
+                provider: "mock",
+                modelId: "m1",
+                amountUsd: 1
+              })
+            ).toThrow(UnknownReservationError);
+            expect(() =>
+              engine.releaseReservation(guess, { taskId: "victim-task", projectId: "victim-project" })
+            ).toThrow(UnknownReservationError);
+          }
+
+          // The real owner, holding the actual (unguessable) id, still
+          // operates it normally.
+          expect(() => engine.releaseReservation(real.id, { taskId: "victim-task", projectId: "victim-project" })).not.toThrow();
+        }
+      );
+
+      it("no public method on CostEngine enumerates or otherwise discloses a reservation id that was not already handed to the caller", () => {
+        const engine = new CostEngine();
+        engine.createReservation({ taskId: "hidden" }, 0.5);
+
+        // The only per-reservation-id read is getReservation(id), which
+        // REQUIRES already knowing the id — there is no list()/all()-style
+        // method for outstanding reservations (reservedTotal() only
+        // returns an aggregate number, never individual ids/records).
+        expect((engine as unknown as { listReservations?: unknown }).listReservations).toBeUndefined();
+        expect((engine as unknown as { allReservations?: unknown }).allReservations).toBeUndefined();
+        expect(typeof engine.reservedTotal({})).toBe("number");
+      });
+    }
+  );
 });

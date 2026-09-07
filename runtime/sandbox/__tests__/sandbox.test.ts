@@ -590,12 +590,116 @@ function existsSyncFollows(path: string): boolean {
 
 describe("withTimeout", () => {
   it("resolves normally when the operation finishes before the timeout", async () => {
-    const result = await withTimeout(Promise.resolve("done"), 1000);
+    const result = await withTimeout(async () => "done", 1000);
     expect(result).toBe("done");
   });
 
-  it("rejects with SandboxTimeoutError when the operation hangs past the timeout", async () => {
-    const hangingForever = new Promise(() => {}); // never resolves
-    await expect(withTimeout(hangingForever, 20)).rejects.toThrow(SandboxTimeoutError);
+  it("rejects with SandboxTimeoutError when a signal-respecting operation is aborted past the timeout", async () => {
+    const hangingButCooperative = (signal: AbortSignal) =>
+      new Promise<never>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    await expect(withTimeout(hangingButCooperative, 20)).rejects.toThrow(SandboxTimeoutError);
   });
+
+  describe(
+    "P1 fix (27th independent review round, finding 9, 'timeout must actually cancel sandbox work'): the " +
+      "operation is now handed an AbortSignal and withTimeout genuinely waits for it to settle, rather than " +
+      "racing an opaque Promise and abandoning it in the background",
+    () => {
+      it("the operation actually RECEIVES a genuine AbortSignal instance", async () => {
+        let receivedSignal: unknown;
+        await withTimeout(async (signal) => {
+          receivedSignal = signal;
+          return "ok";
+        }, 1000);
+        expect(receivedSignal).toBeInstanceOf(AbortSignal);
+      });
+
+      it("the signal is aborted at the deadline, with the SandboxTimeoutError as its abort reason", async () => {
+        let observedReason: unknown;
+        const operation = (signal: AbortSignal) =>
+          new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => {
+              observedReason = signal.reason;
+              reject(new Error("aborted"));
+            });
+          });
+        await expect(withTimeout(operation, 20)).rejects.toThrow(SandboxTimeoutError);
+        expect(observedReason).toBeInstanceOf(SandboxTimeoutError);
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: a real, observable side effect (a spawned child process " +
+          "writing a marker file) is genuinely terminated at the deadline — the marker file is NEVER created, " +
+          "even long after the child's original (un-cancelled) completion time would have passed",
+        async () => {
+          const tempRoot = mkdtempSync(join(tmpdir(), "uasf-withtimeout-sideeffect-"));
+          const markerPath = join(tempRoot, "marker.txt");
+          try {
+            const { spawn } = await import("node:child_process");
+
+            const operation = (signal: AbortSignal) =>
+              new Promise<void>((resolve, reject) => {
+                // A child process that, if left running, writes a marker
+                // file after 300ms — a genuine, externally-observable side
+                // effect, exactly the kind bölüm 87 says must never
+                // silently occur after a reported timeout.
+                const child = spawn(
+                  process.execPath,
+                  ["-e", `setTimeout(() => require('fs').writeFileSync(${JSON.stringify(markerPath)}, 'done'), 300)`],
+                  { signal }
+                );
+                child.once("exit", (code, exitSignal) => {
+                  if (exitSignal) reject(new Error(`child terminated by signal ${exitSignal}`));
+                  else resolve();
+                });
+                child.once("error", (err) => reject(err));
+              });
+
+            // Timeout well before the child's own 300ms marker-write.
+            await expect(withTimeout(operation, 30)).rejects.toThrow(SandboxTimeoutError);
+
+            // Wait comfortably PAST the child's original, un-cancelled
+            // completion time (300ms) — proving this isn't merely "we
+            // stopped waiting before it would have written the file," but
+            // that the child process itself was actually killed.
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            expect(existsSyncFollows(markerPath)).toBe(false);
+          } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+          }
+        }
+      );
+
+      it("withTimeout does not return until the aborted operation has genuinely settled (no abandoned waiting)", async () => {
+        let cleanupRan = false;
+        const operation = (signal: AbortSignal) =>
+          new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => {
+              // Simulate real cleanup work happening synchronously inside
+              // the abort handler, BEFORE the operation's promise settles.
+              cleanupRan = true;
+              reject(new Error("aborted"));
+            });
+          });
+
+        await expect(withTimeout(operation, 20)).rejects.toThrow(SandboxTimeoutError);
+        // If withTimeout had merely raced an abandoned promise, this
+        // assertion would already be true regardless — the REAL proof is
+        // the side-effect test above; this is a fast, deterministic
+        // companion check that the abort handler is the thing that
+        // actually produced the rejection withTimeout awaited.
+        expect(cleanupRan).toBe(true);
+      });
+
+      it("a rejection unrelated to the timeout (the operation's own genuine failure) is never masked as a SandboxTimeoutError", async () => {
+        const ownFailure = new Error("genuine operation failure, unrelated to any timeout");
+        const operation = async () => {
+          throw ownFailure;
+        };
+        await expect(withTimeout(operation, 1000)).rejects.toBe(ownFailure);
+      });
+    }
+  );
 });

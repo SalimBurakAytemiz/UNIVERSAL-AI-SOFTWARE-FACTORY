@@ -393,6 +393,165 @@ describe("PolicyEngine", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (27th independent review round, finding 1, 'snapshot risk before validating it'): the authoritative " +
+      "snapshot is built BEFORE risk is validated, and risk is validated against the snapshot, not the caller's " +
+      "own (possibly getter/Proxy-backed) object",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a risk getter returning a valid value on its ONE read " +
+          "cannot be re-invoked by evaluate() to smuggle a different, unvalidated value into the authoritative " +
+          "action",
+        () => {
+          let callCount = 0;
+          const action = {
+            actionType: "x",
+            description: "d",
+            get risk() {
+              callCount++;
+              // If evaluate() ever read `risk` a SECOND time, this would return
+              // an invalid value that the old (validate-then-snapshot) order
+              // would never re-check.
+              return callCount === 1 ? 0 : -1;
+            }
+          };
+          const engine = new PolicyEngine();
+          engine.addRule(lowRiskAllowRule(2));
+
+          const result = engine.evaluate(action as unknown as { actionType: string; risk: 0; description: string });
+
+          expect(callCount).toBe(1); // the getter is consulted exactly once, ever
+          expect(result.action.risk).toBe(0); // the SAME value that was validated
+          expect(result.decision).toBe("ALLOW");
+        }
+      );
+
+      it("a risk getter whose single read returns an invalid value is rejected, never given a second chance", () => {
+        let callCount = 0;
+        const action = {
+          actionType: "x",
+          description: "d",
+          get risk() {
+            callCount++;
+            return -1;
+          }
+        };
+        const engine = new PolicyEngine();
+
+        expect(() =>
+          engine.evaluate(action as unknown as { actionType: string; risk: 0; description: string })
+        ).toThrow(InvalidRiskLevelError);
+        expect(callCount).toBe(1);
+      });
+
+      it("a Proxy-wrapped action cannot answer 'risk' differently for validation vs. rule evaluation", () => {
+        const reads: number[] = [];
+        const target = { actionType: "proxied", description: "d", risk: 1 };
+        const proxied = new Proxy(target, {
+          get(t, prop, receiver) {
+            if (prop === "risk") {
+              reads.push(reads.length); // record each access
+            }
+            return Reflect.get(t, prop, receiver);
+          }
+        });
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(2));
+
+        const result = engine.evaluate(proxied as unknown as { actionType: string; risk: 0; description: string });
+
+        // Exactly one trap invocation for `risk` — every later reference in
+        // evaluate() (validation, rule evaluation, audit payload, returned
+        // action) uses the already-copied, non-Proxy `authoritativeAction`.
+        expect(reads.length).toBe(1);
+        expect(result.action.risk).toBe(1);
+        expect(result.decision).toBe("ALLOW");
+      });
+
+      it("mutating the caller's original action object AFTER evaluate() returns never affects the returned decision (pre-existing invariant, still holds under the new ordering)", () => {
+        const action: { actionType: string; risk: 0 | 1 | 2 | 3 | 4 | 5; description: string } = {
+          actionType: "x",
+          risk: 1,
+          description: "d"
+        };
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(2));
+        const result = engine.evaluate(action);
+        action.risk = 5;
+        expect(result.action.risk).toBe(1);
+        expect(result.decision).toBe("ALLOW");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (27th independent review round, finding 2, 'detach registered policy rules'): addRule() stores an " +
+      "independent, frozen copy of the caller's rule object, not the caller's own live reference",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: mutating priority on the caller's own rule object AFTER " +
+          "registration does not retroactively change evaluation order",
+        () => {
+          const engine = new PolicyEngine();
+          const lowPriorityDeny = denyRule("low-priority-deny", 1);
+          const highPriorityAllow: PolicyRule = { name: "high-allow", priority: 100, evaluate: () => "ALLOW" };
+          engine.addRule(lowPriorityDeny);
+          engine.addRule(highPriorityAllow);
+
+          // Attempt to promote the DENY rule above the ALLOW rule after the fact.
+          (lowPriorityDeny as { priority: number }).priority = 1000;
+
+          // DENY always wins regardless of priority anyway (bölüm 241), but the
+          // real point here is that the ENGINE's copy of `priority` (1) is what
+          // determines internal ordering/bookkeeping, not the caller's mutated
+          // live object (1000) — provable via matchedRule when only ONE rule
+          // exists at each priority tier in a case where priority actually
+          // decides the outcome (two non-DENY rules).
+          const engine2 = new PolicyEngine();
+          const lowPriorityRule: PolicyRule = { name: "low", priority: 1, evaluate: () => "APPROVAL_REQUIRED" };
+          const highPriorityRule: PolicyRule = { name: "high", priority: 2, evaluate: () => "ALLOW" };
+          engine2.addRule(lowPriorityRule);
+          engine2.addRule(highPriorityRule);
+          (lowPriorityRule as { priority: number }).priority = 1000; // attempt to outrank "high" after registration
+
+          const result = engine2.evaluate({ actionType: "x", risk: 0, description: "d" });
+          expect(result.matchedRule).toBe("high"); // still the ORIGINALLY higher-priority rule
+          expect(result.decision).toBe("ALLOW");
+        }
+      );
+
+      it(
+        "REGRESSION: replacing evaluate() on the caller's own rule object after registration cannot change " +
+          "the registered rule's decision logic",
+        () => {
+          const engine = new PolicyEngine();
+          const rule: PolicyRule = { name: "mandatory-deny", priority: 100, evaluate: () => "DENY" };
+          engine.addRule(rule);
+
+          // Attempt to silently neuter the DENY rule after registration.
+          (rule as { evaluate: PolicyRule["evaluate"] }).evaluate = () => "ALLOW";
+
+          const result = engine.evaluate({ actionType: "x", risk: 0, description: "d" });
+          expect(result.decision).toBe("DENY"); // the engine's frozen copy still has the ORIGINAL evaluate
+        }
+      );
+
+      it("the caller's original rule object cannot be mutated to alter the registered copy's own properties (frozen)", () => {
+        const engine = new PolicyEngine();
+        const rule: PolicyRule = { name: "r", priority: 1, evaluate: () => "ALLOW" };
+        engine.addRule(rule);
+
+        // Mutating the caller's OWN object is always allowed (it's their object) —
+        // the guarantee is that it has no effect on the engine's stored copy.
+        (rule as { priority: number }).priority = 999;
+        (rule as { name: string }).name = "renamed";
+
+        const result = engine.evaluate({ actionType: "x", risk: 0, description: "d" });
+        expect(result.matchedRule).toBe("r"); // engine's copy kept the ORIGINAL name
+      });
+    }
+  );
 });
 
 describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)", () => {
@@ -515,7 +674,15 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       workflow.execute("deploy-12");
 
       const types = auditLog.all().map((r) => r.type);
-      expect(types).toEqual(["APPROVAL_REQUESTED", "APPROVAL_APPROVED", "APPROVAL_EXECUTED"]);
+      // P1 fix (27th independent review round, finding 5, "finalize approval only after successful execution"):
+      // execute() now composes beginExecution()+completeExecution() — an honest, MORE granular audit trail (a
+      // genuine "claimed, in-flight" event exists, not just "requested" then "done") — see approval.ts's fix note.
+      expect(types).toEqual([
+        "APPROVAL_REQUESTED",
+        "APPROVAL_APPROVED",
+        "APPROVAL_EXECUTION_STARTED",
+        "APPROVAL_EXECUTED"
+      ]);
       expect(auditLog.verifyIntegrity()).toBe(true);
     });
 

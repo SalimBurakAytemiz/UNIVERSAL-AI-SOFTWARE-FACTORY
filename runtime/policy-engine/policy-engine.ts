@@ -109,8 +109,31 @@ export class PolicyEngine {
 
   constructor(private readonly auditLog: AuditLog = new AuditLog()) {}
 
+  /**
+   * P1 fix (27th independent review round, finding 2, "detach registered
+   * policy rules"): `addRule()` used to push the caller's OWN `PolicyRule`
+   * object reference directly into `#rules`. Even with `#rules` itself now
+   * genuinely runtime-private (26th round), the individual rule OBJECTS
+   * inside it remained the exact same objects the caller still held a
+   * reference to — `rule.priority = Number.MAX_SAFE_INTEGER` after
+   * registration would retroactively promote a rule to always sort first
+   * (`ordered = [...this.#rules].sort(...)` re-reads `priority` on every
+   * `evaluate()` call, never a value captured at registration time), and
+   * `rule.evaluate = () => "ALLOW"` would silently replace a registered
+   * DENY rule's entire decision logic with an always-ALLOW after the fact
+   * — defeating default-deny (bölüm 147) without ever calling `addRule()`
+   * again. Fixed: `addRule()` now stores `freezeRecord({ ...rule })` — an
+   * independent, frozen copy — so the caller's original `rule` object is
+   * never the one consulted; mutating `priority` or `evaluate` on the
+   * caller's own reference after registration has no effect on the
+   * engine's behavior. `evaluate` itself is a function VALUE (like `name`
+   * or `priority`, an ordinary copied property) — freezing the copy
+   * prevents REPLACING which function is called, though the underlying
+   * function object's own closed-over behavior is unrelated, caller-
+   * authored logic outside this engine's control either way.
+   */
   addRule(rule: PolicyRule): void {
-    this.#rules.push(rule);
+    this.#rules.push(freezeRecord({ ...rule }));
   }
 
   get auditTrail(): AuditLog {
@@ -149,13 +172,30 @@ export class PolicyEngine {
    * reference to the same object.
    */
   evaluate(action: PolicyAction): PolicyEvaluationResult {
-    // P1 fix (26th independent review round, finding 4, "reject invalid
-    // risk values before policy evaluation"): validated BEFORE the
-    // authoritative snapshot is even built — bkz. `assertValidRiskLevel()`
-    // ve `InvalidRiskLevelError`'ın üstündeki fix notu. Fail closed: an
-    // invalid `risk` never reaches a single rule, not even the first one.
-    assertValidRiskLevel(action.risk);
+    // P1 fix (27th independent review round, finding 1, "snapshot risk
+    // before validating it"): the previous order was `assertValidRiskLevel
+    // (action.risk)` FIRST, then `freezeRecord({ ...action })` SECOND — two
+    // SEPARATE reads of `action`'s properties (including `risk`). If
+    // `action` is a Proxy or has a `risk` getter, nothing requires it to
+    // return the SAME value both times: it could return a valid `0` for
+    // the validation read, then an invalid (or merely DIFFERENT) value for
+    // the snapshot read one line later — validation would pass against a
+    // value that never actually ends up in `authoritativeAction`, while
+    // the REAL value baked into the snapshot every rule below evaluates
+    // against was never validated at all. Fixed: the object spread — which
+    // reads every one of `action`'s own enumerable properties exactly
+    // ONCE via `[[Get]]`, copying each into a genuine, static data
+    // property on a NEW plain object — now runs FIRST, producing
+    // `authoritativeAction` BEFORE any validation. `assertValidRiskLevel`
+    // then runs against `authoritativeAction.risk`, a value that is no
+    // longer a getter/Proxy trap at all (it is a real, frozen own
+    // property), so every subsequent read anywhere in this method sees the
+    // exact SAME value that was validated — there is no second read left
+    // for a hostile getter to answer differently. `action` itself (the
+    // caller's original, possibly getter-backed object) is never read
+    // again after this one spread.
     const authoritativeAction: PolicyAction = freezeRecord({ ...action });
+    assertValidRiskLevel(authoritativeAction.risk);
     const ordered = [...this.#rules].sort((a, b) => b.priority - a.priority);
 
     // P1 fix (7th independent review round, "higher-priority ALLOW bypasses

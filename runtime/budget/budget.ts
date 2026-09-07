@@ -173,7 +173,53 @@ export class BudgetGuard {
    * kopya oluştur — orijinal nesneye yapılan hiçbir sonraki mutasyon iç
    * durumu etkileyemez.
    */
-  private readonly limits: Readonly<BudgetLimits>;
+  /**
+   * P1 fix (27th independent review round, finding 6, "keep budget limits
+   * runtime-private"): this used to be declared with TypeScript's
+   * compile-time-only `private readonly` — in the emitted JS it is an
+   * ordinary, enumerable instance property. `(guard as any).limits =
+   * { perTaskUsd: Number.MAX_VALUE }` from any caller holding a
+   * `BudgetGuard` reference would silently replace the configured
+   * ceilings — the freezing/detaching this constructor already does only
+   * protects against MUTATING the object in place, not against
+   * REPLACING the property that points to it entirely (a `readonly`
+   * class field is still an ordinary writable property in JS unless it
+   * is a genuine `#private` field). Fixed: a genuine ECMAScript private
+   * field (`#limits`), assigned once in the constructor body — `as any`,
+   * bracket access, and every reflection API fail to reach it.
+   */
+  #limits: Readonly<BudgetLimits>;
+
+  /**
+   * P1 fix (27th independent review round targeted-audit follow-up, same
+   * root class as finding 3 [capability-gateway/gateway.ts's `#policy`/
+   * `#approvals`] and finding 6 [`#limits`, immediately above]):
+   * `costEngine`/`now`/`auditLog` used to be declared as TypeScript
+   * constructor-parameter-property `private readonly` fields — compile-time
+   * only. In the emitted JS these are ordinary, enumerable instance
+   * properties: `(guard as any).costEngine = fakeCostEngineWhoseRecord
+   * IsANoOpAndWhoseTotalsAreAlwaysZero` from any caller holding a
+   * `BudgetGuard` reference would silently defeat EVERY ceiling check
+   * (`totalFor`/`total`/`totalInWindow`/`reservedTotal`, all read from
+   * `this.#costEngine`) and every spend/reservation record
+   * (`record`/`createReservation`/`commitReservation`/`releaseReservation`,
+   * all written through `this.#costEngine`) — the exact same class of bug
+   * `#limits` just above was fixed for, just reachable through a different
+   * property name. `now` is likewise authoritative for the daily/monthly
+   * ceiling WINDOW boundary (`startOfUtcDay(this.#now())`/
+   * `startOfUtcMonth(this.#now())`) — replacing it could make every spend
+   * appear to fall inside a perpetually-fresh window, defeating periodic
+   * ceilings entirely. `auditLog` is the sole channel every
+   * `BUDGET_*` event in this class reaches — replacing it with a
+   * discard-everything stub would silently erase the audit trail baseline
+   * section 147/303 requires for "no silent spending." Fixed identically to
+   * `#limits`: genuine ECMAScript private fields, assigned once in the
+   * constructor body — `as any`, bracket access, and every reflection API
+   * fail to reach them.
+   */
+  readonly #costEngine: CostEngine;
+  readonly #now: () => Date;
+  readonly #auditLog?: AuditLog;
 
   /**
    * P1 fix (10th independent review round, "concurrent model invocations
@@ -225,7 +271,7 @@ export class BudgetGuard {
    * shared $1.00 ceiling — $1.20 committed, reintroducing the exact race
    * the 10th round's reservation model was meant to make structurally
    * impossible, one layer up. Fixed: reservation storage now lives on
-   * `this.costEngine` itself (`createReservation()`/`getReservation()`/
+   * `this.#costEngine` itself (`createReservation()`/`getReservation()`/
    * `markReservationReconciliationFailed()`/`deleteReservation()`/
    * `reservedTotal()` — bkz. runtime/cost/cost-engine.ts) — the SAME
    * object every cooperating `BudgetGuard` already shares by
@@ -247,25 +293,23 @@ export class BudgetGuard {
    * guard over the same ledger, or a different ledger entirely) can
    * never observe a partially-updated state.
    */
-  constructor(
-    private readonly costEngine: CostEngine,
-    limits: BudgetLimits,
-    private readonly now: () => Date = () => new Date(),
-    private readonly auditLog?: AuditLog
-  ) {
+  constructor(costEngine: CostEngine, limits: BudgetLimits, now: () => Date = () => new Date(), auditLog?: AuditLog) {
     // Yanlış yapılandırılmış bir tavan (NaN/Infinity/negatif), kurulum
     // anında hemen reddedilir — ilk harcama denemesine kadar beklenmez.
     assertValidBudgetLimits(limits);
-    this.limits = freezeRecord({ ...limits });
+    this.#limits = freezeRecord({ ...limits });
+    this.#costEngine = costEngine;
+    this.#now = now;
+    this.#auditLog = auditLog;
   }
 
   /**
    * Yapılandırılmış tavanların salt-okunur, ayrık bir anlık görüntüsü.
-   * Döndürülen nesne üzerindeki hiçbir mutasyon iç `this.limits`'i
+   * Döndürülen nesne üzerindeki hiçbir mutasyon iç `this.#limits`'i
    * etkilemez (donmuş + kopya).
    */
   getLimits(): Readonly<BudgetLimits> {
-    return freezeRecord({ ...this.limits });
+    return freezeRecord({ ...this.#limits });
   }
 
   /**
@@ -291,7 +335,7 @@ export class BudgetGuard {
    * (1) CostEngine'e zaten KAYDEDİLMİŞ gerçek harcamalar, (2) henüz
    * mutabakata varılmamış ama zaten AYRILMIŞ (`reserve()` ile açılmış,
    * henüz `commit()`/`release()` edilmemiş) tutarlar — artık
-   * `this.costEngine.reservedTotal()` üzerinden bu ledger'a bağlı HER
+   * `this.#costEngine.reservedTotal()` üzerinden bu ledger'a bağlı HER
    * `BudgetGuard`'ın PAYLAŞTIĞI tek/yetkili toplam (bkz. 16th independent
    * review round fix notu, bu dosyanın üstünde), (3) bu ÇAĞRININ kendi
    * projeksiyonu. (2)'nin dahil edilmesi, tam olarak 10th independent
@@ -301,21 +345,21 @@ export class BudgetGuard {
   private buildCeilingChecks(scope: CostScope, projectedAmountUsd: number): CeilingCheck[] {
     const checks: CeilingCheck[] = [];
 
-    if (this.limits.perTaskUsd !== undefined && scope.taskId !== undefined) {
+    if (this.#limits.perTaskUsd !== undefined && scope.taskId !== undefined) {
       const taskScope: CostScope =
         scope.projectId !== undefined ? { taskId: scope.taskId, projectId: scope.projectId } : { taskId: scope.taskId };
       checks.push({
         ceiling: "perTaskUsd",
-        limit: this.limits.perTaskUsd,
-        projected: this.costEngine.totalFor(taskScope) + this.costEngine.reservedTotal(taskScope) + projectedAmountUsd
+        limit: this.#limits.perTaskUsd,
+        projected: this.#costEngine.totalFor(taskScope) + this.#costEngine.reservedTotal(taskScope) + projectedAmountUsd
       });
     }
 
-    if (this.limits.perRunUsd !== undefined) {
+    if (this.#limits.perRunUsd !== undefined) {
       checks.push({
         ceiling: "perRunUsd",
-        limit: this.limits.perRunUsd,
-        projected: this.costEngine.total() + this.costEngine.reservedTotal({}) + projectedAmountUsd
+        limit: this.#limits.perRunUsd,
+        projected: this.#costEngine.total() + this.#costEngine.reservedTotal({}) + projectedAmountUsd
       });
     }
 
@@ -324,24 +368,24 @@ export class BudgetGuard {
     // tavanlar tek bir görev için değil bir dönem için tanımlıdır.
     const periodScope: CostScope = scope.projectId !== undefined ? { projectId: scope.projectId } : {};
 
-    if (this.limits.dailyUsd !== undefined) {
+    if (this.#limits.dailyUsd !== undefined) {
       checks.push({
         ceiling: "dailyUsd",
-        limit: this.limits.dailyUsd,
+        limit: this.#limits.dailyUsd,
         projected:
-          this.costEngine.totalInWindow(periodScope, startOfUtcDay(this.now())) +
-          this.costEngine.reservedTotal(periodScope) +
+          this.#costEngine.totalInWindow(periodScope, startOfUtcDay(this.#now())) +
+          this.#costEngine.reservedTotal(periodScope) +
           projectedAmountUsd
       });
     }
 
-    if (this.limits.monthlyUsd !== undefined) {
+    if (this.#limits.monthlyUsd !== undefined) {
       checks.push({
         ceiling: "monthlyUsd",
-        limit: this.limits.monthlyUsd,
+        limit: this.#limits.monthlyUsd,
         projected:
-          this.costEngine.totalInWindow(periodScope, startOfUtcMonth(this.now())) +
-          this.costEngine.reservedTotal(periodScope) +
+          this.#costEngine.totalInWindow(periodScope, startOfUtcMonth(this.#now())) +
+          this.#costEngine.reservedTotal(periodScope) +
           projectedAmountUsd
       });
     }
@@ -364,11 +408,11 @@ export class BudgetGuard {
     try {
       assertValidMonetaryAmount(projectedAmountUsd, "BudgetGuard.assertWithinBudget");
     } catch (err) {
-      this.auditLog?.append({
+      this.#auditLog?.append({
         type: "BUDGET_INVALID_AMOUNT_REJECTED",
         actor: "budget-guard",
         payload: { scope, projectedAmountUsd, reason: err instanceof Error ? err.message : String(err) },
-        timestamp: this.now().toISOString()
+        timestamp: this.#now().toISOString()
       });
       throw err;
     }
@@ -385,21 +429,21 @@ export class BudgetGuard {
     // dağınık/rastgele bir epsilon değil.
     for (const check of checks) {
       if (exceedsMonetaryAmount(check.projected, check.limit)) {
-        this.auditLog?.append({
+        this.#auditLog?.append({
           type: "BUDGET_BLOCKED",
           actor: "budget-guard",
           payload: { scope, projectedAmountUsd, ...check },
-          timestamp: this.now().toISOString()
+          timestamp: this.#now().toISOString()
         });
         throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
       }
     }
 
-    this.auditLog?.append({
+    this.#auditLog?.append({
       type: "BUDGET_CHECK_PASSED",
       actor: "budget-guard",
       payload: { scope, projectedAmountUsd, checks },
-      timestamp: this.now().toISOString()
+      timestamp: this.#now().toISOString()
     });
   }
 
@@ -412,6 +456,25 @@ export class BudgetGuard {
    * condition) OLUŞAMAZ — her çağrı, bir sonraki başlamadan tamamen biter
    * (eşzamanlılık güvenliği, JS çalışma zamanının kendisinden gelir).
    */
+  /**
+   * P1 fix (27th independent review round, finding 7, "snapshot spend
+   * entries before checking them"): `entry.amountUsd` (and `.taskId`/
+   * `.projectId`) used to be read ONCE here (for `assertWithinBudget`'s
+   * ceiling check) and then read AGAIN inside `this.#costEngine.record
+   * (entry)` (which spreads `entry`'s own properties to build the
+   * recorded `CostEntry`) — two SEPARATE reads of the SAME caller-owned
+   * object. If `entry` is a getter/Proxy, nothing requires those two
+   * reads to agree: a small, ceiling-compliant amount could be checked
+   * here while a completely different (larger, or negative/NaN) amount
+   * is what actually gets durably recorded, or vice versa — "no silent
+   * spending" (bölüm 147) depends on the CHECKED amount and the RECORDED
+   * amount being provably the same value. Fixed: `entry` is copied into
+   * `snapshot` — a genuine, static plain object with no getters/Proxy
+   * behavior — as the VERY FIRST thing this method does, reading every
+   * property exactly once; `assertWithinBudget()` and
+   * `costEngine.record()` both operate on this SAME snapshot, never the
+   * original `entry` parameter again.
+   */
   spend(entry: {
     taskId: string;
     agentId?: string;
@@ -420,8 +483,9 @@ export class BudgetGuard {
     modelId: string;
     amountUsd: number;
   }) {
-    this.assertWithinBudget({ taskId: entry.taskId, projectId: entry.projectId }, entry.amountUsd);
-    return this.costEngine.record(entry);
+    const snapshot = { ...entry };
+    this.assertWithinBudget({ taskId: snapshot.taskId, projectId: snapshot.projectId }, snapshot.amountUsd);
+    return this.#costEngine.record(snapshot);
   }
 
   /**
@@ -441,11 +505,11 @@ export class BudgetGuard {
     try {
       assertValidMonetaryAmount(amountUsd, "BudgetGuard.reserve");
     } catch (err) {
-      this.auditLog?.append({
+      this.#auditLog?.append({
         type: "BUDGET_INVALID_AMOUNT_REJECTED",
         actor: "budget-guard",
         payload: { scope, amountUsd, reason: err instanceof Error ? err.message : String(err) },
-        timestamp: this.now().toISOString()
+        timestamp: this.#now().toISOString()
       });
       throw err;
     }
@@ -453,27 +517,27 @@ export class BudgetGuard {
     const checks = this.buildCeilingChecks(scope, amountUsd);
     for (const check of checks) {
       if (exceedsMonetaryAmount(check.projected, check.limit)) {
-        this.auditLog?.append({
+        this.#auditLog?.append({
           type: "BUDGET_RESERVATION_BLOCKED",
           actor: "budget-guard",
           payload: { scope, amountUsd, ...check },
-          timestamp: this.now().toISOString()
+          timestamp: this.#now().toISOString()
         });
         throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
       }
     }
 
     // Rezervasyon, bu ledger'a bağlı HER `BudgetGuard`'ın PAYLAŞTIĞI
-    // `this.costEngine`'in KENDİSİNDE oluşturulur — artık bu sınıfın
+    // `this.#costEngine`'in KENDİSİNDE oluşturulur — artık bu sınıfın
     // kendi özel bir Map'inde DEĞİL (bkz. bu sınıfın üstündeki 16th
     // independent review round fix notu).
-    const created = this.costEngine.createReservation(scope, amountUsd);
+    const created = this.#costEngine.createReservation(scope, amountUsd);
 
-    this.auditLog?.append({
+    this.#auditLog?.append({
       type: "BUDGET_RESERVATION_CREATED",
       actor: "budget-guard",
       payload: { reservationId: created.id, scope, amountUsd, checks },
-      timestamp: this.now().toISOString()
+      timestamp: this.#now().toISOString()
     });
 
     return freezeRecord({ id: created.id, scope: created.scope, amountUsd: created.amountUsd });
@@ -522,7 +586,17 @@ export class BudgetGuard {
     reservationId: string,
     entry: { taskId: string; agentId?: string; projectId?: string; provider: string; modelId: string; amountUsd: number }
   ) {
-    const reservation = this.costEngine.getReservation(reservationId);
+    // P1 fix (27th independent review round, finding 7, "snapshot spend
+    // entries before checking them" — same root class, applied here too):
+    // `entry` used to be read repeatedly across this method (the
+    // `commitReservation()` call, the ownership-mismatch audit payload,
+    // the commit-failed audit payload, the overages check) — several
+    // SEPARATE reads of a caller-owned object that, if getter/Proxy-
+    // backed, could answer differently each time. `snapshot` captures
+    // every field exactly once, up front; every reference below uses it,
+    // never the original `entry` parameter again.
+    const snapshot = { ...entry };
+    const reservation = this.#costEngine.getReservation(reservationId);
     if (!reservation) {
       throw new UnknownReservationError(reservationId);
     }
@@ -542,7 +616,7 @@ export class BudgetGuard {
     // before.
     let recorded: CostEntry;
     try {
-      recorded = this.costEngine.commitReservation(reservationId, entry);
+      recorded = this.#costEngine.commitReservation(reservationId, snapshot);
     } catch (err) {
       if (err instanceof ReservationOwnershipMismatchError) {
         // P1 fix (26th independent review round, finding 3, "reservation
@@ -560,68 +634,68 @@ export class BudgetGuard {
         // nothing new); a legitimate reviewer can still recover the true
         // scope by cross-referencing this reservation's own
         // `BUDGET_RESERVATION_CREATED` audit event by `reservationId`.
-        this.auditLog?.append({
+        this.#auditLog?.append({
           type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
           actor: "budget-guard",
           payload: {
             reservationId,
-            suppliedTaskId: entry.taskId,
-            suppliedProjectId: entry.projectId,
-            suppliedAgentId: entry.agentId,
-            suppliedProvider: entry.provider,
-            suppliedModelId: entry.modelId
+            suppliedTaskId: snapshot.taskId,
+            suppliedProjectId: snapshot.projectId,
+            suppliedAgentId: snapshot.agentId,
+            suppliedProvider: snapshot.provider,
+            suppliedModelId: snapshot.modelId
           },
-          timestamp: this.now().toISOString()
+          timestamp: this.#now().toISOString()
         });
         throw err;
       }
-      // Ownership already matched `entry` at this point — `commitReservation()`
-      // checks ownership BEFORE validating the amount — so `entry`'s own
+      // Ownership already matched `snapshot` at this point — `commitReservation()`
+      // checks ownership BEFORE validating the amount — so `snapshot`'s own
       // identity fields are provably the reservation's authoritative scope
       // here, safe to log without any privileged read.
-      this.auditLog?.append({
+      this.#auditLog?.append({
         type: "BUDGET_RESERVATION_COMMIT_FAILED",
         actor: "budget-guard",
         payload: {
           reservationId,
           confirmedScope: {
-            taskId: entry.taskId,
-            projectId: entry.projectId,
-            agentId: entry.agentId,
-            provider: entry.provider,
-            modelId: entry.modelId
+            taskId: snapshot.taskId,
+            projectId: snapshot.projectId,
+            agentId: snapshot.agentId,
+            provider: snapshot.provider,
+            modelId: snapshot.modelId
           },
           reservedAmountUsd: reservation.amountUsd,
-          attemptedActualAmountUsd: entry.amountUsd,
+          attemptedActualAmountUsd: snapshot.amountUsd,
           reason: err instanceof Error ? err.message : String(err)
         },
-        timestamp: this.now().toISOString()
+        timestamp: this.#now().toISOString()
       });
       throw err;
     }
 
-    const overages = this.buildCeilingChecks({ taskId: entry.taskId, projectId: entry.projectId }, 0).filter((check) =>
+    const overages = this.buildCeilingChecks({ taskId: snapshot.taskId, projectId: snapshot.projectId }, 0).filter((check) =>
       exceedsMonetaryAmount(check.projected, check.limit)
     );
 
-    this.auditLog?.append({
+    this.#auditLog?.append({
       type: "BUDGET_RESERVATION_COMMITTED",
       actor: "budget-guard",
       payload: {
         reservationId,
         confirmedScope: {
-          taskId: entry.taskId,
-          projectId: entry.projectId,
-          agentId: entry.agentId,
-          provider: entry.provider,
-          modelId: entry.modelId
+          taskId: snapshot.taskId,
+          projectId: snapshot.projectId,
+          agentId: snapshot.agentId,
+          provider: snapshot.provider,
+          modelId: snapshot.modelId
         },
         reservedAmountUsd: reservation.amountUsd,
-        actualAmountUsd: entry.amountUsd,
+        actualAmountUsd: snapshot.amountUsd,
         entry: recorded,
         overages
       },
-      timestamp: this.now().toISOString()
+      timestamp: this.#now().toISOString()
     });
 
     return recorded;
@@ -677,7 +751,7 @@ export class BudgetGuard {
     // that outcome into the SAME audit events/error types as before.
     let released: LedgerReservation;
     try {
-      released = this.costEngine.releaseReservation(reservationId, callerScope);
+      released = this.#costEngine.releaseReservation(reservationId, callerScope);
     } catch (err) {
       if (err instanceof UnresolvedReconciliationError) {
         // P1 fix (26th independent review round, finding 3, "reservation
@@ -692,29 +766,29 @@ export class BudgetGuard {
         // id. `getReservation()` no longer returns `scope` at all (bkz.
         // cost-engine.ts), closing this read entirely; `amountUsd` remains
         // safe to log (it plays no role in the ownership check).
-        const reservation = this.costEngine.getReservation(reservationId);
-        this.auditLog?.append({
+        const reservation = this.#costEngine.getReservation(reservationId);
+        this.#auditLog?.append({
           type: "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED",
           actor: "budget-guard",
           payload: { reservationId, amountUsd: reservation?.amountUsd },
-          timestamp: this.now().toISOString()
+          timestamp: this.#now().toISOString()
         });
       } else if (err instanceof ReservationOwnershipMismatchError) {
-        this.auditLog?.append({
+        this.#auditLog?.append({
           type: "BUDGET_RESERVATION_RELEASE_REJECTED_OWNERSHIP_MISMATCH",
           actor: "budget-guard",
           payload: { reservationId, suppliedScope: callerScope },
-          timestamp: this.now().toISOString()
+          timestamp: this.#now().toISOString()
         });
       }
       throw err;
     }
 
-    this.auditLog?.append({
+    this.#auditLog?.append({
       type: "BUDGET_RESERVATION_RELEASED",
       actor: "budget-guard",
       payload: { reservationId, scope: released.scope, amountUsd: released.amountUsd },
-      timestamp: this.now().toISOString()
+      timestamp: this.#now().toISOString()
     });
   }
 }

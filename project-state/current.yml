@@ -934,6 +934,54 @@ factory:
     explicit instruction, this round does NOT merge, does NOT move to P1, and does NOT declare P0 complete. P0
     remains BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN.
 
+    A twenty-seventh independent Codex review reproduced TEN NEW findings (9 P1, 1 P2), fixed as one consolidated
+    closure batch per explicit Founder instruction: (1) `PolicyEngine.evaluate()` read `action.risk` for
+    validation, then built its detached snapshot afterward — two separate reads of a caller-owned object that, if
+    getter/Proxy-backed, need not agree; reordered so the snapshot is built FIRST and validation reads that SAME
+    static copy. (2) `PolicyEngine.addRule()` stored the caller's own mutable rule object directly — mutating
+    `priority`/`evaluate`/`name` after registration could silently change evaluation order or replace a rule's
+    decision logic; fixed by storing `freezeRecord({ ...rule })`, a detached copy. (3) `CapabilityGateway`'s
+    `#policy`/`#approvals` were TypeScript compile-time-only `private readonly` — converted to genuine ECMAScript
+    private fields (`as any` property replacement previously defeated the ENTIRE decision engine silently). (4)
+    `authorize()` matched approval evidence against the caller's original, still-mutable `action` object instead
+    of the SAME detached snapshot `policy.evaluate()` already decided on — fixed to compare against
+    `result.action`. (5) approval evidence moved straight to EXECUTED before the wrapped callback ran, so a
+    thrown callback left a false "successfully executed" record with no valid retry path; added an
+    EXECUTING/EXECUTION_FAILED three-state lifecycle (`beginExecution`/`completeExecution`/`failExecution` in
+    `policy-engine/approval.ts`, composed by a backward-compatible `execute()` wrapper preserving all 79+
+    pre-existing call sites) so a genuine callback failure is now distinguishable and non-retryable under the
+    same id. (6) `BudgetGuard`'s `#limits` was also still TS-private-only — converted to a genuine private field.
+    (7) `BudgetGuard.spend()`/`commit()` and `CostEngine.record()`/`commitReservation()` all read a caller-owned
+    `entry`'s fields (especially `amountUsd`) at multiple separate points — a getter/Proxy could desynchronize
+    the checked amount from the recorded amount; fixed with a single upfront `{ ...entry }` snapshot in each
+    method. (8) reservation ids were purely sequential and, combined with ordinary-predictable
+    `ReservationOwnership` scope fields, offered no genuinely unforgeable proof of ownership; fixed by embedding
+    a `randomBytes(16)` suffix in the id itself (zero test-call-site changes needed, since no test ever hardcoded
+    a predictable id and no enumeration method exists). (9) `sandbox.ts`'s `withTimeout()` used `Promise.race()`
+    against an already-started opaque Promise — this only stops the CALLER from waiting, never the underlying
+    operation, which keeps running (and producing side effects) after the "timeout" returns; redesigned to accept
+    an `(signal: AbortSignal) => Promise<T>` factory the operation must cooperate with, proven by a BLOCKER
+    regression that spawns a real child process, times it out, and confirms via a 400ms wait that its delayed
+    filesystem side effect never occurs. (10) `orchestrator.ts`'s `bootstrapProject()` built its internal
+    `CapabilityGateway` with no approvals argument at all, defaulting to a brand-new, function-call-local
+    `ApprovalWorkflow()` that NO caller could ever reach — making a risk-5 scaffold unconditionally impossible to
+    bootstrap regardless of genuine Founder approval (the structural opposite of round 25's "approval can be
+    forged," just as much a defect); fixed by threading optional `approvals`/`approvalId` fields through
+    `BootstrapProjectInput`, wired into the internal gateway when supplied, falling back to the old safe
+    (unreachable, default-deny) behavior when omitted. The targeted audit of these same ten root classes directly
+    in P0 code found one further genuine instance: `BudgetGuard`'s constructor-parameter `costEngine`/`now`/
+    `auditLog` were ALSO still TS-private-only in the same constructor `#limits` was just fixed in —
+    `costEngine` gates every ceiling check and spend/reservation record, `now` gates the daily/monthly ceiling
+    window boundary, and `auditLog` is the sole channel every `BUDGET_*` event reaches; all three converted to
+    genuine `#costEngine`/`#now`/`#auditLog` private fields, with matching regression tests. Every one of the
+    eleven fixes (ten findings plus the one audit-discovered instance) carries deterministic regression tests
+    (932 total tests, up from 886) and was verified via a temporary in-place bypass reproducing the exact
+    predicted failure — including one bypass that produced a REAL, externally observable side effect (finding
+    9's marker file genuinely appearing on disk under the reverted code) — then fully reverted, with every prior
+    round's regression re-confirmed passing. Per explicit Founder instruction, this round does NOT merge, does
+    NOT move to P1, does NOT declare P0 complete, and does NOT invoke Codex itself. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4147,6 +4195,37 @@ blockers:
     P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit
     instruction, this round does not merge, does not move to P1, does not declare P0 complete, and does not
     invoke Codex itself.
+  - >-
+    Awaiting a 28th independent (Codex) re-review of the pushed fixes — round 27 (Founder-forwarded consolidated
+    closure batch) found TEN NEW findings (9 P1, 1 P2): `PolicyEngine.evaluate()` reading `action.risk` for
+    validation and building its detached snapshot afterward (two separate reads of a possibly getter/Proxy-backed
+    object); `PolicyEngine.addRule()` storing the caller's own mutable rule object directly, letting a
+    post-registration mutation change evaluation order or a rule's own decision logic; `CapabilityGateway`'s
+    `#policy`/`#approvals` still TypeScript-`private`-only; `authorize()` matching approval evidence against the
+    caller's original mutable `action` instead of the SAME detached snapshot policy already evaluated; approval
+    evidence moving to EXECUTED before the wrapped callback's actual success was known, with no valid retry path
+    on failure; `BudgetGuard`'s `#limits` still TypeScript-`private`-only; `BudgetGuard.spend()`/`commit()` and
+    `CostEngine.record()`/`commitReservation()` reading a caller-owned spend entry's fields at multiple separate
+    points instead of a single snapshot; reservation ids being purely sequential/guessable with no genuinely
+    unforgeable ownership proof; `sandbox.ts`'s `withTimeout()` using `Promise.race()` against an
+    already-started, non-cancellable Promise (stops waiting, never stops the underlying work); and
+    `orchestrator.ts`'s `bootstrapProject()` building its internal `CapabilityGateway` with no reachable approvals
+    store at all, making a risk-5 scaffold unconditionally impossible to bootstrap regardless of genuine Founder
+    approval. All ten fixed, tested, and verified per the full required sequence: lint, typecheck, build, 932/932
+    tests, validate:requirements, history-aware secret-scan, all 9 P0 proofs, the production-install proof
+    (`npm run verify:production-install`), and Factory Doctor. All ten root causes, fixes, and regression evidence
+    are detailed in `completed_milestones`'s round-27 entries and the per-requirement notes in
+    `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0018, 0019, 0020, 0030, 0033). A targeted audit
+    of exactly these ten root classes found one further genuine instance directly in P0 code:
+    `BudgetGuard`'s constructor-parameter `costEngine`/`now`/`auditLog` were ALSO still TypeScript-`private`-only
+    in the exact same constructor `#limits` was just fixed in — `costEngine` gates every ceiling check and
+    spend/reservation record, `now` gates the daily/monthly ceiling window boundary, and `auditLog` is the sole
+    channel every `BUDGET_*` audit event reaches — all three converted to genuine `#costEngine`/`#now`/
+    `#auditLog` private fields, found and fixed proactively during that same audit, same as rounds 25/26's
+    precedent. Tested (932/932 tests, +46 net new) and verified per the full required sequence. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit instruction,
+    this round does not merge, does not move to P1, does not declare P0 complete, and does not invoke Codex
+    itself.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -4164,6 +4243,73 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 27). A fresh,
+  independent Codex review of the complete branch (forwarded by the
+  Founder) found TEN actionable findings (9 priority-P1, 1 priority-P2)
+  and required them fixed as ONE consolidated closure batch: (1) snapshot
+  risk before validating it in `policy-engine/policy-engine.ts`'s
+  `evaluate()` (a getter/Proxy-backed `action.risk` could answer
+  differently between the validation read and the snapshot read) — fixed
+  by building the detached `authoritativeAction` snapshot FIRST, then
+  validating THAT static copy; (2) detach registered policy rules in
+  `addRule()` (the caller's own mutable rule object was stored directly,
+  letting a post-registration mutation change evaluation order or a
+  rule's own decision logic) — fixed by storing `freezeRecord({ ...rule
+  })`; (3) make `capability-gateway/gateway.ts`'s `#policy`/`#approvals`
+  genuinely runtime-private (still TypeScript-`private`-only) — converted
+  to real ECMAScript private fields; (4) bind approval matching to the
+  SAME detached action `policy.evaluate()` already decided on, not a
+  second, re-readable caller-owned `action` object; (5) finalize approval
+  evidence only after the wrapped callback genuinely succeeds — added an
+  EXECUTING/EXECUTION_FAILED lifecycle (`beginExecution`/
+  `completeExecution`/`failExecution` in `policy-engine/approval.ts`) so a
+  thrown callback is recorded as a genuine, non-retryable failure instead
+  of a false EXECUTED; (6) make `budget/budget.ts`'s `#limits` genuinely
+  runtime-private (same class as finding 3, in the same file); (7)
+  snapshot spend entries in `budget.ts`'s `spend()`/`commit()` and
+  `cost/cost-engine.ts`'s `record()`/`commitReservation()` exactly ONCE
+  before validating/recording them, closing the same getter/Proxy TOCTOU
+  class as finding 1, just on spend amounts instead of risk; (8) make
+  reservation ids genuinely unforgeable by embedding a `randomBytes(16)`
+  suffix (sequential ids plus ordinary-predictable ownership-scope fields
+  offered no real proof of ownership); (9) make `sandbox/sandbox.ts`'s
+  `withTimeout()` ACTUALLY cancel the underlying operation on timeout
+  (the old `Promise.race()` only stopped the CALLER from waiting, never
+  the work itself) — redesigned around an `(signal: AbortSignal) =>
+  Promise<T>` factory contract, proven with a real spawned child process
+  whose delayed side effect is confirmed to never occur after timeout;
+  (10) provide a genuinely reachable approval path for a risk-5
+  `bootstrapProject()` in `project-lifecycle/orchestrator.ts` (the
+  internal `CapabilityGateway` used to be built with no approvals
+  argument at all, defaulting to a function-call-local, structurally
+  unreachable `ApprovalWorkflow()` — making risk-5 bootstrap
+  UNCONDITIONALLY impossible regardless of genuine Founder approval) —
+  fixed by threading optional `approvals`/`approvalId` fields through
+  `BootstrapProjectInput`, falling back to the old safe default when
+  omitted. All ten fixes carry deterministic regression tests and were
+  each verified via a temporary in-place bypass reproducing the exact
+  predicted failure (including finding 9's real child-process/marker-file
+  proof), then fully reverted. A targeted audit of exactly these ten root
+  classes found one further genuine instance directly in P0 code:
+  `BudgetGuard`'s constructor-parameter `costEngine`/`now`/`auditLog`
+  were ALSO still TypeScript-`private`-only in the exact same constructor
+  `#limits` was just fixed in — all three converted to genuine
+  `#costEngine`/`#now`/`#auditLog` private fields, with matching
+  regression tests, found and fixed proactively during that same audit.
+  Full required sequence re-run clean: lint, typecheck, build, 932/932
+  tests (+46 net new), validate:requirements, history-aware secret-scan,
+  all 9 P0 proofs, the production-install proof
+  (`npm run verify:production-install`), and Factory Doctor. Requirement
+  registry updated (UASF-REQ-0018, UASF-REQ-0019, UASF-REQ-0020,
+  UASF-REQ-0030, UASF-REQ-0033) from this real evidence only. Do not
+  proceed to further P0 feature work, merge, move to P1, or declare P0
+  complete until an independent (Codex) re-review of this diff confirms
+  no blocking P0 finding remains — per explicit Founder instruction, this
+  session does not invoke Codex itself. If/when that comes back clean,
+  resume from the prior exact_next_action below.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 26). A fresh,
   independent Codex review of the complete branch (forwarded by the
   Founder) found SEVEN actionable findings (4 priority-P1, 3 priority-P2)

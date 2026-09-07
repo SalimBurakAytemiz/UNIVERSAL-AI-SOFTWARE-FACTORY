@@ -2,6 +2,7 @@
 // çağrısının maliyeti izlenir. "Sessiz harcama yok" ilkesi (bölüm 147)
 // burada başlar — bir tutar bu motora kaydedilmeden harcanmış sayılmaz.
 
+import { randomBytes } from "node:crypto";
 import { freezeRecord } from "../util/immutable.js";
 
 export class InvalidMonetaryAmountError extends Error {
@@ -294,10 +295,22 @@ export class CostEngine {
   constructor(private readonly now: () => Date = () => new Date()) {}
 
   record(entry: Omit<CostEntry, "timestamp">): CostEntry {
+    // P1 fix (27th independent review round, finding 7, "snapshot spend
+    // entries before checking them" — same root class as
+    // runtime/budget/budget.ts's `spend()`/`commit()`): `entry.amountUsd`
+    // used to be read HERE (for validation) and then read AGAIN one line
+    // below via the `{ ...entry, timestamp }` spread — two separate reads
+    // of a caller-owned object that, if getter/Proxy-backed, need not
+    // agree. A validated-small/valid amount could differ from the amount
+    // that actually ends up durably recorded. Fixed: `entry` is spread
+    // into `snapshot` FIRST — a genuine, static plain object — reading
+    // every property exactly once; validation and the recorded `full`
+    // entry both derive from this SAME snapshot.
+    const snapshot: Omit<CostEntry, "timestamp"> = { ...entry };
     // Doğrudan record() çağrıları da (BudgetGuard'ı atlayan çağrılar dahil)
     // korunur — bozuk bir tutarın toplamlara sızmasına asla izin verilmez.
-    assertValidMonetaryAmount(entry.amountUsd, `CostEngine.record(taskId=${entry.taskId})`);
-    const full: CostEntry = { ...entry, timestamp: this.now().toISOString() };
+    assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.record(taskId=${snapshot.taskId})`);
+    const full: CostEntry = { ...snapshot, timestamp: this.now().toISOString() };
     // İç diziye eklenen nesne İLE dışarı döndürülen nesne KASITLI OLARAK
     // aynı referans DEĞİLDİR: çağıran döndürülen kaydı (ör. amountUsd'yi
     // NaN'a) mutasyona uğratsa bile, iç toplamlar (total/totalFor/
@@ -344,10 +357,40 @@ export class CostEngine {
    * `reserve()` çağrısının ASLA iç içe geçmemesini garanti eder. Doğrudan
    * (BudgetGuard atlanarak) çağrılsa bile tutar doğrulanır — `record()`
    * ile AYNI felsefe: bozuk bir tutarın hiçbir yoldan sızmaması.
+   *
+   * P1 fix (27th independent review round, finding 8, "require unforgeable
+   * reservation ownership"): the reservation id used to be a purely
+   * SEQUENTIAL, predictable string (`res-1`, `res-2`, ...) — Codex pointed
+   * out that neither the id NOR the `ReservationOwnership` scope fields
+   * (`taskId`/`projectId`/`agentId`/`provider`/`modelId`) are secrets: they
+   * are ordinary, often business-predictable identifiers, so an unrelated
+   * caller who could guess or already legitimately knows a project's task
+   * naming scheme could, in principle, ALSO guess a sequential reservation
+   * id and present a matching scope to `commitReservation()`/
+   * `releaseReservation()` — the existing ownership-scope check (24th/25th
+   * rounds) compares two things neither of which is actually secret. Fixed
+   * by making the id ITSELF the unguessable capability/handle the finding
+   * asks for: it now embeds a genuine `randomBytes(16)` (128 bits) suffix
+   * — astronomically infeasible to guess or enumerate — in addition to the
+   * existing monotonic counter (kept purely for human-readable ordering in
+   * logs, never itself load-bearing for security). `commitReservation()`/
+   * `releaseReservation()` already require the caller to present the exact
+   * id string (there is no `list()`/enumeration method exposed anywhere on
+   * `CostEngine` — bkz. bu sınıfın diğer metodları — so an id can only ever
+   * be OBTAINED from `reserve()`'s own return value, or from legitimate
+   * `AuditLog` access), so "knows the unguessable id" now stands ALONGSIDE
+   * "supplies the matching scope" as a second, genuinely unforgeable
+   * factor — an unrelated caller who merely guesses/knows the human-
+   * meaningful scope fields still cannot operate a reservation without
+   * ALSO knowing its cryptographically random id. `getReservation()`
+   * already never lets a caller who has the id fish out the `scope`
+   * needed to pass the OTHER check (26th round) — combined, no public API
+   * on this class ever hands out reusable authorization material for a
+   * reservation the caller was not already given.
    */
   createReservation(scope: ReservationOwnership, amountUsd: number): LedgerReservation {
     assertValidMonetaryAmount(amountUsd, "CostEngine.createReservation");
-    const id = `res-${++this.#reservationSeq}`;
+    const id = `res-${++this.#reservationSeq}-${randomBytes(16).toString("hex")}`;
     const frozenScope = freezeRecord({ ...scope });
     this.#reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
     return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
@@ -444,12 +487,24 @@ export class CostEngine {
     if (!reservation) {
       throw new UnknownReservationError(id);
     }
-    if (ownershipMismatches(reservation.scope, entry)) {
+    // P1 fix (27th independent review round, finding 7, "snapshot spend
+    // entries before checking them" — same root class as `record()`
+    // above and `runtime/budget/budget.ts`'s `spend()`/`commit()`):
+    // `entry` used to be read separately by `ownershipMismatches()`, then
+    // AGAIN by `assertValidMonetaryAmount(entry.amountUsd, ...)`, then
+    // AGAIN inside `record()`'s own spread — three separate reads of a
+    // caller-owned object. A getter/Proxy-backed `entry` could pass the
+    // ownership check with one identity, then have its `amountUsd` (or
+    // even its identity, for the record ultimately kept) answer
+    // differently by the time anything is actually recorded. `snapshot`
+    // is a genuine, static copy — read once, used everywhere below.
+    const snapshot: Omit<CostEntry, "timestamp"> = { ...entry };
+    if (ownershipMismatches(reservation.scope, snapshot)) {
       reservation.status = "RECONCILIATION_FAILED";
-      throw new ReservationOwnershipMismatchError("commit", id, reservation.scope, entry);
+      throw new ReservationOwnershipMismatchError("commit", id, reservation.scope, snapshot);
     }
     try {
-      assertValidMonetaryAmount(entry.amountUsd, `CostEngine.commitReservation(id=${id})`);
+      assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.commitReservation(id=${id})`);
     } catch (err) {
       // Doğrulama BAŞARISIZ olursa rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED"
       // olarak işaretlenip KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard)
@@ -457,7 +512,7 @@ export class CostEngine {
       reservation.status = "RECONCILIATION_FAILED";
       throw err;
     }
-    const recorded = this.record(entry);
+    const recorded = this.record(snapshot);
     this.#reservations.delete(id);
     return recorded;
   }

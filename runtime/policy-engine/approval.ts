@@ -35,7 +35,23 @@ import type { PolicyAction } from "./policy-engine.js";
  * from REJECTED at both the type and audit-event level — see
  * `requestChanges()` below.
  */
-export type ApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "REQUEST_CHANGES" | "EXECUTED";
+/**
+ * P1 fix (27th independent review round, finding 5, "finalize approval
+ * only after successful execution"): `EXECUTING` and `EXECUTION_FAILED`
+ * are new, added for the split beginExecution()/completeExecution()/
+ * failExecution() lifecycle below — see its fix note for the full
+ * rationale. `EXECUTING` is a genuine intermediate, non-terminal state (a
+ * request in flight); `EXECUTION_FAILED` is terminal for this approval id,
+ * the same way `EXECUTED`/`REJECTED`/`REQUEST_CHANGES` already are.
+ */
+export type ApprovalStatus =
+  | "PENDING"
+  | "APPROVED"
+  | "REJECTED"
+  | "REQUEST_CHANGES"
+  | "EXECUTING"
+  | "EXECUTED"
+  | "EXECUTION_FAILED";
 
 interface MutableApprovalRequest {
   id: string;
@@ -48,6 +64,8 @@ interface MutableApprovalRequest {
   evidenceRef?: string;
   /** Only ever set by requestChanges() — the reviewer's evidence for WHAT must change, distinct from a REJECT's finality. */
   changeRequestReason?: string;
+  /** Only ever set by failExecution() — why the actual work failed after a genuine APPROVED claim was made. */
+  failureReason?: string;
   /**
    * P1 fix (25th independent review round, "approval must be bound to
    * complete action identity"): only ever set by `requestFor()` (below) —
@@ -268,22 +286,103 @@ export class ApprovalWorkflow {
   }
 
   /**
-   * Yürütmeye izin verir — yalnızca İÇ yetkili kaydın durumu APPROVED ise.
-   * Çağıranın elinde tuttuğu (ve artık asla mutasyona uğratılamayan) bir
-   * kopya değil, HER ZAMAN bu sınıfın kendi Map'indeki gerçek durum
-   * kontrol edilir; aksi halde ApprovalRequiredError fırlatır. Hiçbir kod
-   * yolu bunu atlayamaz.
+   * P1 fix (27th independent review round, finding 5, "finalize approval
+   * only after successful execution"): the previous single `execute()`
+   * method transitioned APPROVED -> EXECUTED UNCONDITIONALLY, and
+   * `CapabilityGateway.authorize()` (bkz. capability-gateway/gateway.ts)
+   * called it BEFORE running the actual risky callback — so if that
+   * callback threw (the provider call failed, the deployment errored,
+   * whatever the approved action actually was), the approval record
+   * already, PERMANENTLY claimed `EXECUTED` even though the real work
+   * never succeeded. That evidence is now simply FALSE — "no claim
+   * without evidence" (bölüm 303) cuts both ways: a record must not claim
+   * success that never happened, any more than it may omit a real one.
+   * Fixed with a three-step lifecycle, split across three methods:
+   *
+   * 1. `beginExecution(id)` — APPROVED -> EXECUTING. This is the SAME
+   *    atomic, single-synchronous-tick CLAIM the old `execute()` provided
+   *    (still the one moment that blocks a concurrent replay: a second
+   *    caller presenting the same `approvalId` while the first is
+   *    in-flight sees status `EXECUTING`, not `APPROVED`, so
+   *    `CapabilityGateway`'s `isBoundToExactAction()` match fails and it
+   *    throws `ApprovalEvidenceMismatchError` instead of ALSO proceeding —
+   *    identical replay protection, just no longer conflated with "the
+   *    work already succeeded").
+   * 2. `completeExecution(id)` — EXECUTING -> EXECUTED. Called ONLY after
+   *    the real work genuinely completes successfully.
+   * 3. `failExecution(id, reason?)` — EXECUTING -> EXECUTION_FAILED
+   *    (terminal for this id, an explicit, honest failure record, never
+   *    reusable to try again under the SAME id). Called from the caller's
+   *    catch block.
+   *
+   * Valid retry semantics: `EXECUTION_FAILED` is terminal, exactly the
+   * same way `EXECUTED`/`REJECTED`/`REQUEST_CHANGES` already are in this
+   * state machine — consistent with this codebase's established
+   * philosophy that approval/decision/technology-lifecycle ids are
+   * permanent and never resurrected once they reach a terminal state
+   * (`DuplicateApprovalIdError`, decision-ledger's no-un-superseding,
+   * technology-registry's no-un-forbidding). A genuine retry after a
+   * failure means requesting a brand-new approval (`requestFor()` with a
+   * fresh id) and obtaining a fresh reviewer decision — never resuming a
+   * half-failed one under its original id, which would reopen exactly the
+   * kind of ambiguous "is this still valid?" state this fix exists to
+   * close.
    */
-  execute(id: string): ApprovalRequest {
+  beginExecution(id: string): ApprovalRequest {
     const req = this.mustGet(id);
     if (req.status !== "APPROVED") {
       throw new ApprovalRequiredError(
-        `Action ${id} cannot execute: status is ${req.status}, requires APPROVED`
+        `Action ${id} cannot begin execution: status is ${req.status}, requires APPROVED`
+      );
+    }
+    req.status = "EXECUTING";
+    this.audit("APPROVAL_EXECUTION_STARTED", req);
+    return freezeRecord(req);
+  }
+
+  /** EXECUTING -> EXECUTED. Call ONLY after the real work this approval authorized has genuinely succeeded. */
+  completeExecution(id: string): ApprovalRequest {
+    const req = this.mustGet(id);
+    if (req.status !== "EXECUTING") {
+      throw new ApprovalRequiredError(
+        `Action ${id} cannot complete execution: status is ${req.status}, requires EXECUTING`
       );
     }
     req.status = "EXECUTED";
     this.audit("APPROVAL_EXECUTED", req);
     return freezeRecord(req);
+  }
+
+  /** EXECUTING -> EXECUTION_FAILED (terminal for this id — bkz. üstteki fix notu, "valid retry semantics"). */
+  failExecution(id: string, reason?: string): ApprovalRequest {
+    const req = this.mustGet(id);
+    if (req.status !== "EXECUTING") {
+      throw new ApprovalRequiredError(
+        `Action ${id} cannot fail execution: status is ${req.status}, requires EXECUTING`
+      );
+    }
+    req.status = "EXECUTION_FAILED";
+    req.failureReason = reason;
+    this.audit("APPROVAL_EXECUTION_FAILED", req);
+    return freezeRecord(req);
+  }
+
+  /**
+   * Convenience wrapper preserving the ORIGINAL one-shot `execute()`
+   * contract (APPROVED -> EXECUTED, throwing `ApprovalRequiredError` for
+   * any other status) for callers that perform no risky, failure-prone
+   * work of their own between claiming and finishing — e.g. tests
+   * asserting the underlying state-machine gating itself. Any REAL,
+   * failure-prone execution (the actual production path,
+   * `CapabilityGateway.authorize()`) MUST use `beginExecution()` /
+   * `completeExecution()` / `failExecution()` directly, wrapped around the
+   * real work, so a thrown error is captured as `EXECUTION_FAILED` rather
+   * than being reported as this convenience method's own uncaught
+   * exception while secretly having already claimed `EXECUTED`.
+   */
+  execute(id: string): ApprovalRequest {
+    this.beginExecution(id);
+    return this.completeExecution(id);
   }
 
   get(id: string): ApprovalRequest | undefined {
@@ -316,7 +415,8 @@ export class ApprovalWorkflow {
         status: req.status,
         decidedBy: req.decidedBy,
         evidenceRef: req.evidenceRef,
-        changeRequestReason: req.changeRequestReason
+        changeRequestReason: req.changeRequestReason,
+        failureReason: req.failureReason
       },
       timestamp: new Date().toISOString()
     });

@@ -1630,4 +1630,214 @@ describe("BudgetGuard", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (27th independent review round, finding 6, 'keep budget limits runtime-private'): the internal " +
+      "limits field now uses a genuine ECMAScript #private field, not TypeScript's compile-time-only `private`",
+    () => {
+      it("the internal limits field is not reachable as an ordinary JS property", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 1 });
+        expect((guard as unknown as Record<string, unknown>).limits).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private limits field", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 1 });
+        expect(Object.getOwnPropertyNames(guard)).not.toContain("limits");
+        expect(Reflect.ownKeys(guard).map(String)).not.toContain("limits");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot replace the configured ceilings via property access", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 1 });
+
+        (guard as unknown as Record<string, unknown>).limits = { perTaskUsd: Number.MAX_VALUE };
+        const spread: Record<string, unknown> = { ...guard };
+        expect(spread.limits).toEqual({ perTaskUsd: Number.MAX_VALUE }); // an inert stray property, nothing more
+
+        // The guard still enforces its ORIGINAL, genuine $1 ceiling.
+        expect(() => guard.reserve({ taskId: "t" }, 2)).toThrow(BudgetExceededError);
+        expect(guard.getLimits()).toEqual({ perTaskUsd: 1 });
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (27th independent review round targeted-audit follow-up, same root class as finding 6): " +
+      "costEngine/now/auditLog are also genuine ECMAScript #private fields, not TypeScript's compile-time-only " +
+      "`private readonly` constructor-parameter properties they used to be",
+    () => {
+      it("none of costEngine/now/auditLog are reachable as an ordinary JS property", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 1 });
+        const asRecord = guard as unknown as Record<string, unknown>;
+        expect(asRecord.costEngine).toBeUndefined();
+        expect(asRecord.now).toBeUndefined();
+        expect(asRecord.auditLog).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes any of them", () => {
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 1 });
+        const ownProps = Object.getOwnPropertyNames(guard);
+        const reflectKeys = Reflect.ownKeys(guard).map(String);
+        for (const name of ["costEngine", "now", "auditLog"]) {
+          expect(ownProps).not.toContain(name);
+          expect(reflectKeys).not.toContain(name);
+        }
+      });
+
+      it("REGRESSION: a plain JS consumer cannot redirect ceiling checks/spend recording by replacing costEngine", () => {
+        const realCostEngine = new CostEngine();
+        const guard = new BudgetGuard(realCostEngine, { perTaskUsd: 1 });
+
+        const forgedCostEngine = new CostEngine();
+        (guard as unknown as Record<string, unknown>).costEngine = forgedCostEngine;
+        const spread: Record<string, unknown> = { ...guard };
+        expect(spread.costEngine).toBe(forgedCostEngine); // an inert stray property, nothing more
+
+        // The guard still enforces its ORIGINAL $1 ceiling against the
+        // REAL cost engine — a forged property assignment cannot make
+        // spend() check/record against a different, attacker-controlled
+        // ledger with always-zero totals.
+        const recorded = guard.spend({ taskId: "t", provider: "mock", modelId: "m1", amountUsd: 0.5 });
+        expect(realCostEngine.total()).toBe(0.5);
+        expect(forgedCostEngine.total()).toBe(0); // the forged engine never saw this spend
+        expect(recorded.amountUsd).toBe(0.5);
+        expect(() => guard.spend({ taskId: "t", provider: "mock", modelId: "m1", amountUsd: 1 })).toThrow(BudgetExceededError);
+      });
+
+      it("REGRESSION: a plain JS consumer cannot defeat periodic (dailyUsd) ceilings by replacing the clock", () => {
+        let fixedNow = new Date("2024-01-15T12:00:00.000Z");
+        const guard = new BudgetGuard(new CostEngine(), { dailyUsd: 1 }, () => fixedNow);
+
+        guard.spend({ taskId: "t", provider: "mock", modelId: "m1", amountUsd: 0.9 });
+
+        // Forge a `now` that always reports a moment far in the future —
+        // if this reached the real window computation, every subsequent
+        // spend would look like it starts a brand-new, empty day.
+        (guard as unknown as Record<string, unknown>).now = () => new Date("2099-01-01T00:00:00.000Z");
+        const spread: Record<string, unknown> = { ...guard };
+        expect(typeof spread.now).toBe("function"); // an inert stray property, nothing more
+
+        // The guard still enforces the ORIGINAL $1 daily ceiling against
+        // the SAME UTC calendar day the forged clock was never consulted
+        // for.
+        expect(() => guard.spend({ taskId: "t", provider: "mock", modelId: "m1", amountUsd: 0.2 })).toThrow(BudgetExceededError);
+      });
+
+      it("REGRESSION: a plain JS consumer cannot silently suppress the audit trail by replacing auditLog", async () => {
+        const { AuditLog } = await import("../../audit/audit-log.js");
+        const realAuditLog = new AuditLog();
+        const guard = new BudgetGuard(new CostEngine(), { perTaskUsd: 1 }, undefined, realAuditLog);
+
+        const forgedAuditLog = { append: () => {} };
+        (guard as unknown as Record<string, unknown>).auditLog = forgedAuditLog;
+        const spread: Record<string, unknown> = { ...guard };
+        expect(spread.auditLog).toBe(forgedAuditLog); // an inert stray property, nothing more
+
+        guard.spend({ taskId: "t", provider: "mock", modelId: "m1", amountUsd: 0.5 });
+
+        // The real audit log genuinely recorded the event; the forged
+        // stand-in was never called by this class's internals.
+        expect(realAuditLog.all().some((r) => r.type === "BUDGET_CHECK_PASSED")).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (27th independent review round, finding 7, 'snapshot spend entries before checking them'): the " +
+      "complete spend entry is captured exactly once, before validation, so a getter/Proxy-backed entry cannot " +
+      "answer differently for the ceiling check than for what actually gets recorded",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction (spend()): an amount getter answering differently on a " +
+          "second read cannot desynchronize the checked amount from the recorded amount",
+        () => {
+          const costEngine = new CostEngine();
+          const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+          let reads = 0;
+          const entry = {
+            taskId: "t",
+            provider: "mock",
+            modelId: "m1",
+            get amountUsd() {
+              reads += 1;
+              // If spend() ever re-read amountUsd after the ceiling check,
+              // this would let a ceiling-compliant check record a WILDLY
+              // different (over-ceiling) actual cost.
+              return reads === 1 ? 0.5 : 999;
+            }
+          };
+
+          const recorded = guard.spend(entry as unknown as { taskId: string; provider: string; modelId: string; amountUsd: number });
+
+          expect(reads).toBe(1); // the getter is consulted exactly once, ever
+          expect(recorded.amountUsd).toBe(0.5); // the SAME value that was checked
+          expect(costEngine.total()).toBe(0.5);
+        }
+      );
+
+      it(
+        "BLOCKER regression, exact reproduction (commit()): an amount getter answering differently across " +
+          "commitReservation()'s internal checks cannot desynchronize the reserved-ownership/amount checks " +
+          "from the recorded amount",
+        () => {
+          const costEngine = new CostEngine();
+          const guard = new BudgetGuard(costEngine, { perTaskUsd: 10 });
+          const reservation = guard.reserve({ taskId: "t" }, 1);
+
+          let reads = 0;
+          const entry = {
+            taskId: "t",
+            provider: "mock",
+            modelId: "m1",
+            get amountUsd() {
+              reads += 1;
+              return reads === 1 ? 1 : -999; // valid on first read, invalid thereafter
+            }
+          };
+
+          const recorded = guard.commit(
+            reservation.id,
+            entry as unknown as { taskId: string; provider: string; modelId: string; amountUsd: number }
+          );
+
+          expect(reads).toBe(1);
+          expect(recorded.amountUsd).toBe(1);
+          expect(costEngine.total()).toBe(1);
+        }
+      );
+
+      it("a Proxy-wrapped spend entry cannot answer any field differently across the check-then-record boundary", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 });
+        const reads: Record<string, number> = {};
+        const target = { taskId: "t", provider: "mock", modelId: "m1", amountUsd: 0.5 };
+        const proxied = new Proxy(target, {
+          get(t, prop, receiver) {
+            reads[String(prop)] = (reads[String(prop)] ?? 0) + 1;
+            return Reflect.get(t, prop, receiver);
+          }
+        });
+
+        const recorded = guard.spend(proxied as unknown as { taskId: string; provider: string; modelId: string; amountUsd: number });
+
+        // Every field of the caller's object is read AT MOST once — the
+        // single object-spread snapshot — never again afterward.
+        for (const count of Object.values(reads)) {
+          expect(count).toBe(1);
+        }
+        expect(recorded.amountUsd).toBe(0.5);
+      });
+
+      it("mutating the caller's original entry object AFTER spend()/commit() returns never affects the recorded cost", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 5 });
+        const entry = { taskId: "t", provider: "mock", modelId: "m1", amountUsd: 0.5 };
+
+        const recorded = guard.spend(entry);
+        entry.amountUsd = 999;
+
+        expect(recorded.amountUsd).toBe(0.5);
+        expect(costEngine.total()).toBe(0.5);
+      });
+    }
+  );
 });

@@ -5,7 +5,8 @@ import { basename, join } from "node:path";
 import { bootstrapProject, PreflightTraceabilityFailedError, type BootstrapProjectInput } from "../orchestrator.js";
 import { scaffoldProjectOs } from "../../project-os/scaffold.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
-import { CapabilityDeniedError } from "../../capability-gateway/gateway.js";
+import { CapabilityDeniedError, CapabilityApprovalRequiredError, ApprovalEvidenceMismatchError } from "../../capability-gateway/gateway.js";
+import { ApprovalWorkflow } from "../../policy-engine/approval.js";
 import { createDefaultModelRegistry, ModelRegistry } from "../../models/registry.js";
 import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
 import { FileStateStore, type StateStore } from "../../state/file-store.js";
@@ -1358,6 +1359,264 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         expect(invokeCount()).toBe(1);
         expect(existsSync(join(tempRoot, "proj-scaffold-allow"))).toBe(true);
         expect(result.scaffold.projectRoot).toContain("proj-scaffold-allow");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (27th independent review round, finding 10, 'provide a real approval path for risk-5 bootstrap')",
+    () => {
+      function spyProvider(id: string): { provider: ModelProvider; invokeCount: () => number } {
+        let calls = 0;
+        const provider: ModelProvider = {
+          id,
+          async invoke(model): Promise<ModelInvocationResponse> {
+            calls += 1;
+            return { provider: id, modelId: model.modelId, costUsd: model.costPerCall, output: "should never run" };
+          }
+        };
+        return { provider, invokeCount: () => calls };
+      }
+
+      it("BLOCKER regression: a risk-5 bootstrap with a genuine, exact-identity-matching APPROVED request succeeds exactly once", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-approved-"));
+        const policy = new PolicyEngine();
+        policy.addRule({ name: "allow-model-invoke", priority: 10, evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null) });
+
+        const { provider, invokeCount } = spyProvider("mock");
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+
+        const projectId = "proj-risk5-approved";
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-risk5-1";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId
+        });
+        approvals.approve(approvalId, "founder@example.com");
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome(projectId),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway,
+          costEngine,
+          risk: 5,
+          approvals,
+          approvalId
+        });
+
+        expect(invokeCount()).toBe(1);
+        expect(existsSync(join(tempRoot, projectId))).toBe(true);
+        expect(result.scaffold.projectRoot).toContain(projectId);
+        // Approval evidence is genuinely consumed exactly once — status is
+        // now EXECUTED, not merely APPROVED (bkz. round 27 finding 5's
+        // beginExecution()/completeExecution() lifecycle).
+        expect(approvals.get(approvalId)?.status).toBe("EXECUTED");
+
+        // A second bootstrap attempt reusing the SAME (now-EXECUTED)
+        // approval id must NOT be able to authorize another scaffold —
+        // replay protection holds across the orchestrator boundary too.
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            costEngine,
+            risk: 5,
+            approvals,
+            approvalId
+          })
+        ).rejects.toThrow();
+      });
+
+      it("a PENDING (not yet decided) approval id still blocks the bootstrap", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-pending-"));
+        const policy = new PolicyEngine();
+        const { provider, invokeCount } = spyProvider("mock");
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(provider);
+
+        const projectId = "proj-risk5-pending";
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-risk5-pending";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId
+        });
+        // deliberately never approved
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            risk: 5,
+            approvals,
+            approvalId
+          })
+        ).rejects.toThrow();
+
+        expect(invokeCount()).toBe(0);
+        expect(existsSync(join(tempRoot, projectId))).toBe(false);
+      });
+
+      it("a REJECTED approval still blocks the bootstrap", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-rejected-"));
+        const policy = new PolicyEngine();
+        const projectId = "proj-risk5-rejected";
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-risk5-rejected";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId
+        });
+        approvals.reject(approvalId, "founder@example.com");
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            risk: 5,
+            approvals,
+            approvalId
+          })
+        ).rejects.toThrow();
+
+        expect(existsSync(join(tempRoot, projectId))).toBe(false);
+      });
+
+      it("a REQUEST_CHANGES approval still blocks the bootstrap", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-changes-"));
+        const policy = new PolicyEngine();
+        const projectId = "proj-risk5-changes";
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-risk5-changes";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId
+        });
+        approvals.requestChanges(approvalId, "founder@example.com", "need a smaller blast radius first");
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            risk: 5,
+            approvals,
+            approvalId
+          })
+        ).rejects.toThrow();
+
+        expect(existsSync(join(tempRoot, projectId))).toBe(false);
+      });
+
+      it("omitting approvals/approvalId still unconditionally blocks a risk-5 bootstrap (default-deny preserved — this is the OLD safe behavior, not a regression)", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-no-approvals-"));
+        const policy = new PolicyEngine();
+        const projectId = "proj-risk5-no-approvals";
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            risk: 5
+          })
+        ).rejects.toThrow(CapabilityApprovalRequiredError);
+
+        expect(existsSync(join(tempRoot, projectId))).toBe(false);
+      });
+
+      it("a caller-forged, LOCAL ApprovalWorkflow (never wired into BootstrapProjectInput.approvals) cannot smuggle approval — the exact failure mode this finding fixes", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-forged-workflow-"));
+        const policy = new PolicyEngine();
+        const projectId = "proj-risk5-forged";
+
+        // A caller creates their OWN local workflow, approves a matching
+        // request on it, but never passes it as `approvals` — simulating
+        // an attempt to reuse pre-27th-round call sites that had no way to
+        // wire in a real approval store. This must still fail: the
+        // orchestrator's internal gateway must use ITS OWN (here: the
+        // default, empty) approval store, never one merely constructed
+        // and approved by the caller off to the side. Because an
+        // `approvalId` IS supplied, the gateway looks it up in its own
+        // (empty) store and finds no such request — a genuine
+        // `ApprovalEvidenceMismatchError`, not the "no reference supplied
+        // at all" `CapabilityApprovalRequiredError` — but the bootstrap is
+        // blocked either way, which is the only thing that matters here.
+        const forgedApprovals = new ApprovalWorkflow();
+        const forgedId = "forged-approval";
+        forgedApprovals.requestFor(forgedId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId
+        });
+        forgedApprovals.approve(forgedId, "attacker@example.com");
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            risk: 5,
+            approvalId: forgedId
+            // note: `approvals: forgedApprovals` deliberately NOT passed
+          })
+        ).rejects.toThrow(ApprovalEvidenceMismatchError);
+
+        expect(existsSync(join(tempRoot, projectId))).toBe(false);
+      });
+
+      it("an approval whose recorded identity does not exactly match the scaffold action (wrong projectId) cannot authorize a different project's bootstrap", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-mismatch-"));
+        const policy = new PolicyEngine();
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-for-other-project";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: "Scaffold Project OS for 'some-other-project'",
+          projectId: "some-other-project"
+        });
+        approvals.approve(approvalId, "founder@example.com");
+
+        const projectId = "proj-risk5-mismatched-target";
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            risk: 5,
+            approvals,
+            approvalId
+          })
+        ).rejects.toThrow();
+
+        expect(existsSync(join(tempRoot, projectId))).toBe(false);
       });
     }
   );

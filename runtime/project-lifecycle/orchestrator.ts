@@ -25,7 +25,8 @@ import { join } from "node:path";
 import { parseProjectGenome, type ProjectGenome } from "../project-genome/genome.js";
 import { composeOrganizationFromGenome, type OrganizationComposition } from "../organization-composer/composer.js";
 import { scaffoldProjectOs, type ScaffoldResult } from "../project-os/scaffold.js";
-import { CapabilityGateway } from "../capability-gateway/gateway.js";
+import { CapabilityGateway, type ApprovalReference } from "../capability-gateway/gateway.js";
+import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
 import type { ModelRegistry } from "../models/registry.js";
@@ -87,6 +88,42 @@ export interface BootstrapProjectInput {
   readonly risk?: RiskLevel;
   /** Factory'nin kendi gereksinim kayıt defterindeki izlenebilirlik sorunları (varsa) — boş olmayan bir liste bootstrap'i durdurur. */
   readonly preflightTraceabilityIssues?: readonly TraceabilityIssue[];
+  /**
+   * P1 fix (27th independent review round, finding 10, "provide a real
+   * approval path for risk-5 bootstrap"): the `CapabilityGateway` this
+   * function builds internally used to be constructed with NO approvals
+   * argument at all (`new CapabilityGateway(policy)`), which defaults to a
+   * brand-new, empty `ApprovalWorkflow()` — a store LOCAL to this single
+   * function call that no caller anywhere could ever reach to record a
+   * genuine reviewer decision in. A risk-5 (or any APPROVAL_REQUIRED)
+   * scaffold was therefore UNCONDITIONALLY impossible to bootstrap,
+   * regardless of whether a real Founder had genuinely approved it —
+   * there was structurally no path for approval evidence to reach this
+   * function at all, the exact opposite failure mode from "approval can
+   * be forged" (round 25's finding 1 for `CapabilityGateway` itself), but
+   * just as much a defect: a real capability the baseline requires
+   * (approved risky actions may proceed) was simply unreachable here.
+   * `approvals`, where supplied, is the CALLER's own authoritative
+   * `ApprovalWorkflow` — the SAME organization-wide store a reviewer
+   * would have called `requestFor()`/`approve()` on BEFORE ever invoking
+   * `bootstrapProject()` — wired into the internal `CapabilityGateway`
+   * at construction time (the same trusted-at-wiring-time pattern
+   * `CapabilityGateway`'s own constructor already establishes). Omitted,
+   * this function falls back to the OLD, safe default: a fresh, empty
+   * workflow that can never authorize anything above ALLOW — default
+   * deny is preserved for any caller that does not explicitly wire in a
+   * real approval store.
+   */
+  readonly approvals?: ApprovalWorkflow;
+  /**
+   * The id of an existing, `APPROVED` request in `approvals` that covers
+   * this EXACT scaffold action (bkz. `CapabilityGateway.authorize()`'s
+   * `isBoundToExactAction()` — actionType/description/risk/projectId must
+   * all match what `approvals.requestFor()` recorded). Required for a
+   * risk-5 scaffold to ever proceed; ignored (harmlessly) for a lower-risk
+   * action that policy already ALLOWs outright.
+   */
+  readonly approvalId?: string;
 }
 
 export interface BootstrapProjectResult {
@@ -159,7 +196,9 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     budgetLimits,
     costEngine: callerCostEngine,
     stateStore: callerStateStore,
-    modelGateway: callerModelGateway
+    modelGateway: callerModelGateway,
+    approvals: callerApprovals,
+    approvalId
   } = input;
   const risk = input.risk ?? 1;
   const budgetGuardLimits: BudgetLimits = budgetLimits ? freezeRecord({ ...budgetLimits }) : {};
@@ -271,12 +310,23 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // call in this whole function, so a stateful rule's answer cannot
   // possibly differ between "may I start" and "may I actually mutate the
   // filesystem": they are the SAME decision, checked once.
-  const gateway = new CapabilityGateway(policy);
+  // P1 fix (27th independent review round, finding 10, "provide a real
+  // approval path for risk-5 bootstrap"): `callerApprovals`, where
+  // supplied, is the CALLER's own authoritative `ApprovalWorkflow` (bkz.
+  // `BootstrapProjectInput.approvals`'ın üstündeki fix notu) — wired into
+  // this gateway at construction, exactly the trusted-at-wiring-time
+  // pattern `CapabilityGateway`'s own constructor already requires.
+  // Omitted, `new ApprovalWorkflow()` (the existing default parameter)
+  // preserves the prior, safe default: an empty store that can never
+  // authorize anything above ALLOW.
+  const gateway = new CapabilityGateway(policy, callerApprovals ?? new ApprovalWorkflow());
   const scaffoldAction = {
     actionType: "project.scaffold",
     risk,
-    description: `Scaffold Project OS for '${genome.project.id}'`
+    description: `Scaffold Project OS for '${genome.project.id}'`,
+    projectId: genome.project.id
   };
+  const approvalReference: ApprovalReference | undefined = approvalId !== undefined ? { approvalId } : undefined;
 
   const router = new CheapestCapableModelRouter(modelRegistry);
   const modelDecision = router.selectModel({
@@ -310,7 +360,7 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
       }
     );
     return scaffoldProjectOs(baseDir, genome.project.id);
-  });
+  }, approvalReference);
 
   // P1 fix (5th independent review round, "final-destination / dangling
   // symlink escape"): eskiden bu dosya yolları düz `join()` ile

@@ -1076,6 +1076,27 @@
     `private rules`) — confirmed exactly the 3 predicted tests failed, then reverted and re-confirmed all tests
     passing.
 
+    P1 fix (27th independent review round, findings 1-2, consolidated closure batch): (1) "snapshot risk before
+    validating it" — `evaluate()` used to read `action.risk` for `assertValidRiskLevel()`, THEN build the
+    detached `authoritativeAction` snapshot afterward — two separate reads of a caller-owned object that, if
+    getter/Proxy-backed, need not agree; a getter answering `0` on the validation read and something else on
+    every subsequent read could pass validation while every rule actually evaluates a different, unvalidated
+    value. Fixed by reordering: `authoritativeAction` is now built FIRST (a single `{ ...action }` read), and
+    `assertValidRiskLevel(authoritativeAction.risk)` validates that SAME static snapshot — no rule, and no
+    later mutation/getter re-invocation, can ever see a value that differs from what was validated. (2) "detach
+    registered policy rules" — `addRule()` used to `push()` the caller's own mutable rule object directly;
+    mutating `rule.priority`/`rule.evaluate`/`rule.name` on the caller's own reference AFTER registration would
+    silently change evaluation order or replace a rule's entire decision logic, defeating "DENY always wins" (the
+    same class as this file's own round-26 `#rules`-privacy fix, just reachable by mutating the RULE OBJECT
+    itself rather than the array holding it). Fixed: `addRule()` now stores `freezeRecord({ ...rule })` — a
+    frozen, detached copy — so no post-registration mutation of the caller's original object reaches the engine's
+    internal state. New regression tests (7 total, across both findings) prove: a getter/Proxy-backed `risk` that
+    answers differently on a second read is consulted exactly once and the validated value is what every rule
+    evaluates; mutating a registered rule's `priority`/`evaluate`/`name` on the caller's own object afterward has
+    zero effect on evaluation order or outcome. Verified via a temporary bypass (reverting finding 1's ordering
+    and finding 2's snapshot-on-register) — confirmed the exact predicted tests failed in each case, then both
+    reverted and all tests re-confirmed passing.
+
 - id: UASF-REQ-0019
   title: Capability gateway (foundation)
   description: Enforcement point routing actions through the policy engine before execution.
@@ -1141,6 +1162,54 @@
     reverted: finding 2's weakened binding check (4 predicted failures), finding 3's removed consumption call (3
     predicted failures, including a genuine `Promise.allSettled` concurrency race), and finding 7's reintroduced
     two-call pattern (the exact `CapabilityDeniedError` reproduction).
+
+    P1 fix (27th independent review round, findings 3-5 and 10, consolidated closure batch): (3) "make gateway
+    dependencies runtime-private" — `#policy`/`#approvals` used to be TypeScript constructor-parameter `private
+    readonly` fields, compile-time-only; `(gateway as any).policy = alwaysAllowStub` from any caller holding a
+    `CapabilityGateway` reference would silently replace the ENTIRE decision engine this class exists to enforce
+    through. Converted to genuine ECMAScript `#policy`/`#approvals` private fields, assigned once in the
+    constructor body. (4) "bind approval to the policy-evaluated action" — `authorize()` evaluated a detached
+    `authoritativeAction` snapshot for the policy decision, but then matched approval evidence by re-reading
+    `action` (the caller's original, still-mutable object) a second time; a getter/Proxy-backed `action` could
+    answer a low, ALLOW-eligible risk during policy evaluation and a different value during the approval match,
+    letting a genuinely mismatched approval slip through. Fixed: `isBoundToExactAction()` now compares the
+    approval evidence against `result.action` (the SAME detached snapshot `policy.evaluate()` already produced
+    and decided on) — never the caller's original object again. (5) "finalize approval only after successful
+    execution" — a matching APPROVED request was moved straight to EXECUTED via `approvals.execute()` BEFORE the
+    wrapped `execute()` callback ran; if that callback threw (a real, failure-prone async operation — a paid
+    model call, a filesystem mutation), the approval record falsely claimed successful execution had completed,
+    with no way to distinguish "genuinely executed" from "claimed then failed," and no valid retry path. Fixed
+    with a three-state lifecycle in `runtime/policy-engine/approval.ts` (bkz. UASF-REQ-0020's own round-27 note
+    below): `beginExecution()` (APPROVED -> EXECUTING, non-terminal) runs BEFORE the callback, then
+    `completeExecution()` (EXECUTING -> EXECUTED) on success or `failExecution()` (EXECUTING -> EXECUTION_FAILED,
+    terminal, with a recorded `failureReason`) on failure — `authorize()`'s callback is wrapped in try/catch to
+    route to whichever outcome actually occurred; the original error is always rethrown unchanged. (10) "provide a
+    real approval path for risk-5 bootstrap" — `runtime/project-lifecycle/orchestrator.ts`'s `bootstrapProject()`
+    used to construct its internal `CapabilityGateway` with NO approvals argument at all
+    (`new CapabilityGateway(policy)`), defaulting to a brand-new `ApprovalWorkflow()` LOCAL to that single function
+    call — structurally unreachable by any caller, so a risk-5 (or any APPROVAL_REQUIRED) scaffold was
+    UNCONDITIONALLY impossible to bootstrap regardless of genuine Founder approval — the exact opposite failure
+    mode from finding 1's "approval can be forged" (round 25), but just as much a defect. Fixed: `BootstrapProjectInput`
+    gained optional `approvals`/`approvalId` fields; when supplied, the caller's OWN authoritative `ApprovalWorkflow`
+    (the same store a reviewer would have called `requestFor()`/`approve()` on beforehand) is wired into the
+    internal gateway at construction time, and the matching `ApprovalReference` is passed through to
+    `gateway.authorize()`; omitted, the function falls back to the OLD safe default (default deny preserved for
+    callers that do not opt in). New regression tests: findings 3-5 add tests across
+    `capability-gateway/__tests__/gateway.test.ts` (not-reachable-as-property, no-reflection-exposure, and forged
+    inert-property tests for finding 3; a getter-based mutation-between-policy-and-approval BLOCKER regression for
+    finding 4; callback-throws, async-throw, original-error-rethrown, failure-reason-recorded,
+    non-retryable-after-failure, and concurrent-replay-with-one-failure tests for finding 5); finding 10 adds a
+    "full risk-5 bootstrap approval regression" describe block to
+    `project-lifecycle/__tests__/orchestrator.test.ts` (7 tests) proving a genuine matching APPROVED request
+    succeeds exactly once (and reaches EXECUTED), PENDING/REJECTED/REQUEST_CHANGES requests all still block,
+    omitting `approvals`/`approvalId` still unconditionally blocks (default deny preserved — not a regression),
+    a caller-forged LOCAL `ApprovalWorkflow` never wired into `BootstrapProjectInput.approvals` cannot smuggle
+    approval, and an approval recorded for a DIFFERENT project's identity cannot authorize this one. Every fix
+    verified via a temporary in-place bypass reproducing the exact predicted failure, then fully reverted; finding
+    10's bypass (reverting to `new CapabilityGateway(policy)` with no `approvalReference` passed) confirmed the
+    exact predicted `CapabilityApprovalRequiredError` on the BLOCKER regression, and correctly changed the forged-
+    workflow test's expected error type (no approval reference at all, rather than a lookup miss against the
+    default empty store) — both reverted and all 54 orchestrator tests re-confirmed passing.
 
 - id: UASF-REQ-0020
   title: Human approval workflow
@@ -1268,6 +1337,38 @@
     now calls atomically before running its risky callback (finding 3). No changes to `ApprovalWorkflow`'s own
     state machine or persistence scope were needed beyond `requestFor()`'s addition; new coverage lives in
     `capability-gateway/__tests__/gateway.test.ts` (see UASF-REQ-0019).
+
+    P1 fix (27th independent review round, finding 5 — see UASF-REQ-0019 for the full narrative): the single
+    unconditional `execute(id)` method (APPROVED -> EXECUTED) that `CapabilityGateway.authorize()` called BEFORE
+    running its wrapped callback could not distinguish "the callback genuinely succeeded" from "the callback threw
+    and nothing actually completed" — the approval record was already EXECUTED either way, permanently and
+    falsely certifying success on a failure, with no valid retry path (a second attempt against the same id would
+    see an already-EXECUTED, non-PENDING/non-APPROVED status and be rejected as replay, exactly as it should be
+    for a genuinely completed approval, but wrongly so for one that never actually ran). `ApprovalStatus` gained
+    two states: `EXECUTING` (non-terminal, in-flight — set the moment execution genuinely begins) and
+    `EXECUTION_FAILED` (terminal — set only if the wrapped work demonstrably threw, carrying an optional
+    `failureReason`). Three new granular methods replace the single transition: `beginExecution(id)` (APPROVED ->
+    EXECUTING), `completeExecution(id)` (EXECUTING -> EXECUTED, called only after the wrapped work genuinely
+    returns), and `failExecution(id, reason?)` (EXECUTING -> EXECUTION_FAILED). The original `execute(id)` is kept
+    as a backward-compatible convenience wrapper composing `beginExecution()` + `completeExecution()` for any
+    caller with no failure-prone work to guard — every one of the 79+ pre-existing direct-`execute()`-call test
+    sites continues to work unchanged. `CapabilityGateway.authorize()` (the only production call site wrapping a
+    real, failure-prone async callback) now calls `beginExecution()` before the callback and routes to
+    `completeExecution()`/`failExecution()` from a try/catch around it (see UASF-REQ-0019's own round-27 note).
+    "Valid retry semantics": `EXECUTION_FAILED` is terminal — the SAME approval id can never be retried (matching
+    the existing DENY-precedent contract that an approval authorizes at most one execution attempt); a genuine
+    retry means requesting a brand-new approval id via `requestFor()`. New regression tests in
+    `capability-gateway/__tests__/gateway.test.ts` prove: a callback that throws leaves the record
+    `EXECUTION_FAILED`, never `EXECUTED`; the same holds for an async throw; the original error is rethrown
+    unchanged (`.rejects.toBe(boom)`); the failure reason is recorded; a second attempt against the same
+    (now-`EXECUTION_FAILED`) id is rejected as non-retryable; and a `Promise.allSettled` concurrent-replay test
+    confirms one execution's failure never corrupts another's independent success. A pre-existing audit-log-
+    sequence test was updated to expect the new, more granular `APPROVAL_EXECUTION_STARTED` event alongside the
+    existing `APPROVAL_REQUESTED`/`APPROVAL_APPROVED`/`APPROVAL_EXECUTED` sequence — a legitimate improvement in
+    audit trail granularity, not a regression. Verified via a temporary bypass (reverting `authorize()`'s
+    try/catch-wrapped `beginExecution`/`completeExecution`/`failExecution` calls back to a single unconditional
+    `execute()` before the callback) — confirmed the exact predicted callback-throws/failure-reason/non-retryable
+    tests failed, then reverted and re-confirmed all passing.
 
 - id: UASF-REQ-0021
   title: Durable state / resume
@@ -2797,6 +2898,55 @@
     event type without marking the reservation RECONCILIATION_FAILED (the legitimate owner can still commit it
     normally).
 
+    P1 fix (27th independent review round, findings 6-8, consolidated closure batch): (6) "keep budget limits
+    runtime-private" — `BudgetGuard`'s `#limits` used to be TypeScript compile-time-only `private readonly`;
+    `(guard as any).limits = { perTaskUsd: Number.MAX_VALUE }` from any caller holding a reference would silently
+    replace the configured ceilings. Converted to a genuine ECMAScript `#limits` private field. (7) "snapshot
+    spend entries before checking them" — `BudgetGuard.spend()`/`commit()` and `CostEngine.record()`/
+    `commitReservation()` all used to read `entry.amountUsd` (and, in `commit()`'s case, several other `entry.*`
+    fields across the ownership check, audit payloads, and the overages check) at MULTIPLE separate points; a
+    getter/Proxy-backed `entry` could answer differently for the ceiling check than for what actually gets
+    recorded, letting a ceiling-compliant check authorize a wildly different, over-ceiling actual cost. Fixed:
+    each method now builds `const snapshot = { ...entry }` as its very first step — a genuine static copy, read
+    exactly once — and every subsequent reference uses `snapshot`, never the original `entry` parameter again.
+    (8) "require unforgeable reservation ownership" — reservation ids were purely sequential (`res-1`, `res-2`,
+    ...) and, combined with `ReservationOwnership`'s ordinary business-predictable scope fields, neither the id
+    nor the scope is actually secret; an unrelated caller who could guess/predict a reservation id and construct
+    a matching scope could operate (`commitReservation()`/`releaseReservation()`) a reservation it never created.
+    Fixed by making the id ITSELF the unguessable capability: `createReservation()` now embeds a genuine
+    `randomBytes(16)` (128-bit) suffix alongside the existing monotonic counter (kept purely for human-readable
+    log ordering, never load-bearing). No enumeration/list method exists anywhere on `CostEngine`, so "knows the
+    unguessable id" now stands alongside "supplies the matching scope" as a second, genuinely unforgeable factor
+    — this required zero changes to any of the 101 existing `commit`/`release`/`commitReservation`/
+    `releaseReservation` call sites across `budget.test.ts`/`cost-engine.test.ts`, since none ever hardcoded a
+    predictable id string. New regression tests (across `budget/__tests__/budget.test.ts` and
+    `cost/__tests__/cost-engine.test.ts`): findings 6-7 add not-reachable/no-reflection-exposure/forged-inert-
+    property tests for `#limits`, plus BLOCKER regressions for both `spend()` and `commit()` proving a getter
+    read exactly once with the checked amount matching the recorded amount, and a Proxy-wrapped-entry test
+    tracking per-field read counts; finding 8 adds a 20-id entropy/uniqueness test, a BLOCKER regression proving
+    four guessed sequential-style ids (plus the correctly-guessed real scope) are all rejected as
+    `UnknownReservationError` while the real owner's real id still works, and a no-enumeration-method-exists
+    test. Targeted-audit follow-up (same root class as finding 6, found while auditing this file for other
+    genuine TypeScript-private-only authoritative dependencies): `BudgetGuard`'s constructor-parameter
+    `costEngine`/`now`/`auditLog` were ALSO still TS-private-only, in the exact same constructor `#limits` was
+    just fixed in. `costEngine` is the authoritative dependency EVERY ceiling check (`totalFor`/`total`/
+    `totalInWindow`/`reservedTotal`) and EVERY spend/reservation record (`record`/`createReservation`/
+    `commitReservation`/`releaseReservation`) reads and writes through — replacing it would silently defeat
+    budget enforcement entirely, the identical bug class just reachable through a different property name; `now`
+    gates the daily/monthly ceiling WINDOW boundary computation, so replacing it could make every spend appear to
+    fall inside a perpetually-fresh window; `auditLog` is the sole channel every `BUDGET_*` event reaches, so
+    replacing it could silently erase the audit trail. All three converted to genuine ECMAScript `#costEngine`/
+    `#now`/`#auditLog` private fields. Five new regression tests prove: none of the three are reachable as an
+    ordinary property or via reflection APIs; a forged `costEngine` property assignment is an inert stray
+    property that never reaches real ceiling checks or spend recording (the guard still enforces its original
+    ceiling against the REAL cost engine); a forged `now` cannot desynchronize the daily ceiling window; and a
+    forged `auditLog` cannot suppress the real audit trail. Every fix in this batch verified via a temporary
+    in-place bypass reproducing the exact predicted failure (including a MULTI-LAYER bypass reverting all four
+    `snapshot` insertions across `budget.ts`/`cost-engine.ts` simultaneously for finding 7, and reverting the
+    `#costEngine`/`#now`/`#auditLog` fields back to TS-private constructor-parameter properties for the audit
+    follow-up), then fully reverted: all 119 `budget.test.ts` tests and the full `cost-engine.test.ts` suite
+    re-confirmed passing after each revert.
+
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
   description: Register worker classes (linux-general, gpu, macos, ...) with capability metadata; select smallest sufficient worker.
@@ -3131,6 +3281,31 @@
     `path.relative()` results for EQUALITY rather than concatenating a
     separator onto a prefix, so it was never susceptible to this bug in
     the first place.
+
+    P1 fix (27th independent review round, finding 9, "timeout must actually cancel sandbox work"): `withTimeout()`
+    used to accept an already-started, opaque `Promise<T>` and race it against a timer via `Promise.race()` —
+    `Promise.race()` only ever stops THIS FUNCTION from waiting any longer; the underlying operation keeps running
+    to completion regardless, with no way to observe or prevent whatever side effects it produces after the
+    "timeout" already returned to its caller. Explicitly does NOT attempt to retrofit cancellation onto an
+    arbitrary, already-started Promise — the finding's own instruction ("do NOT pretend arbitrary Promises are
+    cancellable") is structurally impossible to violate with this design, since there is no already-started
+    Promise to retrofit. Fixed: `withTimeout()`'s signature changed to accept an `(signal: AbortSignal) =>
+    Promise<T>` FACTORY instead — the operation itself must observe and cooperate with cancellation (via
+    `fs/promises`' `{signal}` option, `fetch()`'s native `signal` support, `child_process.spawn(..., {signal})`,
+    or a manual `signal.addEventListener('abort', ...)` handler); an internal `AbortController` aborts with a
+    `SandboxTimeoutError` the moment the timer fires, and the timer is always cleared in a `finally` block
+    regardless of outcome. New regression tests prove: the operation genuinely receives an `AbortSignal` instance;
+    the abort reason is a `SandboxTimeoutError`; a genuine, real-world "unrelated failure" (the operation itself
+    throws something other than an abort) is never masked as a timeout; `withTimeout()` correctly waits for
+    genuine settlement when the operation finishes before the deadline; and, as the round's single most rigorous
+    regression, a BLOCKER test spawns a REAL child process (`child_process.spawn(process.execPath, ["-e",
+    "setTimeout(() => require('fs').writeFileSync(markerPath, 'done'), 300)"], {signal})`), times it out at 30ms,
+    then waits 400ms and asserts the marker file was NEVER created — proving actual OS-level process termination,
+    not merely "this function stopped waiting" while the child kept running and wrote its side effect anyway (the
+    exact failure mode Codex described). Verified via a temporary bypass (reverting to the old opaque-Promise +
+    `Promise.race()` implementation) — confirmed the marker file WAS created under the bypass (the real, externally
+    observable proof that the pre-fix code let the timed-out operation's side effect complete anyway), then fully
+    reverted and re-confirmed the marker file is never created post-fix.
 
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
