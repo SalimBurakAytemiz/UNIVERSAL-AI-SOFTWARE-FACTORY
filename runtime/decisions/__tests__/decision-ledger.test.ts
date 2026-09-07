@@ -293,4 +293,91 @@ describe("FounderDecisionLedger", () => {
       });
     }
   );
+
+  describe("P2 fix (24th independent review round, 'validate persisted supersession graph')", () => {
+    function fakeStore(data: unknown): StateStore {
+      return {
+        write: () => undefined,
+        read: () => data as never,
+        exists: () => true
+      };
+    }
+
+    it("rejects a supersededBy target that does not exist anywhere in the persisted batch", () => {
+      const store = fakeStore([
+        { decisionId: "a", project: "p", decision: "Use PostgreSQL", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "missing-id" }
+      ]);
+      expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+    });
+
+    it("rejects a supersededBy target belonging to a DIFFERENT project (supersede() always copies the project)", () => {
+      const store = fakeStore([
+        { decisionId: "a", project: "proj-x", decision: "Use PostgreSQL", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+        { decisionId: "b", project: "proj-y", decision: "Use MySQL", source: "s", status: "ACTIVE", createdAt: "x" }
+      ]);
+      expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+    });
+
+    it("rejects a self-referencing supersededBy (a decision cannot supersede itself)", () => {
+      const store = fakeStore([
+        { decisionId: "a", project: "p", decision: "Use PostgreSQL", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "a" }
+      ]);
+      expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+    });
+
+    it("rejects a direct two-node cycle (A superseded by B, B superseded by A)", () => {
+      const store = fakeStore([
+        { decisionId: "a", project: "p", decision: "d-a", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+        { decisionId: "b", project: "p", decision: "d-b", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "a" }
+      ]);
+      expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+    });
+
+    it("rejects a multi-node cycle (A -> B -> C -> A)", () => {
+      const store = fakeStore([
+        { decisionId: "a", project: "p", decision: "d-a", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+        { decisionId: "b", project: "p", decision: "d-b", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "c" },
+        { decisionId: "c", project: "p", decision: "d-c", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "a" }
+      ]);
+      expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+    });
+
+    it("loads a genuinely valid multi-step supersession chain (A -> B -> C) with no false-positive cycle detection", () => {
+      const store = fakeStore([
+        { decisionId: "a", project: "p", decision: "d-a", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+        { decisionId: "b", project: "p", decision: "d-b", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "c" },
+        { decisionId: "c", project: "p", decision: "d-c", source: "s", status: "ACTIVE", createdAt: "x" }
+      ]);
+
+      const restored = FounderDecisionLedger.loadFrom(store, "decisions.json");
+      expect(restored.get("a")?.supersededBy).toBe("b");
+      expect(restored.get("b")?.supersededBy).toBe("c");
+      expect(restored.hasActiveDecision("c")).toBe(true);
+    });
+
+    it(
+      "REGRESSION (same root class as assumption-register.ts's 'restored assumptions must be detached'): " +
+        "mutating the original persisted object after loadFrom() does not change authoritative state",
+      () => {
+        const original: { decisionId: string; project: string; decision: string; source: string; status: string; createdAt: string; supersededBy?: string } = {
+          decisionId: "detach-a",
+          project: "p",
+          decision: "original decision text",
+          source: "s",
+          status: "ACTIVE",
+          createdAt: "x"
+        };
+        const store = fakeStore([original]);
+        const ledger = FounderDecisionLedger.loadFrom(store, "decisions.json");
+
+        original.status = "SUPERSEDED";
+        original.supersededBy = "someone-else";
+        original.decision = "mutated after load";
+
+        expect(ledger.get("detach-a")!.status).toBe("ACTIVE");
+        expect(ledger.get("detach-a")!.supersededBy).toBeUndefined();
+        expect(ledger.get("detach-a")!.decision).toBe("original decision text");
+      }
+    );
+  });
 });

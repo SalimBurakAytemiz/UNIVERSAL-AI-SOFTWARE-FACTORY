@@ -90,13 +90,38 @@ export class DuplicateApprovalIdError extends Error {
   }
 }
 
+/**
+ * P1 fix (24th independent review round, "approval state must be
+ * runtime-private"): the request/decision map used to be declared with
+ * TypeScript's `private` keyword — which is a COMPILE-TIME-ONLY marker.
+ * It compiles to an entirely ordinary, enumerable JavaScript instance
+ * property; nothing about it is actually hidden at runtime. A consumer
+ * holding a reference to an `ApprovalWorkflow` instance could reach in via
+ * `(workflow as any).requests` (or plain bracket access, `workflow
+ * ["requests"]`, which needs no type-system escape hatch at all) and
+ * mutate an approval record's `status` DIRECTLY — e.g. flipping a PENDING
+ * request straight to "APPROVED" — completely bypassing `approve()`'s
+ * reviewer-identity check and its audit-log entry. The `freezeRecord()`-
+ * based detachment already used everywhere this class RETURNS a record
+ * only protects outgoing copies; it does nothing to protect the
+ * authoritative Map itself from being reached through the instance
+ * directly. Fixed the same way `runtime/models/gateway.ts`'s
+ * `#providers`/`#rawInvoke` already are: a genuine ECMAScript private
+ * class field (`#requests`, not `private requests`). This is enforced by
+ * the JS runtime itself, not a TypeScript/developer convention — `as
+ * any`, bracket access, `Object.getOwnPropertyNames()`, and
+ * `Reflect.ownKeys()` all fail to reach it (a private field is not even
+ * listed as an own property key by any reflection API), and any code
+ * outside this class body attempting to write `x.#requests` is a
+ * `SyntaxError` at PARSE time, not merely a runtime rejection.
+ */
 export class ApprovalWorkflow {
-  private readonly requests = new Map<string, MutableApprovalRequest>();
+  #requests = new Map<string, MutableApprovalRequest>();
 
   constructor(private readonly auditLog?: AuditLog) {}
 
   request(id: string, actionDescription: string, risk: number): ApprovalRequest {
-    if (this.requests.has(id)) {
+    if (this.#requests.has(id)) {
       throw new DuplicateApprovalIdError(id);
     }
     const req: MutableApprovalRequest = {
@@ -106,7 +131,7 @@ export class ApprovalWorkflow {
       status: "PENDING",
       requestedAt: new Date().toISOString()
     };
-    this.requests.set(id, req);
+    this.#requests.set(id, req);
     this.audit("APPROVAL_REQUESTED", req);
     return freezeRecord(req);
   }
@@ -210,16 +235,16 @@ export class ApprovalWorkflow {
   }
 
   get(id: string): ApprovalRequest | undefined {
-    const req = this.requests.get(id);
+    const req = this.#requests.get(id);
     return req ? freezeRecord(req) : undefined;
   }
 
   list(): readonly ApprovalRequest[] {
-    return [...this.requests.values()].map((r) => freezeRecord(r));
+    return [...this.#requests.values()].map((r) => freezeRecord(r));
   }
 
   private mustGet(id: string): MutableApprovalRequest {
-    const req = this.requests.get(id);
+    const req = this.#requests.get(id);
     if (!req) throw new Error(`No approval request found for id ${id}`);
     return req;
   }

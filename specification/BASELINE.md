@@ -53,9 +53,26 @@ being declared complete:
   out-of-range PID accepted as a confirmed-live lock owner; a blank
   founder-confirmation identity accepted as valid; a schema/runtime
   contract mismatch for model records; and a missing REQUEST_CHANGES
-  approval decision. All fixed and regression-tested on branch
-  `claude/ai-factory-baseline-v1-seawq7`. P0 status remains
-  BLOCKED_PENDING_REVIEW until an independent review confirms
+  approval decision. In a 24th round, a further fresh review found TEN
+  more actionable findings (8 P1, 2 P2), also fixed as one consolidated
+  batch: a cross-project write bypass in the project-isolation store; an
+  unguarded reservation-deletion primitive bypassing budget reconciliation
+  protections; a scheduler ranking rule that could still select an
+  excess-resource (GPU/high-memory) worker over a sufficient smaller one
+  when cheaper; approval-workflow state reachable via ordinary JS property
+  access instead of genuine runtime encapsulation; a capability gateway
+  with no way to honor a genuinely-approved action; a bootstrap flow that
+  could incur real model cost before its scaffold authorization was even
+  checked; persisted-state restore paths in the Assumption Register and
+  Founder Decision Ledger retaining caller/store-owned mutable object
+  references; a technology registry that let `register()` silently
+  overwrite an existing (including FORBIDDEN) record; missing whole-graph
+  validation of the persisted decision-supersession chain; and a secret
+  scanner that silently skipped (rather than failing closed on) an
+  unreadable historical blob or current-tree file. All fixed and
+  regression-tested on branch `claude/ai-factory-baseline-v1-seawq7`. P0
+  status remains BLOCKED_PENDING_REVIEW until an independent review
+  confirms
   INDEPENDENT_REVIEW_RESULT: CLEAN. See `project-state/current.yml`'s
   `p0_closure_record` and `p0_status`/`blockers` narrative for the full,
   honest history of every prior round (the twentieth round's CLEAN

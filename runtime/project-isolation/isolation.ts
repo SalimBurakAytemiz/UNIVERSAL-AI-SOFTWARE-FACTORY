@@ -15,14 +15,37 @@ export class CrossProjectAccessDeniedError extends Error {
   }
 }
 
+/**
+ * P1 fix (24th independent review round, "project writes must require
+ * caller identity"): `set()` used to accept only a SINGLE `projectId` —
+ * the TARGET being written to — with no separate notion of WHO (which
+ * project's own code/agent) was making the call. `get()`/`keysFor()`
+ * already required BOTH a `callerProjectId` and a `targetProjectId` and
+ * rejected a mismatch (bkz. `CrossProjectAccessDeniedError`), but `set()`
+ * had no equivalent caller-vs-target check at all — any caller holding a
+ * reference to this store could write into ANY project's bucket merely by
+ * passing that project's id as the (unchecked) target, e.g. code running
+ * "for" project A calling `store.set("project-B", ...)` and silently
+ * mutating project B's data. Default deny (baseline section 86) must
+ * apply to writes exactly as it already does to reads — a caller cannot
+ * be trusted to self-report which project it is acting FOR unless that
+ * claim is checked against the project it is actually trying to touch.
+ */
 export class ProjectIsolationStore<T> {
   private readonly data = new Map<string, Map<string, T>>();
 
-  /** Bir proje yalnızca kendi adına veri yazabilir. */
-  set(projectId: string, key: string, value: T): void {
-    const bucket = this.data.get(projectId) ?? new Map<string, T>();
+  /**
+   * Bir proje yalnızca kendi adına veri yazabilir — `callerProjectId` ile
+   * `targetProjectId` eşleşmiyorsa CrossProjectAccessDeniedError fırlatılır,
+   * `get()`/`keysFor()` ile AYNI kontrol, AYNI hata türü.
+   */
+  set(callerProjectId: string, targetProjectId: string, key: string, value: T): void {
+    if (callerProjectId !== targetProjectId) {
+      throw new CrossProjectAccessDeniedError(callerProjectId, targetProjectId);
+    }
+    const bucket = this.data.get(targetProjectId) ?? new Map<string, T>();
     bucket.set(key, value);
-    this.data.set(projectId, bucket);
+    this.data.set(targetProjectId, bucket);
   }
 
   /**

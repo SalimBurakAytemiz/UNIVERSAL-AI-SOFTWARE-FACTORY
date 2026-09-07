@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { CostEngine, InvalidMonetaryAmountError, assertValidMonetaryAmount, exceedsMonetaryAmount } from "../cost-engine.js";
+import {
+  CostEngine,
+  InvalidMonetaryAmountError,
+  UnknownReservationError,
+  UnresolvedReconciliationError,
+  assertValidMonetaryAmount,
+  exceedsMonetaryAmount
+} from "../cost-engine.js";
 
 describe("CostEngine", () => {
   it("accumulates cost entries and reports totals scoped by task", () => {
@@ -177,4 +184,89 @@ describe("CostEngine", () => {
       expect(exceedsMonetaryAmount(total, 1)).toBe(false);
     });
   });
+
+  describe(
+    "P1 fix (24th independent review round, 'reservation deletion must not bypass reconciliation') " +
+      "— reservation lifecycle is enforced at the ledger level, not only through BudgetGuard",
+    () => {
+      it("there is no generic, unguarded deleteReservation() left on the public API", () => {
+        const engine = new CostEngine();
+        expect((engine as unknown as Record<string, unknown>).deleteReservation).toBeUndefined();
+      });
+
+      it("commitReservation() records a real cost and removes the reservation on success", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5);
+
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.5
+        });
+
+        expect(recorded.amountUsd).toBe(0.5);
+        expect(engine.totalFor({ taskId: "t1" })).toBe(0.5);
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0); // reservation is gone
+        expect(engine.getReservation(reservation.id)).toBeUndefined();
+      });
+
+      it(
+        "commitReservation() with an invalid amount marks the reservation RECONCILIATION_FAILED and " +
+          "PROTECTS it — no cost is recorded and the reservation is not removed (capacity stays reserved)",
+        () => {
+          const engine = new CostEngine();
+          const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+
+          expect(() =>
+            engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
+          ).toThrow(InvalidMonetaryAmountError);
+
+          expect(engine.totalFor({ taskId: "t1" })).toBe(0); // no cost recorded
+          expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5); // capacity still protected
+          expect(engine.getReservation(reservation.id)?.status).toBe("RECONCILIATION_FAILED");
+
+          // The core invariant this finding requires: a normal consumer
+          // cannot free this protected reservation's capacity for free —
+          // releaseReservation() (the only other exit) refuses it outright.
+          expect(() => engine.releaseReservation(reservation.id)).toThrow(UnresolvedReconciliationError);
+          expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5); // still protected after the rejected release
+        }
+      );
+
+      it("releaseReservation() removes an ordinary ACTIVE reservation with no cost recorded", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+
+        const released = engine.releaseReservation(reservation.id);
+
+        expect(released.amountUsd).toBe(0.5);
+        expect(engine.totalFor({ taskId: "t1" })).toBe(0); // never spent
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0); // capacity freed
+        expect(engine.getReservation(reservation.id)).toBeUndefined();
+      });
+
+      it("releaseReservation() throws UnresolvedReconciliationError for a RECONCILIATION_FAILED reservation and does not remove it", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+        engine.markReservationReconciliationFailed(reservation.id);
+
+        expect(() => engine.releaseReservation(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(engine.getReservation(reservation.id)).toBeDefined(); // still protected, not deleted
+      });
+
+      it("commitReservation()/releaseReservation() throw UnknownReservationError for a nonexistent or already-resolved id", () => {
+        const engine = new CostEngine();
+        expect(() =>
+          engine.commitReservation("never-existed", { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 })
+        ).toThrow(UnknownReservationError);
+        expect(() => engine.releaseReservation("never-existed")).toThrow(UnknownReservationError);
+
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.1);
+        engine.releaseReservation(reservation.id);
+        expect(() => engine.releaseReservation(reservation.id)).toThrow(UnknownReservationError);
+      });
+    }
+  );
 });

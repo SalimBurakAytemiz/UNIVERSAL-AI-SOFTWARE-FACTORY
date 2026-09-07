@@ -173,6 +173,32 @@
     detected unchanged. Verified against this repository's real tree and
     full git history: PASS.
 
+    P2 fix (24th independent review round, "secret history scan must fail closed on unreadable blobs"):
+    `readBlobContent()` used to catch EVERY error (a `maxBuffer` overrun on an unusually large historical blob,
+    a transient `git cat-file` failure) and return `null`, which `scanGitHistory()` then treated identically to
+    "this blob is binary, skip it" — a blob that could not be READ was never actually SCANNED, so the scanner
+    could report an honest-looking PASS despite never inspecting a reachable historical blob's content at all.
+    Fixed: `readBlobContent()` no longer swallows errors (and `maxBuffer` was raised from 64 MiB to 512 MiB to
+    make genuine truncation far less likely in the first place); `scanGitHistory()` now returns
+    `{ findings, unreadableBlobs }`, and `main()` treats ANY unreadable blob as a fail-closed scan result,
+    reported explicitly (path/sha/reason), never silently absorbed into an implicit PASS. A deterministic
+    regression (via a scoped `vi.mock("node:child_process")` intercepting only the exact `git cat-file -p <sha>`
+    call for one targeted blob) proves an unreadable historical blob is reported as a coverage failure and that
+    the secret inside that SPECIFIC blob was never actually scanned — avoiding the impracticality of committing
+    an actual multi-hundred-MB blob into a throwaway test repo just to exceed maxBuffer. Targeted-audit fix for
+    the SAME root class found in the sibling current-tree scan: `scanFile()` had an identical silent
+    `catch { return []; }` for any file `git ls-files` reports as tracked that then fails to read (a
+    permissions error, a race with a concurrent delete) — fixed the same way (no longer catches; `main()`'s new
+    `scanCurrentTree()` helper collects per-file read failures and folds them into the same fail-closed
+    reporting, `unreadableFiles`). All existing `scanGitHistory()` callers (8 sites in
+    tests/secret-scan.test.mjs) updated for the new return shape, each now also asserting zero unreadable blobs
+    for the non-regression cases. Verified via two temporary bypasses (restoring the old silent-catch in
+    `readBlobContent()`, and removing `scanFile()`'s new no-catch behavior) — confirmed the exact predicted
+    failures (a `TypeError` crash on `null` content for the first, since the removed `!content` guard was no
+    longer needed once the try/catch was legitimately removed; a thrown-error assertion failure for the second),
+    then both reverted and re-confirmed the full 45-test suite and a real `npm run secret-scan` run against this
+    repository both passing/PASS.
+
 - id: UASF-REQ-0003
   title: Baseline specification preservation
   description: >
@@ -597,6 +623,28 @@
     still loads correctly. Verified via a temporary bypass reproducing
     the predicted symptom, then fully reverted.
 
+    P1 fix (24th independent review round, same root class as assumption-register.ts's "restored assumptions
+    must be detached" — see UASF-REQ-0011): `loadFrom()` still stored the exact object `store.read()` returned;
+    now copies each validated candidate (`{ ...candidate }`) before insertion, fully detaching it. Regression
+    test proves mutating the original object after load does not change the ledger's authoritative state.
+
+    P2 fix (24th independent review round, "validate persisted supersession graph"): `describeInvalidPersistedDecision()`
+    validates each record in isolation and cannot see whether a `supersededBy` target actually exists, belongs
+    to the same project, or whether the graph of `supersededBy` edges as a whole forms valid, acyclic chains.
+    A persisted decision could reference a `supersededBy` target that was never itself persisted, a target
+    belonging to a different project (`supersede()` always copies the project, so a live-created record could
+    never cross projects), a self-reference, or a cycle — `supersede()`'s own ACTIVE-only guard makes a cycle
+    impossible to create live, but a hand-edited persisted file has no such guard. Added
+    `describeInvalidPersistedDecisionGraph()`, run after every individual record passes validation and before
+    any record enters the authoritative map: checks every `supersededBy` target exists and shares the source's
+    project, rejects self-reference, and runs a standard three-color DFS cycle detection over the whole batch.
+    Six new regression tests prove: a missing target, a cross-project target, a self-reference, a direct
+    two-node cycle, and a multi-node (A->B->C->A) cycle are all refused, while a genuinely valid multi-step
+    chain (A->B->C) still loads with no false-positive cycle detection. Verified via two separate temporary
+    bypasses (disabling the graph check, and disabling the detach copy) — confirmed the exact predicted 5 graph
+    tests and 1 detach test failed respectively, with no cross-contamination between the two bypasses, then both
+    reverted and all tests re-confirmed passing.
+
 - id: UASF-REQ-0011
   title: Assumption register
   description: Track assumptions with PROPOSED/ACCEPTED/REJECTED/VALIDATED/SUPERSEDED lifecycle.
@@ -689,6 +737,18 @@
     performs one-shot writes to unique per-project paths, never a
     restore-into-authoritative-collection operation).
 
+    P1 fix (24th independent review round, "restored assumptions must be detached"): `loadFrom()`'s validated
+    records still stored the EXACT object `store.read()` returned, directly into `this.assumptions` — if the
+    caller/store held (or a cache later re-returned) a reference to that same object and mutated it afterward,
+    authoritative registry state changed with no `accept()`/`reject()`/`validate()` call and no invariant
+    re-check at all. Since every field on the internal record type is a primitive, a shallow copy
+    (`{ ...validated }`) fully detaches it. Regression tests prove mutating the original object after load does
+    not change the register's state, and specifically cannot smuggle a HIGH-impact assumption into ACCEPTED
+    without ever going through `accept()`'s Founder-confirmation check. The identical root class was found and
+    fixed in the same round in `runtime/decisions/decision-ledger.ts`'s `loadFrom()` (UASF-REQ-0010). Verified
+    via a temporary bypass (storing the un-copied reference again) — confirmed the exact predicted 2 tests
+    failed, then reverted and re-confirmed all passing.
+
 - id: UASF-REQ-0012
   title: Requirements engine
   description: Support BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL/... requirement types with stable IDs.
@@ -749,6 +809,23 @@
     mutating the object passed into register(), or a record returned by
     all(), cannot un-forbid a technology. Confirmed via git-stash that
     these tests fail on the pre-fix code.
+
+    P1 fix (24th independent review round, "technology registry must reject uncontrolled overwrites"):
+    `register()` still unconditionally accepted a SECOND call for an existing id, silently replacing the
+    record wholesale — including replacing a FORBIDDEN technology with a fresh PREFERRED one, completely
+    bypassing bölüm 53-54's governance without even needing the object-mutation route already closed above.
+    Fixed: `register()` now throws `DuplicateTechnologyIdError` for any id collision, regardless of target
+    lifecycle; the only way to change an EXISTING technology's lifecycle is the new `transitionLifecycle(id, to,
+    reason)` method, which requires a non-blank `reason` (audited via an optional `AuditLog`,
+    `TECHNOLOGY_LIFECYCLE_TRANSITIONED`) and refuses (`InvalidTechnologyLifecycleTransitionError`) any
+    transition OUT of DEPRECATED/FORBIDDEN back to a recommendable lifecycle — a one-way governance gate,
+    consistent with decision-ledger.ts's "no un-superseding" philosophy. Eight new regression tests prove: the
+    exact FORBIDDEN->PREFERRED `register()` bypass is refused; any duplicate id is refused regardless of target
+    lifecycle; normal forward transitions work; transitioning INTO FORBIDDEN from any prior lifecycle works;
+    transitioning OUT of FORBIDDEN or DEPRECATED is refused; an unknown id and a blank reason are both refused;
+    and a real transition is audited with the correct from/to/reason. Verified via a temporary bypass (disabling
+    the governance transition guard) — confirmed the exact predicted 2 tests failed, then reverted and
+    re-confirmed all passing.
 
 - id: UASF-REQ-0015
   title: Business capability registry (foundation)
@@ -923,7 +1000,27 @@
   proof_refs:
     - "proofs/p0-integrated-flow/proof.test.ts"
   security_refs: []
-  notes: "Tests assert the wrapped execute() function is never called on DENY or APPROVAL_REQUIRED, only on ALLOW. Now the real enforcement point in front of Project OS scaffolding in the integrated pipeline — not just a standalone demonstration."
+  notes: >
+    Tests assert the wrapped execute() function is never called on DENY or APPROVAL_REQUIRED, only on ALLOW. Now
+    the real enforcement point in front of Project OS scaffolding in the integrated pipeline — not just a
+    standalone demonstration.
+
+    P1 fix (24th independent review round, "approved requests must pass capability gateway"): `authorize()`
+    used to unconditionally throw `CapabilityApprovalRequiredError` for an APPROVAL_REQUIRED decision, with no
+    way to present evidence of an approval that had already genuinely happened — so an action a human Founder
+    had actually approved through `ApprovalWorkflow` (UASF-REQ-0020) could still never execute through this,
+    the ONE authoritative gateway (baseline section 147). Added an optional `ApprovalEvidence` parameter
+    (`{ workflow, approvalId }`); `authorize()` independently re-verifies it before allowing execution: the
+    referenced request must exist, be APPROVED (never PENDING/REJECTED/REQUEST_CHANGES), and its own recorded
+    `actionDescription`/`risk` must match the action being authorized right now (`ApprovalEvidenceMismatchError`
+    otherwise) — an approval for one action can never be replayed to authorize a different one. An explicit
+    DENY is checked first and is never affected by approval evidence, however genuine. Six new end-to-end
+    regression tests (real `ApprovalWorkflow` + `CapabilityGateway` together) prove: a matching APPROVED request
+    executes; PENDING/REJECTED/REQUEST_CHANGES requests are all still blocked; replay against an unrelated
+    approved action is rejected; an unknown approval id is rejected; and DENY always wins even with genuine
+    approval evidence attached. Verified via a temporary bypass (accepting any existing request regardless of
+    status/action match) — confirmed exactly the 4 predicted tests (REJECTED, REQUEST_CHANGES, replay, unknown
+    id) failed, then reverted and re-confirmed all passing.
 
 - id: UASF-REQ-0020
   title: Human approval workflow
@@ -1026,6 +1123,19 @@
     the decision and evidence" is honestly out of scope for this fix
     (adding a persistence layer that doesn't otherwise exist would be
     architecture expansion beyond this finding).
+
+    P1 fix (24th independent review round, "approval state must be runtime-private"): the request/decision map
+    was declared with TypeScript's `private` keyword — compile-time-only, compiling to an ordinary enumerable
+    JS property. A consumer holding an `ApprovalWorkflow` instance could reach it via `(workflow as any).requests`
+    (or plain bracket access) and mutate a record's `status` directly, e.g. flipping PENDING straight to
+    APPROVED, completely bypassing `approve()`'s reviewer-identity check and audit event. Fixed the same way
+    `runtime/models/gateway.ts`'s `#providers`/`#rawInvoke` already are: a genuine ECMAScript private class
+    field (`#requests`), enforced by the JS runtime itself — `as any`, bracket access,
+    `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all fail to reach it. Regression tests prove the
+    field is unreachable via ordinary property access and every reflection API, and that mutating a returned
+    (frozen) record still cannot change authoritative state. Verified via a temporary bypass (reverting to TS
+    `private requests`) — confirmed the exact predicted 3 new tests failed, then reverted and re-confirmed all
+    passing.
 
 - id: UASF-REQ-0021
   title: Durable state / resume
@@ -1936,6 +2046,23 @@
     detected, equal and smaller amounts never register as exceeding, and
     repeated decimal accumulation lands exactly on a whole-dollar ceiling.
 
+    P1 fix (24th independent review round, "reservation deletion must not bypass reconciliation"): the public
+    `deleteReservation(id)` method removed ANY reservation, ACTIVE or RECONCILIATION_FAILED, unconditionally —
+    callable directly by any code holding a `CostEngine` reference, bypassing `BudgetGuard.commit()`/`release()`
+    entirely and silently discarding the protection a RECONCILIATION_FAILED reservation exists to provide.
+    Removed from the public API and replaced with two invariant-enforcing methods: `commitReservation(id, entry)`
+    (validates the amount, marks RECONCILIATION_FAILED and preserves the reservation on failure, and only
+    removes it once a real cost is genuinely recorded) and `releaseReservation(id)` (refuses to remove a
+    RECONCILIATION_FAILED reservation, throwing `UnresolvedReconciliationError`). `BudgetGuard.commit()`/
+    `release()` (runtime/budget/budget.ts) now delegate to these instead of performing the mutation themselves,
+    so the protection holds regardless of caller. New regression tests directly on `CostEngine` (not only via
+    `BudgetGuard`) prove: no generic `deleteReservation` remains on the public API, a failed commit protects
+    (never frees) the reservation's capacity, and `releaseReservation` rejects a RECONCILIATION_FAILED
+    reservation while still allowing ordinary ACTIVE release. Verified via a temporary bypass of the
+    RECONCILIATION_FAILED guard — confirmed the exact predicted 13 tests (across cost-engine.test.ts AND several
+    pre-existing budget.test.ts regressions from earlier rounds) failed, then reverted and re-confirmed all
+    passing.
+
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
   description: >
@@ -2496,8 +2623,20 @@
     - "runtime/scheduler/scheduler.ts"
   test_refs:
     - "runtime/scheduler/__tests__/scheduler.test.ts"
-  proof_refs: []
+  proof_refs:
+    - "proofs/smallest-sufficient-worker/proof.test.ts"
   security_refs: []
+  notes: >
+    P1 fix (24th independent review round, "worker sufficiency must rank before price"): `selectWorker()` used
+    to rank candidates by cost ALONE — cost happened to correlate with resource-class weight in every prior
+    test/proof, but a cheaper-per-minute GPU/high-memory worker would still have been selected over a sufficient
+    smaller worker, exactly the waste baseline section 83 forbids. Added `WORKER_CLASS_EXCESS_WEIGHT` (lower =
+    leaner) so ranking is now: capability/resource sufficiency (existing capability filter) -> excess-resource
+    minimization (new weight comparison) -> availability (existing IDLE filter) -> cost (tie-break only among
+    equally-lean candidates). Regression tests prove a cheaper GPU worker and a cheaper high-memory worker both
+    lose to a sufficient smaller worker, while cost still breaks ties within the same weight tier. Verified via
+    a temporary bypass (reverting to the old cheapest-of-all reduce) — confirmed exactly the two new
+    excess-weight tests failed with the predicted worker selected, then reverted and re-confirmed all passing.
 
 - id: UASF-REQ-0033
   title: Sandbox (foundation)
@@ -2721,7 +2860,18 @@
     - "runtime/project-isolation/__tests__/isolation.test.ts"
   proof_refs: []
   security_refs: []
-  notes: "Default-deny keyed store proven for the data-access case; filesystem/worker-level isolation is not yet wired to this abstraction."
+  notes: >
+    Default-deny keyed store proven for the data-access case; filesystem/worker-level isolation is not yet wired to this abstraction.
+
+    P1 fix (24th independent review round, "project writes must require caller identity"): `set()` used to
+    accept only a target project id, with no separate caller identity — a caller acting for project A could
+    write directly into project B's bucket by passing B's id as the (unchecked) target. `set()` now requires
+    BOTH `callerProjectId` and `targetProjectId`, exactly like `get()`/`keysFor()` already did, and rejects a
+    mismatch with the same `CrossProjectAccessDeniedError` (default deny now applies uniformly to reads AND
+    writes). Regression tests added: cross-project write rejection, a rejected write cannot overwrite a
+    victim project's existing data, and a caller cannot write for any project other than its own. Verified via
+    a temporary bypass of the new check — confirmed the exact predicted cross-project-write tests failed, then
+    reverted and re-confirmed all tests passing.
 
 - id: UASF-REQ-0035
   title: Event-driven agent activation
@@ -3897,3 +4047,19 @@
       architecture work, this was NOT fixed this round. Recorded here so
       a future session (or an explicit Founder/review request to add
       agent-scoped model invocation) does not need to re-discover it.
+
+    P1 fix (24th independent review round, finding 6, "authorize scaffold before paid model work"): the
+    `project.scaffold` policy check used to run AFTER the real, guarded model invocation — so a bootstrap that
+    was never going to be authorized to scaffold (an explicit DENY, or an unresolved APPROVAL_REQUIRED) still
+    incurred a genuine, paid model call and its real cost first, before being rejected and discarding the whole
+    scaffold. Required ordering (baseline section 147): authorization -> model call (if actually required) ->
+    filesystem mutation -> reconciliation/accounting. Fixed by evaluating the exact same `project.scaffold`
+    `CapabilityGateway.authorize()` decision, via a no-op `execute`, BEFORE the model invocation — this call's
+    only job is to gate progression on the same decision the real scaffold call (unchanged, still immediately
+    adjacent to the actual `scaffoldProjectOs()` mutation) will use. Three new regression tests prove: a DENY on
+    `project.scaffold` blocks the bootstrap with zero model invocations, zero cost recorded, and zero filesystem
+    mutation, even though the model's own `model.invoke` action would independently be ALLOWED; an
+    APPROVAL_REQUIRED scaffold (risk 5) behaves identically; and the ALLOWED happy path is unaffected (model
+    still invoked exactly once, scaffold still created). Verified via a temporary bypass (removing the new
+    pre-check) — confirmed the exact predicted 2 tests failed (model invoked once despite the scaffold being
+    denied/approval-required), then reverted and re-confirmed all passing.

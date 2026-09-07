@@ -76,6 +76,87 @@ function describeInvalidPersistedDecision(value: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * P2 fix (24th independent review round, "validate persisted supersession
+ * graph"): `describeInvalidPersistedDecision()` above validates each
+ * record IN ISOLATION — it cannot see whether a `supersededBy` target
+ * actually exists, belongs to the same project, or whether the graph of
+ * `supersededBy` edges as a WHOLE forms valid, acyclic chains (`A -> B ->
+ * C`), since none of that is knowable from a single record. A persisted
+ * decision could reference `supersededBy: "missing-id"` (a target that
+ * was never itself persisted), a target belonging to a DIFFERENT project
+ * (`supersede()` always copies `old.project` into the replacement, so a
+ * cross-project reference could never have been produced live), or even
+ * form a cycle (`A -> B -> A`) — `supersede()`'s own ACTIVE-only guard
+ * (bkz. `DecisionAlreadySupersededError`) makes a cycle impossible to
+ * create through the live API, but a hand-edited/corrupted persisted file
+ * has no such guard. Restoring any of these into authoritative state would
+ * silently corrupt "which decision is currently active, and why?" —
+ * exactly what baseline section 255 (Decision Explainability) requires to
+ * always be answerable. Run AFTER every individual record passes
+ * `describeInvalidPersistedDecision()` and BEFORE any record is inserted
+ * into the authoritative map (fail closed on the WHOLE batch, same
+ * philosophy as the per-record check above).
+ */
+function describeInvalidPersistedDecisionGraph(
+  records: readonly MutableFounderDecision[]
+): { index: number; reason: string } | undefined {
+  const byId = new Map<string, MutableFounderDecision>();
+  records.forEach((r) => byId.set(r.decisionId, r));
+
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    if (record.supersededBy === undefined) continue;
+    if (record.supersededBy === record.decisionId) {
+      return { index: i, reason: `supersededBy cannot reference itself ('${record.decisionId}')` };
+    }
+    const target = byId.get(record.supersededBy);
+    if (!target) {
+      return { index: i, reason: `supersededBy '${record.supersededBy}' does not reference any persisted decision` };
+    }
+    if (target.project !== record.project) {
+      return {
+        index: i,
+        reason: `supersededBy '${record.supersededBy}' belongs to project '${target.project}', not '${record.project}'`
+      };
+    }
+  }
+
+  // Cycle detection over the supersededBy edges (A -> B means A was
+  // superseded by B). Standard three-color DFS: WHITE = unvisited, GRAY =
+  // on the current path, BLACK = fully resolved with no cycle found.
+  const WHITE = 0;
+  const GRAY = 1;
+  const BLACK = 2;
+  const color = new Map<string, number>(records.map((r) => [r.decisionId, WHITE]));
+
+  function visit(id: string, path: readonly string[]): { index: number; reason: string } | undefined {
+    color.set(id, GRAY);
+    const next = byId.get(id)!.supersededBy;
+    if (next !== undefined) {
+      if (color.get(next) === GRAY) {
+        const cycleIndex = records.findIndex((r) => r.decisionId === id);
+        return { index: cycleIndex, reason: `supersession chain forms a cycle: ${[...path, id, next].join(" -> ")}` };
+      }
+      if (color.get(next) === WHITE) {
+        const result = visit(next, [...path, id]);
+        if (result) return result;
+      }
+    }
+    color.set(id, BLACK);
+    return undefined;
+  }
+
+  for (const record of records) {
+    if (color.get(record.decisionId) === WHITE) {
+      const result = visit(record.decisionId, []);
+      if (result) return result;
+    }
+  }
+
+  return undefined;
+}
+
 export class DuplicateDecisionError extends Error {
   constructor(decisionId: string) {
     super(`Decision id '${decisionId}' already exists. Use supersede() to record a change, never overwrite history.`);
@@ -199,18 +280,37 @@ export class FounderDecisionLedger {
     const ledger = new FounderDecisionLedger();
     const records = store.read<unknown[]>(path) ?? [];
     const seenIds = new Set<string>();
+    // P1 fix (24th independent review round, same root class as
+    // assumption-register.ts's "restored assumptions must be detached"):
+    // each validated candidate is copied (`{ ...candidate }`), never the
+    // exact object `store.read()` returned — a caller/store that later
+    // mutates the original object can no longer reach authoritative state.
+    const validated: MutableFounderDecision[] = [];
     records.forEach((record, index) => {
       const failure = describeInvalidPersistedDecision(record);
       if (failure) {
         throw new CorruptPersistedDecisionError(index, failure);
       }
-      const validated = record as MutableFounderDecision;
-      if (seenIds.has(validated.decisionId)) {
-        throw new CorruptPersistedDecisionError(index, `duplicate decisionId '${validated.decisionId}'`);
+      const candidate = record as MutableFounderDecision;
+      if (seenIds.has(candidate.decisionId)) {
+        throw new CorruptPersistedDecisionError(index, `duplicate decisionId '${candidate.decisionId}'`);
       }
-      seenIds.add(validated.decisionId);
-      ledger.decisions.set(validated.decisionId, validated);
+      seenIds.add(candidate.decisionId);
+      validated.push({ ...candidate });
     });
+
+    // P2 fix (24th independent review round, "validate persisted
+    // supersession graph"): run only AFTER every record has individually
+    // passed validation, and BEFORE any of them enters `ledger.decisions`
+    // — see `describeInvalidPersistedDecisionGraph()`'s note above.
+    const graphFailure = describeInvalidPersistedDecisionGraph(validated);
+    if (graphFailure) {
+      throw new CorruptPersistedDecisionError(graphFailure.index, graphFailure.reason);
+    }
+
+    for (const record of validated) {
+      ledger.decisions.set(record.decisionId, record);
+    }
     return ledger;
   }
 }

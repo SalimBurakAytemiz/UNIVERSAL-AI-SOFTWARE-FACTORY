@@ -241,6 +241,32 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // is removed entirely — it is now fully superseded by this real
   // reservation, which happens earlier and is authoritative rather than
   // advisory.
+  // P1 fix (24th independent review round, "authorize scaffold before paid
+  // model work"): Codex reproduced that this function's ONLY authorization
+  // check for `project.scaffold` used to sit AFTER the model invocation
+  // below — so a bootstrap that was never going to be allowed to scaffold
+  // (an explicit DENY, or an unresolved APPROVAL_REQUIRED) still incurred
+  // a REAL, paid model call and its cost first, only to then throw and
+  // discard the whole scaffold. Required ordering (baseline section 147,
+  // "capability gateway'in policy engine'i atlayan bir yolu olmamalı"):
+  // policy/approval authorization -> allowed execution -> model call (if
+  // actually required) -> filesystem mutation -> reconciliation/
+  // accounting. Fixed by evaluating the EXACT SAME `project.scaffold`
+  // policy decision HERE, before any model work, via a no-op `execute` —
+  // this call's only job is to gate progression on the SAME decision the
+  // real scaffold call below will use; the actual filesystem mutation
+  // still happens through its OWN `authorize()` call immediately adjacent
+  // to where it occurs (unchanged), so a DENY/APPROVAL_REQUIRED decision
+  // now stops the bootstrap before the model is ever invoked, before any
+  // cost is recorded, and before any directory is created.
+  const gateway = new CapabilityGateway(policy);
+  const scaffoldAction = {
+    actionType: "project.scaffold",
+    risk,
+    description: `Scaffold Project OS for '${genome.project.id}'`
+  };
+  await gateway.authorize(scaffoldAction, () => undefined);
+
   const router = new CheapestCapableModelRouter(modelRegistry);
   const modelDecision = router.selectModel({
     taskId: `bootstrap:${genome.project.id}`,
@@ -267,15 +293,7 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     }
   );
 
-  const gateway = new CapabilityGateway(policy);
-  const scaffold = await gateway.authorize(
-    {
-      actionType: "project.scaffold",
-      risk,
-      description: `Scaffold Project OS for '${genome.project.id}'`
-    },
-    () => scaffoldProjectOs(baseDir, genome.project.id)
-  );
+  const scaffold = await gateway.authorize(scaffoldAction, () => scaffoldProjectOs(baseDir, genome.project.id));
 
   // P1 fix (5th independent review round, "final-destination / dangling
   // symlink escape"): eskiden bu dosya yolları düz `join()` ile

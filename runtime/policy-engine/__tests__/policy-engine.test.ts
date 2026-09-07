@@ -539,4 +539,41 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
     }
   );
+
+  describe("P1 fix (24th independent review round, 'approval state must be runtime-private')", () => {
+    it("the internal request map is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("priv-1", "Deploy to production", 5);
+
+      // `as any` still cannot reach it — a genuine ECMAScript private field
+      // has no corresponding property key at all, unlike TS `private`.
+      expect((workflow as unknown as Record<string, unknown>).requests).toBeUndefined();
+      expect((workflow as unknown as Record<string, unknown>)["requests"]).toBeUndefined();
+    });
+
+    it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private request map", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("priv-2", "Deploy to production", 5);
+
+      expect(Object.getOwnPropertyNames(workflow)).not.toContain("requests");
+      expect(Reflect.ownKeys(workflow).map(String)).not.toContain("requests");
+    });
+
+    it("mutating a returned record cannot reach or change the authoritative internal state (frozen + detached, and the map itself is unreachable)", () => {
+      const workflow = new ApprovalWorkflow();
+      workflow.request("priv-3", "Deploy to production", 5);
+      const req = workflow.get("priv-3")!;
+
+      expect(() => {
+        (req as { status: string }).status = "APPROVED";
+      }).toThrow(TypeError);
+      expect(workflow.get("priv-3")!.status).toBe("PENDING");
+
+      // Attempting to reach the internal map via a caller-forged object
+      // shaped like the class also finds nothing — there is no "requests"
+      // property to attach to at all.
+      const forged: Record<string, unknown> = { ...workflow };
+      expect(forged.requests).toBeUndefined();
+    });
+  });
 });

@@ -37,4 +37,44 @@ describe("ResourceAwareScheduler", () => {
       NoSufficientWorkerError
     );
   });
+
+  describe("P1 fix (24th independent review round, 'worker sufficiency must rank before price')", () => {
+    it("never selects a cheaper GPU worker over a sufficient CPU-only worker for a CPU-only task", () => {
+      const registry = new WorkerRegistry();
+      // Deliberately the OPPOSITE of every other test in this file: the GPU
+      // worker is now the CHEAPER of the two. A pure cheapest-first rule
+      // would pick it; smallest-sufficient-worker must not.
+      registry.register({ id: "cpu-expensive", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.5, status: "IDLE" });
+      registry.register({ id: "gpu-cheap", workerClass: "gpu", capabilities: ["cpu", "gpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      const scheduler = new ResourceAwareScheduler(registry);
+
+      const worker = scheduler.selectWorker({ taskId: "lint-job", requiredCapabilities: ["cpu"] });
+
+      expect(worker.id).toBe("cpu-expensive");
+      expect(worker.workerClass).not.toBe("gpu");
+    });
+
+    it("never selects a cheaper high-memory worker over a sufficient linux-container worker", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "container-box", workerClass: "linux-container", capabilities: ["cpu"], costPerMinuteUsd: 0.2, status: "IDLE" });
+      registry.register({ id: "high-mem-box", workerClass: "high-memory", capabilities: ["cpu"], costPerMinuteUsd: 0.02, status: "IDLE" });
+      const scheduler = new ResourceAwareScheduler(registry);
+
+      const worker = scheduler.selectWorker({ taskId: "build-job", requiredCapabilities: ["cpu"] });
+
+      expect(worker.id).toBe("container-box");
+    });
+
+    it("cost still breaks ties among workers with the same resource-excess weight", () => {
+      const registry = new WorkerRegistry();
+      registry.register({ id: "cpu-cheap", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+      registry.register({ id: "cpu-pricey", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.9, status: "IDLE" });
+      registry.register({ id: "mac-cheap", workerClass: "macos", capabilities: ["cpu"], costPerMinuteUsd: 0.05, status: "IDLE" });
+      const scheduler = new ResourceAwareScheduler(registry);
+
+      const worker = scheduler.selectWorker({ taskId: "lint-job", requiredCapabilities: ["cpu"] });
+
+      expect(worker.id).toBe("cpu-cheap"); // same weight tier as mac-cheap, but strictly cheaper
+    });
+  });
 });

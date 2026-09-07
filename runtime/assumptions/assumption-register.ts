@@ -272,7 +272,19 @@ export class AssumptionRegister {
         throw new CorruptPersistedAssumptionError(index, `duplicate id '${validated.id}'`);
       }
       seenIds.add(validated.id);
-      register.assumptions.set(validated.id, validated);
+      // P1 fix (24th independent review round, "restored assumptions must
+      // be detached"): this used to store `validated` — the EXACT object
+      // `store.read()` returned — directly into `this.assumptions`. Every
+      // field on `MutableAssumption` is a primitive (no nested objects/
+      // arrays), so a shallow copy is sufficient to fully detach it: if the
+      // caller/store still holds (or later returns again, e.g. a cache) a
+      // reference to that same object and mutates it — `original.status =
+      // "ACCEPTED"` — authoritative registry state changed with NO
+      // `accept()`/`reject()`/`validate()` call and NO invariant check at
+      // all, the exact same class of bypass `freezeRecord()`-on-read
+      // already protects against for objects LEAVING this class. Now the
+      // register owns its own independent copy from the moment of load.
+      register.assumptions.set(validated.id, { ...validated });
     });
     return register;
   }

@@ -10,8 +10,8 @@
 // `now` enjekte edilebilir bir saat fonksiyonudur; testler bunu ilerleterek
 // gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
-import { assertValidMonetaryAmount, exceedsMonetaryAmount } from "../cost/cost-engine.js";
-import type { CostEngine, CostEntry, CostScope, ReservationOwnership } from "../cost/cost-engine.js";
+import { assertValidMonetaryAmount, exceedsMonetaryAmount, UnknownReservationError, UnresolvedReconciliationError } from "../cost/cost-engine.js";
+import type { CostEngine, CostEntry, CostScope, LedgerReservation, ReservationOwnership } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
 
@@ -24,6 +24,16 @@ import { freezeRecord } from "../util/immutable.js";
 // fix notları), but any code that imported the type from here (or from
 // this module's own `Reservation` interface) sees no shape change.
 export type { ReservationOwnership };
+
+// P1 fix (24th independent review round, "reservation deletion must not
+// bypass reconciliation"): `UnknownReservationError`/`UnresolvedReconciliationError`
+// used to be DEFINED in this file; they now live in cost-engine.ts (bkz.
+// `CostEngine.commitReservation()`/`releaseReservation()`'ın üstündeki fix
+// notu — the invariant they protect must hold at the ledger level, not
+// only when accessed through `BudgetGuard`), re-exported here for API
+// stability so every existing caller/test importing them from this module
+// continues to work unchanged.
+export { UnknownReservationError, UnresolvedReconciliationError };
 
 export type BudgetCeilingName = "perTaskUsd" | "perRunUsd" | "dailyUsd" | "monthlyUsd";
 
@@ -100,16 +110,6 @@ export interface Reservation {
   readonly amountUsd: number;
 }
 
-export class UnknownReservationError extends Error {
-  constructor(reservationId: string) {
-    super(
-      `No open reservation '${reservationId}' — it may have already been committed/released, ` +
-        `or never existed. commit()/release() must be called at most once per reserve() call.`
-    );
-    this.name = "UnknownReservationError";
-  }
-}
-
 /**
  * P1 fix (12th independent review round, "failed reconciliation
  * reservations can still be released"): a reservation whose `commit()`
@@ -136,18 +136,6 @@ export class UnknownReservationError extends Error {
  * (`UnknownReservationError`), never a silent no-op.
  */
 export type ReservationStatus = "ACTIVE" | "RECONCILIATION_FAILED";
-
-export class UnresolvedReconciliationError extends Error {
-  constructor(reservationId: string) {
-    super(
-      `Reservation '${reservationId}' has an UNRESOLVED reconciliation failure (a prior commit() ` +
-        `attempt failed after the provider call may already have run) and cannot be release()d — ` +
-        `release() is only for a reservation where NO cost was ever incurred. Retry commit() with a ` +
-        `corrected amount on this same reservation id instead; that is the only safe path forward.`
-    );
-    this.name = "UnresolvedReconciliationError";
-  }
-}
 
 /**
  * P1 fix (12th independent review round, "commit() accepts accounting
@@ -632,22 +620,21 @@ export class BudgetGuard {
       });
     }
 
+    // P1 fix (24th independent review round, "reservation deletion must
+    // not bypass reconciliation"): the validate-record-delete sequence
+    // used to be performed HERE, ending in a bare `this.costEngine.
+    // deleteReservation(reservationId)` — a generic, unguarded primitive
+    // that ANY caller with a `CostEngine` reference could also invoke
+    // directly, bypassing this exact validation. That sequence now lives
+    // in `CostEngine.commitReservation()` itself (bkz. cost-engine.ts'in
+    // üstündeki fix notu) — it enforces the SAME "mark RECONCILIATION_FAILED
+    // and never delete on a failed validation" rule, but does so at the
+    // ledger level, so the invariant holds even for a caller that never
+    // goes through this `BudgetGuard` at all.
     let recorded: CostEntry;
     try {
-      assertValidMonetaryAmount(entry.amountUsd, `BudgetGuard.commit(reservationId=${reservationId})`);
-      recorded = this.costEngine.record(entry);
+      recorded = this.costEngine.commitReservation(reservationId, entry);
     } catch (err) {
-      // Rezervasyon KASITLI OLARAK silinmez — mutabakat başarısız oldu,
-      // korunan kapasite açık/çözülmemiş kalmalıdır. P1 fix (12th
-      // independent review round, "failed reconciliation reservations can
-      // still be released"): durum artık AÇIKÇA "RECONCILIATION_FAILED"
-      // olarak işaretlenir — bkz. `ReservationStatus`/
-      // `UnresolvedReconciliationError`'ın üstündeki not — bu, release()'in
-      // bu rezervasyonu ARTIK KABUL ETMEYECEĞİ anlamına gelir; TEK ileri
-      // yol, düzeltilmiş bir tutarla commit()'i AYNI id ile tekrar
-      // denemektir. Marked on the SHARED ledger, visible to every
-      // `BudgetGuard` bound to it (bkz. 16th independent review round).
-      this.costEngine.markReservationReconciliationFailed(reservationId);
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_COMMIT_FAILED",
         actor: "budget-guard",
@@ -662,12 +649,6 @@ export class BudgetGuard {
       });
       throw err;
     }
-
-    // Rezervasyon ANCAK ŞİMDİ, gerçek maliyet GÜVENLE ve KALICI olarak
-    // kaydedildikten SONRA silinir — "başarılı mutabakat, rezervasyonu
-    // TAM OLARAK BİR KEZ serbest bırakır/dönüştürür." SHARED ledger'dan
-    // silinir, bu yüzden her bağlı `BudgetGuard` bunu HEMEN görür.
-    this.costEngine.deleteReservation(reservationId);
 
     const overages = this.buildCeilingChecks({ taskId: entry.taskId, projectId: entry.projectId }, 0).filter((check) =>
       exceedsMonetaryAmount(check.projected, check.limit)
@@ -718,25 +699,33 @@ export class BudgetGuard {
    * as before.
    */
   release(reservationId: string): void {
-    const reservation = this.costEngine.getReservation(reservationId);
-    if (!reservation) {
-      throw new UnknownReservationError(reservationId);
+    // P1 fix (24th independent review round, "reservation deletion must
+    // not bypass reconciliation"): the RECONCILIATION_FAILED protection
+    // now lives in `CostEngine.releaseReservation()` itself (bkz.
+    // cost-engine.ts'in üstündeki fix notu), so it holds regardless of
+    // whether the caller goes through this `BudgetGuard` or talks to the
+    // ledger directly — this method's own job is now just translating
+    // that outcome into the SAME audit events/error types as before.
+    let released: LedgerReservation;
+    try {
+      released = this.costEngine.releaseReservation(reservationId);
+    } catch (err) {
+      if (err instanceof UnresolvedReconciliationError) {
+        const reservation = this.costEngine.getReservation(reservationId);
+        this.auditLog?.append({
+          type: "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED",
+          actor: "budget-guard",
+          payload: { reservationId, scope: reservation?.scope, amountUsd: reservation?.amountUsd },
+          timestamp: this.now().toISOString()
+        });
+      }
+      throw err;
     }
-    if (reservation.status === "RECONCILIATION_FAILED") {
-      this.auditLog?.append({
-        type: "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED",
-        actor: "budget-guard",
-        payload: { reservationId, scope: reservation.scope, amountUsd: reservation.amountUsd },
-        timestamp: this.now().toISOString()
-      });
-      throw new UnresolvedReconciliationError(reservationId);
-    }
-    this.costEngine.deleteReservation(reservationId);
 
     this.auditLog?.append({
       type: "BUDGET_RESERVATION_RELEASED",
       actor: "budget-guard",
-      payload: { reservationId, scope: reservation.scope, amountUsd: reservation.amountUsd },
+      payload: { reservationId, scope: released.scope, amountUsd: released.amountUsd },
       timestamp: this.now().toISOString()
     });
   }

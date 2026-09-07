@@ -1268,4 +1268,97 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (24th independent review round, finding 6, 'authorize scaffold before paid model work'): a " +
+      "bootstrap that is not authorized to scaffold must never invoke the model or incur cost first",
+    () => {
+      function spyProvider(id: string): { provider: ModelProvider; invokeCount: () => number } {
+        let calls = 0;
+        const provider: ModelProvider = {
+          id,
+          async invoke(model): Promise<ModelInvocationResponse> {
+            calls += 1;
+            return { provider: id, modelId: model.modelId, costUsd: model.costPerCall, output: "should never run" };
+          }
+        };
+        return { provider, invokeCount: () => calls };
+      }
+
+      it("a DENY on project.scaffold blocks the whole bootstrap before the model is ever invoked or any cost recorded, even though model.invoke itself is ALLOWED", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-scaffold-deny-"));
+        const policy = new PolicyEngine();
+        policy.addRule({ name: "allow-model-invoke", priority: 10, evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null) });
+        policy.addRule({ name: "deny-scaffold", priority: 20, evaluate: (a) => (a.actionType === "project.scaffold" ? "DENY" : null) });
+
+        const { provider, invokeCount } = spyProvider("mock");
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-scaffold-denied"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            costEngine
+          })
+        ).rejects.toThrow(CapabilityDeniedError);
+
+        expect(invokeCount()).toBe(0); // model never invoked
+        expect(costEngine.total()).toBe(0); // no cost recorded
+        expect(existsSync(join(tempRoot, "proj-scaffold-denied"))).toBe(false); // no filesystem mutation
+      });
+
+      it("an APPROVAL_REQUIRED project.scaffold (risk 5) blocks the whole bootstrap before the model is ever invoked or any cost recorded", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-scaffold-approval-"));
+        const policy = new PolicyEngine();
+        policy.addRule({ name: "allow-model-invoke", priority: 10, evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null) });
+
+        const { provider, invokeCount } = spyProvider("mock");
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-scaffold-approval"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            costEngine,
+            risk: 5
+          })
+        ).rejects.toThrow(); // CapabilityApprovalRequiredError
+
+        expect(invokeCount()).toBe(0); // model never invoked
+        expect(costEngine.total()).toBe(0); // no cost recorded
+        expect(existsSync(join(tempRoot, "proj-scaffold-approval"))).toBe(false); // no filesystem mutation
+      });
+
+      it("an ALLOWED scaffold still invokes the model and scaffolds normally (no regression for the happy path)", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-scaffold-allow-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const { provider, invokeCount } = spyProvider("mock");
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(provider);
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome("proj-scaffold-allow"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway
+        });
+
+        expect(invokeCount()).toBe(1);
+        expect(existsSync(join(tempRoot, "proj-scaffold-allow"))).toBe(true);
+        expect(result.scaffold.projectRoot).toContain("proj-scaffold-allow");
+      });
+    }
+  );
 });

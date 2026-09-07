@@ -1,8 +1,34 @@
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+
+// P2 fix (24th independent review round, "secret history scan must fail
+// closed on unreadable blobs"): to deterministically prove the fix without
+// actually committing an enormous (hundreds-of-MB) blob into a throwaway
+// git repo just to exceed maxBuffer, this intercepts the EXACT single
+// `git cat-file -p <sha>` call `readBlobContent()` makes for one targeted
+// blob sha (set via `globalThis.__SECRET_SCAN_TEST_UNREADABLE_SHA__` right
+// before calling `scanGitHistory()`) and makes it throw, simulating a
+// genuine unreadable-blob condition (maxBuffer overrun, transient git
+// failure, ...). Every other `execFileSync` call (ls-files, rev-list,
+// cat-file --batch-check, and cat-file -p for any OTHER sha) passes
+// through to the real implementation unchanged.
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual("node:child_process");
+  return {
+    ...actual,
+    execFileSync: (file, args, options) => {
+      const targetSha = globalThis.__SECRET_SCAN_TEST_UNREADABLE_SHA__;
+      if (targetSha && file === "git" && args?.[0] === "cat-file" && args?.[1] === "-p" && args?.[2] === targetSha) {
+        throw new Error("simulated unreadable blob (maxBuffer exceeded or transient git failure)");
+      }
+      return actual.execFileSync(file, args, options);
+    }
+  };
+});
+
 import {
   findSecretsInText,
   isPlaceholderValue,
@@ -243,6 +269,17 @@ describe("secret-scan: no whole-file allowlist (regression for the P2 finding)",
   });
 });
 
+describe(
+  "P2 fix (24th independent review round targeted audit, same root class as 'secret history scan must fail " +
+    "closed on unreadable blobs'): scanFile() must not silently skip a current-tree file it cannot read",
+  () => {
+    it("REGRESSION: a tracked file that fails to read throws rather than returning an empty (falsely clean) result", () => {
+      const missingPath = "definitely/does/not/exist.txt";
+      expect(() => scanFile(missingPath, process.cwd())).toThrow();
+    });
+  }
+);
+
 describe("secret-scan: git-history-aware scanning", () => {
   let tempRepo;
 
@@ -280,7 +317,8 @@ describe("secret-scan: git-history-aware scanning", () => {
     expect(trackedNow).not.toContain("credentials.txt");
 
     // But git history scanning must still find it.
-    const findings = scanGitHistory(tempRepo);
+    const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+    expect(unreadableBlobs).toHaveLength(0);
     expect(findings.some((f) => f.pattern === "AWS Access Key ID" && f.file.includes("credentials.txt"))).toBe(true);
   });
 
@@ -293,7 +331,8 @@ describe("secret-scan: git-history-aware scanning", () => {
     git(["add", "fixture.txt"]);
     git(["commit", "-m", "add fixture"]);
 
-    const findings = scanGitHistory(tempRepo);
+    const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+    expect(unreadableBlobs).toHaveLength(0);
     expect(findings).toHaveLength(0);
   });
 
@@ -314,7 +353,8 @@ describe("secret-scan: git-history-aware scanning", () => {
     git(["add", "credentials.txt"]);
     git(["commit", "-m", "add credentials"]);
 
-    const findings = scanGitHistory(tempRepo);
+    const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+    expect(unreadableBlobs).toHaveLength(0);
     expect(findings.length).toBeGreaterThan(0);
     for (const finding of findings) {
       const serialized = JSON.stringify(finding);
@@ -339,7 +379,8 @@ describe("secret-scan: git-history-aware scanning", () => {
     const uniqueShas = new Set(blobs.map((b) => b.sha));
     expect(uniqueShas.size).toBe(blobs.length); // listHistoricalBlobs already dedupes by sha
 
-    const findings = scanGitHistory(tempRepo);
+    const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+    expect(unreadableBlobs).toHaveLength(0);
     expect(findings).toHaveLength(1); // one unique blob -> one finding, not two
   });
 
@@ -358,7 +399,8 @@ describe("secret-scan: git-history-aware scanning", () => {
       const trackedNow = execFileSync("git", ["ls-files"], { cwd: tempRepo, encoding: "utf8" });
       expect(trackedNow).not.toContain("config.env");
 
-      const findings = scanGitHistory(tempRepo);
+      const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+      expect(unreadableBlobs).toHaveLength(0);
       expect(
         findings.some(
           (f) =>
@@ -381,7 +423,8 @@ describe("secret-scan: git-history-aware scanning", () => {
       git(["add", "config.json"]);
       git(["commit", "-m", "oops: add config with a credential"]);
 
-      const findings = scanGitHistory(tempRepo);
+      const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+      expect(unreadableBlobs).toHaveLength(0);
       expect(findings.some((f) => f.pattern === "OpenAI API key" && f.file.includes("config.json"))).toBe(true);
     }
   );
@@ -404,17 +447,65 @@ describe("secret-scan: git-history-aware scanning", () => {
       const trackedNow = execFileSync("git", ["ls-files"], { cwd: tempRepo, encoding: "utf8" });
       expect(trackedNow).not.toContain("config.json");
 
-      const findings = scanGitHistory(tempRepo);
+      const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+      expect(unreadableBlobs).toHaveLength(0);
       expect(findings.some((f) => f.pattern === "OpenAI API key" && f.file.includes("config.json"))).toBe(true);
     }
   );
+
+  describe("P2 fix (24th independent review round, 'secret history scan must fail closed on unreadable blobs')", () => {
+    afterEach(() => {
+      delete globalThis.__SECRET_SCAN_TEST_UNREADABLE_SHA__;
+    });
+
+    it(
+      "REGRESSION: a historical blob whose content cannot be read is never silently treated as clean — it is " +
+        "reported as an unreadable-blob coverage failure, and removing the current file does not hide that",
+      () => {
+        tempRepo = initTempRepo();
+        writeFileSync(join(tempRepo, "big-secret.txt"), "AWS_KEY=AKIAABCDEFGHIJKLMNOP\n"); // secret-scan:allow (fake fixture value written into a temp repo)
+        git(["add", "big-secret.txt"]);
+        git(["commit", "-m", "add a file that will simulate an unreadable historical blob"]);
+        execFileSync("git", ["rm", "big-secret.txt"], { cwd: tempRepo });
+        git(["commit", "-m", "remove it from the current tree"]);
+
+        const blobs = listHistoricalBlobs(tempRepo);
+        const target = blobs.find((b) => b.path === "big-secret.txt");
+        expect(target).toBeDefined();
+
+        // Simulate the blob's content read failing (maxBuffer overrun,
+        // transient git failure, ...) — see the module-level vi.mock above.
+        globalThis.__SECRET_SCAN_TEST_UNREADABLE_SHA__ = target.sha;
+
+        const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+
+        // The failure is surfaced explicitly, not silently absorbed...
+        expect(unreadableBlobs.some((b) => b.sha === target.sha && b.path === "big-secret.txt")).toBe(true);
+        // ...and the secret inside that SPECIFIC unreadable blob was never
+        // actually scanned — proving this is a genuine "could not read"
+        // condition, not a disguised "scanned and found nothing."
+        expect(findings.some((f) => f.file.includes("big-secret.txt"))).toBe(false);
+      }
+    );
+
+    it("a scan with no unreadable blobs reports an empty unreadableBlobs list (no regression)", () => {
+      tempRepo = initTempRepo();
+      writeFileSync(join(tempRepo, "clean.txt"), "hello world\n");
+      git(["add", "clean.txt"]);
+      git(["commit", "-m", "add a clean file"]);
+
+      const { unreadableBlobs } = scanGitHistory(tempRepo);
+      expect(unreadableBlobs).toEqual([]);
+    });
+  });
 });
 
 describe("secret-scan: this repository's own known-historical baseline", () => {
   it("the pre-existing historical fixture blob (commit 981f0a4, before secret-scan:allow existed) is baselined precisely, not hidden by a broad exclusion", () => {
     // Scans the REAL repository (default cwd), proving the baseline
     // actually resolves the genuine finding without rewriting git history.
-    const findings = scanGitHistory();
+    const { findings, unreadableBlobs } = scanGitHistory();
+    expect(unreadableBlobs).toHaveLength(0);
     const historicalFixtureFindings = findings.filter((f) => f.file.startsWith("history:tests/secret-scan.test.mjs@"));
     expect(historicalFixtureFindings).toHaveLength(0);
   });

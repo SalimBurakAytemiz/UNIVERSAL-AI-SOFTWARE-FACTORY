@@ -316,4 +316,68 @@ describe("AssumptionRegister", () => {
       });
     }
   );
+
+  describe("P1 fix (24th independent review round, 'restored assumptions must be detached')", () => {
+    function fakeStore(data: unknown): StateStore {
+      return {
+        write: () => undefined,
+        read: () => data as never,
+        exists: () => true
+      };
+    }
+
+    it(
+      "REGRESSION: mutating the original object returned by the store AFTER loadFrom() does not change " +
+        "the register's authoritative state",
+      () => {
+        const original: { id: string; description: string; reason: string; impact: string; source: string; status: string; createdAt: string } = {
+          id: "detach-1",
+          description: "original description",
+          reason: "r",
+          impact: "LOW",
+          source: "s",
+          status: "PROPOSED",
+          createdAt: new Date().toISOString()
+        };
+        const store = fakeStore([original]);
+        const register = AssumptionRegister.loadFrom(store, "assumptions.json");
+
+        // The caller/store still holds this exact reference and mutates it
+        // AFTER the load completed — simulating a cache or in-memory store
+        // that returns (and later mutates) the same object.
+        original.status = "ACCEPTED";
+        original.description = "mutated after load";
+
+        expect(register.get("detach-1")!.status).toBe("PROPOSED");
+        expect(register.get("detach-1")!.description).toBe("original description");
+      }
+    );
+
+    it(
+      "REGRESSION: mutating the original object cannot smuggle a HIGH-impact assumption into ACCEPTED " +
+        "without ever going through accept()'s Founder-confirmation check",
+      () => {
+        const original: { id: string; description: string; reason: string; impact: string; source: string; status: string; createdAt: string } = {
+          id: "detach-2",
+          description: "d",
+          reason: "r",
+          impact: "LOW", // valid at load time — passes describeInvalidPersistedAssumption()
+          source: "s",
+          status: "PROPOSED",
+          createdAt: new Date().toISOString()
+        };
+        const store = fakeStore([original]);
+        const register = AssumptionRegister.loadFrom(store, "assumptions.json");
+
+        // If the register retained the same reference, this would silently
+        // create a HIGH-impact ACCEPTED record with no confirmedBy at all —
+        // a state accept() itself could never produce.
+        original.impact = "HIGH";
+        original.status = "ACCEPTED";
+
+        expect(register.get("detach-2")!.impact).toBe("LOW");
+        expect(register.get("detach-2")!.status).toBe("PROPOSED");
+      }
+    );
+  });
 });

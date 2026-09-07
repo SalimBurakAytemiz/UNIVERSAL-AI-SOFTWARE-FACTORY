@@ -748,6 +748,86 @@ factory:
     does NOT declare P0 complete. P0 remains BLOCKED_PENDING_REVIEW,
     awaiting the next independent (P0 closure) review.
 
+    THIS SESSION (round 24): a fresh independent Codex review of the
+    complete branch found TEN further actionable findings (8 P1, 2 P2)
+    across cross-project write authorization, budget/cost-reservation
+    lifecycle, worker scheduling, approval-state encapsulation, capability-
+    gateway/approval integration, bootstrap authorization ordering,
+    persisted-state mutability, technology-registry governance, persisted
+    decision-graph integrity, and secret-scan coverage. All ten fixed as
+    one consolidated closure batch: (1) [P1] `runtime/project-isolation/
+    isolation.ts`'s `set()` accepted only a target project id with no
+    separate caller identity, letting a caller acting for project A write
+    directly into project B's bucket; fixed by requiring BOTH a
+    `callerProjectId` and `targetProjectId`, matching `get()`/`keysFor()`'s
+    existing default-deny check. (2) [P1] `runtime/cost/cost-engine.ts`'s
+    public `deleteReservation(id)` removed ANY reservation unconditionally,
+    including a RECONCILIATION_FAILED one — callable directly by any code
+    holding a CostEngine reference, bypassing `BudgetGuard.commit()`/
+    `release()` entirely and silently discarding the protection a failed
+    reconciliation exists to provide; removed from the public API and
+    replaced with `commitReservation()`/`releaseReservation()`, which
+    enforce the same invariants at the ledger level regardless of caller.
+    (3) [P1] `runtime/scheduler/scheduler.ts` ranked candidates by cost
+    alone, so a cheaper-per-minute GPU/high-memory worker could still be
+    selected over a sufficient smaller worker; fixed with an explicit
+    resource-excess-weight comparison that runs BEFORE cost, cost now only
+    a tie-breaker among equally-lean candidates. (4) [P1]
+    `runtime/policy-engine/approval.ts`'s request map used TypeScript's
+    compile-time-only `private`, reachable via ordinary property access to
+    mutate approval status directly, bypassing `approve()`'s reviewer-
+    identity check and audit event; fixed with a genuine ECMAScript
+    `#private` field (matching `models/gateway.ts`'s established
+    `#providers`/`#rawInvoke` pattern), unreachable via `as any`, bracket
+    access, or any reflection API. (5) [P1] `runtime/capability-gateway/
+    gateway.ts`'s `authorize()` unconditionally threw on APPROVAL_REQUIRED
+    with no way to present a genuine, already-decided approval, so an
+    actually-approved action still could never execute through the one
+    authoritative gateway; fixed with an optional `ApprovalEvidence`
+    parameter, independently re-verified (must be APPROVED, and must match
+    the exact action/risk being authorized — no replay across unrelated
+    actions), with DENY always winning regardless of evidence. (6) [P1]
+    `runtime/project-lifecycle/orchestrator.ts`'s bootstrap invoked the
+    real, paid model BEFORE checking `project.scaffold` authorization, so
+    a DENY/APPROVAL_REQUIRED bootstrap still incurred real cost first;
+    fixed by evaluating the same scaffold decision (via a no-op execute)
+    before the model invocation. (7) [P1] `assumption-register.ts`'s (and,
+    via the same targeted audit, `decision-ledger.ts`'s) `loadFrom()`
+    stored the exact object the StateStore returned, so a caller/store
+    mutating that object after load could change authoritative state with
+    no validated transition; fixed with a shallow detaching copy in both.
+    (8) [P1] `runtime/technology-registry/registry.ts`'s `register()`
+    unconditionally overwrote an existing id, letting a FORBIDDEN
+    technology be silently replaced with a PREFERRED record; fixed with
+    `DuplicateTechnologyIdError` on any collision and a new
+    `transitionLifecycle()` that refuses to walk DEPRECATED/FORBIDDEN back
+    to a recommendable lifecycle. (9) [P2] `decision-ledger.ts` validated
+    each persisted record in isolation but never the supersession graph as
+    a whole, so a persisted decision could reference a missing/cross-
+    project/self/cyclic `supersededBy` target; fixed with a whole-batch
+    graph validator (existence, project match, self-reference, three-color
+    DFS cycle detection) run after per-record validation and before
+    authoritative insertion. (10) [P2] `scripts/secret-scan.mjs`'s
+    `readBlobContent()` silently caught every read error and returned
+    null, treated identically to "scanned, found nothing" — letting an
+    unreadably-large or transiently-failing historical blob produce an
+    honest-looking PASS despite never being scanned; fixed by no longer
+    swallowing the error and having `scanGitHistory()`/`main()` report any
+    unreadable blob as an explicit, fail-closed coverage gap. A targeted
+    audit of the same root class found and fixed an identical silent-catch
+    in `scanFile()` for the current-tree scan. All ten fixes carry
+    deterministic regression tests (46 net new tests, 737 -> 783), and
+    every fix was verified via a temporary in-place bypass reproducing the
+    exact predicted failure symptom, then fully reverted (confirmed via
+    grep for the temp-marker in every touched file). A narrow, explicitly-
+    scoped audit of exactly these ten root classes found no further
+    genuine instance beyond what's already fixed, with one exception
+    (the scanFile() current-tree gap above, same file/root class as
+    finding 10, fixed proactively). Per explicit instruction, this round
+    does NOT merge, does NOT move to P1, and does NOT declare P0 complete.
+    P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent (P0
+    closure) review.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -3358,6 +3438,87 @@ completed_milestones:
     than adding real example strings), Factory Doctor (READY on all
     checks), all 9 P0 proofs (13 assertions) — all clean, stable across
     repeated runs, no orphaned processes.
+  - >-
+    THIS SESSION (round 24): fixed a fresh independent Codex review's ten
+    findings (8 P1, 2 P2) as one consolidated closure batch:
+    (1) [P1] "project writes must require caller identity":
+    `runtime/project-isolation/isolation.ts`'s `set()` now requires BOTH a
+    caller and target project id, matching `get()`/`keysFor()`'s existing
+    default-deny check — closes a cross-project write bypass.
+    (2) [P1] "reservation deletion must not bypass reconciliation":
+    `runtime/cost/cost-engine.ts`'s public, unguarded `deleteReservation()`
+    (callable directly by any CostEngine holder, bypassing BudgetGuard
+    entirely) removed and replaced with `commitReservation()`/
+    `releaseReservation()`, which enforce the RECONCILIATION_FAILED
+    protection and real-cost-required-to-delete invariant at the ledger
+    level regardless of caller.
+    (3) [P1] "worker sufficiency must rank before price":
+    `runtime/scheduler/scheduler.ts` now ranks by resource-excess weight
+    BEFORE cost, so a cheaper GPU/high-memory worker can never win over a
+    sufficient smaller one — cost is now only a same-tier tie-breaker.
+    (4) [P1] "approval state must be runtime-private":
+    `runtime/policy-engine/approval.ts`'s request map is now a genuine
+    ECMAScript `#private` field (was TS-only `private`, reachable via
+    ordinary property access), matching `models/gateway.ts`'s established
+    pattern.
+    (5) [P1] "approved requests must pass capability gateway":
+    `runtime/capability-gateway/gateway.ts`'s `authorize()` now accepts
+    optional `ApprovalEvidence`, independently re-verified as APPROVED and
+    bound to the exact action/risk (no replay), with DENY always winning.
+    (6) [P1] "authorize scaffold before paid model work":
+    `runtime/project-lifecycle/orchestrator.ts` now checks
+    `project.scaffold` authorization BEFORE invoking the real, paid model,
+    so a DENY/APPROVAL_REQUIRED bootstrap incurs zero model cost.
+    (7) [P1] "restored assumptions must be detached":
+    `assumption-register.ts`'s (and, via the same targeted audit,
+    `decision-ledger.ts`'s) `loadFrom()` now stores a detached copy of
+    each validated persisted record, closing a caller/store-mutation
+    bypass of the live accept()/supersede() invariants.
+    (8) [P1] "technology registry must reject uncontrolled overwrites":
+    `runtime/technology-registry/registry.ts`'s `register()` now rejects
+    any duplicate id; a new `transitionLifecycle()` is the only way to
+    change an existing technology's lifecycle and refuses to walk
+    DEPRECATED/FORBIDDEN back to a recommendable one.
+    (9) [P2] "validate persisted supersession graph":
+    `decision-ledger.ts`'s `loadFrom()` now validates the WHOLE
+    supersession graph (missing/cross-project/self-referencing/cyclic
+    `supersededBy` targets) after per-record validation, before
+    authoritative insertion.
+    (10) [P2] "secret history scan must fail closed on unreadable blobs":
+    `scripts/secret-scan.mjs`'s blob/file read failures are no longer
+    silently treated as "scanned, found nothing" — both
+    `scanGitHistory()` (history) and the current-tree scan now report any
+    unreadable blob/file as an explicit, fail-closed coverage gap (the
+    current-tree half found and fixed proactively via the same targeted
+    audit). All ten fixes carry deterministic regression tests (46 net
+    new: 737 -> 783) and were each verified via a temporary in-place
+    bypass reproducing the exact predicted failure, then fully reverted
+    (confirmed via grep for the temp-marker in every touched file). A
+    narrow, explicitly-scoped audit of exactly these ten root classes
+    found no further genuine instance beyond what's already fixed.
+  - >-
+    Requirement registry updated from this round's real evidence:
+    UASF-REQ-0034 (Project isolation), UASF-REQ-0029 and UASF-REQ-0030
+    (Cost engine / Budget engine — reservation lifecycle), UASF-REQ-0032
+    (Scheduler — added proofs/smallest-sufficient-worker/proof.test.ts to
+    proof_refs, an existing proof this requirement always covered but
+    never cited), UASF-REQ-0020 (Human approval workflow — runtime
+    encapsulation), UASF-REQ-0019 (Capability gateway — approval evidence
+    integration), UASF-REQ-0007 (Project Factory/Project OS foundation —
+    authorization-before-cost ordering), UASF-REQ-0011 and UASF-REQ-0010
+    (Assumption register / Founder decision ledger — detached restore,
+    supersession graph validation), UASF-REQ-0014 (Technology registry —
+    governed lifecycle transitions), UASF-REQ-0002 (Public secret/hygiene
+    audit — fail-closed unreadable-blob/file coverage). No status field
+    was raised on any requirement beyond what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, a real
+    `rm -rf dist && npm run build`, 783/783 tests (737 + 46 new),
+    validate:requirements (42 schema-valid records), history-and-current-
+    tree-aware secret-scan (PASS, no self-caught false positives this
+    round), Factory Doctor (READY on all checks), all 9 P0 proofs (13
+    assertions) — all clean, stable across repeated runs, no orphaned
+    processes, no leftover TEMP-BYPASS markers anywhere in the tree.
 
 known_limitations:
   - >-
@@ -3798,6 +3959,30 @@ blockers:
     review. Per explicit instruction, this round does not merge, does
     not move to P1, and does not declare P0 complete.
 
+    STILL BLOCKED — P0 BLOCKED_PENDING_REVIEW (round 24): a fresh
+    independent Codex review of the complete branch found TEN further
+    actionable findings (8 P1, 2 P2) spanning cross-project write
+    authorization, budget/cost-reservation lifecycle, worker scheduling,
+    approval-state runtime encapsulation, capability-gateway/approval
+    integration, bootstrap authorization ordering (cost-before-auth),
+    persisted-state mutability (caller/store-owned references retained
+    after restore), technology-registry lifecycle governance, persisted
+    decision-supersession-graph integrity, and secret-scan coverage
+    (silent skip on unreadable blobs/files) — fixed as ONE consolidated
+    closure batch, not piecemeal. All ten root causes, fixes, and
+    regression evidence are detailed in `completed_milestones`'s round-24
+    entries and the per-requirement notes in
+    `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0034,
+    0029, 0030, 0032, 0020, 0019, 0007, 0011, 0010, 0014, 0002). A narrow,
+    explicitly-scoped audit of exactly these ten root classes found no
+    further genuine instance beyond what's already fixed (one exception —
+    the current-tree secret-scan gap sharing finding 10's root class — was
+    found and fixed proactively during that same audit). Tested (783/783
+    tests, +46 net new) and verified per the full required sequence. P0
+    remains BLOCKED_PENDING_REVIEW, awaiting the next independent (P0
+    closure) review. Per explicit instruction, this round does not merge,
+    does not move to P1, and does not declare P0 complete.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -3814,6 +3999,62 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 24). A fresh,
+  independent Codex review of the complete branch found TEN actionable
+  findings (8 priority-P1, 2 priority-P2) and required them fixed as ONE
+  consolidated closure batch: (1) `runtime/project-isolation/isolation.ts`'s
+  `set()` accepted only a target project id with no separate caller
+  identity, letting a caller write directly into another project's bucket
+  — fixed by requiring both a caller and target project id, matching
+  `get()`/`keysFor()`'s existing check; (2) `runtime/cost/cost-engine.ts`'s
+  public `deleteReservation()` removed any reservation unconditionally,
+  bypassing `BudgetGuard` and discarding the RECONCILIATION_FAILED
+  protection — removed and replaced with `commitReservation()`/
+  `releaseReservation()`, enforcing the invariant at the ledger level;
+  (3) `runtime/scheduler/scheduler.ts` ranked candidates by cost alone,
+  letting a cheaper GPU/high-memory worker beat a sufficient smaller one
+  — fixed with a resource-excess-weight comparison ranked before cost;
+  (4) `runtime/policy-engine/approval.ts`'s request map used TS-only
+  `private`, reachable via ordinary property access to bypass approve()'s
+  checks — fixed with a genuine ECMAScript `#private` field; (5)
+  `runtime/capability-gateway/gateway.ts`'s `authorize()` had no way to
+  accept a genuine, already-decided approval for an APPROVAL_REQUIRED
+  action — fixed with an optional `ApprovalEvidence` parameter,
+  independently re-verified and bound to the exact action (no replay);
+  (6) `runtime/project-lifecycle/orchestrator.ts` invoked the real, paid
+  model BEFORE checking `project.scaffold` authorization — fixed by
+  checking that authorization first; (7) `assumption-register.ts`'s (and,
+  via the same audit, `decision-ledger.ts`'s) `loadFrom()` stored the
+  exact object the StateStore returned, letting external mutation reach
+  authoritative state — fixed with a detaching copy in both; (8)
+  `runtime/technology-registry/registry.ts`'s `register()` unconditionally
+  overwrote an existing id, letting a FORBIDDEN technology be silently
+  replaced — fixed with duplicate-id rejection and a governed
+  `transitionLifecycle()`; (9) `decision-ledger.ts` never validated the
+  persisted supersession graph as a whole (missing/cross-project/self/
+  cyclic targets) — fixed with a whole-batch graph validator; (10)
+  `scripts/secret-scan.mjs`'s `readBlobContent()` silently caught every
+  read error, letting an unreadable historical blob produce a false PASS
+  — fixed to fail closed, plus the identical gap in the current-tree
+  `scanFile()` found and fixed via the same targeted audit. All ten fixes
+  carry deterministic regression tests (46 net new, 737 -> 783 total),
+  and every fix was verified via a temporary in-place bypass reproducing
+  the exact predicted failure, then fully reverted (confirmed via grep
+  for the temp-marker in every touched file). A narrow, explicitly-scoped
+  audit of exactly these ten root classes found no further genuine
+  instance beyond what's already fixed. Requirement registry updated
+  (UASF-REQ-0034, 0029, 0030, 0032, 0020, 0019, 0007, 0011, 0010, 0014,
+  0002) from real evidence only; no status raised beyond what evidence
+  supports. Full verification suite re-run and green: lint, typecheck,
+  build, 783/783 tests, validate:requirements (42 records), history-and-
+  current-tree-aware secret-scan (PASS), Factory Doctor (READY), all 9 P0
+  proofs (13 assertions). Per explicit instruction: this session does NOT
+  merge, does NOT move to P1, does NOT declare P0 complete, and does NOT
+  invoke Codex itself. P0 remains BLOCKED_PENDING_REVIEW awaiting the next
+  independent review to return INDEPENDENT_REVIEW_RESULT: CLEAN.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 23). A fresh,
   full-branch independent Codex review (against origin/main) found NINE
   actionable findings (5 priority-P1, 4 priority-P2) and required them

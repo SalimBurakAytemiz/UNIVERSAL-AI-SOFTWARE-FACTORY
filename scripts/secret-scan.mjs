@@ -203,13 +203,20 @@ export function findSecretsInText(content, filePath = "<in-memory>") {
   return findings;
 }
 
+/**
+ * P2 fix (24th independent review round targeted audit, same root class as
+ * "secret history scan must fail closed on unreadable blobs" —
+ * `readBlobContent()`/`scanGitHistory()` below): this used to catch EVERY
+ * read error and return `[]` — indistinguishable from "read successfully,
+ * found nothing." A file `git ls-files` reports as tracked that then
+ * fails to read (a permissions error, a race with a concurrent delete, a
+ * symlink loop) was silently treated as clean, exactly the same class of
+ * unearned `PASS` the history-scan fix above closes. No longer catches
+ * here at all — `main()` is responsible for treating a thrown read error
+ * as an explicit, fail-closed coverage gap, never a silent skip.
+ */
 export function scanFile(path, cwd = process.cwd()) {
-  let buffer;
-  try {
-    buffer = readFileSync(join(cwd, path));
-  } catch {
-    return [];
-  }
+  const buffer = readFileSync(join(cwd, path));
   if (isProbablyBinary(buffer)) return [];
   if (ALLOWLIST_SUBSTRINGS.some((s) => path.includes(s))) return [];
 
@@ -289,23 +296,44 @@ export function listHistoricalBlobs(cwd = process.cwd()) {
   return blobs;
 }
 
+/**
+ * P2 fix (24th independent review round, "secret history scan must fail
+ * closed on unreadable blobs"): this used to swallow EVERY error (a
+ * `maxBuffer` overrun on an unusually large historical blob, a transient
+ * `git cat-file` failure, a permissions error) and return `null` — which
+ * `scanGitHistory()` then treated IDENTICALLY to "this blob is binary,
+ * skip it," a case that is genuinely safe to skip. Those are not the same
+ * thing: a blob that could not be READ was never actually SCANNED, so
+ * treating the two the same let the scanner report an honest-looking
+ * `PASS` even though a REACHABLE historical blob's content was never
+ * inspected at all — exactly the "no claim without evidence" violation
+ * baseline section 303 forbids (a coverage claim with no evidence behind
+ * it). `maxBuffer` is also raised well beyond the old 64 MiB ceiling to
+ * make a genuine truncation far less likely in the first place — but a
+ * larger cap is still a cap, so this function no longer hides a read
+ * failure at all: it throws, and the caller (`scanGitHistory()`) is
+ * responsible for turning that into an explicit, fail-closed scan result
+ * instead of a silent skip.
+ */
 function readBlobContent(sha, cwd = process.cwd()) {
-  try {
-    return execFileSync("git", ["cat-file", "-p", sha], { cwd, maxBuffer: 1024 * 1024 * 64 });
-  } catch {
-    return null;
-  }
+  return execFileSync("git", ["cat-file", "-p", sha], { cwd, maxBuffer: 1024 * 1024 * 512 });
 }
 
 /**
  * Scans every UNIQUE blob ever reachable in git history (deduped by
  * content hash, so identical content committed many times is only
- * scanned once). Returns findings labeled `history:<path>@<short-sha>`.
+ * scanned once). Returns `{ findings, unreadableBlobs }`: `findings` are
+ * labeled `history:<path>@<short-sha>` exactly as before; `unreadableBlobs`
+ * lists any reachable blob whose content could not actually be read (and
+ * was therefore NOT scanned) — a non-empty list here means historical
+ * coverage is INCOMPLETE, and the caller (`main()`) must treat that as a
+ * scan failure, never as an implicit PASS for the blobs it couldn't reach.
  */
 export function scanGitHistory(cwd = process.cwd()) {
   const blobs = listHistoricalBlobs(cwd);
   const seen = new Set();
   const findings = [];
+  const unreadableBlobs = [];
 
   for (const blob of blobs) {
     if (seen.has(blob.sha)) continue;
@@ -313,8 +341,14 @@ export function scanGitHistory(cwd = process.cwd()) {
 
     if (ALLOWLIST_SUBSTRINGS.some((s) => blob.path.includes(s))) continue;
 
-    const content = readBlobContent(blob.sha, cwd);
-    if (!content || isProbablyBinary(content)) continue;
+    let content;
+    try {
+      content = readBlobContent(blob.sha, cwd);
+    } catch (err) {
+      unreadableBlobs.push({ sha: blob.sha, path: blob.path, reason: err instanceof Error ? err.message : String(err) });
+      continue;
+    }
+    if (isProbablyBinary(content)) continue;
 
     const label = `history:${blob.path}@${blob.sha.slice(0, 7)}`;
     const blobFindings = findSecretsInText(content.toString("utf8"), label);
@@ -327,14 +361,32 @@ export function scanGitHistory(cwd = process.cwd()) {
     findings.push(...notBaselined);
   }
 
-  return findings;
+  return { findings, unreadableBlobs };
+}
+
+/**
+ * Scans every currently-tracked file, never silently dropping one whose
+ * read fails — see `scanFile()`'s fix note above. Returns
+ * `{ findings, unreadableFiles }`, mirroring `scanGitHistory()`'s shape.
+ */
+function scanCurrentTree(trackedFiles, cwd) {
+  const findings = [];
+  const unreadableFiles = [];
+  for (const path of trackedFiles) {
+    try {
+      findings.push(...scanFile(path, cwd));
+    } catch (err) {
+      unreadableFiles.push({ path, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { findings, unreadableFiles };
 }
 
 function main() {
   const cwd = process.cwd();
   const trackedFiles = gitTrackedFiles(cwd);
-  const currentFindings = trackedFiles.flatMap((f) => scanFile(f, cwd));
-  const historyFindings = scanGitHistory(cwd);
+  const { findings: currentFindings, unreadableFiles } = scanCurrentTree(trackedFiles, cwd);
+  const { findings: historyFindings, unreadableBlobs } = scanGitHistory(cwd);
 
   const envCheck = checkEnvExamplePlaceholdersOnly(trackedFiles, cwd);
   const envIsTracked = trackedFiles.includes(".env");
@@ -342,20 +394,53 @@ function main() {
   console.log("Public Repository Secret Scan");
   console.log("==============================");
   console.log(`Files scanned (current tree): ${trackedFiles.length}`);
+  console.log(`Current-tree file read failures (fail-closed if any): ${unreadableFiles.length}`);
   console.log(`Unique historical blobs scanned: ${new Set(listHistoricalBlobs(cwd).map((b) => b.sha)).size}`);
+  console.log(`Historical blob read failures (fail-closed if any): ${unreadableBlobs.length}`);
   console.log(`.env tracked in git: ${envIsTracked ? "YES (FAIL)" : "no"}`);
   console.log(`.env.example placeholders only: ${envCheck.ok ? "PASS" : "FAIL"}`);
 
   const allFindings = [...currentFindings, ...historyFindings, ...envCheck.findings];
+  // P2 fix (24th independent review round, "secret history scan must fail
+  // closed on unreadable blobs" + targeted-audit fix for the SAME root
+  // class in the current-tree scan): a blob/file this scanner could not
+  // read is NOT the same as one that was scanned and found clean — see
+  // `readBlobContent()`'s/`scanFile()`'s fix notes. Full coverage (current
+  // tree AND history) is a PRECONDITION for a genuine PASS, not merely one
+  // more finding to list alongside real secrets.
+  const coverageComplete = unreadableBlobs.length === 0 && unreadableFiles.length === 0;
 
-  if (allFindings.length === 0 && !envIsTracked) {
+  if (allFindings.length === 0 && !envIsTracked && coverageComplete) {
     console.log("\nResult: PASS — no likely secrets found in tracked files or git history.");
     return;
   }
 
-  console.log(`\nResult: FAIL — ${allFindings.length} potential issue(s) found (values redacted):`);
+  console.log(
+    `\nResult: FAIL — ${allFindings.length} potential issue(s) found (values redacted)` +
+      (coverageComplete
+        ? ":"
+        : `, plus ${unreadableFiles.length + unreadableBlobs.length} unreadable file(s)/blob(s):`)
+  );
   for (const f of allFindings) {
     console.log(`  - ${f.file}:${f.line} [${f.pattern}]`);
+  }
+  if (unreadableFiles.length > 0) {
+    console.log(
+      `  - ${unreadableFiles.length} current-tree file(s) could not be read and were NOT scanned — treated as a ` +
+        `scan failure rather than silently skipped (baseline section 2/303):`
+    );
+    for (const f of unreadableFiles) {
+      console.log(`      ${f.path} [unreadable: ${f.reason}]`);
+    }
+  }
+  if (unreadableBlobs.length > 0) {
+    console.log(
+      `  - ${unreadableBlobs.length} historical blob(s) could not be read and were NOT scanned — treated as a ` +
+        `scan failure rather than silently skipped (baseline section 2/303):`
+    );
+    for (const b of unreadableBlobs) {
+      console.log(`      history:${b.path}@${b.sha.slice(0, 7)} [unreadable: ${b.reason}]`);
+    }
   }
   if (envIsTracked) {
     console.log("  - .env is tracked by git and must never be committed.");

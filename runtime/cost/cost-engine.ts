@@ -124,6 +124,39 @@ export interface LedgerReservation {
   readonly status: ReservationLedgerStatus;
 }
 
+export class UnknownReservationError extends Error {
+  constructor(reservationId: string) {
+    super(
+      `No open reservation '${reservationId}' — it may have already been committed/released, ` +
+        `or never existed. commit()/release() must be called at most once per reserve() call.`
+    );
+    this.name = "UnknownReservationError";
+  }
+}
+
+/**
+ * P1 fix (24th independent review round, "reservation deletion must not
+ * bypass reconciliation"): moved here (from `runtime/budget/budget.ts`,
+ * which now imports/re-exports it for API stability — same pattern as
+ * `ReservationOwnership`'s 16th-round move) because the invariant it
+ * protects — "a reservation whose commit() attempt failed after a
+ * provider call may already have happened can NEVER be release()d" — must
+ * hold regardless of WHICH caller is trying to remove the reservation, not
+ * only when the removal happens to go through `BudgetGuard.release()`.
+ * See `releaseReservation()`'s note below for the full fix rationale.
+ */
+export class UnresolvedReconciliationError extends Error {
+  constructor(reservationId: string) {
+    super(
+      `Reservation '${reservationId}' has an UNRESOLVED reconciliation failure (a prior commit() ` +
+        `attempt failed after the provider call may already have run) and cannot be release()d — ` +
+        `release() is only for a reservation where NO cost was ever incurred. Retry commit() with a ` +
+        `corrected amount on this same reservation id instead; that is the only safe path forward.`
+    );
+    this.name = "UnresolvedReconciliationError";
+  }
+}
+
 export class CostEngine {
   private readonly entries: CostEntry[] = [];
 
@@ -230,9 +263,73 @@ export class CostEngine {
     if (r) r.status = "RECONCILIATION_FAILED";
   }
 
-  /** Bir rezervasyonu ledger'dan KALICI OLARAK kaldırır (başarılı commit() veya release() sonrası). */
-  deleteReservation(id: string): void {
+  /**
+   * P1 fix (24th independent review round, "reservation deletion must not
+   * bypass reconciliation"): this used to be a single, unguarded
+   * `deleteReservation(id)` — public, and callable by ANY code holding a
+   * reference to this `CostEngine` (not just a cooperating `BudgetGuard`),
+   * for ANY reservation regardless of its status. That meant a "normal
+   * consumer" (something that never went through `BudgetGuard.commit()`/
+   * `release()` at all) could remove a `RECONCILIATION_FAILED`
+   * reservation — one whose protected capacity exists PRECISELY because a
+   * provider call may already have happened and its real cost was never
+   * safely recorded (bkz. `commit()`'s ve `markReservationReconciliationFailed()`'in
+   * üstündeki fix notları) — silently freeing that capacity with NO cost
+   * ever recorded, exactly the "silent spending" bölüm 147 forbids in
+   * reverse (silently discarding the PROTECTION against it). It could
+   * equally delete a perfectly ordinary ACTIVE reservation out from under
+   * its owner, letting a second, unrelated reservation succeed against a
+   * ceiling the first reservation should still have been protecting.
+   * `deleteReservation` is removed from the public API entirely — a
+   * reservation can now ONLY leave this ledger through one of the two
+   * methods below, each of which enforces the SAME domain invariant
+   * regardless of caller: `commitReservation()` requires a genuine,
+   * validated committed cost to accompany the removal (so removing
+   * capacity always means SOME real cost was just recorded, never a free
+   * deletion), and `releaseReservation()` refuses to remove a
+   * `RECONCILIATION_FAILED` reservation at all. `BudgetGuard` no longer
+   * performs commit/release's storage mutation itself — it now calls
+   * these two ledger-owned methods, so the protection holds even for a
+   * caller that talks to `CostEngine` directly, bypassing `BudgetGuard`
+   * altogether.
+   */
+  commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
+    const reservation = this.reservations.get(id);
+    if (!reservation) {
+      throw new UnknownReservationError(id);
+    }
+    try {
+      assertValidMonetaryAmount(entry.amountUsd, `CostEngine.commitReservation(id=${id})`);
+    } catch (err) {
+      // Doğrulama BAŞARISIZ olursa rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED"
+      // olarak işaretlenip KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard)
+      // kendi audit/hata işleme mantığı bu hatayı zaten sarmalar.
+      reservation.status = "RECONCILIATION_FAILED";
+      throw err;
+    }
+    const recorded = this.record(entry);
     this.reservations.delete(id);
+    return recorded;
+  }
+
+  /**
+   * Bir rezervasyonu, HİÇBİR gerçek maliyet oluşmadığı varsayımıyla
+   * (provider çağrısı hiç yapılmadı veya başarısız oldu) serbest bırakır.
+   * `RECONCILIATION_FAILED` durumundaki bir rezervasyon REDDEDİLİR (bkz.
+   * `UnresolvedReconciliationError`'ın üstündeki not) — bu koruma artık bu
+   * ledger'ın KENDİSİNDE uygulanır, yalnızca `BudgetGuard.release()`
+   * üzerinden ÇAĞIRILDIĞINDA değil.
+   */
+  releaseReservation(id: string): LedgerReservation {
+    const reservation = this.reservations.get(id);
+    if (!reservation) {
+      throw new UnknownReservationError(id);
+    }
+    if (reservation.status === "RECONCILIATION_FAILED") {
+      throw new UnresolvedReconciliationError(id);
+    }
+    this.reservations.delete(id);
+    return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
   }
 
   /**
