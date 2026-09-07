@@ -74,7 +74,26 @@ export class WorkerNotFoundError extends Error {
  * ayrık bir kopya döndürür.
  */
 export class WorkerRegistry {
-  private readonly workers: MutableWorkerRecord[] = [];
+  /**
+   * P1 fix (25th independent review round targeted audit, same root class
+   * as `audit/audit-log.ts`'s "audit records must be runtime-private and
+   * append-only"): this array used to be declared with TypeScript's
+   * `private` keyword — compile-time only, so the compiled JS leaves it an
+   * ordinary, enumerable instance property reachable via
+   * `(registry as any).workers` or plain bracket access, with no
+   * type-system escape hatch needed at all. A consumer holding a
+   * `WorkerRegistry` reference could push a fabricated record directly
+   * (bypassing `register()`'s duplicate-id and monetary-amount validation
+   * entirely) or flip a QUARANTINED worker's `status` back to IDLE in
+   * place (bypassing `updateStatus()` and baseline section 85's worker-
+   * quarantine invariant). Fixed the same way `audit-log.ts`'s `#records`
+   * already is: a genuine ECMAScript private class field (`#workers`),
+   * enforced by the JS runtime itself — `as any`, bracket access,
+   * `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all fail to
+   * reach it, and any code outside this class body attempting `x.#workers`
+   * is a `SyntaxError` at PARSE time.
+   */
+  #workers: MutableWorkerRecord[] = [];
 
   register(worker: WorkerRecord): void {
     // P2 targeted-audit fix (7th independent review round, same class as
@@ -89,14 +108,14 @@ export class WorkerRegistry {
     // P2 fix (9th independent review round, "duplicate worker identities
     // break authoritative status"): reject an id collision BEFORE any
     // mutation — see DuplicateWorkerIdError above.
-    if (this.workers.some((w) => w.id === worker.id)) {
+    if (this.#workers.some((w) => w.id === worker.id)) {
       throw new DuplicateWorkerIdError(worker.id);
     }
-    this.workers.push({ ...worker, capabilities: [...worker.capabilities] });
+    this.#workers.push({ ...worker, capabilities: [...worker.capabilities] });
   }
 
   all(): readonly WorkerRecord[] {
-    return this.workers.map((w) => freezeRecord(w));
+    return this.#workers.map((w) => freezeRecord(w));
   }
 
   /**
@@ -104,7 +123,7 @@ export class WorkerRegistry {
    * listesine girmez.
    */
   findCapable(requiredCapabilities: readonly string[]): WorkerRecord[] {
-    return this.workers
+    return this.#workers
       .filter((w) => w.status !== "QUARANTINED" && requiredCapabilities.every((c) => w.capabilities.includes(c)))
       .map((w) => freezeRecord(w));
   }
@@ -116,7 +135,7 @@ export class WorkerRegistry {
    * hiçbir zaman ortaya çıkamaz (bkz. DuplicateWorkerIdError yukarıda).
    */
   updateStatus(id: string, status: WorkerStatus): WorkerRecord {
-    const worker = this.workers.find((w) => w.id === id);
+    const worker = this.#workers.find((w) => w.id === id);
     if (!worker) {
       throw new WorkerNotFoundError(id);
     }

@@ -216,4 +216,38 @@ describe("AuditLog", () => {
       expect(log.all()).toHaveLength(0); // nothing was partially recorded
     });
   });
+
+  describe("P1 fix (25th independent review round, 'audit records must be runtime-private and append-only')", () => {
+    it("the internal records array is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
+      const log = new AuditLog();
+      log.append({ type: "A", actor: "x", payload: {}, timestamp: "2026-01-01T00:00:00.000Z" });
+
+      expect((log as unknown as Record<string, unknown>).records).toBeUndefined();
+      expect((log as unknown as Record<string, unknown>)["records"]).toBeUndefined();
+    });
+
+    it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private records array", () => {
+      const log = new AuditLog();
+      log.append({ type: "A", actor: "x", payload: {}, timestamp: "2026-01-01T00:00:00.000Z" });
+
+      expect(Object.getOwnPropertyNames(log)).not.toContain("records");
+      expect(Reflect.ownKeys(log).map(String)).not.toContain("records");
+    });
+
+    it("REGRESSION: a plain JS consumer cannot push a fabricated record, delete one, or reorder history via property access", () => {
+      const log = new AuditLog();
+      log.append({ type: "A", actor: "x", payload: {}, timestamp: "2026-01-01T00:00:00.000Z" });
+      log.append({ type: "B", actor: "x", payload: {}, timestamp: "2026-01-01T00:00:01.000Z" });
+
+      const forged = (log as unknown as Record<string, unknown>).records as unknown[] | undefined;
+      expect(forged).toBeUndefined(); // there is nothing to .push()/.splice() on at all
+
+      // A forged object shaped like the class also finds nothing to attach to.
+      const spread: Record<string, unknown> = { ...log };
+      expect(spread.records).toBeUndefined();
+
+      expect(log.all().map((r) => r.type)).toEqual(["A", "B"]);
+      expect(log.verifyIntegrity()).toBe(true);
+    });
+  });
 });

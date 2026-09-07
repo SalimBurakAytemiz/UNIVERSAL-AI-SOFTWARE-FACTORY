@@ -31,8 +31,40 @@ function hashOf(record: Omit<AuditRecord, "hash">): string {
  * Genesis previousHash is a fixed constant so tampering with record #0
  * is also detectable.
  */
+/**
+ * P1 fix (25th independent review round, "audit records must be
+ * runtime-private and append-only"): `records` used to be declared with
+ * TypeScript's `private` keyword — compile-time-only, compiling to an
+ * ordinary, enumerable JavaScript instance property. A consumer holding a
+ * reference to an `AuditLog` instance could reach in via
+ * `(auditLog as any).records` (or plain bracket access, no type-system
+ * escape hatch needed at all) and `.push()`/`.splice()`/reassign the array
+ * DIRECTLY — inserting a fabricated record with no hash-chain computation,
+ * or deleting/reordering existing ones — all WITHOUT going through
+ * `append()` at all. `verifyIntegrity()` re-derives each record's hash
+ * from its own fields and checks `previousHash` linkage, so a record
+ * spliced OUT from the middle (with every OTHER record's `previousHash`/
+ * `hash` fields left untouched) breaks the chain and IS caught — but a
+ * record REPLACED wholesale by one with a freshly, correctly recomputed
+ * hash chain (the attacker doing the SAME `hashOf()` computation
+ * `append()` uses) would NOT be caught, since integrity verification only
+ * checks internal CONSISTENCY of whatever is currently in the array, not
+ * that every record's journey there was through `append()`. Fixed the
+ * same way `runtime/policy-engine/approval.ts`'s `#requests` and
+ * `runtime/models/gateway.ts`'s `#providers` already are: a genuine
+ * ECMAScript private class field (`#records`, not `private records`).
+ * This is enforced by the JS runtime itself — `as any`, bracket access,
+ * `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all fail to
+ * reach it, and any code outside this class body attempting to write
+ * `x.#records` is a `SyntaxError` at PARSE time. Combined with `all()`'s
+ * pre-existing `deepFreezeClone()` detachment (outgoing copies were
+ * already safe — this fix closes the OTHER direction: reaching the
+ * authoritative array directly through the instance), there is now no
+ * remaining path to add, remove, or reorder an audit record except
+ * `append()`'s own hash-chained, append-only sequence.
+ */
 export class AuditLog {
-  private readonly records: AuditRecord[] = [];
+  #records: AuditRecord[] = [];
   private static readonly GENESIS_HASH = "0".repeat(64);
 
   /**
@@ -53,17 +85,17 @@ export class AuditLog {
    */
   append(event: AuditEvent): AuditRecord {
     const detachedEvent = structuredClone(event);
-    const previousHash = this.records.length > 0
-      ? this.records[this.records.length - 1]!.hash
+    const previousHash = this.#records.length > 0
+      ? this.#records[this.#records.length - 1]!.hash
       : AuditLog.GENESIS_HASH;
 
     const base = {
       ...detachedEvent,
-      sequence: this.records.length,
+      sequence: this.#records.length,
       previousHash
     };
     const record: AuditRecord = { ...base, hash: hashOf(base) };
-    this.records.push(record);
+    this.#records.push(record);
     return deepFreezeClone(record);
   }
 
@@ -83,7 +115,7 @@ export class AuditLog {
    * olduğundan TypeError fırlatır).
    */
   all(): readonly AuditRecord[] {
-    return this.records.map((r) => deepFreezeClone(r));
+    return this.#records.map((r) => deepFreezeClone(r));
   }
 
   /**
@@ -92,7 +124,7 @@ export class AuditLog {
    */
   verifyIntegrity(): boolean {
     let expectedPrevious = AuditLog.GENESIS_HASH;
-    for (const record of this.records) {
+    for (const record of this.#records) {
       if (record.previousHash !== expectedPrevious) return false;
       const { hash, ...rest } = record;
       if (hashOf(rest) !== hash) return false;

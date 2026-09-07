@@ -247,25 +247,36 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // below — so a bootstrap that was never going to be allowed to scaffold
   // (an explicit DENY, or an unresolved APPROVAL_REQUIRED) still incurred
   // a REAL, paid model call and its cost first, only to then throw and
-  // discard the whole scaffold. Required ordering (baseline section 147,
-  // "capability gateway'in policy engine'i atlayan bir yolu olmamalı"):
-  // policy/approval authorization -> allowed execution -> model call (if
-  // actually required) -> filesystem mutation -> reconciliation/
-  // accounting. Fixed by evaluating the EXACT SAME `project.scaffold`
-  // policy decision HERE, before any model work, via a no-op `execute` —
-  // this call's only job is to gate progression on the SAME decision the
-  // real scaffold call below will use; the actual filesystem mutation
-  // still happens through its OWN `authorize()` call immediately adjacent
-  // to where it occurs (unchanged), so a DENY/APPROVAL_REQUIRED decision
-  // now stops the bootstrap before the model is ever invoked, before any
-  // cost is recorded, and before any directory is created.
+  // discard the whole scaffold.
+  //
+  // P1 fix (25th independent review round, "do not reauthorize after paid
+  // bootstrap work"): the 24th round's own fix above introduced a NEW,
+  // narrower instance of the exact same class it was closing: it called
+  // `gateway.authorize(scaffoldAction, ...)` TWICE — once as a no-op
+  // pre-check here, and again (unchanged) around the real
+  // `scaffoldProjectOs()` call below, with the paid `modelGateway.invoke()`
+  // call sitting BETWEEN them. Each `authorize()` call runs its OWN,
+  // independent `policy.evaluate(scaffoldAction)` — if that policy is
+  // stateful (e.g. a rate-limit/quota rule whose decision can legitimately
+  // change between two calls made moments apart), the FIRST call could
+  // return ALLOW, the paid model call could genuinely execute and commit
+  // real cost, and the SECOND call could then return DENY — money already
+  // spent, but the bootstrap still throws and no scaffold is ever created.
+  // Required invariant (this round's finding): exactly ONE authoritative
+  // authorization decision, made BEFORE any paid work or filesystem
+  // mutation, and never re-evaluated afterward. Fixed by collapsing the
+  // two separate `authorize()` calls into a SINGLE one whose `execute`
+  // callback contains BOTH the paid model invocation AND the scaffold
+  // filesystem mutation — there is now only one `policy.evaluate(scaffoldAction)`
+  // call in this whole function, so a stateful rule's answer cannot
+  // possibly differ between "may I start" and "may I actually mutate the
+  // filesystem": they are the SAME decision, checked once.
   const gateway = new CapabilityGateway(policy);
   const scaffoldAction = {
     actionType: "project.scaffold",
     risk,
     description: `Scaffold Project OS for '${genome.project.id}'`
   };
-  await gateway.authorize(scaffoldAction, () => undefined);
 
   const router = new CheapestCapableModelRouter(modelRegistry);
   const modelDecision = router.selectModel({
@@ -277,23 +288,29 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   const budget = new BudgetGuard(costEngine, budgetGuardLimits);
   const modelGateway = callerModelGateway ?? defaultBootstrapModelGateway();
 
-  const invocationResponse: ModelInvocationResponse = await modelGateway.invoke(
-    modelDecision.model,
-    {
-      prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
-      taskType: "bootstrap-summary"
-    },
-    {
-      policy,
-      budget,
-      risk: 0,
-      taskId: `bootstrap:${genome.project.id}`,
-      projectId: genome.project.id,
-      description: `Bootstrap summary for project '${genome.project.id}'`
-    }
-  );
-
-  const scaffold = await gateway.authorize(scaffoldAction, () => scaffoldProjectOs(baseDir, genome.project.id));
+  // Yalnızca `gateway.authorize()`'ın kendi `execute` geri çağırması
+  // İÇİNDE atanır — bu, hem ücretli model çağrısının HEM DE gerçek dosya
+  // sistemi mutasyonunun, TEK bir yetkilendirme kararının ARDINDAN
+  // gerçekleştiğini garanti eder (bkz. yukarıdaki fix notu).
+  let invocationResponse!: ModelInvocationResponse;
+  const scaffold = await gateway.authorize(scaffoldAction, async () => {
+    invocationResponse = await modelGateway.invoke(
+      modelDecision.model,
+      {
+        prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
+        taskType: "bootstrap-summary"
+      },
+      {
+        policy,
+        budget,
+        risk: 0,
+        taskId: `bootstrap:${genome.project.id}`,
+        projectId: genome.project.id,
+        description: `Bootstrap summary for project '${genome.project.id}'`
+      }
+    );
+    return scaffoldProjectOs(baseDir, genome.project.id);
+  });
 
   // P1 fix (5th independent review round, "final-destination / dangling
   // symlink escape"): eskiden bu dosya yolları düz `join()` ile

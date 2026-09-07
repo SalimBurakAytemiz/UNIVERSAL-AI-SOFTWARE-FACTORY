@@ -27,6 +27,7 @@
 import type { ModelRecord } from "./registry.js";
 import { CapabilityGateway } from "../capability-gateway/gateway.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
+import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import type { BudgetGuard } from "../budget/budget.js";
 import { freezeRecord } from "../util/immutable.js";
 
@@ -79,6 +80,27 @@ export interface ModelProvider {
  * kendisi (enjekte edilebilir alternatif bir CapabilityGateway) tipten
  * SİLİNDİ.
  */
+/**
+ * P1 fix (25th independent review round, "approval evidence must flow
+ * through model invocation path"): `ModelInvocationContext` used to have
+ * NO way to carry approval evidence at all — a risk-5 model invocation
+ * always evaluates to `APPROVAL_REQUIRED` (bkz. policy-engine.ts), but
+ * `invoke()` below called `capabilityGateway.authorize()` with NO third
+ * `approval` argument, so EVERY risk-5 model call was unconditionally
+ * blocked (`CapabilityApprovalRequiredError`), with no code path by which
+ * a genuine, reviewer-granted approval could ever reach it — even worse,
+ * `invoke()` used to construct a BRAND NEW `CapabilityGateway(context.policy)`
+ * on every call, which (per the pre-fix default) came with its own
+ * throwaway, always-empty `ApprovalWorkflow` — so even a caller willing to
+ * hand-roll a workaround had no store to register a real approval into in
+ * the first place. `approvalId` is now an optional per-call reference
+ * (never a workflow object — bkz. `capability-gateway/gateway.ts`'in
+ * `ApprovalReference`'ın üstündeki fix notu, the SAME anti-forgery
+ * reasoning applies here) into `ModelGateway`'s OWN authoritative
+ * `#approvals` store (bkz. aşağıdaki `ModelGateway`), constructor-injected
+ * ONCE by whoever assembles the gateway — never per-call, never from this
+ * context.
+ */
 export interface ModelInvocationContext {
   readonly policy: PolicyEngine;
   readonly budget: BudgetGuard;
@@ -86,6 +108,7 @@ export interface ModelInvocationContext {
   readonly taskId: string;
   readonly projectId?: string;
   readonly description?: string;
+  readonly approvalId?: string;
 }
 
 export class UnknownProviderError extends Error {
@@ -107,6 +130,28 @@ export class ModelGateway {
   // üretir). Bölüm 147'nin "yapısal olarak engellenmeli, geliştirici
   // sözleşmesiyle değil" gereksinimini KARŞILAYAN budur.
   readonly #providers = new Map<string, ModelProvider>();
+
+  /**
+   * P1 fix (25th independent review round, "approval evidence must flow
+   * through model invocation path"): the authoritative approval store for
+   * every invocation this gateway ever authorizes — injected ONCE, at
+   * CONSTRUCTION time, exactly like `CapabilityGateway`'s own `approvals`
+   * field (bkz. capability-gateway/gateway.ts'in `CapabilityGateway`
+   * constructor'ının üstündeki fix notu — the SAME "trust established
+   * once, at construction, by whoever assembles the system" model).
+   * `invoke()` below passes `this.#approvals` (never anything read from
+   * the per-call `context`) into the freshly-constructed
+   * `CapabilityGateway` it builds on EVERY call — a caller wanting a
+   * risk-5 invocation to actually succeed must first `requestFor()`/
+   * `approve()` a matching entry in THIS SAME store (the one reference
+   * they were handed when this `ModelGateway` was constructed), then pass
+   * only its id via `ModelInvocationContext.approvalId`.
+   */
+  readonly #approvals: ApprovalWorkflow;
+
+  constructor(approvals: ApprovalWorkflow = new ApprovalWorkflow()) {
+    this.#approvals = approvals;
+  }
 
   registerProvider(provider: ModelProvider): void {
     this.#providers.set(provider.id, provider);
@@ -257,14 +302,31 @@ export class ModelGateway {
     // `ModelInvocationContext`) — TEK yetkilendirme yolu, HER ÇAĞRIDA
     // doğrudan `context.policy`'den TAZE inşa edilen BU
     // `CapabilityGateway`'dir.
-    const capabilityGateway = new CapabilityGateway(context.policy);
+    //
+    // P1 fix (25th independent review round, "approval evidence must flow
+    // through model invocation path"): `this.#approvals` (this gateway's
+    // OWN authoritative store, injected once at construction — bkz.
+    // yukarıdaki `#approvals`'ın fix notu) is now passed as the SECOND
+    // constructor argument, so a genuine, pre-registered approval can
+    // actually be found and validated for a risk-5 invocation — before
+    // this fix, a brand new, always-empty `ApprovalWorkflow` was
+    // implicitly constructed here on every call, making APPROVAL_REQUIRED
+    // model invocations structurally unauthorizable.
+    const capabilityGateway = new CapabilityGateway(context.policy, this.#approvals);
+    // `approval` bağlantısı yalnızca bir `approvalId` REFERANSIDIR — bir
+    // `ApprovalWorkflow` NESNESİ asla değil (bkz. `ApprovalReference`'ın
+    // fix notu) — ve eylemin TAM kimliğine (actionType/description/risk/
+    // costUsd/projectId) bağlanır, tıpkı `CapabilityGateway.authorize()`'ın
+    // her çağıran için zaten uyguladığı gibi.
+    const approvalReference = context.approvalId !== undefined ? { approvalId: context.approvalId } : undefined;
 
     return capabilityGateway.authorize(
       {
         actionType: "model.invoke",
         risk: executionScope.risk,
         description: executionScope.description,
-        costUsd: executionScope.costPerCallUsd
+        costUsd: executionScope.costPerCallUsd,
+        projectId: executionScope.projectId
       },
       async () => {
         // Provider ÇAĞRILMADAN ÖNCE, tahmini maliyet (costPerCall) TÜM
@@ -297,7 +359,7 @@ export class ModelGateway {
           // Belgelenen mutabakat kuralı: provider hata fırlatırsa hiçbir
           // gerçek maliyet oluşmadığı varsayılır, rezervasyon TAMAMEN
           // serbest bırakılır (bkz. budget.ts release() notu).
-          budget.release(reservation.id);
+          budget.release(reservation.id, reservation.scope);
           throw err;
         }
 
@@ -325,7 +387,8 @@ export class ModelGateway {
         });
 
         return response;
-      }
+      },
+      approvalReference
     );
   }
 

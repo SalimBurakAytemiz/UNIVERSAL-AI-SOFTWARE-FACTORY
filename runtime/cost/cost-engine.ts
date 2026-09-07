@@ -157,6 +157,55 @@ export class UnresolvedReconciliationError extends Error {
   }
 }
 
+/**
+ * P1 fix (25th independent review round, "reservation ownership must be
+ * validated inside CostEngine"): moved here (from `runtime/budget/
+ * budget.ts`, which now imports/re-exports it for API stability — same
+ * pattern as `UnknownReservationError`/`UnresolvedReconciliationError`'s
+ * 24th-round move) because the invariant it protects — "a commit/release
+ * can only ever act on the SAME ownership scope a reservation was
+ * actually created under" — used to be enforced ONLY inside
+ * `BudgetGuard.commit()`, one layer above `CostEngine.commitReservation()`/
+ * `releaseReservation()`. Any caller holding a `CostEngine` reference
+ * directly (bypassing `BudgetGuard` entirely) could call
+ * `commitReservation(id, entry)`/`releaseReservation(id, scope)` with an
+ * entry/scope belonging to a COMPLETELY different task/project/agent than
+ * the one the reservation actually protects — e.g. reserve under project A,
+ * commit or release under project B — silently letting A's protected
+ * capacity be spent or freed under B's name. Fixed: the ownership-mismatch
+ * check now lives INSIDE `commitReservation()`/`releaseReservation()`
+ * themselves (bkz. aşağıdaki metodlar), so it holds regardless of whether
+ * the caller goes through `BudgetGuard` or talks to the ledger directly.
+ */
+export class ReservationOwnershipMismatchError extends Error {
+  constructor(operation: "commit" | "release", reservationId: string, reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership) {
+    super(
+      `${operation}(reservationId=${reservationId}) supplied ownership (taskId=${String(suppliedScope.taskId)}, ` +
+        `projectId=${String(suppliedScope.projectId)}, agentId=${String(suppliedScope.agentId)}, ` +
+        `provider=${String(suppliedScope.provider)}, modelId=${String(suppliedScope.modelId)}) does not match ` +
+        `the reservation's OWN authoritative ownership (taskId=${String(reservationScope.taskId)}, ` +
+        `projectId=${String(reservationScope.projectId)}, agentId=${String(reservationScope.agentId)}, ` +
+        `provider=${String(reservationScope.provider)}, modelId=${String(reservationScope.modelId)}). ` +
+        `A reservation is the authoritative source of ownership for its own commit/release — this call was ` +
+        `rejected before any mutation. A reservation id alone is never sufficient to commit or release capacity ` +
+        `reserved under a different owner's scope.`
+    );
+    this.name = "ReservationOwnershipMismatchError";
+  }
+}
+
+function ownershipMismatches(reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership): boolean {
+  const reservedProvider = reservationScope.provider;
+  const reservedModelId = reservationScope.modelId;
+  return (
+    suppliedScope.taskId !== reservationScope.taskId ||
+    suppliedScope.projectId !== reservationScope.projectId ||
+    suppliedScope.agentId !== reservationScope.agentId ||
+    (reservedProvider !== undefined && suppliedScope.provider !== reservedProvider) ||
+    (reservedModelId !== undefined && suppliedScope.modelId !== reservedModelId)
+  );
+}
+
 export class CostEngine {
   private readonly entries: CostEntry[] = [];
 
@@ -293,10 +342,26 @@ export class CostEngine {
    * caller that talks to `CostEngine` directly, bypassing `BudgetGuard`
    * altogether.
    */
+  /**
+   * P1 fix (25th independent review round, "reservation ownership must be
+   * validated inside CostEngine"): the ownership-mismatch check (bkz.
+   * `ownershipMismatches()`/`ReservationOwnershipMismatchError`'ın
+   * üstündeki not) now runs HERE, before any mutation — a caller can no
+   * longer commit a reservation under a scope different from the one it
+   * was reserved under, regardless of whether they go through
+   * `BudgetGuard.commit()` or call this method directly. A mismatch marks
+   * the reservation `RECONCILIATION_FAILED` (protected — bkz. üstteki
+   * not, aynı bir gerçek provider çağrısının zaten olmuş olabileceği
+   * mantığı) rather than leaving it releasable.
+   */
   commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
     const reservation = this.reservations.get(id);
     if (!reservation) {
       throw new UnknownReservationError(id);
+    }
+    if (ownershipMismatches(reservation.scope, entry)) {
+      reservation.status = "RECONCILIATION_FAILED";
+      throw new ReservationOwnershipMismatchError("commit", id, reservation.scope, entry);
     }
     try {
       assertValidMonetaryAmount(entry.amountUsd, `CostEngine.commitReservation(id=${id})`);
@@ -319,14 +384,35 @@ export class CostEngine {
    * `UnresolvedReconciliationError`'ın üstündeki not) — bu koruma artık bu
    * ledger'ın KENDİSİNDE uygulanır, yalnızca `BudgetGuard.release()`
    * üzerinden ÇAĞIRILDIĞINDA değil.
+   *
+   * P1 fix (25th independent review round, "callers must not release
+   * someone else's active reservation"): `release()` used to take ONLY a
+   * reservation id — no ownership check at all. A reservation id is
+   * predictable (`res-1`, `res-2`, ...) and, once known by ANY caller
+   * (not just the one that created it), was previously SUFFICIENT to
+   * release ANOTHER caller's active, in-flight reservation, freeing its
+   * protected capacity for use by someone else — a reservation id acting
+   * as a bearer capability rather than an authenticated reference. Fixed:
+   * `callerScope` is now a REQUIRED parameter, validated against the
+   * reservation's OWN authoritative `scope` (bkz. `ownershipMismatches()`)
+   * before any deletion. Unlike `commitReservation()`'s mismatch (which
+   * marks `RECONCILIATION_FAILED`, since a real provider call may already
+   * have happened under that reservation), a release-ownership mismatch
+   * does NOT mark the reservation failed — nothing was ever committed by
+   * this call, so the legitimate owner must still be able to normally
+   * release/commit it later; only THIS caller's illegitimate attempt is
+   * rejected.
    */
-  releaseReservation(id: string): LedgerReservation {
+  releaseReservation(id: string, callerScope: ReservationOwnership): LedgerReservation {
     const reservation = this.reservations.get(id);
     if (!reservation) {
       throw new UnknownReservationError(id);
     }
     if (reservation.status === "RECONCILIATION_FAILED") {
       throw new UnresolvedReconciliationError(id);
+    }
+    if (ownershipMismatches(reservation.scope, callerScope)) {
+      throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
     }
     this.reservations.delete(id);
     return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });

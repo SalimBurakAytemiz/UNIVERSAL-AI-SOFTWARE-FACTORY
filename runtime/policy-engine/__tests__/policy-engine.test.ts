@@ -181,6 +181,85 @@ describe("PolicyEngine", () => {
       expect(payload.matchedRule).toBe("low-priority-deny");
     });
   });
+
+  describe("P1 fix (25th independent review round, 'policy actions must be snapshotted before rule evaluation')", () => {
+    it(
+      "REGRESSION, exact reproduction: an earlier ALLOW rule mutating actionType before a later DENY rule " +
+        "runs does not stop DENY from evaluating the ORIGINAL action and winning",
+      () => {
+        const engine = new PolicyEngine();
+        // Registered/evaluated in priority order (higher first): this rule
+        // runs BEFORE the DENY rule below and attempts to mutate the
+        // shared action object as a (careless or malicious) side effect.
+        engine.addRule({
+          name: "mutates-then-allows",
+          priority: 10,
+          evaluate: (action) => {
+            try {
+              (action as { actionType: string }).actionType = "read-file";
+            } catch {
+              // Frozen — the mutation attempt itself is blocked (see the
+              // dedicated TypeError test below). Swallowed here to prove
+              // the SEPARATE invariant this test targets: even if a rule
+              // silently ignores/absorbs that failure and returns a
+              // decision anyway, DENY still evaluates the untouched
+              // original action.
+            }
+            return "ALLOW";
+          }
+        });
+        engine.addRule({
+          name: "deny-secret-mutation",
+          priority: 5,
+          evaluate: (action) => (action.actionType === "secret-mutation" ? "DENY" : null)
+        });
+
+        const result = engine.evaluate({ actionType: "secret-mutation", risk: 1, description: "rotate a secret" });
+
+        expect(result.decision).toBe("DENY");
+        expect(result.matchedRule).toBe("deny-secret-mutation");
+        expect(result.action.actionType).toBe("secret-mutation"); // never actually mutated
+      }
+    );
+
+    it("a rule attempting to mutate the action object it was handed throws TypeError (frozen, not just copied)", () => {
+      const engine = new PolicyEngine();
+      let caught: unknown;
+      engine.addRule({
+        name: "attempts-mutation",
+        priority: 1,
+        evaluate: (action) => {
+          try {
+            (action as { risk: number }).risk = 0;
+          } catch (err) {
+            caught = err;
+          }
+          return "ALLOW";
+        }
+      });
+
+      engine.evaluate({ actionType: "x", risk: 3, description: "x" });
+
+      expect(caught).toBeInstanceOf(TypeError);
+    });
+
+    it("mutating the ORIGINAL caller-owned action object after calling evaluate() does not affect the returned/audited result", () => {
+      const engine = new PolicyEngine();
+      engine.addRule(lowRiskAllowRule(2));
+      const original = { actionType: "read-file", risk: 1 as const, description: "read a file" };
+
+      const result = engine.evaluate(original);
+      original.actionType = "secret-mutation";
+      original.description = "mutated after evaluate() returned";
+
+      expect(result.action.actionType).toBe("read-file");
+      expect(result.action.description).toBe("read a file");
+
+      const [record] = engine.auditTrail.all();
+      const payload = record!.payload as { action: { actionType: string } };
+      expect(payload.action.actionType).toBe("read-file");
+    });
+  });
 });
 
 describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)", () => {

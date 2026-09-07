@@ -17,6 +17,7 @@
 import { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
 import { isNonBlankIdentity } from "../util/identity.js";
+import type { PolicyAction } from "./policy-engine.js";
 
 /**
  * P2 fix (23rd independent review round, "implement REQUEST_CHANGES
@@ -47,6 +48,21 @@ interface MutableApprovalRequest {
   evidenceRef?: string;
   /** Only ever set by requestChanges() — the reviewer's evidence for WHAT must change, distinct from a REJECT's finality. */
   changeRequestReason?: string;
+  /**
+   * P1 fix (25th independent review round, "approval must be bound to
+   * complete action identity"): only ever set by `requestFor()` (below) —
+   * the full identity of the exact `PolicyAction` this approval covers,
+   * beyond the legacy `actionDescription`/`risk` pair. Undefined for a
+   * request created via the legacy `request()` method, which means such a
+   * request can never satisfy `CapabilityGateway`'s full-identity binding
+   * check (bkz. capability-gateway/gateway.ts) — a request that never
+   * recorded its complete identity cannot later be trusted to match one.
+   */
+  actionType?: string;
+  costUsd?: number;
+  projectId?: string;
+  /** The identity of whoever/whatever the approved action is being performed on behalf of, when applicable. */
+  actorId?: string;
 }
 
 /** Dışa döndürülen her kayıt bunun donmuş, ayrık bir kopyasıdır — asla iç nesnenin kendisi değil. */
@@ -128,6 +144,42 @@ export class ApprovalWorkflow {
       id,
       actionDescription,
       risk,
+      status: "PENDING",
+      requestedAt: new Date().toISOString()
+    };
+    this.#requests.set(id, req);
+    this.audit("APPROVAL_REQUESTED", req);
+    return freezeRecord(req);
+  }
+
+  /**
+   * P1 fix (25th independent review round, "approval must be bound to
+   * complete action identity"): the RECOMMENDED way to request an approval
+   * that will be presented to `CapabilityGateway.authorize()` — records
+   * the COMPLETE identity of the exact `PolicyAction` being approved
+   * (`actionType`, `description`, `risk`, `costUsd`), plus an optional
+   * `actorId` (whoever/whatever the action is performed on behalf of),
+   * not just the legacy `actionDescription`/`risk` pair `request()`
+   * stores. Two actions that happen to share a description/risk (e.g. two
+   * differently-scoped deployments) but differ in `actionType` or
+   * `costUsd` are NEVER the same action, and an approval for one must
+   * never be usable to authorize the other — see
+   * `CapabilityGateway.authorize()`'s binding check, which requires ALL
+   * of these fields to match before treating an approval as covering a
+   * given action.
+   */
+  requestFor(id: string, action: PolicyAction, options?: { readonly actorId?: string }): ApprovalRequest {
+    if (this.#requests.has(id)) {
+      throw new DuplicateApprovalIdError(id);
+    }
+    const req: MutableApprovalRequest = {
+      id,
+      actionDescription: action.description,
+      risk: action.risk,
+      actionType: action.actionType,
+      costUsd: action.costUsd,
+      projectId: action.projectId,
+      actorId: options?.actorId ?? action.actorId,
       status: "PENDING",
       requestedAt: new Date().toISOString()
     };
@@ -257,6 +309,10 @@ export class ApprovalWorkflow {
         id: req.id,
         actionDescription: req.actionDescription,
         risk: req.risk,
+        actionType: req.actionType,
+        costUsd: req.costUsd,
+        projectId: req.projectId,
+        actorId: req.actorId,
         status: req.status,
         decidedBy: req.decidedBy,
         evidenceRef: req.evidenceRef,

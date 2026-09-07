@@ -168,19 +168,39 @@ export interface ProposeAssumptionInput {
  * üzerinden gerçekleşir.
  */
 export class AssumptionRegister {
-  private readonly assumptions = new Map<string, MutableAssumption>();
+  /**
+   * P1 fix (25th independent review round targeted audit, same root class
+   * as `audit/audit-log.ts`'s "audit records must be runtime-private and
+   * append-only"): this Map used to be declared with TypeScript's `private`
+   * keyword — compile-time only, so the compiled JS leaves it an ordinary,
+   * enumerable instance property reachable via `(register as any).assumptions`
+   * or plain bracket access, with no type-system escape hatch needed at
+   * all. A consumer holding an `AssumptionRegister` reference could reach
+   * in and flip a HIGH-impact assumption straight to `status: "ACCEPTED"`
+   * with no `confirmedBy` at all, completely bypassing `accept()`'s Founder-
+   * confirmation gate (baseline section 47's "High-impact assumptions
+   * require Founder confirmation" is meaningless if the record can be
+   * mutated without ever calling `accept()`). Fixed the same way
+   * `audit-log.ts`'s `#records`/`policy-engine/approval.ts`'s `#requests`
+   * already are: a genuine ECMAScript private class field (`#assumptions`),
+   * enforced by the JS runtime itself — `as any`, bracket access,
+   * `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all fail to
+   * reach it, and any code outside this class body attempting
+   * `x.#assumptions` is a `SyntaxError` at PARSE time.
+   */
+  #assumptions = new Map<string, MutableAssumption>();
 
   propose(input: ProposeAssumptionInput): Assumption {
-    if (this.assumptions.has(input.id)) {
+    if (this.#assumptions.has(input.id)) {
       throw new DuplicateAssumptionIdError(input.id);
     }
     const assumption: MutableAssumption = { ...input, status: "PROPOSED", createdAt: new Date().toISOString() };
-    this.assumptions.set(input.id, assumption);
+    this.#assumptions.set(input.id, assumption);
     return freezeRecord(assumption);
   }
 
   get(id: string): Assumption | undefined {
-    const assumption = this.assumptions.get(id);
+    const assumption = this.#assumptions.get(id);
     return assumption ? freezeRecord(assumption) : undefined;
   }
 
@@ -226,18 +246,18 @@ export class AssumptionRegister {
   }
 
   allWithStatus(status: AssumptionStatus): readonly Assumption[] {
-    return [...this.assumptions.values()].filter((a) => a.status === status).map((a) => freezeRecord(a));
+    return [...this.#assumptions.values()].filter((a) => a.status === status).map((a) => freezeRecord(a));
   }
 
   private mustGet(id: string): MutableAssumption {
-    const assumption = this.assumptions.get(id);
+    const assumption = this.#assumptions.get(id);
     if (!assumption) throw new AssumptionNotFoundError(id);
     return assumption;
   }
 
   /** Sadece bellekte tutmak yerine bir StateStore'a yazar (bölüm 275, 277). */
   saveTo(store: StateStore, path: string): void {
-    store.write(path, [...this.assumptions.values()]);
+    store.write(path, [...this.#assumptions.values()]);
   }
 
   /**
@@ -284,7 +304,7 @@ export class AssumptionRegister {
       // all, the exact same class of bypass `freezeRecord()`-on-read
       // already protects against for objects LEAVING this class. Now the
       // register owns its own independent copy from the moment of load.
-      register.assumptions.set(validated.id, { ...validated });
+      register.#assumptions.set(validated.id, { ...validated });
     });
     return register;
   }

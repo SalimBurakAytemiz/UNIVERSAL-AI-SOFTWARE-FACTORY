@@ -380,4 +380,42 @@ describe("AssumptionRegister", () => {
       }
     );
   });
+
+  describe(
+    "P1 fix (25th independent review round targeted audit, 'assumption records must be runtime-private'): the " +
+      "internal assumptions Map now uses a genuine ECMAScript #private field, not TypeScript's compile-time-only " +
+      "`private`",
+    () => {
+      it("the internal assumptions Map is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a1", description: "d", reason: "r", impact: "HIGH", source: "s" });
+
+        expect((register as unknown as Record<string, unknown>).assumptions).toBeUndefined();
+        expect((register as unknown as Record<string, unknown>)["assumptions"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private assumptions Map", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a1", description: "d", reason: "r", impact: "HIGH", source: "s" });
+
+        expect(Object.getOwnPropertyNames(register)).not.toContain("assumptions");
+        expect(Reflect.ownKeys(register).map(String)).not.toContain("assumptions");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot flip a HIGH-impact assumption straight to ACCEPTED via property access, bypassing accept()'s Founder-confirmation gate", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a1", description: "d", reason: "r", impact: "HIGH", source: "s" });
+
+        const forged = (register as unknown as Record<string, unknown>).assumptions as
+          | Map<string, { status: string; confirmedBy?: string }>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and mutate at all
+
+        const spread: Record<string, unknown> = { ...register };
+        expect(spread.assumptions).toBeUndefined();
+
+        expect(register.get("a1")!.status).toBe("PROPOSED");
+      });
+    }
+  );
 });

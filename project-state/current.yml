@@ -828,6 +828,65 @@ factory:
     P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent (P0
     closure) review.
 
+    THIS SESSION (round 25): a fresh independent Codex review of the
+    complete branch found TEN further actionable P1 findings across
+    approval-workflow authority, approval-action identity binding,
+    approval replay, reservation-ownership enforcement location,
+    reservation release authorization, approval evidence propagation
+    through the model-invocation path, repeated bootstrap authorization,
+    project-isolation caller identity, audit-record runtime privacy, and
+    policy-action mutation safety during rule evaluation — fixed as ONE
+    consolidated closure batch: (1) `capability-gateway/gateway.ts` and
+    `models/gateway.ts` used to accept (or implicitly construct) a
+    caller-suppliable/throwaway `ApprovalWorkflow` per call; both classes
+    now own their approval store, injected ONCE at construction, exactly
+    like their `policy` dependency. (2) approval matching compared only
+    `actionDescription`/`risk`; `isBoundToExactAction()` now compares the
+    full action identity (actionType, description, risk, costUsd,
+    projectId, actorId). (3) a matching APPROVED request stayed reusable
+    after authorizing execution; `authorize()` now atomically transitions
+    it to EXECUTED in the same synchronous prefix as the match check,
+    before the risky callback runs. (4) `CostEngine.commitReservation()`
+    trusted the caller-supplied scope with no ownership check of its own
+    (the check lived only in `BudgetGuard`, one layer up); the check now
+    runs INSIDE the ledger itself. (5) `releaseReservation()`/
+    `BudgetGuard.release()` took only a reservation id (a predictable
+    bearer token); both now require a mandatory `callerScope` argument,
+    validated against the reservation's own authoritative scope. (6)
+    `ModelInvocationContext` had no way to carry approval evidence, and
+    `ModelGateway.invoke()` built a fresh, always-empty `CapabilityGateway`
+    per call — structurally unauthorizable for any risk-5 model
+    invocation; `ModelGateway` gained a constructor-injected `#approvals`
+    field and an `approvalId` threaded through `ModelInvocationContext`/
+    `RoutingRequest`. (7) `bootstrapProject()` called `authorize()` TWICE
+    (a no-op pre-check, then the real scaffold call) with a paid model
+    invocation between them — a stateful policy rule could ALLOW the first
+    call and DENY the second, after cost was already committed; collapsed
+    into ONE `authorize()` call whose callback contains both the model
+    invocation and the scaffold mutation. (8) `ProjectIsolationStore`
+    compared two caller-supplied strings for equality — trivially
+    satisfied by passing the same value for both; replaced entirely with a
+    closure-based `viewFor(trustedProjectId)` capability model whose views
+    take no project-id parameter at all. (9) `AuditLog`'s `#records` field
+    used TypeScript's compile-time-only `private`; converted to genuine
+    ECMAScript `#records` — a targeted audit for this exact class found
+    four further genuine instances (`decision-ledger.ts`, `assumption-
+    register.ts`, `workers/registry.ts`, `models/registry.ts`), all fixed
+    the same way. (10) `PolicyEngine.evaluate()` passed the same mutable
+    caller-owned action object to every rule; an earlier rule could mutate
+    it before a later DENY rule saw the original — now a frozen
+    `authoritativeAction` snapshot is built before any rule runs. All ten
+    findings plus the four audit-discovered `#private` instances carry
+    deterministic regression tests (42 net new, 783 -> 825 total), and
+    every fix was verified via a temporary in-place bypass reproducing the
+    exact predicted failure, then fully reverted (confirmed via grep for
+    the bypass marker in every touched file). A narrow, explicitly-scoped
+    audit of exactly these ten root classes found the four `#private`
+    instances noted above and no other genuine instance. Per explicit
+    instruction, this round does NOT merge, does NOT move to P1, and does
+    NOT declare P0 complete. P0 remains BLOCKED_PENDING_REVIEW, awaiting
+    the next independent (P0 closure) review.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -3983,6 +4042,35 @@ blockers:
     closure) review. Per explicit instruction, this round does not merge,
     does not move to P1, and does not declare P0 complete.
 
+    STILL BLOCKED — P0 BLOCKED_PENDING_REVIEW (round 25): a fresh
+    independent Codex review of the complete branch found TEN further
+    actionable P1 findings spanning approval-workflow authority
+    (caller-suppliable ApprovalWorkflow instances), approval-action
+    identity binding, approval replay, reservation-ownership enforcement
+    location, reservation release authorization (release-by-id-alone),
+    approval evidence propagation through the model-invocation path,
+    repeated bootstrap authorization around paid model work,
+    project-isolation caller identity (self-reported dual-string
+    comparison), audit-record runtime privacy, and policy-action mutation
+    safety during rule evaluation — fixed as ONE consolidated closure
+    batch, not piecemeal. All ten root causes, fixes, and regression
+    evidence are detailed in `completed_milestones`'s round-25 entries and
+    the per-requirement notes in
+    `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0010,
+    0011, 0018, 0019, 0020, 0022, 0024, 0025, 0029, 0030, 0031, 0034,
+    0042). A narrow, explicitly-scoped audit of exactly these ten root
+    classes found four further genuine instances of finding 9's exact
+    class (TypeScript-`private`-only authoritative mutable state, not
+    genuine ECMAScript `#private`) in `decision-ledger.ts`,
+    `assumption-register.ts`, `workers/registry.ts`, and `models/
+    registry.ts` — all fixed the same way, found and fixed proactively
+    during that same audit, same as round 24's precedent. Tested
+    (825/825 tests, +42 net new) and verified per the full required
+    sequence. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next
+    independent (P0 closure) review. Per explicit instruction, this round
+    does not merge, does not move to P1, and does not declare P0
+    complete.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -3999,6 +4087,73 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 25). A fresh,
+  independent Codex review of the complete branch found TEN actionable
+  P1 findings and required them fixed as ONE consolidated closure batch:
+  (1) `capability-gateway/gateway.ts` used to accept a caller-suppliable
+  `ApprovalWorkflow` instance per call (`{workflow, approvalId}`), letting
+  any caller fabricate a throwaway workflow, approve a fake entry in it
+  with no real reviewer, and hand it back as "evidence" — fixed by having
+  the gateway OWN its authoritative `approvals` store, injected ONCE at
+  construction (mirrored in `models/gateway.ts`'s own `#approvals` field,
+  finding 6); (2) approval matching compared only `actionDescription`/
+  `risk` — two materially different actions sharing a similar
+  description/risk could not be told apart — fixed with
+  `isBoundToExactAction()` comparing the full identity (actionType,
+  description, risk, costUsd, projectId, actorId); (3) a matching
+  APPROVED request stayed reusable (replayable) after authorizing
+  execution — fixed by atomically consuming it (APPROVED -> EXECUTED) in
+  the same synchronous prefix as the match check, before the risky
+  callback runs; (4) `CostEngine.commitReservation()` trusted the
+  caller-supplied scope with no ownership check inside the ledger itself
+  (only `BudgetGuard`, one layer up, checked) — fixed by moving the check
+  into the ledger; (5) `releaseReservation()`/`BudgetGuard.release()`
+  took only a reservation id (a predictable bearer token) — fixed by
+  requiring a mandatory `callerScope` argument validated against the
+  reservation's own authoritative scope; (6) `ModelInvocationContext` had
+  no way to carry approval evidence, and `ModelGateway.invoke()` built a
+  fresh, always-empty `CapabilityGateway` per call, making any risk-5
+  model invocation structurally unauthorizable — fixed with a
+  constructor-injected `#approvals` field and an `approvalId` threaded
+  through `ModelInvocationContext`/`RoutingRequest`; (7)
+  `bootstrapProject()` called `authorize()` TWICE around a paid model
+  invocation (a no-op pre-check, then the real scaffold call) — a
+  stateful policy rule could ALLOW the first call and DENY the second
+  after cost was already committed — fixed by collapsing both into ONE
+  `authorize()` call whose callback contains both the model invocation
+  and the scaffold mutation; (8) `ProjectIsolationStore` compared two
+  caller-supplied strings for equality, trivially satisfied by supplying
+  the same value for both — fixed by replacing the entire API with a
+  closure-based `viewFor(trustedProjectId)` capability model whose views
+  take no project-id parameter at all; (9) `AuditLog`'s `#records` field
+  used TypeScript's compile-time-only `private` — fixed with a genuine
+  ECMAScript `#records` field, and a targeted audit for this exact class
+  found four further genuine instances (`decision-ledger.ts`,
+  `assumption-register.ts`, `workers/registry.ts`, `models/registry.ts`),
+  all fixed the same way; (10) `PolicyEngine.evaluate()` passed the same
+  mutable caller-owned action object to every rule, letting an earlier
+  rule mutate it before a later DENY rule saw the original — fixed by
+  freezing an `authoritativeAction` snapshot before any rule runs. All
+  ten fixes plus the four audit-discovered `#private` instances carry
+  deterministic regression tests (42 net new, 783 -> 825 total), and
+  every fix was verified via a temporary in-place bypass reproducing the
+  exact predicted failure, then fully reverted (confirmed via grep for
+  the bypass marker in every touched file). A narrow, explicitly-scoped
+  audit of exactly these ten root classes found the four `#private`
+  instances noted above and no other genuine instance. Requirement
+  registry updated (UASF-REQ-0010, 0011, 0018, 0019, 0020, 0022, 0024,
+  0025, 0029, 0030, 0031, 0034, 0042) from real evidence only; no status
+  raised beyond what evidence supports. Full verification suite re-run
+  and green: lint, typecheck, build, 825/825 tests, validate:requirements
+  (42 records), history-and-current-tree-aware secret-scan (PASS),
+  Factory Doctor (READY), all 9 P0 proofs (13 assertions). Per explicit
+  instruction: this session does NOT merge, does NOT move to P1, does
+  NOT declare P0 complete, and does NOT invoke Codex itself. P0 remains
+  BLOCKED_PENDING_REVIEW awaiting the next independent review to return
+  INDEPENDENT_REVIEW_RESULT: CLEAN.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 24). A fresh,
   independent Codex review of the complete branch found TEN actionable
   findings (8 priority-P1, 2 priority-P2) and required them fixed as ONE

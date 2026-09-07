@@ -645,6 +645,16 @@
     tests and 1 detach test failed respectively, with no cross-contamination between the two bypasses, then both
     reverted and all tests re-confirmed passing.
 
+    P1 fix (25th independent review round targeted audit, same root class as `audit/audit-log.ts`'s "audit
+    records must be runtime-private and append-only"): the internal `decisions` Map used TypeScript's
+    compile-time-only `private` keyword — reachable at runtime via `(ledger as any).decisions` or plain bracket
+    access, letting a consumer flip a decision's `status` directly, bypassing `supersede()`'s ACTIVE-only guard
+    and "never delete, only SUPERSEDED-and-chain" invariant. Converted to a genuine ECMAScript `#decisions`
+    private field (same pattern as `audit-log.ts`'s `#records`). Three new regression tests prove the field is
+    unreachable via property access or any reflection API, and that a plain JS consumer cannot corrupt decision
+    status this way. Verified via a temporary bypass (reverting to `private decisions`) — confirmed exactly the
+    3 predicted tests failed, then reverted and re-confirmed all tests passing.
+
 - id: UASF-REQ-0011
   title: Assumption register
   description: Track assumptions with PROPOSED/ACCEPTED/REJECTED/VALIDATED/SUPERSEDED lifecycle.
@@ -748,6 +758,17 @@
     fixed in the same round in `runtime/decisions/decision-ledger.ts`'s `loadFrom()` (UASF-REQ-0010). Verified
     via a temporary bypass (storing the un-copied reference again) — confirmed the exact predicted 2 tests
     failed, then reverted and re-confirmed all passing.
+
+    P1 fix (25th independent review round targeted audit, same root class as `audit/audit-log.ts`'s "audit
+    records must be runtime-private and append-only" — identical to this round's `decision-ledger.ts` fix,
+    UASF-REQ-0010): the internal `assumptions` Map used TypeScript's compile-time-only `private` keyword,
+    reachable at runtime via `(register as any).assumptions`, letting a consumer flip a HIGH-impact assumption
+    straight to `status: "ACCEPTED"` with no `confirmedBy` at all — completely bypassing `accept()`'s Founder-
+    confirmation gate (baseline section 47). Converted to a genuine ECMAScript `#assumptions` private field.
+    Three new regression tests prove the field is unreachable via property access or any reflection API, and
+    that a plain JS consumer cannot smuggle a HIGH-impact assumption into ACCEPTED this way. Verified via a
+    temporary bypass (reverting to `private assumptions`) — confirmed exactly the 3 predicted tests failed, then
+    reverted and re-confirmed all tests passing.
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -984,6 +1005,21 @@
     ALLOW). Confirmed via git-stash that 5 of these tests fail against the
     pre-fix code with exactly the DENY-bypass Codex described.
 
+    P1 fix (25th independent review round, "policy actions must be snapshotted before rule evaluation"):
+    `evaluate()` passed the SAME mutable, caller-owned `action` object to every rule in sequence — a careless or
+    malicious earlier rule (e.g. an ALLOW rule for a broad category) could mutate `action.actionType`/`.risk`
+    in place before a later rule (that would otherwise DENY the ORIGINAL action) ever ran, so the later rule
+    evaluated a different action than the one actually being authorized, potentially letting a DENY-worthy
+    action slip through under a relabeled identity. Fixed: the very first thing `evaluate()` does is copy
+    `action` into a frozen `authoritativeAction` snapshot (`freezeRecord`) — every rule, the risk-5 escalation
+    check, the audit payload, and the returned decision all reference this ONE frozen snapshot, never the
+    original mutable parameter. `PolicyAction` also gained optional `projectId`/`actorId` fields (needed for
+    UASF-REQ-0020's complete-identity approval binding). Three new regression tests prove: an earlier rule's
+    mutation attempt throws `TypeError` against the frozen object and a later DENY rule still evaluates the
+    ORIGINAL, untouched action; mutating the action after `evaluate()` returns has no effect on the returned
+    decision. Verified via a temporary bypass (using the raw `action` parameter instead of a frozen snapshot) —
+    confirmed exactly the 3 predicted tests failed, then reverted and re-confirmed all tests passing.
+
 - id: UASF-REQ-0019
   title: Capability gateway (foundation)
   description: Enforcement point routing actions through the policy engine before execution.
@@ -1021,6 +1057,34 @@
     approval evidence attached. Verified via a temporary bypass (accepting any existing request regardless of
     status/action match) — confirmed exactly the 4 predicted tests (REJECTED, REQUEST_CHANGES, replay, unknown
     id) failed, then reverted and re-confirmed all passing.
+
+    Round 25 findings 1-3, 7 (one consolidated closure batch): (1) "approval workflow must be authoritative" —
+    the 24th round's `{ workflow, approvalId }` evidence shape let ANY caller fabricate its own throwaway
+    `ApprovalWorkflow`, request+approve a fake entry with no real reviewer, and hand it back as "evidence"; fixed
+    by making `CapabilityGateway` OWN its authoritative `approvals` store, injected ONCE at construction (never
+    per-call) — `authorize()`'s third parameter is now `ApprovalReference { approvalId: string }`, structurally
+    incapable of carrying a workflow object. (2) "approval must be bound to complete action identity" — matching
+    compared only `actionDescription`/`risk`, so two materially different actions sharing a similar
+    description/risk could not be told apart; `isBoundToExactAction()` now compares `actionType`, `description`,
+    `risk`, `costUsd`, `projectId`, and `actorId` — a legacy `request()`-created approval (which never records
+    these) can never satisfy this check. (3) "approval evidence must be consumed before execution" — a matching
+    APPROVED request stayed APPROVED (reusable) after `authorize()` let execution proceed, so the same approval
+    could authorize two concurrent/sequential executions; fixed by atomically calling `approvals.execute()`
+    (APPROVED -> EXECUTED) in the SAME synchronous prefix as the match check, before the risky callback runs —
+    JS's run-to-completion semantics make a concurrent replay's own re-check see EXECUTED, not APPROVED. (7) "do
+    not reauthorize after paid bootstrap work" — `runtime/project-lifecycle/orchestrator.ts`'s `bootstrapProject()`
+    called `gateway.authorize(scaffoldAction, ...)` TWICE (a no-op pre-check, then the real scaffold call), with a
+    paid model invocation sandwiched between them; a stateful policy rule could answer ALLOW on the first call and
+    DENY on the second, after cost was already committed. Fixed by collapsing both calls into ONE `authorize()`
+    whose `execute` callback contains BOTH the model invocation and the scaffold mutation — exactly one
+    `policy.evaluate(scaffoldAction)` call now exists in the whole function. New regression tests across
+    `capability-gateway/__tests__/gateway.test.ts` (18 tests covering findings 1-3) and
+    `project-lifecycle/__tests__/orchestrator.test.ts` (2 new tests: a stateful ALLOW-then-DENY rule cannot cause
+    paid work followed by a rejected scaffold; a DENY on the sole evaluation fails closed with no paid work at
+    all). Every fix verified via a temporary in-place bypass reproducing the exact predicted failure, then fully
+    reverted: finding 2's weakened binding check (4 predicted failures), finding 3's removed consumption call (3
+    predicted failures, including a genuine `Promise.allSettled` concurrency race), and finding 7's reintroduced
+    two-call pattern (the exact `CapabilityDeniedError` reproduction).
 
 - id: UASF-REQ-0020
   title: Human approval workflow
@@ -1136,6 +1200,18 @@
     (frozen) record still cannot change authoritative state. Verified via a temporary bypass (reverting to TS
     `private requests`) — confirmed the exact predicted 3 new tests failed, then reverted and re-confirmed all
     passing.
+
+    Round 25 findings 1-3, 6 (one consolidated closure batch — see UASF-REQ-0019 for the full findings 1-3
+    narrative, UASF-REQ-0024 for finding 6): added `requestFor(id, action: PolicyAction, options?: {actorId})`,
+    the recommended way to request an approval that will be presented to `CapabilityGateway.authorize()` — it
+    records the COMPLETE action identity (`actionType`, `description`, `risk`, `costUsd`, `projectId`,
+    `actorId`), not just the legacy `actionDescription`/`risk` pair `request()` stores. A request created via the
+    legacy `request()` method deliberately leaves these new fields `undefined`, so it can never satisfy
+    `isBoundToExactAction()`'s full-identity check — only `requestFor()` produces gateway-usable evidence. The
+    pre-existing synchronous `execute()` method (APPROVED -> EXECUTED) is what `CapabilityGateway.authorize()`
+    now calls atomically before running its risky callback (finding 3). No changes to `ApprovalWorkflow`'s own
+    state machine or persistence scope were needed beyond `requestFor()`'s addition; new coverage lives in
+    `capability-gateway/__tests__/gateway.test.ts` (see UASF-REQ-0019).
 
 - id: UASF-REQ-0021
   title: Durable state / resume
@@ -1323,6 +1399,22 @@
     being silently dropped by JSON.stringify inside hashOf(). Confirmed via
     git-stash that these tests fail against the round-3 (shallow-freeze)
     code.
+
+    P1 fix (25th independent review round, "audit records must be runtime-private and append-only"): the
+    internal `records` array used TypeScript's compile-time-only `private` keyword — compiled JS leaves it an
+    ordinary, enumerable instance property, reachable via `(log as any).records` or plain bracket access with no
+    type-system escape hatch needed at all, letting a consumer push a fabricated record, splice one out, or
+    reorder history directly, none of which `verifyIntegrity()` could ever catch (it only walks whatever the
+    array currently contains). Converted to a genuine ECMAScript `#records` private field, the same pattern
+    later reused this round for `policy-engine/approval.ts`'s `#requests` (UASF-REQ-0020),
+    `decisions/decision-ledger.ts`'s `#decisions` (UASF-REQ-0010), `assumptions/assumption-register.ts`'s
+    `#assumptions` (UASF-REQ-0011), `workers/registry.ts`'s `#workers` (UASF-REQ-0031), and
+    `models/registry.ts`'s `#models` (UASF-REQ-0025) — a narrow targeted audit for this exact root class found
+    those four additional genuine instances beyond the ten originally-reported findings. Three new regression
+    tests prove the field is unreachable via ordinary property access and every reflection API
+    (`Object.getOwnPropertyNames`/`Reflect.ownKeys`), and that a plain JS consumer cannot push/delete/reorder
+    history this way. Verified via a temporary bypass (reverting to `private records`) — confirmed exactly the 3
+    predicted tests failed, then reverted and re-confirmed all tests passing.
 
 - id: UASF-REQ-0023
   title: Artifact foundation
@@ -1587,6 +1679,31 @@
     `authorizedRequest`) — confirmed exactly 3 of 3 new tests fail, then
     reverted.
 
+    P1 fix (25th independent review round, finding 6, "approval evidence must flow through model invocation
+    path"): `ModelInvocationContext` had no field to carry approval evidence at all, so a risk-5 model
+    invocation (which the policy engine's own built-in floor always evaluates to `APPROVAL_REQUIRED`) was
+    unconditionally blocked — worse, `invoke()` constructed a BRAND NEW `CapabilityGateway(context.policy)` on
+    every call, which (per `CapabilityGateway`'s new default, UASF-REQ-0019) came with its own throwaway,
+    always-empty `ApprovalWorkflow`, so even a determined caller had no store to register a real approval into.
+    Fixed: `ModelGateway` now owns its OWN authoritative `#approvals: ApprovalWorkflow` field, constructor-
+    injected ONCE (mirroring `CapabilityGateway`'s own construction-time trust model) and passed as the second
+    argument to the `CapabilityGateway` it builds on every `invoke()` call; `ModelInvocationContext` gained an
+    optional `approvalId?: string` reference (never a workflow object) threaded into the authorize() call's
+    `PolicyAction` (which now also carries `projectId` for complete-identity binding); `RoutingRequest` gained a
+    matching `approvalId?: string`, captured into the same frozen `routingScope` snapshot as every other routing
+    field and propagated into `ModelInvocationContext.approvalId` on every candidate invocation (initial and
+    every escalation step) in `runtime/models/router.ts`. Five new regression tests in
+    `models/__tests__/gateway.test.ts` prove: a risk-5 invocation with a valid, matching approval (registered via
+    `ApprovalWorkflow.requestFor()` in the SAME store the gateway was constructed with) succeeds exactly once; a
+    risk-5 invocation with no `approvalId` remains blocked exactly as before (no default bypass introduced);
+    reusing the same approval id for a second invocation is rejected (an approval authorizes exactly one
+    execution); an approval bound to a different action identity (mismatched cost) does not authorize the
+    invocation; and an approval registered in a DIFFERENT `ModelGateway`'s own store is invisible to this
+    gateway. Verified via a temporary bypass (reverting to a fresh, always-empty `ApprovalWorkflow` per call,
+    exactly like the pre-fix code) — confirmed exactly the 2 predicted "success path" tests failed (the 3
+    negative/blocked-case tests correctly stayed green, since they could never have succeeded either way), then
+    reverted and re-confirmed all tests passing.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -1703,6 +1820,17 @@
     validates and round-trips through `register()`. Verified via a
     temporary bypass (reverting `required` to its old `costClass`-based
     array) — 5 of the 6 new tests genuinely failed, then fully reverted.
+
+    P1 fix (25th independent review round targeted audit, same root class as `audit/audit-log.ts`'s "audit
+    records must be runtime-private and append-only" — UASF-REQ-0022): the internal `models` array used
+    TypeScript's compile-time-only `private` keyword, reachable at runtime via `(registry as any).models` or
+    plain bracket access, letting a consumer push a fabricated record directly (bypassing `register()`'s
+    duplicate-id and monetary-amount validation) or flip a DEPRECATED/RETIRED model's `status` back to ACTIVE in
+    place (bypassing `updateStatus()` and baseline section 60-64's cost/routing-integrity invariants). Converted
+    to a genuine ECMAScript `#models` private field. Three new regression tests prove the field is unreachable
+    via property access or any reflection API, and that a plain JS consumer cannot revive a DEPRECATED model
+    this way. Verified via a temporary bypass (reverting to `private models`) — confirmed exactly the 3
+    predicted tests failed, then reverted and re-confirmed all tests passing.
 
 - id: UASF-REQ-0026
   title: MockProvider
@@ -2062,6 +2190,35 @@
     RECONCILIATION_FAILED guard — confirmed the exact predicted 13 tests (across cost-engine.test.ts AND several
     pre-existing budget.test.ts regressions from earlier rounds) failed, then reverted and re-confirmed all
     passing.
+
+    Round 25 findings 4-5 (one consolidated closure batch — see UASF-REQ-0030 for the `BudgetGuard`-facing half
+    of the same fix): (4) "reservation ownership checks must be validated inside CostEngine" — the ownership-
+    mismatch check (taskId/projectId/agentId always compared; provider/modelId compared only when the
+    reservation itself recorded them) used to run ONLY in `BudgetGuard.commit()`, one layer above
+    `commitReservation()`; a caller holding a bare `CostEngine` reference (bypassing `BudgetGuard` entirely)
+    could commit a reservation under a completely different task/project/agent than the one it actually
+    protects. `ReservationOwnershipMismatchError` moved here from `budget.ts` (re-exported there for API
+    stability, matching the 24th round's `UnknownReservationError`/`UnresolvedReconciliationError` pattern), now
+    with an `operation: "commit" | "release"` constructor parameter so one class serves both methods; the check
+    now runs INSIDE `commitReservation()` itself, marking the reservation RECONCILIATION_FAILED before throwing
+    (a real provider call may already have happened under it). (5) "callers must not release someone else's
+    active reservation" — `releaseReservation(id)` took only a reservation id (a predictable, sequential bearer
+    token: `res-1`, `res-2`, ...) with NO ownership check at all, so any caller who merely learned another
+    caller's id could release its active, in-flight reservation, freeing protected capacity that was never
+    theirs. Fixed: `releaseReservation(id, callerScope: ReservationOwnership)` now REQUIRES a second, mandatory
+    scope argument, validated against the reservation's own authoritative scope before any deletion — unlike a
+    commit mismatch, a release mismatch does NOT mark the reservation RECONCILIATION_FAILED, since nothing was
+    ever committed by the illegitimate attempt; only that caller's attempt is rejected, and the legitimate owner
+    can still release/commit normally afterward. `runtime/models/gateway.ts`'s one production call site
+    (`budget.release(reservation.id)` inside `invoke()`'s catch block) updated to
+    `budget.release(reservation.id, reservation.scope)`. Four new regression tests directly on `CostEngine` (not
+    only via `BudgetGuard`) prove: reserve under project A then commit under project B is rejected at the ledger
+    level (preserving A's reservation, marking it RECONCILIATION_FAILED) even bypassing `BudgetGuard` entirely;
+    and caller B, knowing only caller A's reservation id, cannot release A's reservation (A's own release/commit
+    still works normally afterward, and the mismatch does not mark the reservation failed). Verified via two
+    separate temporary bypasses (disabling each ownership check independently) — confirmed the exact predicted
+    21 tests (finding 4, including several pre-existing round-12/13 commit-ownership regressions) and 4 tests
+    (finding 5) failed respectively, then both reverted and all tests re-confirmed passing.
 
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
@@ -2523,6 +2680,20 @@
     by construction, and no code path was found that could accidentally
     form a separate reservation universe over a shared ledger.
 
+    Round 25 findings 4-5 (BudgetGuard-facing half — see UASF-REQ-0029 for the full CostEngine-level narrative):
+    `BudgetGuard.commit()` now delegates its ownership check entirely to `costEngine.commitReservation()`,
+    catching `ReservationOwnershipMismatchError` to still emit the same `BUDGET_RESERVATION_OWNERSHIP_MISMATCH`
+    audit event as before. `BudgetGuard.release(reservationId, callerScope: ReservationOwnership)`'s signature
+    changed to require the same mandatory `callerScope` parameter (every legitimate caller already has this on
+    hand — it is the same `scope` returned by the original `reserve()` call), forwarding to
+    `costEngine.releaseReservation()` and adding a new `BUDGET_RESERVATION_RELEASE_REJECTED_OWNERSHIP_MISMATCH`
+    audit event type on mismatch. All ~24 existing call sites across `budget/__tests__/budget.test.ts` and
+    `cost/__tests__/cost-engine.test.ts` updated to pass the appropriate scope. Two new regression tests prove:
+    caller B, knowing only caller A's reservation id, cannot release A's active reservation via `BudgetGuard`
+    (A's own release still works normally afterward); and a release-ownership mismatch is audited via the new
+    event type without marking the reservation RECONCILIATION_FAILED (the legitimate owner can still commit it
+    normally).
+
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
   description: Register worker classes (linux-general, gpu, macos, ...) with capability metadata; select smallest sufficient worker.
@@ -2611,6 +2782,17 @@
     bypass (`return worker;` instead of `return freezeRecord(worker);`)
     — confirmed exactly this 1 test fails against the bypassed code,
     then the bypass was reverted and the full suite re-confirmed green.
+
+    P1 fix (25th independent review round targeted audit, same root class as `audit/audit-log.ts`'s "audit
+    records must be runtime-private and append-only" — UASF-REQ-0022): the internal `workers` array used
+    TypeScript's compile-time-only `private` keyword, reachable at runtime via `(registry as any).workers` or
+    plain bracket access, letting a consumer push a fabricated record directly (bypassing `register()`'s
+    duplicate-id and monetary-amount validation) or flip a QUARANTINED worker's `status` back to IDLE in place
+    (bypassing `updateStatus()` and baseline section 85's worker-quarantine invariant). Converted to a genuine
+    ECMAScript `#workers` private field. Three new regression tests prove the field is unreachable via property
+    access or any reflection API, and that a plain JS consumer cannot un-quarantine a worker this way. Verified
+    via a temporary bypass (reverting to `private workers`) — confirmed exactly the 3 predicted tests failed,
+    then reverted and re-confirmed all tests passing.
 
 - id: UASF-REQ-0032
   title: Scheduler (foundation)
@@ -2872,6 +3054,21 @@
     victim project's existing data, and a caller cannot write for any project other than its own. Verified via
     a temporary bypass of the new check — confirmed the exact predicted cross-project-write tests failed, then
     reverted and re-confirmed all tests passing.
+
+    P1 fix (25th independent review round, "project isolation must use trusted project identity"): the 24th
+    round's dual-string set(callerProjectId, targetProjectId, ...)/get(...)/keysFor(...) API "enforced"
+    isolation by comparing two caller-supplied strings — trivially satisfied by a caller simply passing the
+    SAME value for both, which established nothing about who the caller actually was. Replaced entirely with a
+    capability/closure model: viewFor(trustedProjectId) is called once by trusted assembling code and returns a
+    ProjectIsolationView whose own set()/get()/keys() methods take NO project-id parameter at all — cross-
+    project access is now structurally inexpressible rather than merely runtime-checked. The old dual-string
+    API and CrossProjectAccessDeniedError are removed (confirmed via grep this store had zero production call
+    sites outside its own test file, so this is a contained, non-breaking change for the rest of the kernel).
+    Test file fully rewritten for the new API, including a regression that smuggles an extra "target project"
+    argument via .call() (simulating a type-unsafe caller attempting the old API shape) and confirms it has no
+    effect. Verified via a temporary bypass (reintroducing an optional override argument read from arguments)
+    — confirmed exactly the predicted smuggling-regression test failed, then reverted and re-confirmed all
+    tests passing.
 
 - id: UASF-REQ-0035
   title: Event-driven agent activation
@@ -4063,3 +4260,35 @@
     still invoked exactly once, scaffold still created). Verified via a temporary bypass (removing the new
     pre-check) — confirmed the exact predicted 2 tests failed (model invoked once despite the scaffold being
     denied/approval-required), then reverted and re-confirmed all passing.
+
+    Round 25 closure summary (a fresh independent Codex review found TEN priority-P1 findings, fixed as one
+    consolidated batch — full per-fix detail lives on UASF-REQ-0019/0020/0024/0029/0030/0034 and in the touched
+    files' own fix-note comments): (1) caller-supplied authority objects — `CapabilityGateway`/`ModelGateway` now
+    own their approval store, injected once at construction. (2) incomplete approval-action binding — approval
+    matching now compares the complete action identity (actionType/description/risk/costUsd/projectId/actorId).
+    (3) reusable/replayable approvals — a matching approval is atomically consumed (APPROVED -> EXECUTED) before
+    the risky callback runs. (4) reservation ownership checks living outside the authoritative ledger — moved
+    into `CostEngine.commitReservation()` itself. (5) release-by-reservation-ID-alone — `releaseReservation()`/
+    `BudgetGuard.release()` now require a mandatory `callerScope` argument. (6) approval evidence dropped through
+    the model invocation path — `ModelGateway` gained a constructor-injected `#approvals` field and
+    `ModelInvocationContext`/`RoutingRequest` gained a threaded `approvalId`. (7) repeated authorization after
+    paid/irreversible work — `bootstrapProject()`'s two separate `authorize()` calls collapsed into one whose
+    callback contains both the paid model invocation and the scaffold mutation. (8) caller-controlled security
+    identity — `ProjectIsolationStore`'s dual-string API replaced with a closure-based `viewFor(trustedProjectId)`
+    capability model whose views take no project-id parameter at all. (9) TypeScript-`private`-only authoritative
+    mutable state — `AuditLog`'s `#records` converted to genuine ECMAScript private; the round's own targeted
+    audit found four further genuine instances of this exact class (`decision-ledger.ts`'s `#decisions`,
+    `assumption-register.ts`'s `#assumptions`, `workers/registry.ts`'s `#workers`, `models/registry.ts`'s
+    `#models` — all fixed the same way, see UASF-REQ-0010/0011/0025/0031). (10) mutable inputs crossing
+    policy/security boundaries — `PolicyEngine.evaluate()` now freezes an `authoritativeAction` snapshot before
+    any rule runs. Every fix carries deterministic regression tests and was verified via a genuine temporary
+    in-place bypass reproducing the exact predicted failure, then fully reverted (confirmed via grep for the
+    bypass marker in every touched file). A narrow, explicitly-scoped audit of exactly these ten root classes
+    (not broadened into unrelated architecture) found the four additional `#private` instances noted above and
+    no other genuine instance. Requirement registry updated (UASF-REQ-0010, 0011, 0018, 0019, 0020, 0022, 0024,
+    0025, 0029, 0030, 0031, 0034, 0042) from real evidence only; no status raised beyond what evidence supports.
+    Full verification suite re-run and green: lint, typecheck, build, 825/825 tests (44 files), validate:
+    requirements (42 records), history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY), all 9
+    P0 proofs (13 assertions). Per explicit instruction: this session does NOT merge, does NOT move to P1, does
+    NOT declare P0 complete, and does NOT invoke Codex itself. P0 remains BLOCKED_PENDING_REVIEW awaiting the
+    next independent review to return INDEPENDENT_REVIEW_RESULT: CLEAN.

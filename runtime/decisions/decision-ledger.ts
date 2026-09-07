@@ -184,7 +184,29 @@ export class DecisionAlreadySupersededError extends Error {
 }
 
 export class FounderDecisionLedger {
-  private readonly decisions = new Map<string, MutableFounderDecision>();
+  /**
+   * P1 fix (25th independent review round targeted audit, same root class
+   * as `audit/audit-log.ts`'s "audit records must be runtime-private and
+   * append-only"): this Map used to be declared with TypeScript's `private`
+   * keyword — compile-time only. Compiled JS leaves it an ordinary,
+   * enumerable instance property, reachable via `(ledger as any).decisions`
+   * or plain bracket access (`ledger["decisions"]`) with no type-system
+   * escape hatch needed at all. A consumer holding a `FounderDecisionLedger`
+   * reference could reach in and mutate a decision's `status` directly
+   * (e.g. flipping ACTIVE straight to SUPERSEDED, or vice versa) — or
+   * insert/delete a Map entry outright — completely bypassing
+   * `supersede()`'s "never delete, only SUPERSEDED-and-chain" invariant and
+   * its ACTIVE-only guard (baseline section 46's decision history must
+   * always remain fully explainable). Fixed the same way `audit-log.ts`'s
+   * `#records`/`policy-engine/approval.ts`'s `#requests`/`models/gateway.ts`'s
+   * `#providers` already are: a genuine ECMAScript private class field
+   * (`#decisions`), enforced by the JS runtime itself — `as any`, bracket
+   * access, `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all
+   * fail to reach it, and any code outside this class body attempting
+   * `x.#decisions` is a `SyntaxError` at PARSE time, not merely rejected at
+   * runtime.
+   */
+  #decisions = new Map<string, MutableFounderDecision>();
 
   /**
    * P1 cross-cutting fix: eskiden bu (ve get()/allFor()) İÇ nesnenin
@@ -195,7 +217,7 @@ export class FounderDecisionLedger {
    * nesne üzerinde gerçekleşir.
    */
   record(decisionId: string, project: string, decision: string, source: string): FounderDecision {
-    if (this.decisions.has(decisionId)) {
+    if (this.#decisions.has(decisionId)) {
       throw new DuplicateDecisionError(decisionId);
     }
     const record: MutableFounderDecision = {
@@ -206,12 +228,12 @@ export class FounderDecisionLedger {
       status: "ACTIVE",
       createdAt: new Date().toISOString()
     };
-    this.decisions.set(decisionId, record);
+    this.#decisions.set(decisionId, record);
     return freezeRecord(record);
   }
 
   get(decisionId: string): FounderDecision | undefined {
-    const record = this.decisions.get(decisionId);
+    const record = this.#decisions.get(decisionId);
     return record ? freezeRecord(record) : undefined;
   }
 
@@ -237,7 +259,7 @@ export class FounderDecisionLedger {
    * açıkça TANIMLAMADIĞI sürece asla sessizce buna izin vermez.
    */
   supersede(oldDecisionId: string, newDecisionId: string, decision: string, source: string): FounderDecision {
-    const old = this.decisions.get(oldDecisionId);
+    const old = this.#decisions.get(oldDecisionId);
     if (!old) throw new DecisionNotFoundError(oldDecisionId);
     if (old.status !== "ACTIVE") {
       throw new DecisionAlreadySupersededError(oldDecisionId, old.status, old.supersededBy);
@@ -250,12 +272,12 @@ export class FounderDecisionLedger {
   }
 
   allFor(project: string): readonly FounderDecision[] {
-    return [...this.decisions.values()].filter((d) => d.project === project).map((d) => freezeRecord(d));
+    return [...this.#decisions.values()].filter((d) => d.project === project).map((d) => freezeRecord(d));
   }
 
   /** Halihazırda ACTIVE bir karar var mı? — aynı soruyu tekrar tekrar sormamak için (bölüm 46). */
   hasActiveDecision(decisionId: string): boolean {
-    return this.decisions.get(decisionId)?.status === "ACTIVE";
+    return this.#decisions.get(decisionId)?.status === "ACTIVE";
   }
 
   /**
@@ -263,7 +285,7 @@ export class FounderDecisionLedger {
    * — süreç yeniden başlasa bile karar geçmişi kaybolmaz.
    */
   saveTo(store: StateStore, path: string): void {
-    store.write(path, [...this.decisions.values()]);
+    store.write(path, [...this.#decisions.values()]);
   }
 
   /**
@@ -309,7 +331,7 @@ export class FounderDecisionLedger {
     }
 
     for (const record of validated) {
-      ledger.decisions.set(record.decisionId, record);
+      ledger.#decisions.set(record.decisionId, record);
     }
     return ledger;
   }

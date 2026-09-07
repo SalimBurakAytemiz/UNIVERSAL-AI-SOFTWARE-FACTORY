@@ -654,7 +654,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.3 })
         ).toThrow(UnknownReservationError);
-        expect(() => guard.release(reservation.id)).toThrow(UnknownReservationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnknownReservationError);
         // Exactly one commit's worth of cost was ever recorded.
         expect(costEngine.total()).toBe(0.3);
       });
@@ -665,7 +665,7 @@ describe("BudgetGuard", () => {
         const reservation = guard.reserve({ taskId: "t1" }, 0.6);
         expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError); // fully reserved
 
-        guard.release(reservation.id);
+        guard.release(reservation.id, reservation.scope);
         expect(costEngine.total()).toBe(0); // nothing was ever recorded
 
         // The released amount is available again for a subsequent reservation.
@@ -674,7 +674,7 @@ describe("BudgetGuard", () => {
 
       it("release() on an unknown/already-resolved reservation id fails closed", () => {
         const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 10 });
-        expect(() => guard.release("never-reserved")).toThrow(UnknownReservationError);
+        expect(() => guard.release("never-reserved", {})).toThrow(UnknownReservationError);
       });
 
       it("task/project isolation remains correct: a reservation for one task does not block a DIFFERENT task's own perTaskUsd ceiling", () => {
@@ -893,7 +893,7 @@ describe("BudgetGuard", () => {
           guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
         ).toThrow(InvalidMonetaryAmountError);
 
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
 
         // The reservation is STILL open (not deleted by the rejected
         // release() attempt) — a second, full-ceiling reservation remains blocked.
@@ -909,7 +909,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: Infinity })
         ).toThrow(InvalidMonetaryAmountError);
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
         expect(() => guard.reserve({ taskId: "t2" }, 1.0)).toThrow(BudgetExceededError);
       });
 
@@ -922,7 +922,7 @@ describe("BudgetGuard", () => {
           guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: -0.1 })
         ).toThrow(InvalidMonetaryAmountError);
 
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
         expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError);
       });
 
@@ -948,7 +948,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.6 })
         ).toThrow(UnknownReservationError);
-        expect(() => guard.release(reservation.id)).toThrow(UnknownReservationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnknownReservationError);
         expect(costEngine.total()).toBe(0.6); // still exactly once
       });
 
@@ -958,7 +958,7 @@ describe("BudgetGuard", () => {
         const reservation = guard.reserve({ taskId: "t1" }, 0.6);
         expect(() => guard.reserve({ taskId: "t2" }, 0.6)).toThrow(BudgetExceededError); // fully reserved
 
-        expect(() => guard.release(reservation.id)).not.toThrow();
+        expect(() => guard.release(reservation.id, reservation.scope)).not.toThrow();
         expect(costEngine.total()).toBe(0);
         expect(() => guard.reserve({ taskId: "t2" }, 0.6)).not.toThrow(); // capacity genuinely freed
       });
@@ -970,7 +970,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
         ).toThrow(InvalidMonetaryAmountError);
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
 
         const events = auditLog.all();
         expect(events.some((e) => e.type === "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED")).toBe(true);
@@ -988,7 +988,7 @@ describe("BudgetGuard", () => {
         expect(() => guard.reserve({ taskId: "b" }, 0.6))
           .toThrow(BudgetExceededError);
         // A caller cannot manually release A to make room for B either.
-        expect(() => guard.release(reservationA.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservationA.id, reservationA.scope)).toThrow(UnresolvedReconciliationError);
         expect(() => guard.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
 
         // The only safe path forward is retrying A's own reconciliation.
@@ -1141,7 +1141,7 @@ describe("BudgetGuard", () => {
           // assumes release() is now the safe cleanup path — it must be
           // REJECTED, not silently accepted, since a real provider call
           // may already have occurred under this reservation's authority.
-          expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+          expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
 
           // The full ceiling remains protected — a second full-ceiling
           // reservation cannot slip through a release() that should never
@@ -1158,7 +1158,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "a", projectId: "Q", provider: "mock", modelId: "m1", amountUsd: 0.6 })
         ).toThrow(ReservationOwnershipMismatchError);
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
       });
 
       it("a retry with the CORRECT ownership after a protected mismatch still succeeds and accounts exactly once", () => {
@@ -1169,7 +1169,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.6 })
         ).toThrow(ReservationOwnershipMismatchError);
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
 
         // The ONLY safe path forward: retry commit() with the CORRECT ownership.
         const recorded = guard.commit(reservation.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
@@ -1180,7 +1180,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 })
         ).toThrow(UnknownReservationError);
-        expect(() => guard.release(reservation.id)).toThrow(UnknownReservationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnknownReservationError);
       });
 
       it("an ownership-mismatch release() rejection is audited with the same event type as an amount-failure rejection", () => {
@@ -1190,7 +1190,7 @@ describe("BudgetGuard", () => {
         expect(() =>
           guard.commit(reservation.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.5 })
         ).toThrow(ReservationOwnershipMismatchError);
-        expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
 
         const events = auditLog.all();
         expect(events.some((e) => e.type === "BUDGET_RESERVATION_OWNERSHIP_MISMATCH")).toBe(true);
@@ -1227,7 +1227,7 @@ describe("BudgetGuard", () => {
           expect(costEngine.total()).toBe(0);
           // The reservation remains protected — release() is also rejected
           // (bkz. the mismatch-marks-RECONCILIATION_FAILED fix above).
-          expect(() => guard.release(reservation.id)).toThrow(UnresolvedReconciliationError);
+          expect(() => guard.release(reservation.id, reservation.scope)).toThrow(UnresolvedReconciliationError);
 
           // A correct retry under the ORIGINAL owner-agent still succeeds.
           const recorded = guard.commit(reservation.id, {
@@ -1423,7 +1423,7 @@ describe("BudgetGuard", () => {
         // bound to the same ledger) frees EXACTLY its $0.60 — no more, no
         // less — since release() is a shared-ledger operation identified
         // by reservation id, not by which guard object created it.
-        guardB.release(reservationA.id);
+        guardB.release(reservationA.id, reservationA.scope);
         expect(() => guardB.reserve({ taskId: "b" }, 0.6)).not.toThrow();
         expect(costEngine.total()).toBe(0);
       });
@@ -1441,7 +1441,7 @@ describe("BudgetGuard", () => {
         // Guard B (a DIFFERENT guard instance, same ledger) sees the
         // SAME protected, unresolved reservation and is likewise
         // rejected from releasing it.
-        expect(() => guardB.release(reservationA.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => guardB.release(reservationA.id, reservationA.scope)).toThrow(UnresolvedReconciliationError);
         expect(() => guardB.reserve({ taskId: "b" }, 1.0)).toThrow(BudgetExceededError);
 
         // The only safe path forward — retrying commit() with a
@@ -1551,6 +1551,53 @@ describe("BudgetGuard", () => {
         // Guard B is constructed AFTER the reservation already exists.
         const guardB = new BudgetGuard(costEngine, { perRunUsd: 1 });
         expect(() => guardB.reserve({ taskId: "b" }, 0.6)).toThrow(BudgetExceededError);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (25th independent review round, 'callers must not release someone else's active reservation'): " +
+      "release() now REQUIRES a callerScope argument, validated against the reservation's own authoritative " +
+      "scope before any deletion — a reservation id alone (a predictable, sequential bearer token) is never " +
+      "sufficient to release capacity reserved under a different owner's scope",
+    () => {
+      it("BLOCKER regression, exact reproduction: caller B, knowing only caller A's reservation id, cannot release A's active reservation via BudgetGuard", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const reservationA = guard.reserve({ taskId: "a", projectId: "A" }, 0.6);
+
+        // Caller B supplies its OWN scope, not A's — merely knowing A's
+        // reservation id must never be sufficient.
+        expect(() => guard.release(reservationA.id, { taskId: "b", projectId: "B" })).toThrow(
+          ReservationOwnershipMismatchError
+        );
+
+        // A's reservation is safely preserved: still counted, still
+        // protecting its own capacity, unaffected by B's rejected attempt.
+        expect(() => guard.reserve({ taskId: "c" }, 0.5)).toThrow(BudgetExceededError);
+
+        // A's own legitimate release still works normally afterward.
+        expect(() => guard.release(reservationA.id, reservationA.scope)).not.toThrow();
+        expect(() => guard.reserve({ taskId: "c" }, 0.6)).not.toThrow();
+      });
+
+      it("a release-ownership mismatch is audited via BUDGET_RESERVATION_RELEASE_REJECTED_OWNERSHIP_MISMATCH and does not mark the reservation RECONCILIATION_FAILED", () => {
+        const auditLog = new AuditLog();
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 }, undefined, auditLog);
+        const reservation = guard.reserve({ taskId: "owner" }, 0.4);
+
+        expect(() => guard.release(reservation.id, { taskId: "someone-else" })).toThrow(
+          ReservationOwnershipMismatchError
+        );
+
+        const events = auditLog.all();
+        expect(events.some((e) => e.type === "BUDGET_RESERVATION_RELEASE_REJECTED_OWNERSHIP_MISMATCH")).toBe(true);
+
+        // Unlike a commit() mismatch, the reservation is NOT marked
+        // RECONCILIATION_FAILED — the legitimate owner can still commit it normally.
+        const recorded = guard.commit(reservation.id, { taskId: "owner", provider: "mock", modelId: "m1", amountUsd: 0.4 });
+        expect(recorded.amountUsd).toBe(0.4);
       });
     }
   );

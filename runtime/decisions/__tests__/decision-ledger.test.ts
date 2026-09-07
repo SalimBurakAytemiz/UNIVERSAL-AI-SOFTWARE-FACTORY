@@ -380,4 +380,42 @@ describe("FounderDecisionLedger", () => {
       }
     );
   });
+
+  describe(
+    "P1 fix (25th independent review round targeted audit, 'decision records must be runtime-private'): the " +
+      "internal decisions Map now uses a genuine ECMAScript #private field, not TypeScript's compile-time-only " +
+      "`private`",
+    () => {
+      it("the internal decisions Map is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
+        const ledger = new FounderDecisionLedger();
+        ledger.record("d1", "proj-a", "some decision", "test");
+
+        expect((ledger as unknown as Record<string, unknown>).decisions).toBeUndefined();
+        expect((ledger as unknown as Record<string, unknown>)["decisions"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private decisions Map", () => {
+        const ledger = new FounderDecisionLedger();
+        ledger.record("d1", "proj-a", "some decision", "test");
+
+        expect(Object.getOwnPropertyNames(ledger)).not.toContain("decisions");
+        expect(Reflect.ownKeys(ledger).map(String)).not.toContain("decisions");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot flip a decision's status directly via property access, bypassing supersede()", () => {
+        const ledger = new FounderDecisionLedger();
+        ledger.record("d1", "proj-a", "original decision", "test");
+
+        const forged = (ledger as unknown as Record<string, unknown>).decisions as
+          | Map<string, { status: string }>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and mutate at all
+
+        const spread: Record<string, unknown> = { ...ledger };
+        expect(spread.decisions).toBeUndefined();
+
+        expect(ledger.get("d1")!.status).toBe("ACTIVE");
+      });
+    }
+  );
 });

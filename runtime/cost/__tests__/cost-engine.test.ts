@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CostEngine,
   InvalidMonetaryAmountError,
+  ReservationOwnershipMismatchError,
   UnknownReservationError,
   UnresolvedReconciliationError,
   assertValidMonetaryAmount,
@@ -230,7 +231,7 @@ describe("CostEngine", () => {
           // The core invariant this finding requires: a normal consumer
           // cannot free this protected reservation's capacity for free —
           // releaseReservation() (the only other exit) refuses it outright.
-          expect(() => engine.releaseReservation(reservation.id)).toThrow(UnresolvedReconciliationError);
+          expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
           expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5); // still protected after the rejected release
         }
       );
@@ -239,7 +240,7 @@ describe("CostEngine", () => {
         const engine = new CostEngine();
         const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
 
-        const released = engine.releaseReservation(reservation.id);
+        const released = engine.releaseReservation(reservation.id, { taskId: "t1" });
 
         expect(released.amountUsd).toBe(0.5);
         expect(engine.totalFor({ taskId: "t1" })).toBe(0); // never spent
@@ -252,7 +253,7 @@ describe("CostEngine", () => {
         const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
         engine.markReservationReconciliationFailed(reservation.id);
 
-        expect(() => engine.releaseReservation(reservation.id)).toThrow(UnresolvedReconciliationError);
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
         expect(engine.getReservation(reservation.id)).toBeDefined(); // still protected, not deleted
       });
 
@@ -261,11 +262,108 @@ describe("CostEngine", () => {
         expect(() =>
           engine.commitReservation("never-existed", { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.1 })
         ).toThrow(UnknownReservationError);
-        expect(() => engine.releaseReservation("never-existed")).toThrow(UnknownReservationError);
+        expect(() => engine.releaseReservation("never-existed", {})).toThrow(UnknownReservationError);
 
         const reservation = engine.createReservation({ taskId: "t1" }, 0.1);
-        engine.releaseReservation(reservation.id);
-        expect(() => engine.releaseReservation(reservation.id)).toThrow(UnknownReservationError);
+        engine.releaseReservation(reservation.id, { taskId: "t1" });
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnknownReservationError);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (25th independent review round, 'reservation ownership must be validated inside CostEngine'): " +
+      "commitReservation() itself (not only BudgetGuard, one layer above) must reject a commit whose supplied " +
+      "ownership does not match the reservation's own authoritative scope",
+    () => {
+      it("BLOCKER regression, exact reproduction: reserve under project A, commit under project B is REJECTED at the ledger level", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "a", projectId: "A" }, 0.6);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, {
+            taskId: "a",
+            projectId: "B",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.6
+          })
+        ).toThrow(ReservationOwnershipMismatchError);
+
+        // Project A's reservation is preserved (not deleted, not silently
+        // committed under B's identity) — no cost was recorded for either project.
+        expect(engine.totalFor({ projectId: "A" })).toBe(0);
+        expect(engine.totalFor({ projectId: "B" })).toBe(0);
+        expect(engine.reservedTotal({ projectId: "A" })).toBe(0.6);
+        expect(engine.getReservation(reservation.id)?.status).toBe("RECONCILIATION_FAILED");
+      });
+
+      it("a caller talking directly to CostEngine (bypassing BudgetGuard entirely) is still rejected", () => {
+        const engine = new CostEngine();
+        // No BudgetGuard involved anywhere in this test — the reservation
+        // owner is CostEngine itself, and the ownership check must hold
+        // even for a caller with a bare CostEngine reference.
+        const reservation = engine.createReservation({ taskId: "owner-task" }, 0.4);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, {
+            taskId: "attacker-task",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.4
+          })
+        ).toThrow(ReservationOwnershipMismatchError);
+
+        expect(engine.totalFor({ taskId: "attacker-task" })).toBe(0);
+        // The legitimate owner can still retry with the correct ownership afterward.
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "owner-task",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.4
+        });
+        expect(recorded.taskId).toBe("owner-task");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (25th independent review round, 'callers must not release someone else's active reservation'): " +
+      "releaseReservation() itself (not only BudgetGuard) must reject a release whose supplied ownership does " +
+      "not match the reservation's own authoritative scope — a reservation id alone is never sufficient",
+    () => {
+      it("BLOCKER regression, exact reproduction: caller B, knowing only caller A's reservation id, cannot release A's reservation", () => {
+        const engine = new CostEngine();
+        const reservationA = engine.createReservation({ taskId: "a", projectId: "A" }, 0.6);
+
+        // Caller B supplies its OWN ownership (not A's) alongside A's
+        // reservation id — the id alone must never be sufficient.
+        expect(() =>
+          engine.releaseReservation(reservationA.id, { taskId: "b", projectId: "B" })
+        ).toThrow(ReservationOwnershipMismatchError);
+
+        // A's reservation is untouched — safely still open and still
+        // protecting its own capacity, unaffected by B's illegitimate attempt.
+        expect(engine.getReservation(reservationA.id)).toBeDefined();
+        expect(engine.reservedTotal({ projectId: "A" })).toBe(0.6);
+
+        // A's own legitimate release (or commit) still works normally afterward.
+        const released = engine.releaseReservation(reservationA.id, { taskId: "a", projectId: "A" });
+        expect(released.amountUsd).toBe(0.6);
+      });
+
+      it("a release-ownership mismatch does NOT mark the reservation RECONCILIATION_FAILED (nothing was committed by the illegitimate attempt)", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "owner" }, 0.3);
+
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "someone-else" })).toThrow(
+          ReservationOwnershipMismatchError
+        );
+
+        // Unlike a commit() mismatch, the reservation remains plain ACTIVE
+        // — the legitimate owner can still release it normally.
+        expect(engine.getReservation(reservation.id)?.status).toBe("ACTIVE");
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "owner" })).not.toThrow();
       });
     }
   );

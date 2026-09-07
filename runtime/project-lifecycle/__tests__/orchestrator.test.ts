@@ -1361,4 +1361,116 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (25th independent review round, 'do not reauthorize after paid bootstrap work'): exactly ONE " +
+      "authorization decision gates both the paid model invocation and the scaffold filesystem mutation — a " +
+      "stateful policy rule is evaluated only once for project.scaffold, never re-evaluated after cost is committed",
+    () => {
+      function spyProvider(id: string): { provider: ModelProvider; invokeCount: () => number } {
+        let calls = 0;
+        const provider: ModelProvider = {
+          id,
+          async invoke(model): Promise<ModelInvocationResponse> {
+            calls += 1;
+            return { provider: id, modelId: model.modelId, costUsd: model.costPerCall, output: "should never run" };
+          }
+        };
+        return { provider, invokeCount: () => calls };
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: a stateful rule that answers ALLOW on its first call and DENY " +
+          "on every call after can never cause paid model work to be committed followed by a rejected scaffold",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-single-authz-"));
+          const policy = new PolicyEngine();
+          let scaffoldEvaluations = 0;
+          policy.addRule({
+            name: "allow-model-invoke",
+            priority: 10,
+            evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+          });
+          policy.addRule({
+            name: "stateful-scaffold-rule",
+            priority: 20,
+            evaluate: (a) => {
+              if (a.actionType !== "project.scaffold") return null;
+              scaffoldEvaluations += 1;
+              return scaffoldEvaluations === 1 ? "ALLOW" : "DENY";
+            }
+          });
+
+          const { provider, invokeCount } = spyProvider("mock");
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(provider);
+          const costEngine = new CostEngine();
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome("proj-single-authz"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            costEngine
+          });
+
+          // Exactly ONE evaluate() call for project.scaffold happened — if
+          // the OLD two-authorize()-call design were still present, a
+          // SECOND (DENY) evaluation would have run AFTER the model call
+          // below had already committed real cost, and this bootstrap
+          // would have thrown instead of succeeding, leaving spent money
+          // with no scaffold ever created.
+          expect(scaffoldEvaluations).toBe(1);
+          expect(invokeCount()).toBe(1);
+          expect(costEngine.all()).toHaveLength(1); // the model invocation was genuinely accounted for
+          expect(existsSync(join(tempRoot, "proj-single-authz"))).toBe(true);
+          expect(result.scaffold.projectRoot).toContain("proj-single-authz");
+        }
+      );
+
+      it("a DENY on the ONLY evaluation is never given a second chance — the whole bootstrap fails closed, and no paid work ever happens", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-single-authz-deny-"));
+        const policy = new PolicyEngine();
+        let scaffoldEvaluations = 0;
+        policy.addRule({
+          name: "allow-model-invoke",
+          priority: 10,
+          evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+        });
+        policy.addRule({
+          name: "stateful-scaffold-rule-deny-first",
+          priority: 20,
+          evaluate: (a) => {
+            if (a.actionType !== "project.scaffold") return null;
+            scaffoldEvaluations += 1;
+            // Would ALLOW on a second call — proves there IS no second
+            // call for this action left to exploit.
+            return scaffoldEvaluations === 1 ? "DENY" : "ALLOW";
+          }
+        });
+
+        const { provider, invokeCount } = spyProvider("mock");
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-single-authz-deny"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            costEngine
+          })
+        ).rejects.toThrow(CapabilityDeniedError);
+
+        expect(scaffoldEvaluations).toBe(1);
+        expect(invokeCount()).toBe(0); // paid work never happened either
+        expect(costEngine.total()).toBe(0);
+        expect(existsSync(join(tempRoot, "proj-single-authz-deny"))).toBe(false);
+      });
+    }
+  );
 });

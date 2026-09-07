@@ -94,7 +94,26 @@ export class ModelNotFoundError extends Error {
  * saklar; all()/findCapable() donmuş, ayrık anlık görüntüler döndürür.
  */
 export class ModelRegistry {
-  private readonly models: ModelRecord[] = [];
+  /**
+   * P1 fix (25th independent review round targeted audit, same root class
+   * as `audit/audit-log.ts`'s "audit records must be runtime-private and
+   * append-only"): this array used to be declared with TypeScript's
+   * `private` keyword — compile-time only, so the compiled JS leaves it an
+   * ordinary, enumerable instance property reachable via
+   * `(registry as any).models` or plain bracket access, with no
+   * type-system escape hatch needed at all. A consumer holding a
+   * `ModelRegistry` reference could push a fabricated record directly
+   * (bypassing `register()`'s duplicate-id and monetary-amount validation
+   * entirely) or flip a DEPRECATED/RETIRED model's `status` back to ACTIVE
+   * in place (bypassing `updateStatus()` and baseline section 60-64's
+   * cost/routing-integrity invariants). Fixed the same way `audit-log.ts`'s
+   * `#records` already is: a genuine ECMAScript private class field
+   * (`#models`), enforced by the JS runtime itself — `as any`, bracket
+   * access, `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all
+   * fail to reach it, and any code outside this class body attempting
+   * `x.#models` is a `SyntaxError` at PARSE time.
+   */
+  #models: ModelRecord[] = [];
 
   register(model: ModelRecord): void {
     // P2 fix (7th independent review round, "invalid model prices corrupt
@@ -105,18 +124,18 @@ export class ModelRegistry {
     // seçilmesine (bölüm 60/61 ihlali). Merkezi doğrulayıcı
     // (`assertValidMonetaryAmount`, cost-engine.ts) BURADA da kullanılır —
     // ayrı/farklı bir kural icat edilmez — ve reddedilen bir kayıt asla
-    // `this.models` dizisine ULAŞMAZ (fail closed, mutasyondan önce kontrol).
+    // `this.#models` dizisine ULAŞMAZ (fail closed, mutasyondan önce kontrol).
     assertValidMonetaryAmount(model.costPerCall, `ModelRegistry.register(modelId=${model.modelId})`);
     // P2 targeted-audit fix (9th independent review round): reject an id
     // collision BEFORE any mutation — see DuplicateModelIdError above.
-    if (this.models.some((m) => m.modelId === model.modelId)) {
+    if (this.#models.some((m) => m.modelId === model.modelId)) {
       throw new DuplicateModelIdError(model.modelId);
     }
-    this.models.push(freezeRecord({ ...model }));
+    this.#models.push(freezeRecord({ ...model }));
   }
 
   all(): readonly ModelRecord[] {
-    return this.models.map((m) => freezeRecord(m));
+    return this.#models.map((m) => freezeRecord(m));
   }
 
   /**
@@ -125,7 +144,7 @@ export class ModelRegistry {
    * modeller asla otomatik yönlendirmeye dahil edilmez.
    */
   findCapable(requiredCapabilities: readonly string[]): ModelRecord[] {
-    return this.models
+    return this.#models
       .filter((m) => USABLE_STATUSES.includes(m.status) && requiredCapabilities.every((cap) => m.capabilities.includes(cap)))
       .map((m) => freezeRecord(m));
   }
@@ -136,12 +155,12 @@ export class ModelRegistry {
    * değiştirir, asla ikinci bir kayıt oluşturmaz.
    */
   updateStatus(modelId: string, status: ModelStatus): ModelRecord {
-    const index = this.models.findIndex((m) => m.modelId === modelId);
+    const index = this.#models.findIndex((m) => m.modelId === modelId);
     if (index === -1) {
       throw new ModelNotFoundError(modelId);
     }
-    const updated = freezeRecord({ ...this.models[index]!, status });
-    this.models[index] = updated;
+    const updated = freezeRecord({ ...this.#models[index]!, status });
+    this.#models[index] = updated;
     return freezeRecord(updated);
   }
 }

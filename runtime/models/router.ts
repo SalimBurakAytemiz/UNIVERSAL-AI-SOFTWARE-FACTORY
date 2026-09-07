@@ -39,6 +39,19 @@ export interface RoutingRequest {
   /** 0 = trivial, 5 = critical. Mirrors PolicyAction.risk in the policy engine. */
   readonly risk: 0 | 1 | 2 | 3 | 4 | 5;
   readonly requiredCapabilities: readonly string[];
+  /**
+   * P1 fix (25th independent review round, "approval evidence must flow
+   * through model invocation path"): `RoutingRequest` used to carry NO way
+   * to reference approval evidence at all — a risk-5 routed invocation was
+   * therefore unconditionally blocked, with no path by which a genuine,
+   * reviewer-granted approval (registered in the `ModelGateway`'s own
+   * `#approvals` store, bkz. gateway.ts) could ever reach
+   * `gateway.invoke()`'s authorization call. `approvalId` is captured into
+   * the SAME frozen `routingScope` snapshot as every other routing field
+   * (bkz. `routeAndExecute()`'s fix note) and propagated into
+   * `ModelInvocationContext.approvalId` on every candidate invocation.
+   */
+  readonly approvalId?: string;
 }
 
 export interface RoutingDecision {
@@ -175,7 +188,11 @@ export class CheapestCapableModelRouter {
       // `ModelInvocationContext` has always supported it — see
       // `RoutingRequest.projectId`'s fix note above.
       projectId: request.projectId,
-      description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`
+      description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`,
+      // P1 fix (25th independent review round, "approval evidence must
+      // flow through model invocation path"): bkz. `RoutingRequest.approvalId`'in
+      // üstündeki fix notu.
+      approvalId: request.approvalId
     });
   }
 

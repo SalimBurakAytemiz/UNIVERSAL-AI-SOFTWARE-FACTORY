@@ -7,6 +7,7 @@
 // (bölüm 147, "capability gateway" bu motorun önüne geçemez).
 
 import { AuditLog } from "../audit/audit-log.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export type PolicyDecision = "ALLOW" | "DENY" | "APPROVAL_REQUIRED";
 
@@ -17,6 +18,17 @@ export interface PolicyAction {
   readonly risk: RiskLevel;
   readonly description: string;
   readonly costUsd?: number;
+  /**
+   * P1 fix (25th independent review round, "approval must be bound to
+   * complete action identity"): project/scope and actor/caller identity,
+   * where present, are now first-class parts of an action's identity —
+   * `CapabilityGateway.authorize()`'s approval-binding check compares
+   * these (bkz. gateway.ts) so an approval scoped to one project/actor can
+   * never authorize a materially different action just because
+   * `actionType`/`description`/`risk`/`costUsd` happen to match.
+   */
+  readonly projectId?: string;
+  readonly actorId?: string;
 }
 
 export interface PolicyRule {
@@ -47,7 +59,39 @@ export class PolicyEngine {
     return this.auditLog;
   }
 
+  /**
+   * P1 fix (25th independent review round, "policy actions must be
+   * snapshotted before rule evaluation"): `action` used to be passed
+   * DIRECTLY (the caller's own, mutable object reference) to EVERY
+   * `rule.evaluate(action)` call in the loop below. A `PolicyRule` is
+   * arbitrary, caller-registered code (`addRule()`) — nothing stops one
+   * rule's `evaluate()` from mutating `action.actionType`/`.risk`/
+   * `.description`/`.costUsd` as a SIDE EFFECT of running (whether
+   * maliciously, or just a careless implementation that "normalizes" the
+   * action in place) before a LATER, higher-priority-ORDERED-but-still-
+   * evaluated `DENY` rule runs — since this loop deliberately never
+   * `break`s early (bkz. bu dosyanın "higher-priority ALLOW bypasses
+   * matching DENY" fix notu), an EARLIER-registered ALLOW rule mutating
+   * `action.actionType` from `"secret-mutation"` to `"read-file"` BEFORE
+   * a DENY rule that specifically matches `"secret-mutation"` runs would
+   * make that DENY rule silently evaluate the WRONG (mutated) action and
+   * never match at all — DENY's supposed-to-be-absolute precedence
+   * (bölüm 241) defeated not by priority ordering (already fixed) but by
+   * the shared mutable object every rule receives. Fixed: `action` is
+   * copied into a frozen, detached `authoritativeAction` (`freezeRecord`)
+   * as the VERY FIRST thing `evaluate()` does — before ANY rule runs —
+   * and `authoritativeAction` (never the original `action` parameter) is
+   * what every rule receives, what is audited, and what is returned in
+   * `PolicyEvaluationResult.action`. A rule attempting
+   * `action.actionType = "x"` on the object IT was handed now throws
+   * `TypeError` (frozen) instead of silently succeeding; even a rule that
+   * mutates the ORIGINAL caller-owned `action` object it somehow still
+   * holds a separate reference to (e.g. closed over it beforehand) cannot
+   * reach `authoritativeAction`, since it is an independent copy, not a
+   * reference to the same object.
+   */
   evaluate(action: PolicyAction): PolicyEvaluationResult {
+    const authoritativeAction: PolicyAction = freezeRecord({ ...action });
     const ordered = [...this.rules].sort((a, b) => b.priority - a.priority);
 
     // P1 fix (7th independent review round, "higher-priority ALLOW bypasses
@@ -70,7 +114,7 @@ export class PolicyEngine {
     let bestNonDeny: { readonly decision: PolicyDecision; readonly rule: string } | null = null;
 
     for (const rule of ordered) {
-      const result = rule.evaluate(action);
+      const result = rule.evaluate(authoritativeAction);
       if (result === null) continue;
       if (result === "DENY") {
         if (denyMatch === null) denyMatch = { rule: rule.name };
@@ -101,7 +145,7 @@ export class PolicyEngine {
     // risk-5 kontrolü bunun üzerine bindirilen ek bir kısıtlamadır, bir
     // geçersiz kılma değil (bölüm 241, DENY en yüksek önceliğe sahiptir).
     const explicitDeny = denyMatch !== null;
-    if (action.risk >= 5 && decision !== "APPROVAL_REQUIRED" && !explicitDeny) {
+    if (authoritativeAction.risk >= 5 && decision !== "APPROVAL_REQUIRED" && !explicitDeny) {
       decision = "APPROVAL_REQUIRED";
       matchedRule = RISK_5_APPROVAL_RULE_NAME;
     }
@@ -109,11 +153,11 @@ export class PolicyEngine {
     this.auditLog.append({
       type: "POLICY_DECISION",
       actor: "policy-engine",
-      payload: { action, decision, matchedRule },
+      payload: { action: authoritativeAction, decision, matchedRule },
       timestamp: new Date().toISOString()
     });
 
-    return { decision, matchedRule, action };
+    return { decision, matchedRule, action: authoritativeAction };
   }
 }
 

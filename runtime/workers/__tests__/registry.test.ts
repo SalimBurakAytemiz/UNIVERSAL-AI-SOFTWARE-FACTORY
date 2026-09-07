@@ -231,4 +231,42 @@ describe("WorkerRegistry", () => {
       expect(registry.all()).toHaveLength(1);
     });
   });
+
+  describe(
+    "P1 fix (25th independent review round targeted audit, 'worker records must be runtime-private'): the " +
+      "internal workers array now uses a genuine ECMAScript #private field, not TypeScript's compile-time-only " +
+      "`private`",
+    () => {
+      it("the internal workers array is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
+        const registry = new WorkerRegistry();
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+
+        expect((registry as unknown as Record<string, unknown>).workers).toBeUndefined();
+        expect((registry as unknown as Record<string, unknown>)["workers"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private workers array", () => {
+        const registry = new WorkerRegistry();
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+
+        expect(Object.getOwnPropertyNames(registry)).not.toContain("workers");
+        expect(Reflect.ownKeys(registry).map(String)).not.toContain("workers");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot un-quarantine a worker via property access, bypassing updateStatus()", () => {
+        const registry = new WorkerRegistry();
+        registry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "QUARANTINED" });
+
+        const forged = (registry as unknown as Record<string, unknown>).workers as
+          | Array<{ status: string }>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and mutate at all
+
+        const spread: Record<string, unknown> = { ...registry };
+        expect(spread.workers).toBeUndefined();
+
+        expect(registry.findCapable(["cpu"])).toHaveLength(0); // still quarantined
+      });
+    }
+  );
 });

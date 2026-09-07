@@ -3,7 +3,13 @@ import { ModelGateway, UnknownProviderError, type ModelInvocationResponse } from
 import { createDefaultModelRegistry } from "../registry.js";
 import { MockProvider } from "../providers/mock-provider.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
-import { CapabilityGateway, CapabilityDeniedError, CapabilityApprovalRequiredError } from "../../capability-gateway/gateway.js";
+import {
+  CapabilityGateway,
+  CapabilityDeniedError,
+  CapabilityApprovalRequiredError,
+  ApprovalEvidenceMismatchError
+} from "../../capability-gateway/gateway.js";
+import { ApprovalWorkflow } from "../../policy-engine/approval.js";
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetGuard, BudgetExceededError } from "../../budget/budget.js";
 import type { ModelProvider, ModelInvocationRequest } from "../gateway.js";
@@ -1002,6 +1008,164 @@ describe("ModelGateway + MockProvider", () => {
         await Promise.all([p1, p2]);
 
         expect(provider.receivedRequests.map((r) => r.prompt).sort()).toEqual(["first prompt", "second prompt"]);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (25th independent review round, 'approval evidence must flow through model invocation path'): " +
+      "ModelGateway owns its OWN authoritative ApprovalWorkflow (constructor-injected, exactly like " +
+      "CapabilityGateway's own approvals field) and ModelInvocationContext.approvalId is the ONLY way a real, " +
+      "reviewer-granted approval can reach a risk-5 invocation",
+    () => {
+      it("BLOCKER regression, exact reproduction: a risk-5 invocation with a valid, matching approval succeeds exactly once", async () => {
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 10 });
+        const model = mockModel({ provider: "controllable", costPerCall: 0.4 });
+
+        // The SAME identity invoke() will build internally: actionType
+        // "model.invoke", the exact description/risk/costUsd/projectId
+        // this call will use.
+        approvals.requestFor("appr-1", {
+          actionType: "model.invoke",
+          description: "risk-5 approved action",
+          risk: 5,
+          costUsd: 0.4,
+          projectId: "project-x"
+        });
+        approvals.approve("appr-1", "founder@example.com");
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 5,
+          taskId: "t1",
+          projectId: "project-x",
+          description: "risk-5 approved action",
+          approvalId: "appr-1"
+        });
+        provider.resolveAll();
+        const response = await responsePromise;
+
+        expect(response.output).toContain("x");
+        expect(costEngine.totalFor({ projectId: "project-x" })).toBe(0.4);
+        expect(approvals.get("appr-1")!.status).toBe("EXECUTED");
+      });
+
+      it("without approvalId, a risk-5 invocation remains blocked exactly as before — no default bypass was introduced", async () => {
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+
+        await expect(
+          gateway.invoke(mockModel({ provider: "controllable" }), { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 5,
+            taskId: "t1"
+          })
+        ).rejects.toThrow(CapabilityApprovalRequiredError);
+        expect(provider.invocationCount).toBe(0);
+      });
+
+      it("reusing the SAME approvalId for a second invocation is rejected — an approval authorizes exactly one execution", async () => {
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const budget = permissiveBudget();
+        const model = mockModel({ provider: "controllable", costPerCall: 0.2 });
+
+        approvals.requestFor("appr-reuse", {
+          actionType: "model.invoke",
+          description: "reused approval",
+          risk: 5,
+          costUsd: 0.2
+        });
+        approvals.approve("appr-reuse", "founder@example.com");
+
+        const context = {
+          policy: permissivePolicy(),
+          budget,
+          risk: 5 as const,
+          taskId: "t1",
+          description: "reused approval",
+          approvalId: "appr-reuse"
+        };
+
+        const p1 = gateway.invoke(model, { prompt: "first" }, context);
+        provider.resolveAll();
+        await expect(p1).resolves.toBeDefined();
+
+        // The SAME approval id, presented again for a SECOND invocation —
+        // the underlying request is now EXECUTED, not APPROVED.
+        await expect(gateway.invoke(model, { prompt: "second" }, context)).rejects.toThrow(
+          ApprovalEvidenceMismatchError
+        );
+        expect(provider.invocationCount).toBe(1); // the second attempt never reached the provider
+      });
+
+      it("an approval bound to a DIFFERENT action identity (different costUsd) does not authorize this invocation", async () => {
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const budget = permissiveBudget();
+        const model = mockModel({ provider: "controllable", costPerCall: 0.4 });
+
+        // Approved for a DIFFERENT cost than the actual invocation will carry.
+        approvals.requestFor("appr-mismatch", {
+          actionType: "model.invoke",
+          description: "mismatched-cost action",
+          risk: 5,
+          costUsd: 999
+        });
+        approvals.approve("appr-mismatch", "founder@example.com");
+
+        await expect(
+          gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget,
+            risk: 5,
+            taskId: "t1",
+            description: "mismatched-cost action",
+            approvalId: "appr-mismatch"
+          })
+        ).rejects.toThrow(ApprovalEvidenceMismatchError);
+        expect(provider.invocationCount).toBe(0);
+      });
+
+      it("an approval registered in a DIFFERENT ModelGateway's own approvals store is invisible to this gateway", async () => {
+        const otherGatewaysApprovals = new ApprovalWorkflow();
+        otherGatewaysApprovals.requestFor("appr-elsewhere", {
+          actionType: "model.invoke",
+          description: "elsewhere",
+          risk: 5,
+          costUsd: 0.1
+        });
+        otherGatewaysApprovals.approve("appr-elsewhere", "founder@example.com");
+
+        // This gateway was constructed with its OWN, separate, empty store.
+        const gateway = new ModelGateway(new ApprovalWorkflow());
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+
+        await expect(
+          gateway.invoke(mockModel({ provider: "controllable", costPerCall: 0.1 }), { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 5,
+            taskId: "t1",
+            description: "elsewhere",
+            approvalId: "appr-elsewhere"
+          })
+        ).rejects.toThrow(ApprovalEvidenceMismatchError);
+        expect(provider.invocationCount).toBe(0);
       });
     }
   );

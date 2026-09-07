@@ -10,7 +10,13 @@
 // `now` enjekte edilebilir bir saat fonksiyonudur; testler bunu ilerleterek
 // gün/ay sınırlarını (rollover) gerçek zaman geçmeden doğrulayabilir.
 
-import { assertValidMonetaryAmount, exceedsMonetaryAmount, UnknownReservationError, UnresolvedReconciliationError } from "../cost/cost-engine.js";
+import {
+  assertValidMonetaryAmount,
+  exceedsMonetaryAmount,
+  ReservationOwnershipMismatchError,
+  UnknownReservationError,
+  UnresolvedReconciliationError
+} from "../cost/cost-engine.js";
 import type { CostEngine, CostEntry, CostScope, LedgerReservation, ReservationOwnership } from "../cost/cost-engine.js";
 import type { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
@@ -33,7 +39,14 @@ export type { ReservationOwnership };
 // only when accessed through `BudgetGuard`), re-exported here for API
 // stability so every existing caller/test importing them from this module
 // continues to work unchanged.
-export { UnknownReservationError, UnresolvedReconciliationError };
+//
+// P1 fix (25th independent review round, "reservation ownership must be
+// validated inside CostEngine"): `ReservationOwnershipMismatchError` used
+// to be DEFINED in this file too — it now also lives in cost-engine.ts for
+// the exact same reason (the ownership check it reports on now runs
+// inside `CostEngine.commitReservation()`/`releaseReservation()`
+// themselves), re-exported here for the same API-stability reason.
+export { ReservationOwnershipMismatchError, UnknownReservationError, UnresolvedReconciliationError };
 
 export type BudgetCeilingName = "perTaskUsd" | "perRunUsd" | "dailyUsd" | "monthlyUsd";
 
@@ -136,42 +149,6 @@ export interface Reservation {
  * (`UnknownReservationError`), never a silent no-op.
  */
 export type ReservationStatus = "ACTIVE" | "RECONCILIATION_FAILED";
-
-/**
- * P1 fix (12th independent review round, "commit() accepts accounting
- * ownership unrelated to the reservation"): `commit()`'s caller-supplied
- * `entry.taskId`/`entry.projectId` used to be recorded VERBATIM into
- * CostEngine with no check against what was ACTUALLY reserved — a caller
- * could reserve for project P / task A and then commit() under project Q
- * / task B, recording the real cost under Q/B while A's protected
- * capacity silently became available again (accounting and reservation
- * ownership diverging). A reservation's OWN `scope` (captured atomically
- * at `reserve()` time, before any provider call) is now the authoritative
- * owner of its own commit — `commit()` validates the caller-supplied
- * taskId/projectId against `reservation.scope` and fails closed
- * (BEFORE any mutation: no cost recorded, no reservation state change)
- * on any mismatch, per this class.
- */
-export class ReservationOwnershipMismatchError extends Error {
-  constructor(
-    reservationId: string,
-    reservationScope: Readonly<ReservationOwnership>,
-    suppliedScope: ReservationOwnership
-  ) {
-    super(
-      `commit(reservationId=${reservationId}) supplied ownership (taskId=${String(suppliedScope.taskId)}, ` +
-        `projectId=${String(suppliedScope.projectId)}, agentId=${String(suppliedScope.agentId)}, ` +
-        `provider=${String(suppliedScope.provider)}, modelId=${String(suppliedScope.modelId)}) does not match ` +
-        `the reservation's OWN authoritative ownership (taskId=${String(reservationScope.taskId)}, ` +
-        `projectId=${String(reservationScope.projectId)}, agentId=${String(reservationScope.agentId)}, ` +
-        `provider=${String(reservationScope.provider)}, modelId=${String(reservationScope.modelId)}). ` +
-        `A reservation is the authoritative source of ownership for its own commit — this call was rejected ` +
-        `before any accounting mutation, and the reservation has been marked RECONCILIATION_FAILED (protected ` +
-        `from release()) rather than left releasable, since a real invocation may already have occurred.`
-    );
-    this.name = "ReservationOwnershipMismatchError";
-  }
-}
 
 /** Verilen anın ait olduğu UTC takvim gününün başlangıcını (00:00:00.000Z) döndürür. */
 function startOfUtcDay(date: Date): string {
@@ -550,91 +527,40 @@ export class BudgetGuard {
       throw new UnknownReservationError(reservationId);
     }
 
-    // P1 fix (12th independent review round, "commit() accepts accounting
-    // ownership unrelated to the reservation"), extended in the 13th
-    // independent review round ("reservation ownership checks omit agent
-    // identity" + "provider/model identity can still change accounting
-    // and audit evidence"): validated BEFORE anything else — no cost
-    // recorded — see `ReservationOwnershipMismatchError`'s note above.
-    // The reservation's OWN `scope` (fixed at reserve() time, BEFORE any
-    // provider call) is authoritative across EVERY dimension it captured
-    // — taskId/projectId/agentId (always compared) and provider/modelId
-    // (compared only when the reservation itself recorded them, so
-    // existing callers that never supplied a provider/modelId at
-    // reserve() time remain unaffected by this dimension). A caller
-    // cannot redefine ANY of these merely by supplying different values
-    // here — including via a provider's own (untrusted) response, which
-    // is exactly why gateway.ts derives its `commit()` call's
-    // provider/modelId from the pre-authorized model snapshot, never from
-    // `response.provider`/`response.modelId` (see gateway.ts's `invoke()`).
-    const reservedProvider = reservation.scope.provider;
-    const reservedModelId = reservation.scope.modelId;
-    const ownershipMismatch =
-      entry.taskId !== reservation.scope.taskId ||
-      entry.projectId !== reservation.scope.projectId ||
-      entry.agentId !== reservation.scope.agentId ||
-      (reservedProvider !== undefined && entry.provider !== reservedProvider) ||
-      (reservedModelId !== undefined && entry.modelId !== reservedModelId);
-
-    if (ownershipMismatch) {
-      // P1 fix (13th independent review round, "ownership-mismatch
-      // failure leaves reservation releasable"): Codex reproduced
-      // reserve() -> mismatched commit() -> catch -> release() SUCCEEDING
-      // — the mismatch check above used to just throw, leaving
-      // `reservation.status` at "ACTIVE", so a caller catching the thrown
-      // error could legally call `release()` next (release() only
-      // rejects "RECONCILIATION_FAILED"), silently restoring the FULL
-      // protected capacity even though a real (or potentially real)
-      // provider call may already have happened under the reservation's
-      // authoritative ownership. An ownership mismatch is EXACTLY the
-      // same "reconciliation could not be safely completed" situation as
-      // a malformed amount (bkz. aşağıdaki catch bloğu) — it must enter
-      // the SAME protected state, marked BEFORE the error is thrown (not
-      // after), so no window exists where the reservation is both
-      // "mismatch detected" and "still releasable." Marked on the SHARED
-      // ledger (`this.costEngine`) — bkz. bu dosyanın üstündeki 16th
-      // independent review round fix notu — so every `BudgetGuard` bound
-      // to this same ledger observes the protected state, not just this
-      // one guard instance.
-      this.costEngine.markReservationReconciliationFailed(reservationId);
-      this.auditLog?.append({
-        type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
-        actor: "budget-guard",
-        payload: {
-          reservationId,
-          reservedScope: reservation.scope,
-          suppliedTaskId: entry.taskId,
-          suppliedProjectId: entry.projectId,
-          suppliedAgentId: entry.agentId,
-          suppliedProvider: entry.provider,
-          suppliedModelId: entry.modelId
-        },
-        timestamp: this.now().toISOString()
-      });
-      throw new ReservationOwnershipMismatchError(reservationId, reservation.scope, {
-        taskId: entry.taskId,
-        projectId: entry.projectId,
-        agentId: entry.agentId,
-        provider: entry.provider,
-        modelId: entry.modelId
-      });
-    }
-
-    // P1 fix (24th independent review round, "reservation deletion must
-    // not bypass reconciliation"): the validate-record-delete sequence
-    // used to be performed HERE, ending in a bare `this.costEngine.
-    // deleteReservation(reservationId)` — a generic, unguarded primitive
-    // that ANY caller with a `CostEngine` reference could also invoke
-    // directly, bypassing this exact validation. That sequence now lives
-    // in `CostEngine.commitReservation()` itself (bkz. cost-engine.ts'in
-    // üstündeki fix notu) — it enforces the SAME "mark RECONCILIATION_FAILED
-    // and never delete on a failed validation" rule, but does so at the
-    // ledger level, so the invariant holds even for a caller that never
-    // goes through this `BudgetGuard` at all.
+    // P1 fix (25th independent review round, "reservation ownership must
+    // be validated inside CostEngine"): the ownership-mismatch check
+    // (taskId/projectId/agentId always compared; provider/modelId
+    // compared only when the reservation itself recorded them) used to be
+    // performed HERE, in `BudgetGuard`, before ever calling into
+    // `CostEngine`. It now lives in `CostEngine.commitReservation()`
+    // itself (bkz. cost-engine.ts'in `ownershipMismatches()`/
+    // `ReservationOwnershipMismatchError`'ın üstündeki fix notu) — the
+    // SAME check the reservation's OWN authoritative `scope` enforces,
+    // but now holding even for a caller that talks to `CostEngine`
+    // directly, bypassing this `BudgetGuard` entirely. This method's job
+    // is now just to translate that outcome into the SAME audit events as
+    // before.
     let recorded: CostEntry;
     try {
       recorded = this.costEngine.commitReservation(reservationId, entry);
     } catch (err) {
+      if (err instanceof ReservationOwnershipMismatchError) {
+        this.auditLog?.append({
+          type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
+          actor: "budget-guard",
+          payload: {
+            reservationId,
+            reservedScope: reservation.scope,
+            suppliedTaskId: entry.taskId,
+            suppliedProjectId: entry.projectId,
+            suppliedAgentId: entry.agentId,
+            suppliedProvider: entry.provider,
+            suppliedModelId: entry.modelId
+          },
+          timestamp: this.now().toISOString()
+        });
+        throw err;
+      }
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_COMMIT_FAILED",
         actor: "budget-guard",
@@ -698,7 +624,20 @@ export class BudgetGuard {
    * (the normal, documented provider-failure case) is released exactly
    * as before.
    */
-  release(reservationId: string): void {
+  /**
+   * P1 fix (25th independent review round, "callers must not release
+   * someone else's active reservation"): `release()` used to take ONLY a
+   * reservation id — a caller who merely LEARNED another caller's
+   * (predictable, sequential) reservation id could release it, freeing
+   * protected capacity that was never theirs to free. `callerScope` is
+   * now a REQUIRED parameter, forwarded unchanged to
+   * `CostEngine.releaseReservation()`, which validates it against the
+   * reservation's own authoritative scope BEFORE any deletion (bkz.
+   * cost-engine.ts'in üstündeki fix notu). Every legitimate caller
+   * already has this scope on hand — it is the SAME `scope` returned by
+   * the original `reserve()` call (`Reservation.scope`).
+   */
+  release(reservationId: string, callerScope: ReservationOwnership): void {
     // P1 fix (24th independent review round, "reservation deletion must
     // not bypass reconciliation"): the RECONCILIATION_FAILED protection
     // now lives in `CostEngine.releaseReservation()` itself (bkz.
@@ -708,7 +647,7 @@ export class BudgetGuard {
     // that outcome into the SAME audit events/error types as before.
     let released: LedgerReservation;
     try {
-      released = this.costEngine.releaseReservation(reservationId);
+      released = this.costEngine.releaseReservation(reservationId, callerScope);
     } catch (err) {
       if (err instanceof UnresolvedReconciliationError) {
         const reservation = this.costEngine.getReservation(reservationId);
@@ -716,6 +655,13 @@ export class BudgetGuard {
           type: "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED",
           actor: "budget-guard",
           payload: { reservationId, scope: reservation?.scope, amountUsd: reservation?.amountUsd },
+          timestamp: this.now().toISOString()
+        });
+      } else if (err instanceof ReservationOwnershipMismatchError) {
+        this.auditLog?.append({
+          type: "BUDGET_RESERVATION_RELEASE_REJECTED_OWNERSHIP_MISMATCH",
+          actor: "budget-guard",
+          payload: { reservationId, suppliedScope: callerScope },
           timestamp: this.now().toISOString()
         });
       }

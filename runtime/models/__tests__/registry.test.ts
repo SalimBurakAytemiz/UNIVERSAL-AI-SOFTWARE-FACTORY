@@ -249,4 +249,42 @@ describe("ModelRegistry", () => {
       expect(registry.all()).toHaveLength(1);
     });
   });
+
+  describe(
+    "P1 fix (25th independent review round targeted audit, 'model records must be runtime-private'): the " +
+      "internal models array now uses a genuine ECMAScript #private field, not TypeScript's compile-time-only " +
+      "`private`",
+    () => {
+      it("the internal models array is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
+        const registry = new ModelRegistry();
+        registry.register(baseModel());
+
+        expect((registry as unknown as Record<string, unknown>).models).toBeUndefined();
+        expect((registry as unknown as Record<string, unknown>)["models"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private models array", () => {
+        const registry = new ModelRegistry();
+        registry.register(baseModel());
+
+        expect(Object.getOwnPropertyNames(registry)).not.toContain("models");
+        expect(Reflect.ownKeys(registry).map(String)).not.toContain("models");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot revive a DEPRECATED model via property access, bypassing updateStatus()", () => {
+        const registry = new ModelRegistry();
+        registry.register(baseModel({ modelId: "m1", status: "DEPRECATED" }));
+
+        const forged = (registry as unknown as Record<string, unknown>).models as
+          | Array<{ status: string }>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and mutate at all
+
+        const spread: Record<string, unknown> = { ...registry };
+        expect(spread.models).toBeUndefined();
+
+        expect(registry.findCapable(["classification"])).toHaveLength(0); // still deprecated
+      });
+    }
+  );
 });
