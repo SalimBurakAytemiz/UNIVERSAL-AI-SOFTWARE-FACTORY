@@ -23,6 +23,59 @@ interface MutableFounderDecision {
 /** Dışa döndürülen her karar bunun donmuş, ayrık bir kopyasıdır. */
 export type FounderDecision = Readonly<MutableFounderDecision>;
 
+/**
+ * P1 targeted-audit fix (23rd independent review round, same root class as
+ * assumption-register.ts's "validate persisted assumptions before
+ * restoring authoritative state"): `loadFrom()` (below) used to insert
+ * every persisted record directly into `this.decisions` with NO
+ * validation — a corrupt or hand-edited record claiming
+ * `status: "SUPERSEDED"` with no `supersededBy` (a combination
+ * `supersede()` itself could never produce, since it always sets both
+ * fields together) would be restored into authoritative state, silently
+ * corrupting "which decision is currently active?" bookkeeping. See
+ * `describeInvalidPersistedDecision()` below.
+ */
+export class CorruptPersistedDecisionError extends Error {
+  constructor(index: number, reason: string) {
+    super(
+      `Persisted decision record at index ${index} is corrupt or violates a domain invariant ` +
+        `(${reason}) and cannot be restored into authoritative state. Persisted state must satisfy the ` +
+        `same invariants as state created through the live record()/supersede() API — see baseline ` +
+        `section 46. Refusing to load rather than silently repairing or dropping the record.`
+    );
+    this.name = "CorruptPersistedDecisionError";
+  }
+}
+
+const VALID_DECISION_STATUSES: readonly FounderDecisionStatus[] = ["ACTIVE", "SUPERSEDED"];
+
+function isNonEmptyDecisionString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** Mirrors assumption-register.ts's `describeInvalidPersistedAssumption()` — see its fix note for the full rationale. */
+function describeInvalidPersistedDecision(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return "not a plain object";
+  }
+  const candidate = value as Record<string, unknown>;
+  if (!isNonEmptyDecisionString(candidate.decisionId)) return "missing or invalid 'decisionId'";
+  if (typeof candidate.project !== "string") return "missing or invalid 'project'";
+  if (typeof candidate.decision !== "string") return "missing or invalid 'decision'";
+  if (typeof candidate.source !== "string") return "missing or invalid 'source'";
+  if (!VALID_DECISION_STATUSES.includes(candidate.status as FounderDecisionStatus)) return "invalid 'status'";
+  if (!isNonEmptyDecisionString(candidate.createdAt)) return "missing or invalid 'createdAt'";
+  if (candidate.supersededBy !== undefined && typeof candidate.supersededBy !== "string") {
+    return "invalid 'supersededBy' (must be a string when present)";
+  }
+  // Domain invariant, identical to what supersede() always produces
+  // together: a SUPERSEDED record must name its replacement.
+  if (candidate.status === "SUPERSEDED" && !isNonEmptyDecisionString(candidate.supersededBy)) {
+    return "SUPERSEDED record is missing 'supersededBy' — supersede() never produces one without the other";
+  }
+  return undefined;
+}
+
 export class DuplicateDecisionError extends Error {
   constructor(decisionId: string) {
     super(`Decision id '${decisionId}' already exists. Use supersede() to record a change, never overwrite history.`);
@@ -132,13 +185,32 @@ export class FounderDecisionLedger {
     store.write(path, [...this.decisions.values()]);
   }
 
-  /** Daha önce saveTo() ile kaydedilmiş bir karar defterini geri yükler. */
+  /**
+   * Daha önce saveTo() ile kaydedilmiş bir karar defterini geri yükler.
+   *
+   * P1 targeted-audit fix (23rd independent review round, same root class
+   * as assumption-register.ts's persisted-state validation fix): her kayıt
+   * eklemeden ÖNCE `describeInvalidPersistedDecision()` ile doğrulanır ve
+   * `decisionId`'ler tekrarlanamaz; HERHANGİ bir kayıt geçersizse TÜM
+   * yükleme reddedilir (fail closed) — bkz. `CorruptPersistedDecisionError`'ın
+   * üstündeki not ve assumption-register.ts'teki aynı desenin gerekçesi.
+   */
   static loadFrom(store: StateStore, path: string): FounderDecisionLedger {
     const ledger = new FounderDecisionLedger();
-    const records = store.read<MutableFounderDecision[]>(path) ?? [];
-    for (const record of records) {
-      ledger.decisions.set(record.decisionId, record);
-    }
+    const records = store.read<unknown[]>(path) ?? [];
+    const seenIds = new Set<string>();
+    records.forEach((record, index) => {
+      const failure = describeInvalidPersistedDecision(record);
+      if (failure) {
+        throw new CorruptPersistedDecisionError(index, failure);
+      }
+      const validated = record as MutableFounderDecision;
+      if (seenIds.has(validated.decisionId)) {
+        throw new CorruptPersistedDecisionError(index, `duplicate decisionId '${validated.decisionId}'`);
+      }
+      seenIds.add(validated.decisionId);
+      ledger.decisions.set(validated.decisionId, validated);
+    });
     return ledger;
   }
 }

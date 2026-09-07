@@ -404,4 +404,139 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       }
     });
   });
+
+  describe(
+    "P2 fix (23rd independent review round, 'implement REQUEST_CHANGES approval decision'): a first-class " +
+      "reviewer outcome, distinct from REJECT, with its own state, evidence, and transitions",
+    () => {
+      it("PENDING -> REQUEST_CHANGES: requestChanges() records the new status, reviewer identity, and reason", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-1", "Deploy to production", 5);
+        const result = workflow.requestChanges("rc-1", "founder@example.com", "Add a rollback plan first");
+
+        expect(result.status).toBe("REQUEST_CHANGES");
+        expect(result.decidedBy).toBe("founder@example.com");
+        expect(result.changeRequestReason).toBe("Add a rollback plan first");
+        expect(workflow.get("rc-1")!.status).toBe("REQUEST_CHANGES");
+      });
+
+      it("REQUEST_CHANGES is NOT the same as REJECTED — they are distinct status values", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-2a", "Deploy to production", 5);
+        workflow.request("rc-2b", "Deploy to production", 5);
+        workflow.requestChanges("rc-2a", "founder@example.com", "Needs more tests");
+        workflow.reject("rc-2b", "founder@example.com");
+
+        expect(workflow.get("rc-2a")!.status).toBe("REQUEST_CHANGES");
+        expect(workflow.get("rc-2b")!.status).toBe("REJECTED");
+        expect(workflow.get("rc-2a")!.status).not.toBe(workflow.get("rc-2b")!.status);
+      });
+
+      it("requestChanges() requires a non-empty reviewer identity (same rule as approve()/reject())", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-3", "Deploy to production", 5);
+        expect(() => workflow.requestChanges("rc-3", "", "some reason")).toThrow(InvalidApprovalDecisionError);
+        expect(() => workflow.requestChanges("rc-3", "   ", "some reason")).toThrow(InvalidApprovalDecisionError);
+        expect(workflow.get("rc-3")!.status).toBe("PENDING"); // never mutated
+      });
+
+      it("requestChanges() requires a non-empty reason — without one it would be indistinguishable from an unexplained REJECT", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-4", "Deploy to production", 5);
+        expect(() => workflow.requestChanges("rc-4", "founder@example.com", "")).toThrow(
+          InvalidApprovalDecisionError
+        );
+        expect(() => workflow.requestChanges("rc-4", "founder@example.com", "   ")).toThrow(
+          InvalidApprovalDecisionError
+        );
+        expect(workflow.get("rc-4")!.status).toBe("PENDING");
+      });
+
+      it("REQUEST_CHANGES is terminal for this request id: it cannot subsequently be approve()d, reject()ed, or requestChanges()d again", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-5", "Deploy to production", 5);
+        workflow.requestChanges("rc-5", "founder@example.com", "Needs a security review");
+
+        expect(() => workflow.approve("rc-5", "founder@example.com")).toThrow();
+        expect(() => workflow.reject("rc-5", "founder@example.com")).toThrow();
+        expect(() => workflow.requestChanges("rc-5", "founder@example.com", "again")).toThrow();
+        expect(workflow.get("rc-5")!.status).toBe("REQUEST_CHANGES");
+      });
+
+      it("a request in REQUEST_CHANGES can never reach EXECUTED", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-6", "Deploy to production", 5);
+        workflow.requestChanges("rc-6", "founder@example.com", "Needs load testing");
+        expect(() => workflow.execute("rc-6")).toThrow(ApprovalRequiredError);
+      });
+
+      it("all invalid transitions into/out of REQUEST_CHANGES are covered: cannot request changes on an already-APPROVED/REJECTED/EXECUTED request", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-7-approved", "Deploy to production", 5);
+        workflow.approve("rc-7-approved", "founder@example.com");
+        expect(() => workflow.requestChanges("rc-7-approved", "founder@example.com", "x")).toThrow();
+
+        workflow.request("rc-7-rejected", "Deploy to production", 5);
+        workflow.reject("rc-7-rejected", "founder@example.com");
+        expect(() => workflow.requestChanges("rc-7-rejected", "founder@example.com", "x")).toThrow();
+
+        workflow.request("rc-7-executed", "Deploy to production", 5);
+        workflow.approve("rc-7-executed", "founder@example.com");
+        workflow.execute("rc-7-executed");
+        expect(() => workflow.requestChanges("rc-7-executed", "founder@example.com", "x")).toThrow();
+      });
+
+      it("a revised action after REQUEST_CHANGES requires a fresh, distinct approval id (permanent-identity philosophy, consistent with DuplicateApprovalIdError)", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-8-v1", "Deploy to production (v1)", 5);
+        workflow.requestChanges("rc-8-v1", "founder@example.com", "Add a rollback plan");
+
+        // The original request-id is immutable/terminal — resubmission
+        // uses a new id, never reusing or resetting "rc-8-v1".
+        const revised = workflow.request("rc-8-v2", "Deploy to production (v2, with rollback plan)", 5);
+        expect(revised.status).toBe("PENDING");
+        expect(workflow.get("rc-8-v1")!.status).toBe("REQUEST_CHANGES");
+        expect(() => workflow.request("rc-8-v1", "Deploy to production (v1, retry)", 5)).toThrow(
+          DuplicateApprovalIdError
+        );
+      });
+
+      it("REQUEST_CHANGES with an evidenceRef records it alongside the reason", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-9", "Deploy to production", 5);
+        const result = workflow.requestChanges(
+          "rc-9",
+          "founder@example.com",
+          "Needs a rollback plan",
+          "evidence://review-comment-17"
+        );
+        expect(result.changeRequestReason).toBe("Needs a rollback plan");
+        expect(result.evidenceRef).toBe("evidence://review-comment-17");
+      });
+
+      it("REQUEST_CHANGES is recorded to the audit log as its own distinct event type, not as APPROVAL_REJECTED", () => {
+        const auditLog = new AuditLog();
+        const workflow = new ApprovalWorkflow(auditLog);
+        workflow.request("rc-10", "Deploy to production", 5);
+        workflow.requestChanges("rc-10", "founder@example.com", "Needs more tests");
+
+        const types = auditLog.all().map((r) => r.type);
+        expect(types).toEqual(["APPROVAL_REQUESTED", "APPROVAL_CHANGES_REQUESTED"]);
+        expect(types).not.toContain("APPROVAL_REJECTED");
+        expect(auditLog.verifyIntegrity()).toBe(true);
+      });
+
+      it("mutating an object returned by requestChanges() cannot change internal state (frozen snapshot, same invariant as approve()/reject())", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("rc-11", "Deploy to production", 5);
+        const result = workflow.requestChanges("rc-11", "founder@example.com", "Needs a design doc");
+
+        expect(() => {
+          (result as { status: string }).status = "APPROVED";
+        }).toThrow(TypeError);
+
+        expect(workflow.get("rc-11")!.status).toBe("REQUEST_CHANGES");
+      });
+    }
+  );
 });

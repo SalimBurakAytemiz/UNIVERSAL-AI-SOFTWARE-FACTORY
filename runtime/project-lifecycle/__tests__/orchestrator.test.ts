@@ -13,6 +13,15 @@ import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetExceededError, InvalidBudgetLimitError, type BudgetLimits } from "../../budget/budget.js";
 import type { TraceabilityIssue } from "../../requirements-traceability/traceability.js";
+import {
+  ModelGateway,
+  UnknownProviderError,
+  type ModelInvocationRequest,
+  type ModelInvocationResponse,
+  type ModelProvider
+} from "../../models/gateway.js";
+import { MockProvider } from "../../models/providers/mock-provider.js";
+import type { ModelRecord } from "../../models/registry.js";
 
 function validGenome(id: string) {
   return {
@@ -994,6 +1003,268 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
 
         expect(existsSync(join(tempRoot, "proj-select-before-scaffold-ok"))).toBe(true);
         expect(result.totalCostUsd).toBe(0.6);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (23rd independent review round, finding 4, 'do not record synthetic model spend without " +
+      "actually invoking a model'): bootstrap's model cost must come from a REAL, guarded invocation",
+    () => {
+      function gatewayWithProvider(provider: ModelProvider): ModelGateway {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(provider);
+        return gateway;
+      }
+
+      function failingProvider(id: string, error: Error): ModelProvider {
+        return {
+          id,
+          async invoke(): Promise<ModelInvocationResponse> {
+            throw error;
+          }
+        };
+      }
+
+      it(
+        "REGRESSION: an unknown/unregistered provider cannot yield a successful bootstrap — it rejects with " +
+          "UnknownProviderError and creates ZERO filesystem mutations",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-unknown-provider-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registryWithUnknownProvider = new ModelRegistry();
+          registryWithUnknownProvider.register({
+            provider: "definitely-not-registered",
+            modelId: "ghost-model",
+            tier: "MOCK",
+            costPerCall: 0,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          // A gateway with only MockProvider registered — never "definitely-not-registered".
+          const modelGateway = gatewayWithProvider(new MockProvider());
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-unknown-provider"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: registryWithUnknownProvider,
+              modelGateway
+            })
+          ).rejects.toThrow(UnknownProviderError);
+
+          expect(readdirSync(tempRoot)).toHaveLength(0);
+        }
+      );
+
+      it(
+        "REGRESSION: a failing provider cannot produce a successful, fabricated bootstrap result — the error " +
+          "propagates, the reservation is released (zero cost recorded), and ZERO filesystem mutations occur",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-failing-provider-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "flaky",
+            modelId: "flaky-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const providerError = new Error("simulated provider outage");
+          const modelGateway = gatewayWithProvider(failingProvider("flaky", providerError));
+          const costEngine = new CostEngine();
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-failing-provider"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: paidRegistry,
+              modelGateway,
+              costEngine,
+              budgetLimits: { perTaskUsd: 10 }
+            })
+          ).rejects.toThrow(providerError);
+
+          expect(readdirSync(tempRoot)).toHaveLength(0);
+          // The reservation was released on provider failure — no cost was
+          // ever recorded, proving no synthetic spend occurred despite the
+          // model being "selected."
+          expect(costEngine.total()).toBe(0);
+        }
+      );
+
+      it(
+        "the real invocation's ACTUAL reported cost is what gets recorded — not merely the model's nominal " +
+          "per-call price — proving a genuine invocation occurred rather than a fabricated charge",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-actual-cost-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "variable-cost",
+            modelId: "variable-cost-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6, // the NOMINAL price — deliberately different from what the provider actually reports
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const actualReportedCost = 0.42;
+          const provider: ModelProvider = {
+            id: "variable-cost",
+            async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+              return { modelId: model.modelId, provider: this.id, costUsd: actualReportedCost, output: request.prompt };
+            }
+          };
+          const modelGateway = gatewayWithProvider(provider);
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome("proj-actual-cost"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          // The ACTUAL reported cost was recorded, not the nominal costPerCall.
+          expect(result.totalCostUsd).toBe(actualReportedCost);
+          expect(result.totalCostUsd).not.toBe(0.6);
+        }
+      );
+
+      it("policy DENY still blocks the model invocation itself (not merely the scaffold), with zero cost recorded", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-deny-invoke-"));
+        const policy = new PolicyEngine(); // default deny
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-summarizer",
+          tier: "MOCK",
+          costPerCall: 0.6,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+        const costEngine = new CostEngine();
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-deny-invoke"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry,
+            costEngine,
+            budgetLimits: { perTaskUsd: 10 }
+          })
+        ).rejects.toThrow(CapabilityDeniedError);
+
+        expect(readdirSync(tempRoot)).toHaveLength(0);
+        expect(costEngine.total()).toBe(0);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (23rd independent review round, finding 5, 'reserve bootstrap budget before filesystem mutation'): " +
+      "budget authorization must be a real, atomic RESERVATION completed before any filesystem mutation, not a " +
+      "read-only precheck a concurrent caller can also pass",
+    () => {
+      it(
+        "CONCURRENCY REGRESSION, exact reproduction: two bootstraps sharing ONE CostEngine and a ceiling that " +
+          "fits only ONE $0.6 invocation — exactly one proceeds, and the rejected one leaves ZERO filesystem " +
+          "side effects (no orphaned project tree)",
+        async () => {
+          const rootA = mkdtempSync(join(tmpdir(), "uasf-orchestrator-reserve-race-a-"));
+          const rootB = mkdtempSync(join(tmpdir(), "uasf-orchestrator-reserve-race-b-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "mock",
+            modelId: "paid-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const sharedCostEngine = new CostEngine();
+          // perRunUsd is scoped globally (not per-task), so it genuinely
+          // collides across two DIFFERENT projects' bootstrap calls —
+          // exactly the shared-ledger scenario the finding describes.
+          const budgetLimits: BudgetLimits = { perRunUsd: 0.6 };
+
+          // Issued back-to-back, synchronously, with NEITHER awaited yet —
+          // each call's own synchronous prefix (through its real,
+          // guarded gateway.invoke() reservation) runs to completion
+          // before control ever returns to this test, so call A's
+          // reservation is guaranteed to be visible to call B's reserve()
+          // check (same pattern as the existing 12th-round concurrent-
+          // budgetLimits test above).
+          const callA = bootstrapProject({
+            genomeCandidate: validGenome("proj-reserve-race-a"),
+            baseDir: rootA,
+            policy,
+            modelRegistry: paidRegistry,
+            costEngine: sharedCostEngine,
+            budgetLimits
+          });
+          const callB = bootstrapProject({
+            genomeCandidate: validGenome("proj-reserve-race-b"),
+            baseDir: rootB,
+            policy,
+            modelRegistry: paidRegistry,
+            costEngine: sharedCostEngine,
+            budgetLimits
+          });
+
+          await expect(callA).resolves.toMatchObject({ totalCostUsd: 0.6 });
+          await expect(callB).rejects.toThrow(BudgetExceededError);
+
+          // The winning call genuinely scaffolded its project...
+          expect(existsSync(join(rootA, "proj-reserve-race-a"))).toBe(true);
+          // ...but the REJECTED call left NO project tree behind at all —
+          // proving the budget reservation was checked and enforced
+          // BEFORE any filesystem mutation, not merely before an
+          // eventual, too-late spend() call.
+          expect(readdirSync(rootB)).toHaveLength(0);
+          expect(existsSync(join(rootB, "proj-reserve-race-b"))).toBe(false);
+
+          rmSync(rootA, { recursive: true, force: true });
+          rmSync(rootB, { recursive: true, force: true });
+        }
+      );
+
+      it("a budget-rejected bootstrap (insufficient ceiling for the real invocation cost) leaves no project tree, sequentially", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-reserve-sequential-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-summarizer",
+          tier: "MOCK",
+          costPerCall: 0.6,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome("proj-reserve-sequential"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry,
+            budgetLimits: { perTaskUsd: 0.1 }
+          })
+        ).rejects.toThrow(BudgetExceededError);
+
+        expect(readdirSync(tempRoot)).toHaveLength(0);
       });
     }
   );

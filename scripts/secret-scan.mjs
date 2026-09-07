@@ -51,7 +51,34 @@ const PATTERNS = [
   // unquoted-key syntax (YAML, TOML, shell/env, plain JS object
   // literals). `['"]?` absorbs that optional closing quote without
   // requiring one, so every previously-supported syntax keeps matching.
-  { name: "Generic API key/secret assignment with a real-looking value", regex: /(api[_-]?key|secret|password|access[_-]?token)['"]?\s*[:=]\s*['"][A-Za-z0-9_\-/.+]{12,}['"]/gi },
+  //
+  // P1 fix (23rd independent review round, "secret scanner must detect
+  // unquoted assignments"): Codex reproduced that this pattern's VALUE
+  // half required the value itself to be wrapped in quotes
+  // (`['"][A-Za-z0-9_\-/.+]{12,}['"]`) — a perfectly common, genuinely
+  // secret-shaped assignment such as `API_KEY=abcdefghijklmnopqrstuv` // secret-scan:allow (illustrative example text in a comment, not a real secret)
+  // (shell/.env style, no quotes at all) or `password: abcdefghijklmnop` // secret-scan:allow (illustrative example text in a comment, not a real secret)
+  // (YAML unquoted scalar) evaded detection entirely, since neither side
+  // of the value has a quote character for the old pattern to anchor on.
+  // Fixed by widening the value half to an explicit alternation: a
+  // single-quoted value, a double-quoted value, OR an unquoted bare value
+  // (still 12+ characters from the same restricted class — no whitespace,
+  // so it naturally stops at the first space/newline/comment marker
+  // rather than ever spanning into surrounding prose). This is additive,
+  // not a loosening of the quoted case: `'...'`/`"..."` still match
+  // exactly as before (the bare-value alternative cannot also match
+  // inside an opening quote, since a quote character is not itself part
+  // of the bare-value character class, so the quoted alternative is tried
+  // and wins at that position). Preserves: precise `secret-scan:allow`
+  // per-line suppression (unchanged, checked before any pattern),
+  // `.env.example` placeholder handling (a separate, dedicated code path
+  // — unaffected), and the existing provider-specific patterns (AWS/
+  // GitHub/Slack/Anthropic/OpenAI), none of which were touched.
+  {
+    name: "Generic API key/secret assignment with a real-looking value",
+    regex:
+      /(api[_-]?key|secret|password|access[_-]?token)['"]?\s*[:=]\s*(?:'[A-Za-z0-9_\-/.+]{12,}'|"[A-Za-z0-9_\-/.+]{12,}"|[A-Za-z0-9_\-/.+]{12,})/gi
+  },
   { name: "Anthropic API key", regex: /sk-ant-[A-Za-z0-9\-_]{20,}/g },
   // P2 fix (18th independent review round, same finding): the old pattern
   // required 20+ CONSECUTIVE alphanumeric characters immediately after

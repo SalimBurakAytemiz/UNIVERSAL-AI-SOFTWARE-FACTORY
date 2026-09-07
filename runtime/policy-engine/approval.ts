@@ -16,8 +16,25 @@
 
 import { AuditLog } from "../audit/audit-log.js";
 import { freezeRecord } from "../util/immutable.js";
+import { isNonBlankIdentity } from "../util/identity.js";
 
-export type ApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "EXECUTED";
+/**
+ * P2 fix (23rd independent review round, "implement REQUEST_CHANGES
+ * approval decision"): the authoritative P0 requirement explicitly lists
+ * THREE reviewer decisions — APPROVE, REJECT, REQUEST_CHANGES — but this
+ * state machine used to have only PENDING/APPROVED/REJECTED/EXECUTED. A
+ * reviewer who wants "this isn't right yet, here's what needs to change"
+ * (a genuinely distinct outcome from an outright REJECT — it implies
+ * revision and resubmission are expected, not final refusal) had no way
+ * to represent that decision: either misclassifying it as REJECTED
+ * (losing the "revise and resubmit" semantics and any recorded reason for
+ * WHAT must change) or leaving the request PENDING forever (never
+ * recording that a reviewer actually looked at it and found it wanting).
+ * `REQUEST_CHANGES` is now a first-class status, structurally distinct
+ * from REJECTED at both the type and audit-event level — see
+ * `requestChanges()` below.
+ */
+export type ApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "REQUEST_CHANGES" | "EXECUTED";
 
 interface MutableApprovalRequest {
   id: string;
@@ -28,6 +45,8 @@ interface MutableApprovalRequest {
   decidedAt?: string;
   decidedBy?: string;
   evidenceRef?: string;
+  /** Only ever set by requestChanges() — the reviewer's evidence for WHAT must change, distinct from a REJECT's finality. */
+  changeRequestReason?: string;
 }
 
 /** Dışa döndürülen her kayıt bunun donmuş, ayrık bir kopyasıdır — asla iç nesnenin kendisi değil. */
@@ -128,6 +147,50 @@ export class ApprovalWorkflow {
   }
 
   /**
+   * P2 fix (23rd independent review round, "implement REQUEST_CHANGES
+   * approval decision"): a distinct, first-class reviewer outcome from
+   * approve()/reject() — "not yet approved, and here is specifically what
+   * must change before it can be." Requires BOTH a genuine (non-blank)
+   * reviewer identity (bkz. `assertValidApprover`, AYNI paylaşılan
+   * `isNonBlankIdentity` doğrulayıcısı) AND a genuine (non-blank) `reason`
+   * describing what needs to change — REQUEST_CHANGES without a reason
+   * would be indistinguishable from an unexplained REJECT, defeating the
+   * entire point of this being a DIFFERENT decision from REJECT. Only
+   * legal from PENDING (the SAME transition guard as approve()/reject()
+   * — bkz. üstteki metodlar), and is TERMINAL for this request id, tıpkı
+   * REJECTED gibi: bu id tekrar approve()/reject()/requestChanges()
+   * ÜZERİNDEN ilerletilemez (hepsi `status !== "PENDING"` kontrolüyle
+   * ZATEN engellenir, hiçbir özel durum eklenmesine gerek kalmadan) —
+   * revize edilmiş eylem için YENİ, ayrı bir id ile request() çağrılması
+   * gerekir (mevcut DuplicateApprovalIdError/kalıcı-kimlik felsefesiyle
+   * TUTARLI). execute()'un KENDİSİ hiçbir değişiklik gerektirmez: zaten
+   * yalnızca `status === "APPROVED"` olduğunda izin verir, bu yüzden
+   * REQUEST_CHANGES durumundaki bir kayıt zaten yapısal olarak asla
+   * EXECUTED'e ulaşamaz.
+   */
+  requestChanges(id: string, decidedBy: string, reason: string, evidenceRef?: string): ApprovalRequest {
+    assertValidApprover(decidedBy);
+    if (!isNonBlankIdentity(reason)) {
+      throw new InvalidApprovalDecisionError(
+        "REQUEST_CHANGES requires a non-empty reason describing what must change before this action " +
+          "can be approved — baseline section 145, Approval Evidence Package. Without a reason, " +
+          "REQUEST_CHANGES would be indistinguishable from an unexplained REJECT."
+      );
+    }
+    const req = this.mustGet(id);
+    if (req.status !== "PENDING") {
+      throw new Error(`Cannot request changes on request ${id}: status is ${req.status}, not PENDING`);
+    }
+    req.status = "REQUEST_CHANGES";
+    req.decidedAt = new Date().toISOString();
+    req.decidedBy = decidedBy;
+    req.changeRequestReason = reason;
+    req.evidenceRef = evidenceRef;
+    this.audit("APPROVAL_CHANGES_REQUESTED", req);
+    return freezeRecord(req);
+  }
+
+  /**
    * Yürütmeye izin verir — yalnızca İÇ yetkili kaydın durumu APPROVED ise.
    * Çağıranın elinde tuttuğu (ve artık asla mutasyona uğratılamayan) bir
    * kopya değil, HER ZAMAN bu sınıfın kendi Map'indeki gerçek durum
@@ -171,7 +234,8 @@ export class ApprovalWorkflow {
         risk: req.risk,
         status: req.status,
         decidedBy: req.decidedBy,
-        evidenceRef: req.evidenceRef
+        evidenceRef: req.evidenceRef,
+        changeRequestReason: req.changeRequestReason
       },
       timestamp: new Date().toISOString()
     });
@@ -179,7 +243,13 @@ export class ApprovalWorkflow {
 }
 
 function assertValidApprover(decidedBy: string): void {
-  if (typeof decidedBy !== "string" || decidedBy.trim().length === 0) {
+  // P2 fix (23rd independent review round, "reject blank founder
+  // confirmation identities"): now backed by the SAME shared
+  // `isNonBlankIdentity()` validator used by assumption-register.ts's
+  // accept() and its persisted-state restore path — a single source of
+  // truth for "is this a genuine, non-blank identity", not two
+  // independently-maintained trim checks.
+  if (!isNonBlankIdentity(decidedBy)) {
     throw new InvalidApprovalDecisionError(
       "An approval/rejection requires a non-empty approver identity (decidedBy) — " +
         "baseline section 145, Approval Evidence Package."

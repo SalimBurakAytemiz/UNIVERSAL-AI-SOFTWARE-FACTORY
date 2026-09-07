@@ -6,6 +6,7 @@
 
 import type { StateStore } from "../state/file-store.js";
 import { freezeRecord } from "../util/immutable.js";
+import { isNonBlankIdentity } from "../util/identity.js";
 
 export type AssumptionImpact = "LOW" | "MEDIUM" | "HIGH";
 export type AssumptionStatus = "PROPOSED" | "ACCEPTED" | "REJECTED" | "VALIDATED" | "SUPERSEDED";
@@ -56,6 +57,88 @@ export class FounderConfirmationRequiredError extends Error {
  * mutasyondan ÖNCE reddedilir (fail closed) — approval.ts'teki
  * DuplicateApprovalIdError ile AYNI desen.
  */
+/**
+ * P1 fix (23rd independent review round, "validate persisted assumptions
+ * before restoring authoritative state"): Codex reproduced that
+ * `loadFrom()` (below) inserted every persisted record DIRECTLY into
+ * `this.assumptions` with NO validation whatsoever — a corrupt or
+ * hand-edited persisted record such as `{ impact: "HIGH", status:
+ * "ACCEPTED", confirmedBy: missing }` was restored straight into
+ * authoritative runtime state, completely bypassing the SAME
+ * Founder-confirmation invariant that `accept()` enforces for every
+ * record created through the live API. Persisted state that never went
+ * through `propose()`/`accept()`/`reject()`/`validate()` must still
+ * satisfy the exact same domain invariants those methods enforce — a
+ * restart must never be a laundering path for state that could never
+ * have been created live. See `describeInvalidPersistedAssumption()`
+ * below (used by `loadFrom()`) for the actual check.
+ */
+export class CorruptPersistedAssumptionError extends Error {
+  constructor(index: number, reason: string) {
+    super(
+      `Persisted assumption record at index ${index} is corrupt or violates a domain invariant ` +
+        `(${reason}) and cannot be restored into authoritative state. Persisted state must satisfy the ` +
+        `same invariants as state created through the live propose()/accept()/reject()/validate() API — ` +
+        `see baseline section 47. Refusing to load rather than silently repairing or dropping the record.`
+    );
+    this.name = "CorruptPersistedAssumptionError";
+  }
+}
+
+const VALID_ASSUMPTION_IMPACTS: readonly AssumptionImpact[] = ["LOW", "MEDIUM", "HIGH"];
+const VALID_ASSUMPTION_STATUSES: readonly AssumptionStatus[] = [
+  "PROPOSED",
+  "ACCEPTED",
+  "REJECTED",
+  "VALIDATED",
+  "SUPERSEDED"
+];
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Returns `undefined` if `value` is a structurally valid, domain-invariant-
+ * respecting persisted assumption record; otherwise a short, human-readable
+ * reason it was rejected. A single function (rather than a boolean
+ * type-guard) so `loadFrom()` can report exactly WHY a record was refused,
+ * consistent with baseline section 303's "no claim without evidence" —
+ * refusing silently, with no diagnosable reason, would itself be a kind of
+ * unaccountable claim ("this record is bad, trust me").
+ */
+function describeInvalidPersistedAssumption(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return "not a plain object";
+  }
+  const candidate = value as Record<string, unknown>;
+  if (!isNonEmptyString(candidate.id)) return "missing or invalid 'id'";
+  if (typeof candidate.description !== "string") return "missing or invalid 'description'";
+  if (typeof candidate.reason !== "string") return "missing or invalid 'reason'";
+  if (!VALID_ASSUMPTION_IMPACTS.includes(candidate.impact as AssumptionImpact)) return "invalid 'impact'";
+  if (typeof candidate.source !== "string") return "missing or invalid 'source'";
+  if (!VALID_ASSUMPTION_STATUSES.includes(candidate.status as AssumptionStatus)) return "invalid 'status'";
+  if (!isNonEmptyString(candidate.createdAt)) return "missing or invalid 'createdAt'";
+  if (candidate.confirmedAt !== undefined && typeof candidate.confirmedAt !== "string") {
+    return "invalid 'confirmedAt' (must be a string when present)";
+  }
+  if (candidate.confirmedBy !== undefined && typeof candidate.confirmedBy !== "string") {
+    return "invalid 'confirmedBy' (must be a string when present)";
+  }
+  // Domain invariant, identical to accept()'s own gate: a HIGH-impact
+  // ACCEPTED record must carry a genuine (non-blank) Founder confirmation
+  // identity — a persisted record can never claim a state the live API
+  // itself could never have produced.
+  if (
+    candidate.impact === "HIGH" &&
+    candidate.status === "ACCEPTED" &&
+    !isNonBlankIdentity(candidate.confirmedBy)
+  ) {
+    return "HIGH-impact ACCEPTED record is missing a valid Founder confirmation identity (confirmedBy)";
+  }
+  return undefined;
+}
+
 export class DuplicateAssumptionIdError extends Error {
   constructor(id: string) {
     super(
@@ -106,10 +189,21 @@ export class AssumptionRegister {
    * kimliği) zorunludur; aksi halde reddedilir. LOW/MEDIUM etkili
    * varsayımlar bir mühendis tarafından da kabul edilebilir (bölüm 313,
    * "safe, reversible implementation details").
+   *
+   * P2 fix (23rd independent review round, "reject blank founder
+   * confirmation identities"): eskiden yalnızca `!confirmedBy` (bir
+   * TRUTHY/falsy kontrolü) kullanılıyordu — `confirmedBy = "   "`
+   * (yalnızca boşluk karakterleri) TRUTHY bir string olduğundan, bu
+   * kontrolü SESSİZCE geçerdi, HIGH etkili bir varsayımı ANLAMLI hiçbir
+   * kimlik OLMADAN "ACCEPTED" durumuna sokardı. Artık approval.ts'nin
+   * `assertValidApprover`'ı ile AYNI, paylaşılan `isNonBlankIdentity()`
+   * doğrulayıcısı kullanılır (bkz. runtime/util/identity.ts) — kırpılmış
+   * (trimmed) uzunluğu sıfır olan HERHANGİ bir string (boş, tek boşluk,
+   * sekme, yeni satır, bunların kombinasyonu) reddedilir.
    */
   accept(id: string, confirmedBy?: string): Assumption {
     const assumption = this.mustGet(id);
-    if (assumption.impact === "HIGH" && !confirmedBy) {
+    if (assumption.impact === "HIGH" && !isNonBlankIdentity(confirmedBy)) {
       throw new FounderConfirmationRequiredError(id);
     }
     assumption.status = "ACCEPTED";
@@ -146,13 +240,40 @@ export class AssumptionRegister {
     store.write(path, [...this.assumptions.values()]);
   }
 
-  /** Daha önce saveTo() ile kaydedilmiş bir varsayım kaydını geri yükler. */
+  /**
+   * Daha önce saveTo() ile kaydedilmiş bir varsayım kaydını geri yükler.
+   *
+   * P1 fix (23rd independent review round, "validate persisted assumptions
+   * before restoring authoritative state"): eskiden her kayıt HİÇBİR
+   * doğrulama olmadan doğrudan `this.assumptions`'a ekleniyordu — bkz.
+   * `CorruptPersistedAssumptionError`'ın üstündeki not. Artık HER kayıt,
+   * eklemeden ÖNCE `describeInvalidPersistedAssumption()` ile yapısal
+   * olarak VE etki-alanı (domain) değişmezleri açısından doğrulanır, ve
+   * içindeki `id`'ler TEKRARLANAMAZ (aynı persist edilmiş dosya içinde iki
+   * kayıt aynı id'yi taşırsa, hangisinin "yetkili" olduğu belirsizdir —
+   * bu da kendi başına bozuk bir durumdur). HERHANGİ bir kayıt geçersizse,
+   * TÜM yükleme reddedilir (fail closed) — bazı kayıtları sessizce
+   * atlayıp diğerlerini yüklemek, kendi başına bir SESSİZ VERİ KAYBI
+   * biçimi olurdu (bölüm 303, "no claim without evidence"; hangi
+   * kayıtların atlandığına dair hiçbir iz bırakmadan devam etmek kabul
+   * edilemez).
+   */
   static loadFrom(store: StateStore, path: string): AssumptionRegister {
     const register = new AssumptionRegister();
-    const records = store.read<MutableAssumption[]>(path) ?? [];
-    for (const record of records) {
-      register.assumptions.set(record.id, record);
-    }
+    const records = store.read<unknown[]>(path) ?? [];
+    const seenIds = new Set<string>();
+    records.forEach((record, index) => {
+      const failure = describeInvalidPersistedAssumption(record);
+      if (failure) {
+        throw new CorruptPersistedAssumptionError(index, failure);
+      }
+      const validated = record as MutableAssumption;
+      if (seenIds.has(validated.id)) {
+        throw new CorruptPersistedAssumptionError(index, `duplicate id '${validated.id}'`);
+      }
+      seenIds.add(validated.id);
+      register.assumptions.set(validated.id, validated);
+    });
     return register;
   }
 }

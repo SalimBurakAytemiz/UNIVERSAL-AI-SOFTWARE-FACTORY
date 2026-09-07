@@ -1,9 +1,9 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
-import { acquireFileLock, FileLockTimeoutError } from "../file-lock.js";
+import { acquireFileLock, FileLockTimeoutError, sanitizeReclaimToken } from "../file-lock.js";
 
 // P2 fix (22nd independent review round, "validate lock metadata before
 // using owner PID"): Codex reproduced that syntactically valid JSON with
@@ -93,6 +93,25 @@ describe(
         JSON.stringify({ pid: 123, token: 42, acquiredAt: "yesterday" }),
       ],
       ["malformed JSON (unparsable)", "{not valid json"],
+      // P2 fix (23rd independent review round, "reject out-of-range lock
+      // owner PIDs"): `pid: null` explicitly (a genuinely representable
+      // JSON value, distinct from "missing pid" where the field is absent
+      // entirely) and a PID one greater than the platform-valid upper
+      // bound (2147483647, i.e. 2^31-1 — Node's own `process.kill()`
+      // rejects anything larger with a TypeError, never ESRCH, confirmed
+      // empirically in this exact environment) must both be treated as
+      // malformed/UNKNOWN owner, never confirmed-live. JSON has no native
+      // NaN/Infinity literal (a file literally containing `NaN`/`Infinity`
+      // as a bare token is simply unparsable JSON, already covered by the
+      // "malformed JSON (unparsable)" case above), so those two review-
+      // requested cases are exercised via `pid: null` and the out-of-range
+      // integer here instead — the closest genuinely JSON-representable
+      // equivalents of "not a valid finite PID number".
+      ["pid explicitly null", JSON.stringify({ pid: null, token: "t", acquiredAt: Date.now() })],
+      [
+        "pid one greater than the platform-valid PID upper bound (2147483648)",
+        JSON.stringify({ pid: 2147483648, token: "t", acquiredAt: Date.now() })
+      ]
     ];
 
     for (const [label, rawContent] of malformedOwnerCases) {
@@ -211,6 +230,178 @@ describe(
       expect(() =>
         acquireFileLock(liveLockDirPath, { timeoutMs: 150, staleMs: 1, pollIntervalMs: 10 })
       ).toThrow(FileLockTimeoutError);
+    });
+
+    it(
+      "P2 fix (23rd independent review round, 'reject out-of-range lock owner PIDs'): a PID exactly at the " +
+        "platform-valid upper bound (2147483647) is NOT treated as malformed — it goes through the ordinary " +
+        "PID-liveness check like any other syntactically valid PID, and (since no real process holds it) is " +
+        "recovered as a confirmed-DEAD owner, immediately, regardless of staleMs",
+      () => {
+        const lockDirPath = makeLockDir();
+        writeRawOwnerFile(
+          lockDirPath,
+          JSON.stringify({ pid: 2147483647, token: "t", acquiredAt: Date.now() })
+        );
+        // Deliberately NOT aged and a huge staleMs — a confirmed-dead
+        // owner must be reclaimed instantly regardless of either.
+
+        const start = Date.now();
+        const release = acquireFileLock(lockDirPath, {
+          timeoutMs: 5_000,
+          staleMs: 60_000,
+          pollIntervalMs: 10
+        });
+        const elapsed = Date.now() - start;
+
+        expect(elapsed).toBeLessThan(2_000);
+        release();
+      }
+    );
+  }
+);
+
+describe(
+  "sanitizeReclaimToken (P1 fix, 23rd independent review round, " +
+    "'sanitize reclaim tokens before deriving filesystem paths')",
+  () => {
+    it("accepts this implementation's own canonical token format (16 lowercase hex characters) unchanged", () => {
+      expect(sanitizeReclaimToken("0123456789abcdef")).toBe("0123456789abcdef");
+      expect(sanitizeReclaimToken("ffffffffffffffff")).toBe("ffffffffffffffff");
+    });
+
+    const rejectedTokens: ReadonlyArray<readonly [string, string | undefined]> = [
+      ["undefined (token never read)", undefined],
+      ["empty string", ""],
+      ["POSIX relative traversal", "../x"],
+      ["POSIX double traversal", "../../x"],
+      ["Windows-style relative traversal", "..\\x"],
+      ["contains a forward slash", "a/b"],
+      ["contains a backslash", "a\\b"],
+      ["absolute POSIX path", "/etc/passwd"],
+      ["absolute Windows-style path", "C:\\evil"],
+      ["bare double-dot", ".."],
+      ["oversized (longer than 16 hex chars)", "0123456789abcdef0123456789abcdef"],
+      ["too short", "abc123"],
+      ["uppercase hex (not this implementation's own lowercase format)", "0123456789ABCDEF"],
+      ["non-hex characters at canonical length", "ghijklmnopqrstuv"]
+    ];
+
+    for (const [label, token] of rejectedTokens) {
+      it(`rejects a token that is ${label}, falling back to the safe fixed placeholder`, () => {
+        expect(sanitizeReclaimToken(token)).toBe("unknown-generation");
+      });
+    }
+  }
+);
+
+describe(
+  "acquireFileLock reclaim-token path-traversal protection (P1 fix, 23rd independent review round, " +
+    "'sanitize reclaim tokens before deriving filesystem paths') — end-to-end, real-filesystem proof " +
+    "that a hostile persisted token cannot redirect deletion outside the intended lock/reclaim directory",
+  () => {
+    const tempDirs: string[] = [];
+
+    afterEach(() => {
+      while (tempDirs.length) {
+        const dir = tempDirs.pop();
+        if (!dir) continue;
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // best-effort
+        }
+      }
+    });
+
+    /**
+     * Fabricates the exact scenario Codex described: an abandoned
+     * `.reclaim` gate whose `owner.json` carries a HOSTILE token
+     * containing real path-separator/traversal components, structured so
+     * that — WITHOUT sanitization — `acquireReclaimGate()`'s derived
+     * `recoveryGatePath` genuinely resolves (via real, existing
+     * intermediate directories, exactly as a real filesystem walk
+     * requires) to a pre-existing, UNRELATED directory living entirely
+     * outside the lock's own temp root, containing a canary file. If the
+     * token is trusted as-is, `acquireRecoveryGate()`'s own stale-then-
+     * `rmSync(recoveryGatePath, {recursive:true, force:true})` path
+     * destroys that unrelated directory. If the token is sanitized, the
+     * derived path can never leave `claimPath`'s own naming scope, and
+     * the unrelated directory is untouched.
+     */
+    function runHostileTokenScenario(): { escapeTarget: string; canaryPath: string } {
+      const root = mkdtempSync(join(tmpdir(), "uasf-file-lock-token-escape-"));
+      tempDirs.push(root);
+
+      // The real, pre-existing, UNRELATED directory the hostile token
+      // will attempt to redirect deletion onto — deliberately placed as a
+      // SIBLING of `root` (i.e. directly inside the shared OS temp
+      // directory), simulating an entirely unrelated piece of filesystem
+      // state that has nothing to do with this lock.
+      const escapeTarget = mkdtempSync(join(tmpdir(), "uasf-file-lock-token-escape-target-"));
+      tempDirs.push(escapeTarget);
+      const canaryPath = join(escapeTarget, "canary.txt");
+      writeFileSync(canaryPath, "must-survive-if-the-fix-works");
+      // Backdated well past any staleMs used below, so `acquireRecoveryGate()`
+      // considers it "abandoned" and proceeds to `rmSync` it once resolved.
+      utimesSync(escapeTarget, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+
+      const lockDirPath = join(root, "cache.lock");
+      const claimPath = `${lockDirPath}.reclaim`;
+      const claimMetaPath = join(claimPath, "owner.json");
+
+      // The literal staging directory a real filesystem walk needs to
+      // already exist for the token's embedded ".." components to be
+      // resolvable at all (a bare ".." can never escape anywhere on its
+      // own — see the fix note in file-lock.ts — it only becomes a real
+      // parent-directory reference once a leading "/" in the token forces
+      // a genuine path-segment boundary right after the "recover-"
+      // prefix). Constructing this staging directory ourselves is exactly
+      // how a real attacker with enough filesystem access to plant a
+      // malicious owner.json in the first place could also stage the
+      // directories needed to complete the escape — proving the
+      // vulnerability is genuinely reachable via real syscalls, not just
+      // theoretically string-shaped.
+      const hostileTokenPrefix = "STAGE";
+      mkdirSync(join(root, `cache.lock.reclaim.recover-${hostileTokenPrefix}`), { recursive: true });
+      const hostileToken = `${hostileTokenPrefix}/../../${basename(escapeTarget)}`;
+
+      // The outer lock itself: a confirmed-dead owner, so acquireFileLock's
+      // retry loop reaches tryReclaimStaleLock -> acquireReclaimGate.
+      mkdirSync(lockDirPath, { recursive: true });
+      const deadPid = spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid;
+      if (!deadPid) throw new Error("expected a pid from the trivial child process");
+      writeFileSync(
+        join(lockDirPath, "owner.json"),
+        JSON.stringify({ pid: deadPid, token: "outer-dead-owner", acquiredAt: Date.now() }),
+        "utf8"
+      );
+
+      // The abandoned `.reclaim` gate itself, carrying the HOSTILE token —
+      // also a confirmed-dead owner, so `acquireReclaimGate()` proceeds
+      // straight to computing `recoveryGatePath` from this token.
+      mkdirSync(claimPath, { recursive: true });
+      writeFileSync(
+        claimMetaPath,
+        JSON.stringify({ pid: deadPid, token: hostileToken, acquiredAt: Date.now() }),
+        "utf8"
+      );
+
+      const release = acquireFileLock(lockDirPath, { timeoutMs: 5_000, staleMs: 50, pollIntervalMs: 10 });
+      release();
+
+      return { escapeTarget, canaryPath };
+    }
+
+    it("a hostile token containing path-traversal components cannot cause the unrelated escape-target directory to be deleted", () => {
+      const { canaryPath } = runHostileTokenScenario();
+
+      // With sanitization in place, the derived recovery-gate path can
+      // never leave `claimPath`'s own naming scope — the pre-existing,
+      // completely unrelated escape-target directory (and its canary
+      // file) must survive completely untouched.
+      expect(existsSync(canaryPath)).toBe(true);
+      expect(readFileSync(canaryPath, "utf8")).toBe("must-survive-if-the-fix-works");
     });
   }
 );

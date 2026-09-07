@@ -3,12 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CorruptPersistedDecisionError,
   DecisionAlreadySupersededError,
   DecisionNotFoundError,
   DuplicateDecisionError,
   FounderDecisionLedger
 } from "../decision-ledger.js";
-import { FileStateStore } from "../../state/file-store.js";
+import { FileStateStore, type StateStore } from "../../state/file-store.js";
 
 describe("FounderDecisionLedger", () => {
   it("records a decision as ACTIVE", () => {
@@ -220,4 +221,76 @@ describe("FounderDecisionLedger", () => {
       }
     });
   });
+
+  describe(
+    "P1 targeted-audit fix (23rd independent review round, same root class as assumption-register.ts's " +
+      "'validate persisted assumptions before restoring authoritative state'): loadFrom() must enforce the " +
+      "same domain invariants live record()/supersede() enforce",
+    () => {
+      function fakeStore(data: unknown): StateStore {
+        return {
+          write: () => undefined,
+          read: () => data as never,
+          exists: () => true
+        };
+      }
+
+      it(
+        "REGRESSION, exact reproduction: a persisted SUPERSEDED record with no supersededBy (a combination " +
+          "supersede() itself can never produce) is refused, not silently restored",
+        () => {
+          const store = fakeStore([
+            {
+              decisionId: "corrupt-1",
+              project: "proj-a",
+              decision: "Use PostgreSQL",
+              source: "s",
+              status: "SUPERSEDED",
+              createdAt: new Date().toISOString()
+              // supersededBy is missing entirely
+            }
+          ]);
+
+          expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(
+            CorruptPersistedDecisionError
+          );
+        }
+      );
+
+      it("rejects a record with an invalid 'status' enum value", () => {
+        const store = fakeStore([
+          { decisionId: "corrupt-2", project: "p", decision: "d", source: "s", status: "PENDING", createdAt: "x" }
+        ]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("rejects a record missing a required field (decisionId)", () => {
+        const store = fakeStore([{ project: "p", decision: "d", source: "s", status: "ACTIVE", createdAt: "x" }]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("rejects two persisted records sharing the same decisionId (duplicate authoritative identity)", () => {
+        const record = { decisionId: "dup", project: "p", decision: "d", source: "s", status: "ACTIVE", createdAt: "x" };
+        const store = fakeStore([record, { ...record }]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("rejects a non-object record", () => {
+        const store = fakeStore([42]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("a genuinely valid persisted history (ACTIVE and SUPERSEDED-with-supersededBy) still loads correctly (no regression)", () => {
+        const store = fakeStore([
+          { decisionId: "a", project: "proj-a", decision: "Use PostgreSQL", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+          { decisionId: "b", project: "proj-a", decision: "Use MySQL", source: "s", status: "ACTIVE", createdAt: "x" }
+        ]);
+
+        const restored = FounderDecisionLedger.loadFrom(store, "decisions.json");
+        expect(restored.get("a")?.status).toBe("SUPERSEDED");
+        expect(restored.get("a")?.supersededBy).toBe("b");
+        expect(restored.hasActiveDecision("b")).toBe(true);
+      });
+    }
+  );
 });

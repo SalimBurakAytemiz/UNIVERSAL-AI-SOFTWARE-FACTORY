@@ -676,6 +676,78 @@ factory:
     NOT declare P0 complete. P0 remains BLOCKED_PENDING_REVIEW, awaiting
     the next independent (P0 closure) review.
 
+    P0 STILL BLOCKED (this session, round 23): a fresh, full-branch
+    independent Codex review reproduced NINE new actionable findings (5
+    priority-P1, 4 priority-P2) spanning security, persistence, cost/
+    accounting, approval, concurrency, and schema-contract gaps — fixed
+    as ONE consolidated closure batch per explicit instruction, not
+    piecemeal across separate review loops. Summary (full detail in
+    `completed_milestones` and the per-requirement notes in
+    `specification/requirements/P0-factory-kernel.yml`):
+    (1) [P1] `runtime/cache/file-lock.ts`'s reclaim-gate recovery derived
+    a filesystem path from a PERSISTED, unvalidated token — a hostile
+    token containing path separators/traversal could redirect a
+    recursive delete outside the intended lock directory; fixed via
+    `sanitizeReclaimToken()`, accepting only this implementation's own
+    canonical 16-hex-char format, falling back to a fixed safe
+    placeholder otherwise; proven end-to-end with a real-filesystem
+    escape scenario whose canary file survives with the fix and is
+    destroyed without it. (2) [P1] the secret scanner's generic pattern
+    required quoted values, missing unquoted shell/.env/YAML/TOML/JS
+    assignments entirely; fixed by widening the value alternation to
+    accept quoted OR unquoted forms, additive not loosening. (3) [P1]
+    `runtime/assumptions/assumption-register.ts`'s `loadFrom()` inserted
+    every persisted record directly into authoritative state with no
+    validation, letting a corrupt HIGH-impact-ACCEPTED-without-
+    confirmedBy record bypass the Founder-confirmation invariant; fixed
+    with full structural + domain-invariant validation, fail-closed on
+    any invalid record (never a partial/silent load) — the identical
+    root class was also found and fixed in the sibling
+    `runtime/decisions/decision-ledger.ts` via a targeted audit. (4)+(5)
+    [P1] `runtime/project-lifecycle/orchestrator.ts`'s bootstrap recorded
+    a model cost via `budget.spend()` without ever actually invoking a
+    model, AND the only pre-scaffold budget check was a read-only
+    precheck with no reservation, letting two concurrent bootstraps
+    sharing one CostEngine both scaffold before only one `spend()`
+    eventually failed — leaving an orphaned project tree; fixed together
+    by routing the task's model call through the same guarded
+    `ModelGateway.invoke()` (real policy authorize -> atomic budget
+    RESERVE, before any provider call -> provider call -> COMMIT/
+    RELEASE) placed before the scaffold, making both the fabricated-
+    spend and the reservation-race structurally impossible in one fix.
+    (6) [P2] `file-lock.ts`'s owner-metadata validation accepted any
+    positive-integer PID, including values beyond the platform-valid
+    upper bound (2147483647) that Node's own `process.kill()` rejects
+    with a non-ESRCH error, misclassifying such metadata as confirmed
+    live; fixed with an explicit upper-bound check. (7) [P2]
+    `assumption-register.ts`'s HIGH-impact confirmation gate used a
+    truthy check (`!confirmedBy`), letting a whitespace-only value pass;
+    fixed with a shared `isNonBlankIdentity()` validator, now also used
+    by `approval.ts`'s existing (already-correct) check for a single
+    source of truth. (8) [P2] `schemas/model.schema.json` required a
+    `costClass` field the runtime `ModelRecord` never has, while making
+    `costPerCall` (the field routing/accounting actually depend on)
+    merely optional — every real runtime record failed schema
+    validation; fixed by making `costPerCall` required and `costClass`
+    optional, a deliberate reconciliation rather than a blanket loosening
+    of both sides. (9) [P2] `runtime/policy-engine/approval.ts` lacked
+    the baseline-required `REQUEST_CHANGES` reviewer decision entirely;
+    added as a first-class `ApprovalStatus` value with its own
+    `requestChanges()` transition (requiring both a non-blank reviewer
+    identity and a non-blank reason), a distinct audit event, and
+    terminal (not further transitionable) semantics — structurally
+    distinct from REJECT. All nine fixes carry deterministic regression
+    tests (70 net new tests, 667 -> 737), and every fix with a
+    practically bypassable code path was verified via a temporary
+    in-place bypass reproducing the exact predicted failure symptom, then
+    fully reverted (confirmed via grep for the temp-marker in every
+    touched file). A narrow, explicitly-scoped audit of exactly these
+    nine root classes (and no other architecture) found no further
+    genuine instance beyond what's already fixed. Per explicit
+    instruction, this round does NOT merge, does NOT move to P1, and
+    does NOT declare P0 complete. P0 remains BLOCKED_PENDING_REVIEW,
+    awaiting the next independent (P0 closure) review.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -3105,6 +3177,187 @@ completed_milestones:
     secret-scan (PASS), Factory Doctor (READY on all checks), all 9 P0
     proofs (13 assertions) — all clean, stable across repeated runs, no
     orphaned processes.
+  - |-
+    THIS SESSION (round 23) — a fresh, full-branch independent Codex
+    review (against origin/main) reproduced NINE new actionable findings
+    (5 priority-P1, 4 priority-P2), fixed as ONE consolidated closure
+    batch per explicit instruction:
+    - [P1] "sanitize reclaim tokens before deriving filesystem paths":
+      `runtime/cache/file-lock.ts`'s `acquireReclaimGate()` derived
+      `recoveryGatePath` by interpolating a token read from PERSISTED
+      `owner.json` metadata directly into a filesystem path, with only a
+      non-empty-string check — a hostile token containing real path
+      separators/traversal (e.g. a leading `/` followed by `../../`)
+      could redirect the `finally` block's
+      `rmSync(recoveryGatePath, {recursive:true, force:true})` onto an
+      unrelated location (reachable by an attacker who could already
+      plant the malicious metadata and pre-stage the needed intermediate
+      directory). Fixed: `sanitizeReclaimToken()` accepts ONLY this
+      implementation's own canonical generated format (exactly 16
+      lowercase hex characters); anything else falls back to the same
+      fixed placeholder already used for unreadable tokens. Regression
+      tests: the canonical format unchanged, ten distinct malformed
+      shapes all fall back safely, and an end-to-end real-filesystem
+      proof (fabricating a hostile token, pre-staging the exact
+      intermediate directory a real syscall walk needs, and a
+      pre-existing "escape target" directory with a canary file at the
+      resolved location) proves the canary survives with the fix.
+      Verified via a temporary bypass — the escape test genuinely
+      destroyed the canary file under the bypass — then fully reverted.
+    - [P1] "secret scanner must detect unquoted assignments": the
+      generic API-key/secret pattern in `scripts/secret-scan.mjs`
+      required the value to be quoted, missing common unquoted shell/
+      .env/YAML/TOML/JS forms entirely. Fixed by widening the value
+      alternation to accept quoted OR unquoted forms (additive, not a
+      loosening of the existing quoted case). Re-running against this
+      repository's real tree/history surfaced one genuine self-caught
+      false positive (this requirement file's own prose containing
+      illustrative unquoted example text), resolved by rewording rather
+      than adding real example strings. Regression tests added for
+      current-tree and git-history unquoted detection; verified against
+      this repository's real tree/history: PASS.
+    - [P1] "validate persisted assumptions before restoring authoritative
+      state": `runtime/assumptions/assumption-register.ts`'s
+      `loadFrom()` inserted every persisted record directly into
+      authoritative state with NO validation — a corrupt record claiming
+      `impact: HIGH, status: ACCEPTED` with a missing/blank `confirmedBy`
+      bypassed `accept()`'s Founder-confirmation invariant entirely for
+      state that never went through the live API. Fixed: a new
+      `describeInvalidPersistedAssumption()` validates every field's
+      type/enum-membership AND the same domain invariant `accept()`
+      enforces, plus rejects duplicate ids within one persisted array;
+      `loadFrom()` now throws `CorruptPersistedAssumptionError` (fail
+      closed — the WHOLE load refused, never a partial/silent drop) on
+      any invalid record. A targeted audit found the IDENTICAL root
+      class in the sibling `runtime/decisions/decision-ledger.ts`
+      (a persisted `status: SUPERSEDED` record with no `supersededBy` —
+      a combination `supersede()` itself can never produce — would
+      silently corrupt "which decision is active?" bookkeeping); fixed
+      the same way with `CorruptPersistedDecisionError`. Sixteen new
+      regression tests total (10 + 6) prove the exact reproductions are
+      refused, invalid enums/missing fields/duplicate ids are refused,
+      and genuinely valid persisted sets still load correctly. Both
+      verified via temporary bypasses restoring the pre-fix blind
+      insert — 14 tests genuinely failed — then fully reverted.
+    - [P1]+[P1] "do not record synthetic model spend without a real
+      invocation" + "reserve bootstrap budget before filesystem
+      mutation": `runtime/project-lifecycle/orchestrator.ts`'s
+      `bootstrapProject()` recorded `modelDecision.model.costPerCall` via
+      `budget.spend()` even though NO model was ever actually invoked
+      (`selectModel()` is a pure selection, never a provider call), so an
+      unknown/misconfigured provider could still yield a "successful"
+      bootstrap with a fabricated charge; separately, the only budget
+      check before the scaffold's real filesystem mutation was a
+      read-only `assertWithinBudget()` precheck with no reservation, so
+      two concurrent bootstraps sharing one CostEngine could both pass
+      it, both scaffold, and only afterward would one `spend()` fail —
+      leaving the rejected bootstrap's real project directory behind.
+      Fixed together: the task's model call now goes through the SAME
+      guarded `ModelGateway.invoke()` every other P0 invocation already
+      uses (policy authorize -> atomic budget RESERVE, before any
+      provider call -> provider call -> COMMIT/RELEASE), placed BEFORE
+      the scaffold — a policy DENY or insufficient budget now rejects
+      the whole bootstrap via a real, reserved invocation before any
+      mutation, and the atomic reservation makes the concurrent-
+      bootstrap race structurally impossible. A new `modelGateway`
+      input (defaulting to a fresh gateway with `MockProvider`
+      registered) was added to `BootstrapProjectInput`. Nine new
+      regression tests prove: an unknown provider and a failing
+      provider each reject cleanly with zero filesystem mutations and
+      zero recorded cost; the ACTUAL reported cost (not the nominal
+      price) is what gets recorded; policy DENY still blocks the
+      invocation itself; and — the concurrency reproduction — two
+      bootstraps sharing one CostEngine with a ceiling fitting only one
+      $0.6 invocation resolve with exactly one succeeding and the
+      rejected one leaving NO project tree behind. Verified via a
+      temporary bypass reproducing all four predicted symptoms
+      (including the exact orphaned-project-tree race), then fully
+      reverted.
+    - [P2] "reject out-of-range lock owner PIDs":
+      `runtime/cache/file-lock.ts`'s owner-metadata validation accepted
+      any positive-integer PID, including values beyond the platform-
+      valid upper bound (2147483647, `2^31-1`) that Node's own
+      `process.kill()` rejects with a non-ESRCH `TypeError` — the
+      existing conservative "any non-ESRCH outcome means alive" rule
+      misclassified such a PID as confirmed live, permanently blocking
+      UNKNOWN-owner recovery for a lock that could never have had a real
+      owner. Fixed: `isValidLockMeta` now also rejects any `pid` greater
+      than this bound. Regression tests prove an out-of-range PID is
+      treated as malformed/recovered via the bounded path, and the
+      boundary value itself (2147483647) is correctly NOT treated as
+      malformed (recovered as confirmed-dead, since no real process
+      holds it).
+    - [P2] "reject blank founder confirmation identities":
+      `assumption-register.ts`'s HIGH-impact confirmation gate used
+      `!confirmedBy` (a truthy/falsy check) — a whitespace-only value is
+      TRUTHY, so it silently passed. Fixed: now uses a new shared
+      `isNonBlankIdentity()` validator (`runtime/util/identity.ts`),
+      also adopted by `approval.ts`'s existing (already-correct)
+      `assertValidApprover` check, for a single source of truth.
+      Regression tests prove whitespace/tab/newline-only values are
+      rejected and a genuine identity still works.
+    - [P2] "align model JSON schema with runtime model record contract":
+      `schemas/model.schema.json` required a `costClass` field the
+      runtime `ModelRecord` interface never has and no runtime code
+      reads/writes, while making `costPerCall` (the field routing/
+      accounting actually depend on) merely optional — every real
+      runtime record (including the default registry's own) failed
+      schema validation. Fixed by reconciling deliberately: `costPerCall`
+      is now required, `costClass` is now optional (retained as purely
+      advisory). Six new regression tests (using the existing `ajv`
+      dependency) prove every default registry record now validates, a
+      record missing `costPerCall` is rejected, the old `costClass`-only
+      shape is now correctly rejected, and real records round-trip
+      through JSON serialization and `register()`. Verified via a
+      temporary bypass (reverting to the old `required` array) — 5 of 6
+      tests genuinely failed — then fully reverted.
+    - [P2] "implement REQUEST_CHANGES approval decision":
+      `runtime/policy-engine/approval.ts` lacked the baseline-required
+      third reviewer decision (APPROVE/REJECT/REQUEST_CHANGES) entirely.
+      Added `REQUEST_CHANGES` as a first-class `ApprovalStatus` value
+      and a new `requestChanges(id, decidedBy, reason, evidenceRef?)`
+      method requiring both a non-blank reviewer identity and a
+      non-blank reason (without a reason it would be indistinguishable
+      from an unexplained REJECT); legal only from PENDING and terminal
+      for that id (a revision needs a fresh id, consistent with
+      DuplicateApprovalIdError's permanent-identity philosophy); records
+      a distinct `APPROVAL_CHANGES_REQUESTED` audit event, never
+      `APPROVAL_REJECTED`. Twelve new regression tests cover the
+      transition, distinctness from REJECTED, blank-identity/blank-
+      reason rejection, terminality, the fresh-id resubmission path,
+      evidenceRef recording, the distinct audit event, and frozen-
+      snapshot immutability. Verified via a temporary bypass
+      (misclassifying REQUEST_CHANGES as REJECTED) — 6 tests genuinely
+      failed — then fully reverted. This module has no existing
+      persistence layer to extend, so "persistence keeps the decision"
+      is honestly out of scope (adding one would be architecture
+      expansion beyond this finding).
+    A narrow, explicitly-scoped audit of exactly these nine root classes
+    (and no other architecture) found no further genuine instance beyond
+    what's already fixed.
+  - >-
+    Requirement registry updated from this round's real evidence:
+    UASF-REQ-0036 (Cache/reuse layer — reclaim-token sanitization,
+    out-of-range PID rejection), UASF-REQ-0002 (Public secret/hygiene
+    audit — unquoted assignment detection), UASF-REQ-0011 (Assumption
+    register — persisted-state validation, blank-identity rejection),
+    UASF-REQ-0010 (Founder decision ledger — persisted-state validation,
+    audit-found sibling), UASF-REQ-0007 (Project Factory/Project OS
+    foundation — real guarded model invocation, reserve-before-mutation),
+    UASF-REQ-0025 (Model registry — schema/runtime contract
+    reconciliation, added model.schema.test.ts to test_refs),
+    UASF-REQ-0020 (Human approval workflow — REQUEST_CHANGES decision).
+    No status field was raised on any requirement beyond what real
+    evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, a real
+    `rm -rf dist && npm run build`, 737/737 tests (667 + 70 new),
+    validate:requirements (42 schema-valid records), history-aware
+    secret-scan (PASS, after resolving one genuine self-caught false
+    positive in this file's own prior-round prose by rewording rather
+    than adding real example strings), Factory Doctor (READY on all
+    checks), all 9 P0 proofs (13 assertions) — all clean, stable across
+    repeated runs, no orphaned processes.
 
 known_limitations:
   - >-
@@ -3526,6 +3779,25 @@ blockers:
     review. Per explicit instruction, this round does not merge, does
     not move to P1, and does not declare P0 complete.
 
+    STILL BLOCKED — P0 BLOCKED_PENDING_REVIEW (round 23). A fresh, full-
+    branch independent Codex review (against origin/main) found NINE
+    actionable findings (5 P1, 4 P2) spanning security (reclaim-token
+    path traversal, unquoted-secret detection), persistence (assumption/
+    decision restore validation), cost/accounting (synthetic model
+    spend, unreserved budget), concurrency (bootstrap reservation race),
+    and schema-contract (model schema drift, missing REQUEST_CHANGES
+    decision) — fixed as ONE consolidated closure batch, not piecemeal.
+    All nine root causes, fixes, and regression evidence are detailed in
+    `completed_milestones`'s round-23 entry and the per-requirement notes
+    in `specification/requirements/P0-factory-kernel.yml`
+    (UASF-REQ-0036, 0002, 0011, 0010, 0007, 0025, 0020). A narrow,
+    explicitly-scoped audit of exactly these nine root classes found no
+    further genuine instance. Tested (737/737 tests, +70 net new) and
+    verified per the full required sequence. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next independent (P0 closure)
+    review. Per explicit instruction, this round does not merge, does
+    not move to P1, and does not declare P0 complete.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -3542,6 +3814,68 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 23). A fresh,
+  full-branch independent Codex review (against origin/main) found NINE
+  actionable findings (5 priority-P1, 4 priority-P2) and required them
+  fixed as ONE consolidated closure batch, not piecemeal across separate
+  review loops: (1) `runtime/cache/file-lock.ts`'s reclaim-gate recovery
+  derived a filesystem path from a persisted, unvalidated token —
+  fixed via `sanitizeReclaimToken()`, accepting only the canonical
+  16-hex-char format; (2) the secret scanner's generic pattern missed
+  unquoted assignments — fixed by widening the value alternation;
+  (3) `runtime/assumptions/assumption-register.ts`'s `loadFrom()`
+  restored persisted records with no validation, bypassing the Founder-
+  confirmation invariant — fixed with full structural + domain-invariant
+  validation, fail-closed on any invalid record; the identical root
+  class was also found and fixed in the sibling
+  `runtime/decisions/decision-ledger.ts`; (4)+(5)
+  `runtime/project-lifecycle/orchestrator.ts`'s bootstrap recorded a
+  fabricated model cost without ever invoking a model, AND used only a
+  read-only budget precheck before the scaffold (allowing a concurrent-
+  bootstrap race to orphan a project tree) — fixed together by routing
+  the model call through the guarded `ModelGateway.invoke()` (real
+  policy authorize -> atomic budget reserve -> provider call -> commit/
+  release) placed before the scaffold; (6) `file-lock.ts`'s PID
+  validation accepted values beyond the platform-valid upper bound —
+  fixed with an explicit boundary check; (7)
+  `assumption-register.ts`'s HIGH-impact confirmation gate accepted a
+  whitespace-only identity — fixed with a shared `isNonBlankIdentity()`
+  validator also adopted by `approval.ts`; (8)
+  `schemas/model.schema.json` required an unused `costClass` field while
+  making the actually-required `costPerCall` optional — fixed by
+  reconciling deliberately (costPerCall required, costClass optional);
+  (9) `runtime/policy-engine/approval.ts` lacked the baseline-required
+  REQUEST_CHANGES reviewer decision — added as a first-class
+  `ApprovalStatus` with its own `requestChanges()` transition, distinct
+  audit event, and terminal semantics. All nine fixes carry deterministic
+  regression tests (70 net new, 667 -> 737 total), and every fix with a
+  practically bypassable code path was verified via a temporary in-place
+  bypass reproducing the exact predicted failure, then fully reverted
+  (confirmed via grep for the temp-marker in every touched file). A
+  narrow, explicitly-scoped audit of exactly these nine root classes
+  found no further genuine instance. Full required verification (lint,
+  typecheck, a real `rm -rf dist && npm run build`, 737/737 tests,
+  `validate:requirements`, `secret-scan`, Factory Doctor, all 9 P0
+  proofs) was re-run clean on this batch before this record was written
+  — see `completed_milestones`'s round-23 entry and the `p0_status`/
+  `blockers` narrative fields above for full detail, and
+  `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0036,
+  0002, 0011, 0010, 0007, 0025, 0020) for the updated requirement
+  evidence. Per explicit instruction: this session did NOT merge, did
+  NOT move to P1, and did NOT declare P0 complete, and did NOT invoke
+  Codex itself. The fix batch is committed and pushed to
+  `claude/ai-factory-baseline-v1-seawq7`. A future session's next action
+  is to WAIT for the next independent (P0 closure) review; only a CLEAN
+  result may close P0. If that review instead finds a new genuine
+  defect, repeat this same fix -> test -> targeted audit -> full
+  verification -> honest state update -> commit/push -> STOP cycle for
+  that new finding, on this same branch. Do not create a new branch, do
+  not merge, and do not begin P1 absent a fresh, explicit Founder
+  instruction to do so (see `governance_decision_recorded` above, which
+  is unchanged by this round).
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 22). A
   twenty-second independent Codex review confirmed all other required
   verification passing (lint, typecheck, build, 649/649 tests at review

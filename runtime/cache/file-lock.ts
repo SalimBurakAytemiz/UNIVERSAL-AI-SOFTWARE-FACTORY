@@ -131,6 +131,30 @@ function isProcessAlive(pid: number): boolean {
  * "onaylanmış CANLI" sayılır (kilit sonsuza dek korunmaz), ne de anında
  * koşulsuz silinir (mevcut yaş/sınır kuralları hâlâ geçerlidir).
  */
+/**
+ * P2 fix (23rd independent review round, "reject out-of-range lock owner
+ * PIDs"): Codex reproduced that a syntactically valid positive integer PID
+ * can still fall OUTSIDE the platform-valid PID domain — Node's own
+ * internal argument validation for `process.kill()` rejects any PID
+ * greater than `MAX_VALID_PID` (2147483647, i.e. `2^31 - 1`, the POSIX
+ * `pid_t`/Node-internal upper bound; confirmed empirically in this exact
+ * environment: `process.kill(2147483648, 0)` throws `ERR_INVALID_ARG_TYPE`,
+ * a TypeError, NOT `ESRCH`) with a `TypeError`/`RangeError`, never `ESRCH`.
+ * `isProcessAlive()`'s existing, intentionally conservative "any non-ESRCH
+ * outcome means alive" rule (17th independent review round fix — correct
+ * for a genuine EPERM/unexpected-errno case) then misclassified such an
+ * out-of-range PID as a CONFIRMED LIVE owner — which `isLockStale()` never
+ * treats as stale regardless of age, permanently blocking the documented
+ * UNKNOWN-owner recovery policy for a lock that could never have had a
+ * real owner in the first place (no real OS process can ever hold a PID
+ * outside this range). Fixed: `isValidLockMeta` now also rejects any `pid`
+ * greater than `MAX_VALID_PID`, routing it into the same UNKNOWN-owner
+ * bounded recovery path as any other structurally invalid metadata (bkz.
+ * 22nd independent review round fix note above, of which this is a direct
+ * extension of the same validation).
+ */
+const MAX_VALID_PID = 2147483647;
+
 function isValidLockMeta(value: unknown): value is LockMeta {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
@@ -139,6 +163,7 @@ function isValidLockMeta(value: unknown): value is LockMeta {
     Number.isInteger(candidate.pid) &&
     Number.isFinite(candidate.pid) &&
     candidate.pid > 0 &&
+    candidate.pid <= MAX_VALID_PID &&
     typeof candidate.token === "string" &&
     candidate.token.length > 0 &&
     typeof candidate.acquiredAt === "number" &&
@@ -350,6 +375,54 @@ function writeGateIdentity(metaPath: string): void {
  * DEĞİLDİR; bu, PID yeniden kullanımı sınırlaması gibi, bu dosyanın
  * kasıtlı olarak kabul ettiği ve belgelediği bir P0-minimal ödünleşimdir.
  */
+/**
+ * P1 fix (23rd independent review round, "sanitize reclaim tokens before
+ * deriving filesystem paths"): Codex found that `acquireReclaimGate()`
+ * derived `recoveryGatePath` by directly interpolating a token READ FROM
+ * PERSISTED METADATA (`readLockMeta(claimMetaPath)?.token`) into a
+ * filesystem path (`${claimPath}.recover-${observedToken}`) with NO
+ * validation of the token's own shape. This repository's OWN token
+ * generator (`writeGateIdentity`, above) always produces a fixed-format,
+ * 16-character lowercase hex string (`randomBytes(8).toString("hex")`) —
+ * but `owner.json` is a plain JSON file on disk, and the 22nd independent
+ * review round's fix only validates that `token` is a NON-EMPTY STRING,
+ * not that it matches this canonical shape. A malformed or hostile
+ * `owner.json` (written by a corrupted process, a misbehaving third party
+ * with filesystem access, or simply bit-rot) could therefore carry a
+ * `token` containing path separators or traversal components (`"../x"`,
+ * `"../../x"`, `"a/b"`, `"a\\b"`, an absolute-path fragment, etc.) — since
+ * `recoveryGatePath` is later passed to `mkdirSync`/`rmSync`, such a token
+ * could redirect the recovery gate (and, via `acquireRecoveryGate`'s own
+ * stale-then-`rmSync` path) OUTSIDE the intended `.reclaim` directory
+ * entirely, causing a RECURSIVE DELETE of an unrelated, attacker- or
+ * corruption-chosen filesystem location.
+ *
+ * Gereken değişmez: kalıcı/güvenilmeyen token verisi, ASLA doğrudan bir
+ * dosya sistemi yolu BİLEŞENİNE yönlendirilemez. Fixed: `sanitizeReclaimToken()`
+ * yalnızca bu uygulamanın KENDİSİNİN ürettiği KANONİK biçimi (tam olarak
+ * 16 küçük harfli onaltılık karakter) kabul eder; bunun dışındaki HERHANGİ
+ * bir değer (yol ayırıcıları, `..`, mutlak yol parçaları, platforma özgü
+ * ayırıcılar, olağandışı uzunluk, boş string dahil) sabit, zararsız bir
+ * yer tutucuya (`"unknown-generation"` — zaten `token` hiç okunamadığında
+ * kullanılan AYNI mevcut geri düşüş değeri) düşürülür. Bu, `recoveryGatePath`'in
+ * HER ZAMAN `claimPath`'in kendisinden türetilen, sabit bir son ek dışında
+ * hiçbir şey İÇERMEMESİNİ garanti eder — token ne olursa olsun, üretilen
+ * yol asla `.reclaim` dizininin dışına ÇIKAMAZ. Sahiplik/token semantiği
+ * (bkz. `releaseFileLock`/`tryReclaimStaleLock`'ın kendi token kontrolleri)
+ * DEĞİŞTİRİLMEDİ — bu fonksiyon yalnızca bir token'ın bir YOL BİLEŞENİ
+ * olarak KULLANILIP KULLANILAMAYACAĞINI belirler, sahiplik kararlarını
+ * DEĞİL.
+ */
+const CANONICAL_RECLAIM_TOKEN_PATTERN = /^[0-9a-f]{16}$/;
+
+/** Exported for direct, deterministic unit testing of every rejected shape (path separators, traversal, absolute paths, oversized/malformed values) without needing to fabricate a full filesystem escape scenario for each one. */
+export function sanitizeReclaimToken(token: string | undefined): string {
+  if (typeof token === "string" && CANONICAL_RECLAIM_TOKEN_PATTERN.test(token)) {
+    return token;
+  }
+  return "unknown-generation";
+}
+
 function acquireReclaimGate(claimPath: string, staleMs: number): boolean {
   const claimMetaPath = join(claimPath, "owner.json");
   try {
@@ -363,7 +436,7 @@ function acquireReclaimGate(claimPath: string, staleMs: number): boolean {
       // yaşlanmamış) — ASLA dokunma.
       return false;
     }
-    const observedToken = readLockMeta(claimMetaPath)?.token ?? "unknown-generation";
+    const observedToken = sanitizeReclaimToken(readLockMeta(claimMetaPath)?.token);
     const recoveryGatePath = `${claimPath}.recover-${observedToken}`;
     if (!acquireRecoveryGate(recoveryGatePath, staleMs)) {
       return false;

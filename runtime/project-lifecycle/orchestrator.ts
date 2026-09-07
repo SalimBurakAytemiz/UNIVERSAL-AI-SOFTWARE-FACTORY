@@ -30,11 +30,30 @@ import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
 import type { ModelRegistry } from "../models/registry.js";
 import { CheapestCapableModelRouter, type RoutingDecision } from "../models/router.js";
+import { ModelGateway, type ModelInvocationResponse } from "../models/gateway.js";
+import { MockProvider } from "../models/providers/mock-provider.js";
 import { CostEngine } from "../cost/cost-engine.js";
 import { assertValidBudgetLimits, BudgetGuard, type BudgetLimits } from "../budget/budget.js";
 import { FileStateStore, type StateStore } from "../state/file-store.js";
 import type { TraceabilityIssue } from "../requirements-traceability/traceability.js";
 import { freezeRecord } from "../util/immutable.js";
+
+/**
+ * The default `ModelGateway` used when a caller doesn't inject their own
+ * (mirrors the existing `callerCostEngine ?? new CostEngine()`/
+ * `callerStateStore ?? new FileStateStore()` sensible-default pattern) —
+ * registers the dependency-free, network-free `MockProvider` so P0's
+ * default registry (whose records all use `provider: "mock"`) can be
+ * invoked without requiring any real, paid provider to be configured. A
+ * caller with real provider adapters registered on the model registry
+ * should inject their own `ModelGateway` (with those providers
+ * registered) via `BootstrapProjectInput.modelGateway`.
+ */
+function defaultBootstrapModelGateway(): ModelGateway {
+  const gateway = new ModelGateway();
+  gateway.registerProvider(new MockProvider());
+  return gateway;
+}
 
 export class PreflightTraceabilityFailedError extends Error {
   constructor(issues: readonly TraceabilityIssue[]) {
@@ -54,6 +73,16 @@ export interface BootstrapProjectInput {
   readonly budgetLimits?: BudgetLimits;
   readonly costEngine?: CostEngine;
   readonly stateStore?: StateStore;
+  /**
+   * The `ModelGateway` used for the bootstrap's own model invocation
+   * (policy + budget reservation + provider call + accounting — see
+   * `ModelGateway.invoke()`). Defaults to a fresh gateway with
+   * `MockProvider` registered (see `defaultBootstrapModelGateway()`
+   * above), matching the default registry's `provider: "mock"` records. A
+   * caller using a real, paid provider registry must inject their own
+   * `ModelGateway` with that provider registered.
+   */
+  readonly modelGateway?: ModelGateway;
   /** Both the Organization Composer's team-activation threshold and the Capability Gateway action's risk level. Defaults to 1 (low). */
   readonly risk?: RiskLevel;
   /** Factory'nin kendi gereksinim kayıt defterindeki izlenebilirlik sorunları (varsa) — boş olmayan bir liste bootstrap'i durdurur. */
@@ -122,8 +151,16 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // nesnesi olduğundan (bir sınıf örneği değil), yalnızca REFERANSINI
   // değil, ALANLARININ KENDİSİNİ de donmuş bir kopyaya alır (bkz.
   // yukarıdaki fix notu).
-  const { genomeCandidate, baseDir, policy, modelRegistry, budgetLimits, costEngine: callerCostEngine, stateStore: callerStateStore } =
-    input;
+  const {
+    genomeCandidate,
+    baseDir,
+    policy,
+    modelRegistry,
+    budgetLimits,
+    costEngine: callerCostEngine,
+    stateStore: callerStateStore,
+    modelGateway: callerModelGateway
+  } = input;
   const risk = input.risk ?? 1;
   const budgetGuardLimits: BudgetLimits = budgetLimits ? freezeRecord({ ...budgetLimits }) : {};
 
@@ -162,19 +199,48 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
 
   // P2 fix (13th independent review round targeted audit, same class as
   // the budgetGuardLimits validation-ordering fix above): `selectModel()`
-  // (a pure computation — no side effects, no policy dependency) and a
-  // non-mutating `assertWithinBudget()` pre-check both used to run AFTER
-  // `scaffoldProjectOs()` had already created real directories on disk —
-  // a registry with no "summarization"-capable model (NoCapableModelError)
-  // or a budget too tight for that specific model's real cost
-  // (BudgetExceededError) would still reject the WHOLE bootstrap, but only
-  // after wasting the scaffold. Neither check depends on the scaffold's
-  // own output, so both now run BEFORE it. The AUTHORITATIVE `budget.spend()`
-  // call deliberately stays AFTER the policy-gated scaffold (bkz. aşağıda)
-  // — this pre-check is a non-mutating, fail-fast OPTIMIZATION only; it
-  // does not reserve anything, so it does not change (and cannot weaken)
-  // the existing "a policy DENY blocks spend too" property that the real
-  // `spend()` call's position already provides.
+  // (a pure computation — no side effects, no policy dependency) runs
+  // BEFORE `scaffoldProjectOs()` — a registry with no
+  // "summarization"-capable model (NoCapableModelError) rejects the whole
+  // bootstrap before wasting a scaffold.
+  //
+  // P1 fix (23rd independent review round, findings 4 & 5 — "bootstrap
+  // must not record synthetic model spend without a real invocation" +
+  // "reserve bootstrap budget before filesystem mutation"): Codex found
+  // TWO compounding defects in what used to sit here: (1) this function
+  // recorded `modelDecision.model.costPerCall` via `budget.spend()` even
+  // though NO model was ever actually invoked — `selectModel()` is a pure
+  // selection, never a provider call — so an unknown/misconfigured
+  // provider could still yield a "successful" bootstrap, and the
+  // persisted state claimed a model produced a result that never
+  // executed; (2) the ONLY budget check before the scaffold's real
+  // filesystem mutation was `assertWithinBudget()`, a READ-ONLY precheck
+  // with no reservation — two concurrent bootstraps sharing one
+  // `CostEngine` could BOTH pass that precheck, BOTH scaffold, and only
+  // afterward would one `spend()` call fail, leaving the rejected
+  // bootstrap's real project directory behind despite the budget ceiling
+  // supposedly preventing execution in the first place. Required
+  // invariant: NO model cost may be recorded without a genuine, guarded
+  // model invocation, and that invocation's budget RESERVATION must
+  // complete (atomically, on the shared ledger — bkz.
+  // runtime/cost/cost-engine.ts'in 16th round fix notu) before any
+  // irreversible filesystem mutation. Fixed by routing this task's model
+  // call through the SAME guarded `ModelGateway.invoke()` every other P0
+  // model invocation already uses (runtime/models/gateway.ts) — its own
+  // internal sequence is ALREADY exactly "policy authorize -> budget
+  // RESERVE (atomic, before any provider call) -> provider call -> budget
+  // COMMIT (real cost) / RELEASE (on failure)" — placed BEFORE the
+  // scaffold: a policy DENY or a budget ceiling too tight for the real
+  // model's cost now rejects the ENTIRE bootstrap via this real,
+  // reserved-then-committed invocation, before `scaffoldProjectOs()` ever
+  // runs, and two concurrent bootstraps sharing one `CostEngine` can no
+  // longer both scaffold on the strength of a check that reserved
+  // nothing — `budget.reserve()`'s own atomicity (bkz. budget.ts'in 10th/
+  // 16th round fix notları) ensures only one concurrent invocation can
+  // ever pass. The old, separate `budget.assertWithinBudget()` precheck
+  // is removed entirely — it is now fully superseded by this real
+  // reservation, which happens earlier and is authoritative rather than
+  // advisory.
   const router = new CheapestCapableModelRouter(modelRegistry);
   const modelDecision = router.selectModel({
     taskId: `bootstrap:${genome.project.id}`,
@@ -183,9 +249,22 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   });
   const costEngine = callerCostEngine ?? new CostEngine();
   const budget = new BudgetGuard(costEngine, budgetGuardLimits);
-  budget.assertWithinBudget(
-    { taskId: `bootstrap:${genome.project.id}`, projectId: genome.project.id },
-    modelDecision.model.costPerCall
+  const modelGateway = callerModelGateway ?? defaultBootstrapModelGateway();
+
+  const invocationResponse: ModelInvocationResponse = await modelGateway.invoke(
+    modelDecision.model,
+    {
+      prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
+      taskType: "bootstrap-summary"
+    },
+    {
+      policy,
+      budget,
+      risk: 0,
+      taskId: `bootstrap:${genome.project.id}`,
+      projectId: genome.project.id,
+      description: `Bootstrap summary for project '${genome.project.id}'`
+    }
   );
 
   const gateway = new CapabilityGateway(policy);
@@ -197,14 +276,6 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     },
     () => scaffoldProjectOs(baseDir, genome.project.id)
   );
-
-  budget.spend({
-    taskId: `bootstrap:${genome.project.id}`,
-    projectId: genome.project.id,
-    provider: modelDecision.model.provider,
-    modelId: modelDecision.model.modelId,
-    amountUsd: modelDecision.model.costPerCall
-  });
 
   // P1 fix (5th independent review round, "final-destination / dangling
   // symlink escape"): eskiden bu dosya yolları düz `join()` ile
@@ -238,7 +309,11 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     selectedModel: {
       modelId: modelDecision.model.modelId,
       tier: modelDecision.model.tier,
-      costUsd: modelDecision.model.costPerCall
+      // P1 fix (23rd independent review round): the ACTUAL cost the real,
+      // guarded invocation incurred (`invocationResponse.costUsd`) — never
+      // the model's merely nominal per-call price — since this field now
+      // documents a genuine invocation that really happened.
+      costUsd: invocationResponse.costUsd
     },
     totalCostUsd
   });

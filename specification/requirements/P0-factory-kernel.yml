@@ -150,6 +150,29 @@
     those same historical commits, not a real secret and not reachable
     through any broader exclusion.
 
+    P1 fix (23rd independent review round, "secret scanner must detect
+    unquoted assignments"): the "Generic API key/secret assignment"
+    pattern required the VALUE half to be wrapped in quotes, so a
+    perfectly common unquoted assignment (a shell/.env-style KEY=value
+    line, or a YAML-style key: value line — see the regression tests
+    below for concrete illustrative examples, not reproduced here to
+    avoid confusing this prose itself with secret-shaped content) evaded
+    detection entirely. Fixed by
+    widening the value alternation to accept a single-quoted, double-
+    quoted, OR unquoted bare value (still 12+ characters from the same
+    restricted class, so it naturally stops at whitespace rather than
+    spanning into prose) — additive, not a loosening of the existing
+    quoted case. Re-running the scanner against this repository's real
+    tree/history surfaced one genuine self-caught false positive (this
+    requirement file's own prior-round prose containing illustrative
+    unquoted example text), resolved with `secret-scan:allow` markers on
+    those two lines, matching the established precedent from the 18th
+    round's identical self-caught false positive. Regression tests added
+    for unquoted .env/shell, YAML, TOML, and JS/TS forms (current-tree and
+    git-history), confirming the pre-existing quoted forms remain
+    detected unchanged. Verified against this repository's real tree and
+    full git history: PASS.
+
 - id: UASF-REQ-0003
   title: Baseline specification preservation
   description: >
@@ -387,6 +410,42 @@
     remain active. Confirmed via git-stash that 4 of these tests fail
     against the pre-fix code with exactly this reproduction.
 
+    P1 fix (23rd independent review round, findings 4 & 5, "do not
+    record synthetic model spend without a real invocation" + "reserve
+    bootstrap budget before filesystem mutation"): Codex found two
+    compounding defects in bootstrapProject()'s model-cost handling: (1)
+    the function recorded `modelDecision.model.costPerCall` via
+    `budget.spend()` even though NO model was ever actually invoked —
+    `selectModel()` is a pure selection, never a provider call — so an
+    unknown/misconfigured provider could still yield a "successful"
+    bootstrap with a fabricated charge; (2) the only budget check before
+    the scaffold's real filesystem mutation was `assertWithinBudget()`, a
+    read-only precheck with no reservation, so two concurrent bootstraps
+    sharing one CostEngine could both pass it, both scaffold, and only
+    afterward would one `spend()` fail — leaving the rejected bootstrap's
+    real project directory behind despite the ceiling supposedly
+    preventing execution. Fixed by routing the task's model call through
+    the SAME guarded `ModelGateway.invoke()` every other P0 invocation
+    already uses (policy authorize -> budget RESERVE, atomic, before any
+    provider call -> provider call -> budget COMMIT/RELEASE), placed
+    BEFORE the scaffold — a policy DENY or an insufficient budget now
+    rejects the whole bootstrap via a real, reserved invocation before
+    any filesystem mutation, and the atomic reservation makes the
+    concurrent-bootstrap race structurally impossible. A new
+    `modelGateway` input (defaulting to a fresh gateway with
+    `MockProvider` registered) was added to `BootstrapProjectInput`. Nine
+    new regression tests prove: an unknown provider and a failing
+    provider each reject cleanly with zero filesystem mutations and zero
+    recorded cost; the ACTUAL reported cost (not the nominal price) is
+    what gets recorded; policy DENY still blocks the invocation itself;
+    and — the concurrency reproduction — two bootstraps sharing one
+    CostEngine with a ceiling fitting only one $0.6 invocation resolve
+    with exactly one succeeding and the rejected one leaving NO project
+    tree behind. Both halves of the fix verified via a temporary bypass
+    reproducing all four predicted failure symptoms (fabricated success
+    on an unknown/failing provider, nominal-not-actual cost recorded, and
+    the exact orphaned-project-tree race), then fully reverted.
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -518,6 +577,26 @@
     git-stash that 5 of these tests fail against the pre-fix code with
     exactly the branching corruption Codex described.
 
+    P1 targeted-audit fix (23rd independent review round, same root class
+    as assumption-register.ts's "validate persisted assumptions before
+    restoring authoritative state" — see UASF-REQ-0011): loadFrom()
+    inserted every persisted record directly into authoritative state
+    with NO validation — a corrupt/hand-edited record claiming
+    `status: "SUPERSEDED"` with no `supersededBy` (a combination
+    supersede() itself can never produce, since it always sets both
+    together) would silently corrupt "which decision is currently
+    active?" bookkeeping. Fixed the same way: a new
+    `describeInvalidPersistedDecision()` validates every field's type/
+    enum-membership AND this same SUPERSEDED-requires-supersededBy
+    domain invariant, plus rejects duplicate decisionIds within one
+    persisted array; loadFrom() now throws
+    `CorruptPersistedDecisionError` (fail closed) if any record fails.
+    Six new regression tests prove the exact reproduction is refused,
+    invalid enum values/missing fields/duplicate ids are refused, and a
+    genuinely valid history (ACTIVE + SUPERSEDED-with-supersededBy)
+    still loads correctly. Verified via a temporary bypass reproducing
+    the predicted symptom, then fully reverted.
+
 - id: UASF-REQ-0011
   title: Assumption register
   description: Track assumptions with PROPOSED/ACCEPTED/REJECTED/VALIDATED/SUPERSEDED lifecycle.
@@ -565,6 +644,50 @@
     remain independent, and the error names the offending id. Confirmed via
     git-stash that all 4 of these tests fail against the pre-fix code with
     exactly this confirmation-erasure symptom.
+
+    P1 fix (23rd independent review round, "validate persisted assumptions
+    before restoring authoritative state"): Codex reproduced that
+    loadFrom() inserted every persisted record DIRECTLY into authoritative
+    state with NO validation — a corrupt/hand-edited record such as
+    `{impact: "HIGH", status: "ACCEPTED", confirmedBy: missing}` was
+    restored straight in, completely bypassing accept()'s Founder-
+    confirmation invariant for state that never went through the live API.
+    Fixed: a new `describeInvalidPersistedAssumption()` validates every
+    field's type/enum-membership AND the SAME HIGH-impact-ACCEPTED-needs-
+    confirmedBy domain invariant accept() enforces, plus rejects duplicate
+    ids within one persisted array; loadFrom() now throws
+    `CorruptPersistedAssumptionError` (fail closed — the WHOLE load is
+    refused, never a partial/silent-drop) if any record fails. Ten new
+    regression tests prove the exact reproduction (missing confirmedBy)
+    is refused, a whitespace-only confirmedBy is ALSO refused (see the
+    companion fix below), invalid enum values/missing fields/duplicate
+    ids are all refused, and a genuinely valid persisted set (including a
+    properly-confirmed HIGH record) still loads correctly.
+
+    P2 fix (23rd independent review round, "reject blank founder
+    confirmation identities"): accept()'s HIGH-impact gate used to check
+    only `!confirmedBy` (a truthy/falsy check) — `confirmedBy = "   "`
+    (whitespace only) is a TRUTHY string, so it silently passed the gate.
+    Fixed: now uses the SAME shared `isNonBlankIdentity()` validator
+    (runtime/util/identity.ts, also used by approval.ts's
+    `assertValidApprover` — a single source of truth) requiring a
+    trimmed, non-empty identity. Regression tests prove whitespace/tab/
+    newline-only confirmedBy values are rejected and a genuine identity
+    still works. Both fixes verified via a temporary bypass reproducing
+    both predicted symptoms (14 tests total failed across this
+    requirement and the sibling decision-ledger.ts audit fix below),
+    then fully reverted.
+
+    P1 targeted-audit fix (23rd independent review round, same root
+    class): audited every `loadFrom()`/persisted-collection-restore
+    pattern in the P0 path and found one further genuine instance —
+    `runtime/decisions/decision-ledger.ts` (bkz. UASF-REQ-0010) — same
+    root cause, same fix pattern, also fixed this round. No other
+    `StateStore` consumer in `runtime/` restores a domain-invariant-
+    bearing in-memory collection this way (file-cache.ts is a generic
+    key-value cache with no domain invariants; orchestrator.ts only
+    performs one-shot writes to unique per-project paths, never a
+    restore-into-authoritative-collection operation).
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -864,6 +987,45 @@
     attempt; and the error names the offending id. Confirmed via git-stash
     that 8 of these tests fail against the pre-fix code, including the
     exact EXECUTED-record-erasure reproduction Codex described.
+
+    P2 fix (23rd independent review round, "implement REQUEST_CHANGES
+    approval decision"): the authoritative P0 requirement lists THREE
+    reviewer decisions — APPROVE, REJECT, REQUEST_CHANGES — but
+    `ApprovalStatus` only had PENDING/APPROVED/REJECTED/EXECUTED. A
+    reviewer with "not yet, here's what must change" had no way to
+    represent that decision without misclassifying it as REJECTED (losing
+    the "revise and resubmit" semantics and any recorded reason) or
+    leaving the request PENDING forever. Fixed: `REQUEST_CHANGES` is now
+    a first-class `ApprovalStatus` value; a new `requestChanges(id,
+    decidedBy, reason, evidenceRef?)` method requires BOTH a genuine
+    (non-blank, via the shared `isNonBlankIdentity` — see UASF-REQ-0011)
+    reviewer identity AND a genuine non-blank `reason` (without a reason,
+    REQUEST_CHANGES would be indistinguishable from an unexplained
+    REJECT); is legal only from PENDING (the same guard as approve()/
+    reject()) and is terminal for that request id — a revised action
+    requires a fresh, distinct id via request() (consistent with
+    DuplicateApprovalIdError's permanent-identity philosophy); records a
+    distinct `APPROVAL_CHANGES_REQUESTED` audit event, never
+    `APPROVAL_REJECTED`; and — since execute() already only permits
+    `status === "APPROVED"` — a REQUEST_CHANGES record is structurally
+    unable to ever reach EXECUTED, with no change needed to execute()
+    itself. Twelve new regression tests prove: the state transition and
+    recorded reason/identity; REQUEST_CHANGES is distinct from REJECTED
+    (not merely a rename); blank reviewer identity and blank reason are
+    both rejected; REQUEST_CHANGES is terminal (cannot subsequently
+    approve/reject/request-changes again, cannot execute); a revised
+    action needs a fresh id; evidenceRef is recorded alongside the
+    reason; the audit event is distinct; and the frozen-snapshot
+    immutability invariant holds for requestChanges()'s return value too.
+    Verified via a temporary bypass (misclassifying REQUEST_CHANGES as
+    REJECTED, simulating the pre-fix absence of this decision) that
+    correctly failed 6 of the new tests, then fully reverted. This module
+    has no existing persistence (saveTo/loadFrom) layer to extend for
+    REQUEST_CHANGES — unlike assumption-register.ts/decision-ledger.ts,
+    ApprovalWorkflow is currently in-memory-only, so "persistence keeps
+    the decision and evidence" is honestly out of scope for this fix
+    (adding a persistence layer that doesn't otherwise exist would be
+    architecture expansion beyond this finding).
 
 - id: UASF-REQ-0021
   title: Durable state / resume
@@ -1327,6 +1489,7 @@
     - "schemas/model.schema.json"
   test_refs:
     - "runtime/models/__tests__/registry.test.ts"
+    - "runtime/models/__tests__/model.schema.test.ts"
   proof_refs: []
   security_refs: []
   notes: >
@@ -1402,6 +1565,34 @@
     meaningful via a temporary in-place bypass (returning the pre-freeze
     object instead of `freezeRecord(updated)`) — confirmed exactly this 1
     test fails against the bypassed code, then the bypass was reverted.
+
+    P2 fix (23rd independent review round, "align model JSON schema with
+    runtime model record contract"): `schemas/model.schema.json` and the
+    runtime `ModelRecord` contract genuinely disagreed — the schema
+    required a `costClass` field the runtime `ModelRecord` interface never
+    had and no runtime code ever reads or writes, while making
+    `costPerCall` (the field cheapest-capable-model routing and cost
+    accounting ACTUALLY depend on) merely optional. This meant every real
+    runtime `ModelRecord` (including `createDefaultModelRegistry()`'s own
+    records) failed schema validation, and a schema-valid EXTERNAL record
+    could legally omit the pricing routing/accounting require. Fixed by
+    reconciling deliberately, not loosening both sides: `costPerCall` is
+    now required (matching what the runtime always populates and
+    consumes) and `costClass` is now optional (matching that nothing in
+    the runtime contract ever reads or writes it; retained, documented as
+    purely advisory, for any external tooling that wants it). Six new
+    regression tests (using the same `ajv` dependency already used by
+    `scripts/validate-requirements.mjs`) prove: every default registry
+    record now passes schema validation; a schema-valid record with
+    `costPerCall` can be `register()`ed without throwing; a record missing
+    `costPerCall` is correctly rejected; a record still carrying the old
+    `costClass` field validates (no regression for existing external
+    data); the OLD-style shape (`costClass`, no `costPerCall`) is now
+    correctly rejected, proving the fix and not merely a description
+    change; and a real `ModelRecord`, JSON-serialized and re-parsed, still
+    validates and round-trips through `register()`. Verified via a
+    temporary bypass (reverting `required` to its old `costClass`-based
+    array) — 5 of the 6 new tests genuinely failed, then fully reverted.
 
 - id: UASF-REQ-0026
   title: MockProvider
@@ -3097,6 +3288,59 @@
     "malformed PID passed into liveness checks", or "malformed owner
     records bypassing UNKNOWN-owner recovery" exists anywhere else in
     this file.
+
+    P1 fix (23rd independent review round, "sanitize reclaim tokens
+    before deriving filesystem paths"): Codex found that
+    `acquireReclaimGate()`'s abandoned-then-recover path derived
+    `recoveryGatePath` by interpolating a token read directly from
+    PERSISTED metadata (`readLockMeta(claimMetaPath)?.token`) into a
+    filesystem path, with only a non-empty-string check (22nd round) —
+    a malformed or hostile `owner.json` could carry a token containing
+    real path separators/traversal components (e.g. a leading `/`
+    followed by `../../`), and since the final `finally` block does
+    `rmSync(recoveryGatePath, {recursive:true, force:true})`, a
+    sufficiently staged filesystem (an attacker with enough access to
+    plant the malicious metadata could also pre-stage the necessary
+    intermediate directory) could redirect that recursive delete onto an
+    entirely unrelated location. Fixed: `sanitizeReclaimToken()` accepts
+    ONLY this implementation's own canonical generated format (exactly 16
+    lowercase hex characters, matching `randomBytes(8).toString("hex")`)
+    — anything else (path separators, `..`, absolute paths, oversized/
+    undersized/wrong-charset values, empty/undefined) falls back to the
+    same fixed, harmless placeholder (`"unknown-generation"`) already used
+    when the token is unreadable. Ownership/ordinary token semantics
+    elsewhere (release()/tryReclaimStaleLock()'s own checks) are
+    unchanged. Regression tests prove: the canonical format is accepted
+    unchanged; ten distinct malformed shapes (POSIX/Windows traversal,
+    embedded slash/backslash, absolute paths, bare `..`, oversized,
+    too-short, wrong case, non-hex) all fall back safely; and an
+    end-to-end, real-filesystem proof — fabricating a hostile token,
+    pre-staging the exact intermediate directory a real syscall walk
+    would need, and pre-creating an unrelated, pre-existing "escape
+    target" directory with a canary file at the location the traversal
+    would resolve to — proves the canary survives completely untouched.
+    Verified via a temporary bypass (trusting the token unconditionally)
+    — the end-to-end escape test genuinely destroyed the canary file
+    under the bypass (`existsSync` false), proving the vulnerability was
+    real and the fix prevents it, then fully reverted.
+
+    P2 fix (23rd independent review round, "reject out-of-range lock
+    owner PIDs"): Codex found that a syntactically valid positive integer
+    PID can still fall outside the platform-valid PID domain — Node's own
+    `process.kill()` rejects any PID greater than 2147483647 (`2^31 - 1`)
+    with a `TypeError`/`ERR_INVALID_ARG_TYPE`, never `ESRCH` (confirmed
+    empirically). `isProcessAlive()`'s existing conservative "any
+    non-ESRCH outcome means alive" rule then misclassified such a PID as
+    CONFIRMED LIVE, permanently blocking UNKNOWN-owner recovery for a
+    lock that could never have had a real owner. Fixed: `isValidLockMeta`
+    now also rejects any `pid` greater than this platform-valid upper
+    bound, routing it into the same UNKNOWN-owner bounded recovery path
+    as other structurally invalid metadata. A regression test proves a
+    PID one greater than the boundary is treated as malformed/recovered
+    via the bounded path, and a companion test proves the boundary value
+    itself (2147483647) is NOT treated as malformed — it goes through the
+    ordinary liveness check and is recovered as confirmed-dead, since no
+    real process holds it.
 
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation

@@ -123,6 +123,74 @@ describe(
   }
 );
 
+describe(
+  "secret-scan: P1 fix (23rd independent review round, 'secret scanner must detect unquoted assignments') " +
+    "— unquoted secret-shaped assignments must be detected across every previously-supported syntax",
+  () => {
+    it("detects an unquoted shell/.env-style KEY=value assignment", () => {
+      const findings = findSecretsInText("API_KEY=abcdefghijklmnopqrstuv", ".env"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("detects an unquoted shell-style PASSWORD=value assignment", () => {
+      const findings = findSecretsInText("PASSWORD=abcdefghijklmnopqrstuvwxyz", ".env"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("detects an unquoted YAML-style key: value assignment", () => {
+      const findings = findSecretsInText("password: abcdefghijklmnopqrstuvwxyz", "config.yaml"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("detects an unquoted TOML-style key = value assignment", () => {
+      const findings = findSecretsInText("api_key = abcdefghijklmnopqrstuvwxyz", "config.toml"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("still detects the pre-existing single-quoted form (no regression)", () => {
+      const findings = findSecretsInText("access_token: 'abcdefghijklmnopqrstuvwxyz'", "config.yaml"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("still detects the pre-existing double-quoted JSON form (no regression)", () => {
+      const findings = findSecretsInText('{"secret": "abcdefghijklmnopqrstuvwxyz"}', "config.json"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("still detects the pre-existing unquoted JS/TS const assignment form (no regression)", () => {
+      const findings = findSecretsInText("const password = abcdefghijklmnopqrstuvwxyz;", "config.ts"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("does not flag a short, obviously non-secret unquoted value (no broad false positive)", () => {
+      const findings = findSecretsInText("password=no", "config.env");
+      expect(findings).toHaveLength(0);
+    });
+
+    it("respects secret-scan:allow for a deliberately fake unquoted fixture", () => {
+      const findings = findSecretsInText(
+        "API_KEY=abcdefghijklmnopqrstuv // secret-scan:allow (fake fixture value)",
+        ".env"
+      );
+      expect(findings).toHaveLength(0);
+    });
+  }
+);
+
 describe("secret-scan: no whole-file allowlist (regression for the P2 finding)", () => {
   let tempRoot;
 
@@ -274,6 +342,32 @@ describe("secret-scan: git-history-aware scanning", () => {
     const findings = scanGitHistory(tempRepo);
     expect(findings).toHaveLength(1); // one unique blob -> one finding, not two
   });
+
+  it(
+    "P1 fix (23rd independent review round, 'secret scanner must detect unquoted assignments'): an " +
+      "unquoted shell/.env-style secret assignment, committed and later deleted, remains detected via history scanning",
+    () => {
+      tempRepo = initTempRepo();
+      writeFileSync(join(tempRepo, "config.env"), "API_KEY=abcdefghijklmnopqrstuv\n"); // secret-scan:allow (fake fixture value written into a temp repo)
+      git(["add", "config.env"]);
+      git(["commit", "-m", "oops: add unquoted credential"]);
+
+      execFileSync("git", ["rm", "config.env"], { cwd: tempRepo });
+      git(["commit", "-m", "remove config"]);
+
+      const trackedNow = execFileSync("git", ["ls-files"], { cwd: tempRepo, encoding: "utf8" });
+      expect(trackedNow).not.toContain("config.env");
+
+      const findings = scanGitHistory(tempRepo);
+      expect(
+        findings.some(
+          (f) =>
+            f.pattern === "Generic API key/secret assignment with a real-looking value" &&
+            f.file.includes("config.env")
+        )
+      ).toBe(true);
+    }
+  );
 
   it(
     "P2 fix (18th independent review round): a synthetic project-scoped OpenAI key (sk-proj-) committed " +
