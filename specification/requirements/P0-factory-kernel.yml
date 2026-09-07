@@ -2567,6 +2567,7 @@
     - "runtime/cache/__tests__/cache.test.ts"
     - "runtime/cache/__tests__/file-cache.test.ts"
     - "runtime/cache/__tests__/file-cache.cross-process.test.ts"
+    - "runtime/cache/__tests__/file-lock.test.ts"
   proof_refs:
     - "proofs/cache-reuse/proof.test.ts"
   security_refs: []
@@ -2996,6 +2997,106 @@
     swallowed-error-treated-as-success pattern in the first place; each
     terminates via a simple structural condition, not a time-based
     deadline, so this specific bug class does not apply to any of them.
+
+    P2 fix (22nd independent review round, "validate lock metadata before
+    using owner PID"): a twenty-second independent Codex review, after
+    the twenty-first round's CLEAN P0-scope conclusion on the acquisition-
+    timeout bug, found one further remaining P2 correctness blocker, one
+    level up in the SAME `runtime/cache/file-lock.ts` metadata-parsing
+    path. `readLockMeta()` used to cast `JSON.parse()`'s result directly
+    as `LockMeta` (`JSON.parse(...) as LockMeta`) with NO runtime
+    validation — TypeScript's `as` assertion is a compile-time-only
+    annotation and performs no actual runtime check. Codex reproduced
+    that syntactically VALID JSON carrying structurally MALFORMED
+    ownership fields — `{}`, or `{"pid":"123"}` (a string, not a number)
+    — was cast through unexamined. The malformed `pid` field then reached
+    `isProcessAlive(pid)` directly; `process.kill(pid, 0)` threw an
+    unexpected (non-ESRCH) error for the invalid PID value (e.g.
+    `ERR_INVALID_ARG_TYPE` for a non-integer, or an unusual signal
+    interpretation for `pid: 0`, which POSIX defines as "signal the
+    caller's own process group" and so does not throw at all), and
+    `isProcessAlive()`'s existing "any non-ESRCH error/success means
+    conservatively alive" rule (17th round fix, intentionally
+    conservative to protect genuine live owners) then misclassified the
+    malformed record as a CONFIRMED LIVE owner. Since `isLockStale()`
+    treats a confirmed-live owner as never stale regardless of age, this
+    permanently blocked the documented UNKNOWN-owner recovery policy from
+    ever running for that lock — Codex confirmed this concretely with
+    `staleMs: 1` and a genuinely abandoned lock directory: acquisition
+    always timed out instead of recovering. Required invariant: lock
+    metadata must never be trusted merely because it parses as valid
+    JSON — owner metadata must be structurally validated before any
+    PID/liveness decision is made, and malformed metadata must enter the
+    same bounded UNKNOWN-owner recovery policy as unreadable/corrupt
+    metadata, never CONFIRMED LIVE and never an unconditional immediate
+    delete. Fixed: added `isValidLockMeta()`, a runtime structural
+    validator checked before ANY parsed value is trusted as `LockMeta` —
+    it rejects anything that is not a non-null, non-array object; a `pid`
+    that is not a finite integer strictly greater than zero; a `token`
+    that is not a non-empty string; or an `acquiredAt` that is not a
+    finite number. `readLockMeta()` now returns `undefined` — exactly the
+    same signal already used for unreadable/corrupt metadata — whenever
+    this validation fails, rather than returning a value that only
+    LOOKS like a `LockMeta` at the type level. Because `readLockMeta()`
+    is the SOLE point in this file where parsed JSON crosses into the
+    `LockMeta` type (confirmed via a full audit below), this single fix
+    automatically and correctly propagates through every consumer:
+    `isLockStale()` now sees malformed metadata exactly like unreadable
+    metadata and falls through to the existing, already-bounded
+    `mtime`-based UNKNOWN-owner fallback; `acquireReclaimGate()`'s
+    `observedToken` lookup and `releaseFileLock()`'s token-ownership
+    check both already used optional chaining against `readLockMeta()`'s
+    result and needed no changes. Fifteen new deterministic regression
+    tests added in a new file,
+    `runtime/cache/__tests__/file-lock.test.ts` (unit-level, real
+    on-disk lock directories with hand-fabricated `owner.json` content,
+    driven entirely through the public `acquireFileLock()` API — no
+    child-process spawning needed for this fix, since it is deterministic
+    parsing/validation logic, not a cross-process race): ten malformed-
+    metadata variants (empty object, string pid, missing pid, pid = 0,
+    negative pid, fractional pid, null, array, wrong field types,
+    unparsable JSON) each prove recovery happens promptly instead of
+    exhausting the configured timeout; a "not yet aged" malformed-lock
+    case proves malformed metadata still honors the same bounded
+    UNKNOWN-owner staleness window rather than being stolen instantly; a
+    dedicated case proves malformed metadata does not bypass the
+    acquisition deadline (still throws `FileLockTimeoutError` within
+    budget when recovery genuinely cannot occur yet); a genuinely
+    CONFIRMED-LIVE owner (this test process' own real, live PID) is
+    proven never reclaimed regardless of age; a genuinely CONFIRMED-DEAD
+    owner (fabricated via a real, fully-awaited, now-exited child
+    process, isolating the liveness check from any timing race) is
+    proven still reclaimed near-instantly; and an isolation check proves
+    an unrelated, genuinely live lock is unaffected by a malformed lock
+    elsewhere. Verified via a temporary in-place bypass restoring the old
+    behavior (an `isValidLockMeta` that unconditionally accepted any
+    non-null object, with `readLockMeta` reverted to the original blind
+    `as LockMeta` cast) — 6 of the 15 new tests genuinely failed under
+    this bypass with exactly the predicted symptom
+    (`FileLockTimeoutError` at the full configured budget instead of
+    prompt recovery: the empty-object, missing-pid, `pid = 0`,
+    fractional-pid, and array cases, plus the cross-lock isolation
+    check); the remaining 9 tests were unaffected by the bypass by
+    construction (either because `process.kill()` happens to throw
+    `ESRCH` for those particular malformed values in this environment
+    regardless of validation — e.g. a numeric-looking string PID or a
+    negative PID that resolves to a nonexistent process group, both
+    empirically confirmed via direct `process.kill()` probing — or
+    because they exercise the already-correct unparsable-JSON/valid-
+    metadata paths this round did not change). The bypass was then fully
+    reverted (confirmed via `grep -n "TEMP-BYPASS"
+    runtime/cache/file-lock.ts` returning empty) and all 15 tests
+    re-confirmed passing. A targeted audit of the lock metadata parsing/
+    liveness/recovery path (grepped every `JSON.parse`, `as LockMeta`,
+    and `isProcessAlive(` call site in `file-lock.ts`) confirmed
+    `readLockMeta()` is the ONLY place parsed JSON is cast to `LockMeta`,
+    `isProcessAlive()` has exactly ONE call site (`isLockStale()`, fed
+    exclusively by `readLockMeta()`'s now-validated result), and every
+    other `readLockMeta()` consumer already used safe optional chaining
+    — no other genuine instance of "blind type cast from parsed JSON",
+    "malformed PID passed into liveness checks", or "malformed owner
+    records bypassing UNKNOWN-owner recovery" exists anywhere else in
+    this file.
 
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation

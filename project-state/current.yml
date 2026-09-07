@@ -617,13 +617,72 @@ factory:
     closure is revoked. P0 is BLOCKED_PENDING_REVIEW, awaiting a
     twenty-first independent review.
 
+    P0 STILL BLOCKED (this session, round 22): a twenty-second independent
+    Codex review confirmed all other required verification passing (lint,
+    typecheck, build, 649/649 tests at review time, requirement
+    validation, secret scanning) but found ONE remaining P2 correctness
+    blocker, one level up from the twenty-first round's fix, in the SAME
+    file's metadata-parsing path: "validate lock metadata before using
+    owner PID". `runtime/cache/file-lock.ts`'s `readLockMeta()` cast
+    `JSON.parse()`'s result directly as `LockMeta` (`as LockMeta`) with NO
+    runtime validation — TypeScript's `as` assertion performs no actual
+    check at runtime. Codex reproduced that syntactically VALID JSON
+    carrying structurally MALFORMED ownership fields (`{}`, or
+    `{"pid":"123"}` — a string, not a number) was cast through
+    unexamined. The malformed `pid` then reached `isProcessAlive(pid)`
+    directly; `process.kill(pid, 0)` threw an unexpected (non-ESRCH)
+    error for the invalid value, and `isProcessAlive()`'s existing
+    intentionally-conservative "any non-ESRCH outcome means alive" rule
+    (17th round fix) then misclassified the malformed record as a
+    CONFIRMED LIVE owner — which `isLockStale()` never treats as stale
+    regardless of age, permanently blocking the documented UNKNOWN-owner
+    recovery policy. Codex confirmed this concretely: with `staleMs: 1`
+    and a genuinely abandoned lock directory carrying malformed owner
+    metadata, acquisition always timed out instead of recovering. Fixed
+    this session: added `isValidLockMeta()`, a runtime structural
+    validator (non-null non-array object; `pid` a finite integer greater
+    than zero; `token` a non-empty string; `acquiredAt` a finite number)
+    checked before ANY parsed value is trusted as `LockMeta`;
+    `readLockMeta()` now returns `undefined` — the SAME signal already
+    used for unreadable/corrupt metadata — whenever validation fails,
+    routing malformed metadata into the existing, already-bounded
+    `mtime`-based UNKNOWN-owner fallback rather than CONFIRMED LIVE.
+    Fifteen new deterministic regression tests added in a new file,
+    `runtime/cache/__tests__/file-lock.test.ts` (unit-level, real on-disk
+    lock directories with hand-fabricated `owner.json` content, driven
+    through the public `acquireFileLock()` API): ten malformed-metadata
+    variants each prove prompt recovery instead of exhausted timeout; a
+    "not yet aged" malformed case proves the bounded staleness window is
+    still honored (not stolen instantly); a dedicated case proves the
+    acquisition deadline is still respected when recovery genuinely
+    cannot occur yet; genuinely CONFIRMED-LIVE and CONFIRMED-DEAD owner
+    cases prove those existing protections are unaffected; and an
+    isolation case proves an unrelated live lock is unaffected by a
+    malformed lock elsewhere. Verified via a temporary bypass restoring
+    the old blind-cast behavior — 6 of the 15 new tests genuinely failed
+    with exactly the predicted symptom (timeout instead of prompt
+    recovery), the remaining 9 were unaffected by construction (either
+    `process.kill()` happens to throw ESRCH for those particular
+    malformed values in this environment regardless of validation, or
+    they exercise already-correct paths this round did not change) — then
+    fully reverted and all 15 tests re-confirmed passing. A targeted
+    audit of the lock metadata parsing/liveness/recovery path confirmed
+    `readLockMeta()` is the ONLY place parsed JSON is cast to `LockMeta`,
+    `isProcessAlive()` has exactly ONE call site fed exclusively by its
+    now-validated result, and every other `readLockMeta()` consumer
+    already used safe optional chaining — no other genuine instance of
+    this root class exists anywhere else in the file. Per explicit
+    instruction, this round does NOT merge, does NOT move to P1, and does
+    NOT declare P0 complete. P0 remains BLOCKED_PENDING_REVIEW, awaiting
+    the next independent (P0 closure) review.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
 # upgrades any individual UASF-REQ requirement's own status; see
 # specification/requirements/P0-factory-kernel.yml for those.
 p0_closure_record:
-  p0_status: REOPENED_PENDING_21ST_REVIEW
+  p0_status: BLOCKED_PENDING_22ND_REVIEW
   p0_status_note: >-
     This record documents the TWENTIETH review's CLEAN result and this
     session's own direct re-verification of it, on
@@ -633,14 +692,20 @@ p0_closure_record:
     P2 fail-open/liveness defect in runtime/cache/file-lock.ts (a failed
     stale-lock removal could be reported as reclaim success, letting the
     acquisition retry loop bypass its own deadline check and spin
-    indefinitely). That finding revokes this record's FINALITY, not its
-    factual content: the twentieth review's CLEAN verdict really was
-    returned, and the checks below really did pass on that commit. The
-    fix for the twenty-first round's finding is implemented, tested, and
+    indefinitely); fixed, tested, and pushed. A further, twenty-second
+    independent Codex review then reproduced one more real P2 defect in
+    the SAME file's metadata-parsing path (malformed but syntactically
+    valid owner.json content could be misread as a confirmed-live owner,
+    permanently blocking UNKNOWN-owner recovery); also fixed, tested, and
+    pushed. Neither finding changes this record's factual content: the
+    twentieth review's CLEAN verdict really was returned, and the checks
+    below really did pass on that commit. The fixes for the twenty-first
+    and twenty-second rounds' findings are implemented, tested, and
     described in full in the `p0_status`/`blockers` narrative fields
-    above; see those for the round-21 evidence. next_lifecycle_state and
-    the merge/tag/P1 booleans below are UNCHANGED from what this session
-    recorded at the time — they reflect the twentieth-round closure
+    above; see those for the round-21/round-22 evidence.
+    next_lifecycle_state and the merge/tag/P1 booleans below are
+    UNCHANGED from what this session recorded at the time — they reflect
+    the twentieth-round closure
     attempt's own instructions and were never acted upon regardless.
   final_reviewed_branch: claude/ai-factory-baseline-v1-seawq7
   final_implementation_commit: e1b440fd007b7eeb0c1eae13f1d3e8342c5466aa
@@ -2982,6 +3047,64 @@ completed_milestones:
     explicitly authorized future instruction, exactly as the existing
     `governance_decision_recorded` (autonomous-merge authority) already
     establishes and continues to establish unchanged.
+  - |-
+    THIS SESSION (round 22) — a twenty-second independent Codex review
+    confirmed all other required verification passing (lint, typecheck,
+    build, 649/649 tests at review time, requirement validation, secret
+    scanning) but found ONE remaining P2 finding, one level up from the
+    twenty-first round's fix, in the SAME file's metadata-parsing path:
+    - [P2] "validate lock metadata before using owner PID":
+      `runtime/cache/file-lock.ts`'s `readLockMeta()` cast
+      `JSON.parse()`'s result directly as `LockMeta` with no runtime
+      validation. Codex reproduced that syntactically valid JSON with
+      structurally malformed ownership fields (`{}`, or
+      `{"pid":"123"}`) reached `isProcessAlive(pid)` with an invalid
+      PID, whose resulting unexpected (non-ESRCH) error was interpreted
+      by the existing, intentionally-conservative liveness check as
+      "confirmed alive" — permanently blocking the documented
+      UNKNOWN-owner recovery policy (confirmed concretely with
+      `staleMs: 1`: acquisition always timed out instead of recovering
+      an abandoned lock). Fixed: added `isValidLockMeta()`, a runtime
+      structural validator (non-null non-array object; `pid` a finite
+      integer greater than zero; `token` a non-empty string;
+      `acquiredAt` a finite number); `readLockMeta()` now returns
+      `undefined` — the same signal already used for unreadable/corrupt
+      metadata — whenever validation fails, routing malformed metadata
+      into the existing bounded UNKNOWN-owner `mtime`-based fallback
+      instead of a false CONFIRMED-LIVE result. Fifteen new deterministic
+      regression tests added in a new file,
+      `runtime/cache/__tests__/file-lock.test.ts` (unit-level, real
+      on-disk lock directories with hand-fabricated `owner.json`
+      content, driven through the public `acquireFileLock()` API): ten
+      malformed-metadata variants, a not-yet-aged case, a
+      deadline-not-bypassed case, live-owner and dead-owner protection
+      cases, and a cross-lock isolation case. Verified via a temporary
+      bypass restoring the old blind-cast behavior — 6 of the 15 new
+      tests genuinely failed with the predicted timeout-instead-of-
+      recovery symptom, the remaining 9 unaffected by construction
+      (either `process.kill()` happens to throw ESRCH for those
+      particular malformed values regardless of validation, or they
+      exercise already-correct paths this round did not change) — then
+      fully reverted, all 15 re-confirmed passing. A targeted audit of
+      the metadata parsing/liveness/recovery path confirmed
+      `readLockMeta()` is the ONLY place parsed JSON is cast to
+      `LockMeta`, `isProcessAlive()` has exactly one call site fed by
+      its now-validated result, and every other `readLockMeta()`
+      consumer already used safe optional chaining — no other genuine
+      instance of this root class found.
+  - >-
+    Requirement registry updated from this round's real evidence:
+    UASF-REQ-0036 (Cache / reuse layer — added
+    `runtime/cache/__tests__/file-lock.test.ts` to `test_refs`, appended
+    the metadata-validation fix note). No status field was raised on any
+    requirement beyond what real evidence supports.
+  - >-
+    Re-ran the full required sequence: lint, typecheck, a real
+    `rm -rf dist && npm run build`, 667/667 tests (652 + 15 new),
+    validate:requirements (42 schema-valid records), history-aware
+    secret-scan (PASS), Factory Doctor (READY on all checks), all 9 P0
+    proofs (13 assertions) — all clean, stable across repeated runs, no
+    orphaned processes.
 
 known_limitations:
   - >-
@@ -3371,6 +3494,38 @@ blockers:
     re-review of this fix. Per explicit instruction, this round does not
     merge, does not move to P1, and does not declare P0 complete.
 
+    STILL BLOCKED — P0 BLOCKED_PENDING_REVIEW (round 22). A twenty-second
+    independent Codex review confirmed all other required verification
+    passing (lint, typecheck, build, 649/649 tests at review time,
+    requirement validation, secret scanning) but found ONE remaining P2
+    finding, one level up from the twenty-first round's fix, in the SAME
+    file's metadata-parsing path: "validate lock metadata before using
+    owner PID". `runtime/cache/file-lock.ts`'s `readLockMeta()` cast
+    `JSON.parse()`'s result directly as `LockMeta` with no runtime
+    validation — syntactically valid JSON with structurally malformed
+    ownership fields (`{}`, or `{"pid":"123"}`) reached
+    `isProcessAlive(pid)` with an invalid PID, whose resulting
+    unexpected error was interpreted by the existing conservative
+    liveness check as "confirmed alive," permanently blocking the
+    documented UNKNOWN-owner recovery policy (Codex confirmed with
+    `staleMs: 1`: acquisition always timed out instead of recovering).
+    Fixed this session: added `isValidLockMeta()`, a runtime structural
+    validator (pid must be a finite integer > 0; token a non-empty
+    string; acquiredAt a finite number); `readLockMeta()` now returns
+    `undefined` on any validation failure, routing malformed metadata
+    into the existing bounded UNKNOWN-owner fallback instead of a false
+    CONFIRMED-LIVE result. Fifteen new deterministic regression tests
+    added in `runtime/cache/__tests__/file-lock.test.ts`, verified via a
+    temporary bypass (6 of 15 tests genuinely failed with the predicted
+    symptom, the rest unaffected by construction), then fully reverted.
+    A targeted audit of the metadata parsing/liveness/recovery path
+    found no other genuine instance of this root class. Tested
+    (667/667 tests, +15 net new) and verified per the full required
+    sequence — see completed_milestones for full detail. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next independent (P0 closure)
+    review. Per explicit instruction, this round does not merge, does
+    not move to P1, and does not declare P0 complete.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -3387,6 +3542,63 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 22). A
+  twenty-second independent Codex review confirmed all other required
+  verification passing (lint, typecheck, build, 649/649 tests at review
+  time, requirement validation, secret scanning) but found ONE remaining
+  P2 finding, one level up from the twenty-first round's fix, in the
+  SAME file's metadata-parsing path: "validate lock metadata before
+  using owner PID". `runtime/cache/file-lock.ts`'s `readLockMeta()` cast
+  `JSON.parse()`'s result directly as `LockMeta` with no runtime
+  validation — syntactically valid JSON with structurally malformed
+  ownership fields (`{}`, or `{"pid":"123"}`) reached
+  `isProcessAlive(pid)` with an invalid PID, whose resulting unexpected
+  (non-ESRCH) error was interpreted by the existing conservative
+  liveness check as "confirmed alive," permanently blocking the
+  documented UNKNOWN-owner recovery policy (Codex confirmed with
+  `staleMs: 1`: acquisition always timed out instead of recovering an
+  abandoned lock). Fixed this session: added `isValidLockMeta()`, a
+  runtime structural validator (`pid` a finite integer greater than
+  zero; `token` a non-empty string; `acquiredAt` a finite number);
+  `readLockMeta()` now returns `undefined` on any validation failure,
+  routing malformed metadata into the existing bounded UNKNOWN-owner
+  `mtime`-based fallback instead of a false CONFIRMED-LIVE result.
+  Fifteen new deterministic regression tests added in a new file,
+  `runtime/cache/__tests__/file-lock.test.ts` (unit-level, real on-disk
+  lock directories, driven through the public `acquireFileLock()` API):
+  ten malformed-metadata variants, a not-yet-aged case, a
+  deadline-not-bypassed case, live-owner and dead-owner protection
+  cases, and a cross-lock isolation case. Verified via a temporary
+  bypass restoring the old blind-cast behavior — 6 of the 15 new tests
+  genuinely failed with the predicted timeout-instead-of-recovery
+  symptom, the remaining 9 unaffected by construction (either
+  `process.kill()` happens to throw ESRCH for those particular
+  malformed values regardless of validation, or they exercise
+  already-correct paths this round did not change) — then fully
+  reverted, all 15 re-confirmed passing. A targeted audit of the
+  metadata parsing/liveness/recovery path found no other genuine
+  instance of this root class. Full required verification (lint,
+  typecheck, a real `rm -rf dist && npm run build`, 667/667 tests,
+  `validate:requirements`, `secret-scan`, Factory Doctor, all 9 P0
+  proofs) was re-run clean on this fix before this record was written —
+  see `completed_milestones`'s round-22 entry and the
+  `p0_status`/`blockers` narrative fields above for full detail, and
+  `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0036)
+  for the updated requirement evidence. Per explicit instruction: this
+  session did NOT merge, did NOT move to P1, and did NOT declare P0
+  complete. The fix is committed and pushed to
+  `claude/ai-factory-baseline-v1-seawq7`. A future session's next
+  action is to WAIT for the next independent (P0 closure) review; only
+  a CLEAN result from that review may close P0. If that review instead
+  finds a new genuine defect, repeat this same fix -> test -> targeted
+  audit -> full verification -> honest state update -> commit/push ->
+  STOP cycle for that new finding, on this same branch. Do not create a
+  new branch, do not merge, and do not begin P1 absent a fresh, explicit
+  Founder instruction to do so (see `governance_decision_recorded`
+  above, which is unchanged by this round).
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS REOPENED — BLOCKED_PENDING_REVIEW (this session, round 21). A
   twenty-first independent Codex review found ONE real P2 blocker after
   the twentieth round's CLEAN result, so that CLEAN result is no longer

@@ -97,9 +97,59 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+/**
+ * P2 fix (22nd independent review round, "validate lock metadata before
+ * using owner PID"): eskiden `readLockMeta`, `JSON.parse`'ın sonucunu
+ * DOĞRUDAN `LockMeta` olarak KÖRÜ KÖRÜNE cast ediyordu (`as LockMeta`) —
+ * TypeScript'in bu cast'i çalışma zamanında (runtime) DOĞRULAMADIĞINI
+ * unutarak. Codex, sözdizimsel olarak GEÇERLİ JSON'un (`{}`, ya da
+ * `{"pid":"123"}` gibi) YANLIŞ biçimli sahiplik metadata'sı taşıyabildiğini
+ * ve bunun `isLockStale`'e kadar hiç yakalanmadan ulaştığını gösterdi:
+ * `meta.pid` (ör. `undefined` ya da `"123"` bir STRING) doğrudan
+ * `isProcessAlive(pid)`'e geçiyor, `process.kill(pid, 0)` bu geçersiz PID
+ * için (ESRCH DIŞINDA) beklenmeyen bir hata fırlatıyor, ve `isProcessAlive`
+ * bu hatayı "muhafazakâr olarak CANLI" sayıyordu — YANLIŞ BİÇİMLİ metadata,
+ * SAHTE bir "onaylanmış CANLI sahip" sonucuna dönüşüyor, kilit ASLA
+ * BİLİNMEYEN-sahip kurtarma politikasına girmiyor, ve otomatik kurtarma
+ * KALICI olarak engellenebiliyordu (Codex, `staleMs=1` ile bile
+ * `acquireFileLock`'ın sonsuza dek zaman aşımına uğradığını, terk edilmiş
+ * kilidi HİÇBİR ZAMAN kurtaramadığını doğruladı).
+ *
+ * Gereken değişmez: metadata, SADECE geçerli JSON olduğu için ASLA
+ * güvenilmemelidir — bir PID/canlılık kararı verilmeden ÖNCE sahiplik
+ * metadata'sının YAPISAL olarak geçerli olduğu doğrulanmalıdır. Fixed:
+ * `isValidLockMeta` artık her alanı açıkça doğrular (nesne midir, null/dizi
+ * değil midir, `pid` sonlu bir TAM SAYI mıdır ve sıfırdan büyük müdür,
+ * `token` boş olmayan bir string midir, `acquiredAt` sonlu bir sayı mıdır)
+ * — bu doğrulamalardan HERHANGİ biri başarısız olursa `readLockMeta`
+ * `undefined` döndürür, TIPKI okunamayan/bozuk metadata gibi. Bu, TEK bir
+ * güven sınırında (bu fonksiyon) uygulandığından, `isLockStale` (ve onun
+ * üzerinden `tryReclaimStaleLock`/`acquireReclaimGate`/`releaseFileLock`)
+ * otomatik olarak doğru şekilde davranır: yapısal olarak geçersiz
+ * metadata `meta` alanını `undefined` görür ve ZATEN VAR OLAN, BELGELENMİŞ
+ * BİLİNMEYEN-sahip `mtime`-tabanlı SINIRLI kurtarma yoluna düşer — ne
+ * "onaylanmış CANLI" sayılır (kilit sonsuza dek korunmaz), ne de anında
+ * koşulsuz silinir (mevcut yaş/sınır kuralları hâlâ geçerlidir).
+ */
+function isValidLockMeta(value: unknown): value is LockMeta {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.pid === "number" &&
+    Number.isInteger(candidate.pid) &&
+    Number.isFinite(candidate.pid) &&
+    candidate.pid > 0 &&
+    typeof candidate.token === "string" &&
+    candidate.token.length > 0 &&
+    typeof candidate.acquiredAt === "number" &&
+    Number.isFinite(candidate.acquiredAt)
+  );
+}
+
 function readLockMeta(metaPath: string): LockMeta | undefined {
   try {
-    return JSON.parse(readFileSync(metaPath, "utf8")) as LockMeta;
+    const parsed: unknown = JSON.parse(readFileSync(metaPath, "utf8"));
+    return isValidLockMeta(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
