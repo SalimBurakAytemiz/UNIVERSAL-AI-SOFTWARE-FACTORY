@@ -481,6 +481,88 @@ factory:
     independent review — the nineteenth review's own framing calls this
     the P0 closure re-review. P0 remains open.
 
+    FORMAL P0 CLOSURE (this session, on top of commit e1b440f): the
+    twentieth independent Codex review returned
+    INDEPENDENT_REVIEW_RESULT: CLEAN, stating "No actionable defects were
+    identified within the documented P0 scope." This result and quote
+    are RECORDED here as relayed/reported by that review process — the
+    same evidentiary basis every review finding in every prior round of
+    this file was recorded under (this session has never had direct
+    access to the independent Codex reviewer itself; every one of the
+    twenty rounds above was resolved from the review content as reported
+    into this session). What IS independently, directly re-verified by
+    this session itself, on the same commit, before writing this closure
+    record: `npm run lint` (PASS), `npm run typecheck` (PASS), a real
+    `rm -rf dist && npm run build` (PASS), `npm test` (649/649 PASS,
+    exactly matching the reported count), `npm run validate:requirements`
+    (PASS, 42 schema-valid records), `npm run secret-scan` (PASS against
+    this repository's actual current tree and full git history), Factory
+    Doctor (READY on all checks), and all 9 P0 proofs (13 assertions,
+    PASS) — see `p0_closure_record` below for the structured form of this
+    evidence. P0 is now CLOSED per this independent CLEAN result plus
+    this session's own direct re-verification of every check that can be
+    directly re-verified. This closure record does NOT retroactively
+    upgrade any individual UASF-REQ-#### requirement's `status` field
+    beyond what its own existing implementation_refs/test_refs/proof_refs
+    already evidence — no requirement was touched by this closure pass
+    (baseline section 294, "no unsupported upgrades", continues to apply
+    per-requirement exactly as it did in every prior round). Known,
+    previously-documented limitations (see `known_limitations` below)
+    are NOT erased or reduced by this closure — they remain accurate,
+    honest scope boundaries of what P0 delivers, not defects the
+    twentieth review was assessing against a wider scope. Per explicit
+    instruction accompanying this closure: P1 implementation has NOT
+    begun, the architecture baseline tag has NOT been moved, and this
+    branch has NOT been merged to main by this session (repository
+    governance for an actual merge has not been separately authorized
+    here; see `governance_decision_recorded` below, which remains
+    unchanged and still applies to autonomous-merge authority
+    specifically). MERGE_READINESS is recorded as READY_FOR_MAIN_MERGE
+    (a status, not an action) — actually merging remains a decision for
+    the Human Founder or an explicitly authorized future instruction.
+
+# Structured closure record (baseline section 277, durable evidence).
+# This is the machine-checkable counterpart to the `p0_status` narrative
+# above — see that field for the full reasoning and caveats. Nothing here
+# upgrades any individual UASF-REQ requirement's own status; see
+# specification/requirements/P0-factory-kernel.yml for those.
+p0_closure_record:
+  p0_status: CLOSED
+  final_reviewed_branch: claude/ai-factory-baseline-v1-seawq7
+  final_implementation_commit: e1b440fd007b7eeb0c1eae13f1d3e8342c5466aa
+  independent_review_result: CLEAN
+  independent_review_statement: >-
+    No actionable defects were identified within the documented P0 scope.
+  independent_review_evidentiary_note: >-
+    This result is recorded as reported into this session by the
+    independent Codex review process, on the same basis every prior
+    round's review findings in this file were recorded — this session
+    has no direct channel to the reviewer itself. The verified_checks
+    below, by contrast, were each independently re-run and observed
+    directly by this session on final_implementation_commit before this
+    record was written.
+  verified_checks:
+    lint: PASS
+    typecheck: PASS
+    build: PASS
+    tests: "649/649 PASS"
+    validate_requirements: "PASS (42 schema-valid requirement records)"
+    secret_scan: "PASS (current tree + full git history)"
+    factory_doctor: "READY (Node.js, npm, Python, Git, Docker)"
+    p0_proofs: "PASS (9 proof files, 13 assertions)"
+  known_limitations_carried_forward: >-
+    Unchanged and unreduced by this closure — see the `known_limitations`
+    list below for the full, honest set of documented P0 scope
+    boundaries (e.g. only one integrated pipeline wired end-to-end;
+    JSON-file persistence rather than SQLite; MockProvider only, no real
+    model adapters; no agent-identity concept in the invocation path;
+    no LICENSE file yet).
+  next_lifecycle_state: READY_FOR_MAIN_MERGE
+  next_implementation_phase: "P1, NOT_STARTED"
+  merge_performed_by_this_session: false
+  p1_started_by_this_session: false
+  architecture_baseline_tag_moved: false
+
 completed_milestones:
   - Existing public repository audited; Baseline V1 specification preserved
     verbatim; annotated tag architecture-baseline-v1 pushed by the Founder
@@ -2702,6 +2784,36 @@ completed_milestones:
     tests (647 + 2 new), validate:requirements, history-aware secret-scan
     (PASS), Factory Doctor (READY on all checks), all 9 P0 proofs (13
     assertions) — all clean.
+  - |-
+    FORMAL P0 CLOSURE (this session, on top of commit e1b440f): the
+    twentieth independent Codex review returned
+    INDEPENDENT_REVIEW_RESULT: CLEAN ("No actionable defects were
+    identified within the documented P0 scope"). This session
+    independently re-ran and directly observed every check that can be
+    directly re-verified on that same commit before writing this closure
+    record — lint, typecheck, a real `rm -rf dist && npm run build`,
+    649/649 tests (exactly matching the reported count), requirement
+    validation (42 schema-valid records), a genuine secret-scan PASS
+    against this repository's real current tree and full git history,
+    Factory Doctor READY, and all 9 P0 proofs (13 assertions) — see the
+    new structured `p0_closure_record` (top-level key, alongside
+    `factory`) for the machine-checkable form of this evidence. No
+    individual UASF-REQ requirement's `status` field was upgraded by
+    this pass — each already carries its own evidence-based status from
+    the round that last touched it, and this closure record does not
+    retroactively claim more than that per-requirement evidence supports
+    (baseline section 294). `known_limitations` below is preserved
+    exactly, unreduced — closing P0 does not mean these documented scope
+    boundaries have disappeared, only that no BLOCKING defect remains
+    within P0's own documented scope. Per the explicit instruction
+    accompanying this closure: P1 has NOT been started, the architecture
+    baseline tag has NOT been moved, and this branch has NOT been merged
+    to main by this session — `next_lifecycle_state: READY_FOR_MAIN_MERGE`
+    in `p0_closure_record` is a recorded STATUS, not an action taken;
+    actually merging remains a decision for the Human Founder or an
+    explicitly authorized future instruction, exactly as the existing
+    `governance_decision_recorded` (autonomous-merge authority) already
+    establishes and continues to establish unchanged.
 
 known_limitations:
   - >-
@@ -3045,6 +3157,21 @@ blockers:
     work, and do not declare P0 complete, until that re-review confirms
     no blocking finding remains.
 
+    RESOLVED — P0 CLOSED. The TWENTIETH independent Codex review
+    returned INDEPENDENT_REVIEW_RESULT: CLEAN ("No actionable defects
+    were identified within the documented P0 scope"), on top of commit
+    e1b440f. This session independently re-verified every directly-
+    re-checkable item on that same commit (lint, typecheck, build,
+    649/649 tests, requirement validation, secret-scan, Factory Doctor,
+    all 9 P0 proofs — all PASS) before recording formal closure; see the
+    structured `p0_closure_record` (top-level key) and the `p0_status`
+    closure paragraph above for full detail. This is the last entry in
+    this blockers log for the P0 phase: there is no twenty-first review
+    being awaited, and no further P0 blocking work is outstanding.
+    Per explicit instruction, this closure is bookkeeping/evidence-only:
+    P1 has NOT been started, the architecture baseline tag has NOT been
+    moved, and this branch has NOT been merged to main by this session.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -3061,6 +3188,45 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS FORMALLY CLOSED (this session). The twentieth independent Codex
+  review returned INDEPENDENT_REVIEW_RESULT: CLEAN ("No actionable
+  defects were identified within the documented P0 scope") on top of
+  commit e1b440fd007b7eeb0c1eae13f1d3e8342c5466aa on
+  claude/ai-factory-baseline-v1-seawq7. This session independently
+  re-ran and directly observed every directly-re-checkable item on that
+  same commit before recording closure: lint PASS, typecheck PASS, a
+  real `rm -rf dist && npm run build` PASS, 649/649 tests PASS (exactly
+  matching the reported count), `npm run validate:requirements` PASS (42
+  schema-valid records), `npm run secret-scan` PASS (against this
+  repository's real current tree and full git history), Factory Doctor
+  READY, and all 9 P0 proofs PASS. See `p0_closure_record` (top-level
+  key) for the structured evidence, and the `p0_status`/`blockers`
+  closure paragraphs above for the full narrative. No individual
+  UASF-REQ requirement's `status` was upgraded by this closure pass — it
+  is a bookkeeping/evidence action, not new implementation. Documented
+  `known_limitations` are preserved exactly, unreduced.
+
+  Per the explicit instruction accompanying this closure: this session
+  did NOT begin P1, did NOT move the architecture-baseline-v1 tag, and
+  did NOT merge this branch to main. `next_lifecycle_state` is recorded
+  as READY_FOR_MAIN_MERGE and `next_implementation_phase` as "P1,
+  NOT_STARTED" — both are recorded STATUSES, not actions taken. The
+  standing `governance_decision_recorded` entry below (autonomous-merge
+  authority declined three times, absent a fresh, explicit Founder-
+  initiated request) is UNCHANGED and continues to govern: a future
+  session must not merge to main, move the baseline tag, or begin P1
+  implementation without a fresh, explicit instruction from the Human
+  Founder authorizing that specific next step. If/when such an
+  instruction arrives, the natural next actions (in the order the
+  Founder chooses) are: (a) merge claude/ai-factory-baseline-v1-seawq7
+  to main, and/or (b) begin P1 per baseline section 304's phased plan,
+  starting from a fresh assessment of what P1 scope the Founder wants
+  first — do not assume the prior exact_next_action's P1-adjacent notes
+  below (wiring remaining foundation modules, SQLite, licensing) are
+  still the Founder's priority without confirming.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   STOP at the independent-review boundary, per explicit instruction: the
   fix for the nineteenth independent Codex review's ONE remaining P2
   finding is implemented, tested, and pushed to

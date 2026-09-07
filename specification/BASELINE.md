@@ -35,8 +35,17 @@ being declared complete:
 - **P0 — Factory Kernel**: baseline preservation, requirement registry, CLI,
   schemas, Model Gateway + MockProvider + cheapest-capable-model routing,
   Cost Engine + budgets, Policy Engine, cache/reuse layer, durable state,
-  Factory Doctor, baseline status reporting. *In progress — see CHANGELOG.md
-  and `specification/requirements/` for current, honestly-scoped status.*
+  Factory Doctor, baseline status reporting. *CLOSED — passed its twentieth
+  independent (Codex) closure review with INDEPENDENT_REVIEW_RESULT: CLEAN
+  on branch `claude/ai-factory-baseline-v1-seawq7`, commit `e1b440f`. See
+  `project-state/current.yml`'s `p0_closure_record` for the structured
+  evidence (lint/typecheck/build/649 tests/requirement validation/secret
+  scan/Factory Doctor/proofs, all independently re-verified) and
+  `specification/requirements/` for the per-requirement status this
+  closure did not retroactively alter. Closure is a scope/evidence
+  statement for P0 only, not a claim that main has been merged or that P1
+  has begun — see `project-state/current.yml` for current merge/P1
+  status.*
 - **P1 — General software/business platform**: not started.
 - **P2 — Digital production (games, 3D, AI/ML, data, GPU)**: not started.
 - **P3 — Universal/advanced operations**: not started.
