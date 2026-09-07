@@ -887,6 +887,53 @@ factory:
     NOT declare P0 complete. P0 remains BLOCKED_PENDING_REVIEW, awaiting
     the next independent (P0 closure) review.
 
+    Round 26 (Founder-forwarded independent Codex review, consolidated closure batch, 7 findings — 4 P1, 3 P2):
+    (1) `ajv`/`js-yaml` lived under `devDependencies` even though runtime code imports both directly
+    (`project-genome/genome.ts`, `cli/commands/baseline-status.ts`) — `npm ci --omit=dev` (real production
+    install) stripped them, and the compiled CLI would crash with `MODULE_NOT_FOUND`; moved both to a new
+    `dependencies` block, regenerated package-lock.json, and added `scripts/verify-production-install.mjs`
+    (`npm run verify:production-install`) — a genuine proof that copies the built `dist/` output into an
+    isolated directory, runs a real `npm ci --omit=dev`, and actually RUNS the compiled CLI's baseline status
+    (js-yaml) and the ajv-backed genome validator (accept + reject) against that production-only install. (2)
+    `CostEngine`'s `#entries`/`#reservations`/`#reservationSeq` still used TypeScript's compile-time-only
+    `private` — converted to genuine ECMAScript private fields, same pattern as `audit-log.ts`. (3)
+    `getReservation()` publicly returned a reservation's `scope` — the exact material the ownership check
+    compares against — letting an attacker use it as reconnaissance to forge a passing `callerScope`; a second
+    channel (`ReservationOwnershipMismatchError`'s message) disclosed the same data. Fixed: `getReservation()`
+    now returns a `scope`-omitting `ReservationView`; the error message no longer discloses the true scope
+    (still recoverable by a legitimate reviewer via the `BUDGET_RESERVATION_CREATED` audit event, a separate,
+    `#private`-protected channel never returned to the caller). (4) `PolicyEngine.evaluate()` never validated
+    `action.risk` before rules ran — `risk: -1` satisfied a low-risk ALLOW rule's `<=` comparison; added
+    `assertValidRiskLevel()` as the first statement in `evaluate()`, rejecting anything but an integer 0-5
+    inclusive, fail closed. (5) `ProjectIsolationStore.viewFor().set()` stored the caller's mutable object
+    reference directly — the same object stored under two projects (or mutated after storing) silently crossed
+    the isolation boundary; fixed with `deepFreezeClone()` (structuredClone + recursive freeze), the same
+    primitive `audit-log.ts` uses. (6) `decision-ledger.ts`'s persisted-state validation checked "SUPERSEDED
+    requires supersededBy" but never the symmetric "ACTIVE must NOT carry supersededBy" — added the reverse
+    check, since `supersede()` only ever sets both fields together. (7) `Cache.get()`/`FileCache.get()` (both
+    its initial check and its lock-protected re-check) compared expiry with strict `<`, letting an entry read
+    back exactly `now === expiresAt` (including `ttlMs: 0` in the same millisecond) serve one more time; fixed
+    to `now >= expiresAt` in all three locations. A narrow, explicitly-scoped audit of exactly these seven root
+    classes found four further genuine "TypeScript-private authoritative mutable state" instances directly
+    analogous to finding 2 — `TechnologyRegistry`'s `#technologies` (governs the FORBIDDEN/DEPRECATED
+    non-reversal guarantee), `ArtifactRegistry`'s `#artifacts` (governs "no claim without evidence" evidence
+    integrity), `PolicyEngine`'s `#rules` (the entire default-deny enforcement surface itself), and
+    `ProjectIsolationStore`'s `#data` (the isolation boundary this class exists to enforce) — all four converted
+    the same way, with matching regression tests. All seven findings plus the four audit-discovered instances
+    carry deterministic regression tests (61 net new, 825 -> 886 total), and every fix was verified via a
+    temporary in-place bypass reproducing the exact predicted failure, then fully reverted (confirmed via grep/
+    diff for every touched file). Two candidate "same root class" instances were investigated and deliberately
+    NOT changed, with reasoning recorded in this round's commit: `runtime/models/router.ts`'s
+    `minTierForRisk()` has the same structural risk-validation gap as finding 4, but every reachable call site
+    either passes a hardcoded literal risk or routes through `gateway.invoke()` -> `policy.evaluate()`, which
+    (post-fix-4) already rejects an invalid risk before any model executes — no live exploitable path exists
+    today, so no redundant defense-in-depth was added; `runtime/cache/file-lock.ts`'s staleness-age comparisons
+    (a deliberately different, already-multi-round-hardened domain: erring toward "not yet stale" at the
+    boundary is the conservative direction for RECLAIMING a lock, the opposite of cache-TTL's "expire at the
+    deadline" direction) were left untouched as a different, correctly-reasoned design, not an oversight. Per
+    explicit instruction, this round does NOT merge, does NOT move to P1, and does NOT declare P0 complete. P0
+    remains BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4070,6 +4117,36 @@ blockers:
     independent (P0 closure) review. Per explicit instruction, this round
     does not merge, does not move to P1, and does not declare P0
     complete.
+  - >-
+    Awaiting a 27th independent (Codex) re-review of the pushed fixes — round 26 (Founder-forwarded consolidated
+    closure batch) found 7 NEW findings (4 P1, 3 P2): runtime dependencies (`ajv`/`js-yaml`) misplaced under
+    devDependencies, breaking a real `npm ci --omit=dev` production install; `CostEngine`'s ledger state
+    (`entries`/`reservations`/`reservationSeq`) still TypeScript-`private`-only; `getReservation()` publicly
+    leaking forgeable reservation-ownership evidence (plus a matching leak in the mismatch error message);
+    `PolicyEngine.evaluate()` never validating `risk` before rule evaluation, letting an invalid value (e.g.
+    `-1`) satisfy a low-risk ALLOW rule; `ProjectIsolationStore.viewFor().set()` storing caller-owned mutable
+    object references directly, letting a mutation cross the project-isolation boundary; `decision-ledger.ts`'s
+    persisted-state validation missing the symmetric "ACTIVE must not carry supersededBy" check; and
+    `Cache`/`FileCache`'s expiry comparison using strict `<` instead of `>=`, serving one stale read exactly at
+    the expiry deadline (including `ttlMs: 0`). All seven fixed, tested, and verified per the full required
+    sequence: lint, typecheck, build, 886/886 tests, validate:requirements, history-aware secret-scan, all 9 P0
+    proofs, and a new genuine production-install proof (`npm run verify:production-install`, not merely a
+    static devDependencies check). All seven root causes, fixes, and regression evidence are detailed in
+    `completed_milestones`'s round-26 entries and the per-requirement notes in
+    `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0010, 0014, 0018, 0023, 0029, 0034, 0036,
+    0040). A narrow, explicitly-scoped audit of exactly these seven root classes found four further genuine
+    instances of finding 2's exact class (TypeScript-`private`-only authoritative mutable state) in
+    `technology-registry/registry.ts`, `artifacts/artifact-registry.ts`, `policy-engine/policy-engine.ts`
+    (`#rules` — the entire default-deny enforcement surface), and `project-isolation/isolation.ts` (`#data` —
+    the isolation boundary itself) — all four converted the same way, found and fixed proactively during that
+    same audit, same as round 25's precedent. Two candidate instances of OTHER finding root classes were
+    investigated and deliberately left unchanged with recorded reasoning (see this round's `p0_status` entry):
+    `router.ts`'s `minTierForRisk()` (no live exploitable path — `gateway.invoke()` already rejects invalid risk
+    downstream) and `file-lock.ts`'s staleness-age comparisons (a deliberately different, correctly-conservative
+    domain, not the same bug). Tested (886/886 tests, +61 net new) and verified per the full required sequence.
+    P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit
+    instruction, this round does not merge, does not move to P1, does not declare P0 complete, and does not
+    invoke Codex itself.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -4087,6 +4164,81 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 26). A fresh,
+  independent Codex review of the complete branch (forwarded by the
+  Founder) found SEVEN actionable findings (4 priority-P1, 3 priority-P2)
+  and required them fixed as ONE consolidated closure batch: (1)
+  `package.json` had `ajv`/`js-yaml` under `devDependencies` even though
+  runtime code (`project-genome/genome.ts`, `cli/commands/baseline-
+  status.ts`) imports both directly — `npm ci --omit=dev` stripped them,
+  crashing the compiled CLI — fixed by moving both to a new `dependencies`
+  block, regenerating package-lock.json, and adding a genuine proof
+  (`scripts/verify-production-install.mjs`, `npm run
+  verify:production-install`) that runs a real `npm ci --omit=dev` in an
+  isolated directory and actually executes the compiled CLI/ajv-backed
+  validator against it, not merely a static devDependencies check; (2)
+  `CostEngine`'s `#entries`/`#reservations`/`#reservationSeq` still used
+  TypeScript's compile-time-only `private` — fixed with genuine ECMAScript
+  private fields, same pattern as `audit-log.ts`; (3) `getReservation()`
+  publicly returned a reservation's `scope` — the exact material the
+  ownership check compares against, usable as reconnaissance to forge a
+  passing `callerScope` — fixed by returning a `scope`-omitting
+  `ReservationView` and redacting the same data from
+  `ReservationOwnershipMismatchError`'s message (still recoverable by a
+  legitimate reviewer via the separate, `#private`-protected
+  `BUDGET_RESERVATION_CREATED` audit event); (4) `PolicyEngine.evaluate()`
+  never validated `action.risk` before any rule ran — `risk: -1` satisfied
+  a low-risk ALLOW rule's `<=` comparison — fixed with
+  `assertValidRiskLevel()` as the first statement in `evaluate()`,
+  rejecting anything but an integer 0-5 inclusive, fail closed; (5)
+  `ProjectIsolationStore.viewFor().set()` stored the caller's mutable
+  object reference directly, letting a mutation cross the project-
+  isolation boundary — fixed with `deepFreezeClone()` (the same primitive
+  `audit-log.ts` uses); (6) `decision-ledger.ts`'s persisted-state
+  validation checked "SUPERSEDED requires supersededBy" but never the
+  symmetric "ACTIVE must not carry supersededBy" — fixed by adding the
+  reverse check, since `supersede()` only ever sets both fields together;
+  (7) `Cache`/`FileCache`'s expiry check compared with strict `<`,
+  serving one stale read exactly at `now === expiresAt` (including
+  `ttlMs: 0` in the same millisecond) — fixed to `now >= expiresAt` in
+  all three affected locations (cache.ts's one check, file-cache.ts's
+  two). All seven fixes carry deterministic regression tests (61 net new,
+  825 -> 886 total), and every fix was verified via a temporary in-place
+  bypass reproducing the exact predicted failure, then fully reverted
+  (confirmed via grep/diff for every touched file). A narrow,
+  explicitly-scoped audit of exactly these seven root classes found four
+  further genuine instances of finding 2's exact class
+  (TypeScript-`private`-only authoritative mutable state) in
+  `technology-registry/registry.ts` (`#technologies`, governing the
+  FORBIDDEN/DEPRECATED non-reversal guarantee), `artifacts/artifact-
+  registry.ts` (`#artifacts`, governing evidence integrity),
+  `policy-engine/policy-engine.ts` (`#rules`, the entire default-deny
+  enforcement surface), and `project-isolation/isolation.ts` (`#data`,
+  the isolation boundary itself) — all four converted the same way, found
+  and fixed proactively during that same audit, same as round 25's
+  precedent. Two candidate instances of other root classes were
+  investigated and deliberately left unchanged, with reasoning recorded:
+  `router.ts`'s `minTierForRisk()` has the same structural gap as finding
+  4, but no live exploitable path exists today (every reachable call site
+  either passes a hardcoded risk or routes through `gateway.invoke()` ->
+  `policy.evaluate()`, which post-fix-4 already rejects invalid risk
+  first); `file-lock.ts`'s staleness-age comparisons are a deliberately
+  different, already-multi-round-hardened domain (erring toward "not yet
+  stale" at the boundary is the conservative direction for RECLAIMING a
+  lock — the opposite of cache-TTL's "expire at the deadline" direction),
+  not the same bug. Requirement registry updated (UASF-REQ-0010, 0014,
+  0018, 0023, 0029, 0034, 0036, 0040) from real evidence only; no status
+  raised beyond what evidence supports. Full verification suite re-run
+  and green: lint, typecheck, build, 886/886 tests, validate:requirements
+  (42 records), history-and-current-tree-aware secret-scan (PASS), the
+  new production-install proof (PASS), Factory Doctor (READY), all 9 P0
+  proofs (13 assertions). Per explicit instruction: this session does NOT
+  merge, does NOT move to P1, does NOT declare P0 complete, and does NOT
+  invoke Codex itself. P0 remains BLOCKED_PENDING_REVIEW awaiting the
+  next independent review to return INDEPENDENT_REVIEW_RESULT: CLEAN.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 25). A fresh,
   independent Codex review of the complete branch found TEN actionable
   P1 findings and required them fixed as ONE consolidated closure batch:

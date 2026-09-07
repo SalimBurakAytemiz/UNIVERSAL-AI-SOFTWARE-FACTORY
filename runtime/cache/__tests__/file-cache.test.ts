@@ -203,4 +203,78 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       expect(computeOnce).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe(
+    "P2 fix (26th independent review round, finding 7, 'cache must expire at the deadline'): identical >= boundary " +
+      "semantics as cache.ts's Cache.get(), applied to BOTH FileCache.get()'s initial check and its lock-protected " +
+      "re-check",
+    () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it("now < expiresAt: the durable entry is still valid", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-expiry-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        cache.set("k", "v", 100); // expiresAt = 1_000_100
+        vi.setSystemTime(1_000_099);
+        expect(cache.get("k")).toBe("v");
+      });
+
+      it("BLOCKER regression, exact reproduction: now === expiresAt is expired, not one more valid read", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-expiry-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        cache.set("k", "v", 100); // expiresAt = 1_000_100
+        vi.setSystemTime(1_000_100); // exactly the deadline
+        expect(cache.get("k")).toBeUndefined();
+      });
+
+      it("now > expiresAt: the durable entry is expired", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-expiry-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        cache.set("k", "v", 100);
+        vi.setSystemTime(1_000_101);
+        expect(cache.get("k")).toBeUndefined();
+      });
+
+      it("ttlMs: 0 never survives its own expiration boundary, even read back at the exact same instant it was set", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-expiry-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        vi.useFakeTimers();
+        vi.setSystemTime(2_000_000);
+        cache.set("k", "v", 0); // expiresAt === computedAt === now
+        expect(cache.get("k")).toBeUndefined();
+      });
+
+      it("a SECOND, independent FileCache instance sees the same >= boundary on a durably-persisted entry (exercises the lock-protected re-check path, not just the initial in-process check)", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-expiry-cross-"));
+        const path = join(tempRoot, "cache.json");
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        {
+          const processA = new FileCache<string>(new FileStateStore(), path);
+          processA.set("k", "v", 100); // expiresAt = 1_000_100
+        }
+        vi.setSystemTime(1_000_100); // exactly the deadline, from a fresh instance/process
+        const processB = new FileCache<string>(new FileStateStore(), path);
+        expect(processB.get("k")).toBeUndefined();
+      });
+
+      it("size() reflects that a boundary-expired entry is actually deleted from durable storage, not merely hidden from get()", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-expiry-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        cache.set("k", "v", 0);
+        expect(cache.get("k")).toBeUndefined();
+        expect(cache.size()).toBe(0);
+      });
+    }
+  );
 });

@@ -2,6 +2,8 @@
 // Bu depo, birden çok projeyi aynı süreçte barındırabilir; bir projenin
 // kodu/ajanı, başka bir projenin verisine YANLIŞLIKLA bile erişememelidir.
 
+import { deepFreezeClone } from "../util/immutable.js";
+
 /**
  * P1 fix (25th independent review round, "project isolation must use
  * trusted project identity"): the previous API —
@@ -52,7 +54,21 @@ export interface ProjectIsolationView<T> {
 }
 
 export class ProjectIsolationStore<T> {
-  private readonly data = new Map<string, Map<string, T>>();
+  /**
+   * P1 targeted-audit fix (26th independent review round, same root class
+   * as finding 2, "cost ledger state must be runtime-private"): this
+   * Map-of-Maps used to be declared with TypeScript's compile-time-only
+   * `private` — in the emitted JS it is an ordinary, enumerable instance
+   * property. This class's ENTIRE purpose (bölüm 86: "Cross-project:
+   * DEFAULT DENY") is that a view returned by `viewFor()` can reach only
+   * its own bound project's bucket; a caller with `(store as
+   * any).data.get("other-project")` access would defeat that isolation
+   * completely by reading or writing ANY project's bucket directly,
+   * bypassing `viewFor()`'s capability model entirely. A genuine
+   * ECMAScript private field (`#data`) closes this the same way every
+   * other P0 authoritative store's field already does.
+   */
+  #data = new Map<string, Map<string, T>>();
 
   /**
    * `trustedProjectId`, bu depoyu kuran/yönlendiren GÜVENİLİR koddan
@@ -63,13 +79,35 @@ export class ProjectIsolationStore<T> {
    * argüman bile yoktur.
    */
   viewFor(trustedProjectId: string): ProjectIsolationView<T> {
-    const data = this.data;
+    const data = this.#data;
     return {
+      // P2 fix (26th independent review round, finding 5, "detach values
+      // across project isolation views"): `set()` used to store the
+      // caller-supplied `value` REFERENCE directly — if the SAME mutable
+      // object was stored under two different projects (or the caller
+      // simply kept a reference and mutated it afterward), the store's
+      // authoritative bucket for EVERY project holding that reference
+      // changed too, silently breaching isolation without either project
+      // ever explicitly writing to the other's bucket. `deepFreezeClone()`
+      // (bkz. runtime/util/immutable.ts, the SAME primitive `audit-log.ts`
+      // uses for its own "never mutable, from any angle" evidence) takes a
+      // full `structuredClone()`-based deep copy — completely detached from
+      // the caller's own object graph, sharing NO nested object/array
+      // reference — and deep-freezes it before storing. Each project's
+      // `set()` call, even for the identical input value, produces its OWN
+      // independent copy; mutating the caller's original object (or a
+      // value returned by `get()`) afterward can never reach — or be
+      // reached by — another project's stored data.
       set(key: string, value: T): void {
         const bucket = data.get(trustedProjectId) ?? new Map<string, T>();
-        bucket.set(key, value);
+        bucket.set(key, deepFreezeClone(value));
         data.set(trustedProjectId, bucket);
       },
+      // `get()` returns the SAME already-deep-frozen, already-detached
+      // value `set()` stored — no further cloning is needed on read, since
+      // that value can never be mutated (attempting to throws `TypeError`)
+      // and was never shared with any other project's bucket in the first
+      // place.
       get(key: string): T | undefined {
         return data.get(trustedProjectId)?.get(key);
       },

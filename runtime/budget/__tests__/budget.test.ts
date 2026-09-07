@@ -1327,28 +1327,57 @@ describe("BudgetGuard", () => {
         expect(recorded.modelId).toBe("model-1");
       });
 
-      it("the ownership-mismatch audit event identifies the reservation's authoritative owner across ALL dimensions, never the caller's rejected values", () => {
-        const auditLog = new AuditLog();
-        const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 1 }, undefined, auditLog);
-        const reservation = guard.reserve({ taskId: "a", agentId: "owner-agent", provider: "authorized-provider", modelId: "authorized-model" }, 0.5);
+      it(
+        "P1 fix (26th independent review round, finding 3, 'reservation ownership evidence must not be forgeable'): " +
+          "the ownership-mismatch audit event records ONLY the caller's own supplied (rejected) values — never the " +
+          "reservation's true authoritative scope, which a mismatched caller has no legitimate claim to learn — " +
+          "but a reviewer with real audit-log access can still recover the true scope by cross-referencing the " +
+          "same reservation's own BUDGET_RESERVATION_CREATED event by reservationId",
+        () => {
+          const auditLog = new AuditLog();
+          const guard = new BudgetGuard(new CostEngine(), { perRunUsd: 1 }, undefined, auditLog);
+          const reservation = guard.reserve({ taskId: "a", agentId: "owner-agent", provider: "authorized-provider", modelId: "authorized-model" }, 0.5);
 
-        expect(() =>
-          guard.commit(reservation.id, {
-            taskId: "a",
-            agentId: "attacker-agent",
-            provider: "attacker-provider",
-            modelId: "attacker-model",
-            amountUsd: 0.5
-          })
-        ).toThrow(ReservationOwnershipMismatchError);
+          expect(() =>
+            guard.commit(reservation.id, {
+              taskId: "a",
+              agentId: "attacker-agent",
+              provider: "attacker-provider",
+              modelId: "attacker-model",
+              amountUsd: 0.5
+            })
+          ).toThrow(ReservationOwnershipMismatchError);
 
-        const event = auditLog.all().find((e) => e.type === "BUDGET_RESERVATION_OWNERSHIP_MISMATCH");
-        expect(event).toBeDefined();
-        const payload = event!.payload as { reservedScope: { agentId?: string; provider?: string; modelId?: string } };
-        expect(payload.reservedScope.agentId).toBe("owner-agent");
-        expect(payload.reservedScope.provider).toBe("authorized-provider");
-        expect(payload.reservedScope.modelId).toBe("authorized-model");
-      });
+          const events = auditLog.all();
+          const mismatchEvent = events.find((e) => e.type === "BUDGET_RESERVATION_OWNERSHIP_MISMATCH");
+          expect(mismatchEvent).toBeDefined();
+          const mismatchPayload = mismatchEvent!.payload as Record<string, unknown>;
+          // Only the attacker's OWN supplied values appear — echoing back
+          // data the caller already possesses discloses nothing new.
+          expect(mismatchPayload.suppliedAgentId).toBe("attacker-agent");
+          expect(mismatchPayload.suppliedProvider).toBe("attacker-provider");
+          expect(mismatchPayload.suppliedModelId).toBe("attacker-model");
+          // The reservation's TRUE authoritative scope is NOT present anywhere
+          // in this event's payload — a mismatched caller must learn nothing
+          // about the real owner from their own rejected attempt.
+          expect(JSON.stringify(mismatchPayload)).not.toContain("owner-agent");
+          expect(JSON.stringify(mismatchPayload)).not.toContain("authorized-provider");
+          expect(JSON.stringify(mismatchPayload)).not.toContain("authorized-model");
+
+          // A legitimate reviewer with real audit-log access still has full
+          // forensic traceability: the reservation's own creation event
+          // (written when nothing was wrong) already recorded the true
+          // scope, joinable by the SAME reservationId.
+          const createdEvent = events.find(
+            (e) => e.type === "BUDGET_RESERVATION_CREATED" && (e.payload as { reservationId?: string }).reservationId === reservation.id
+          );
+          expect(createdEvent).toBeDefined();
+          const createdScope = (createdEvent!.payload as { scope: { agentId?: string; provider?: string; modelId?: string } }).scope;
+          expect(createdScope.agentId).toBe("owner-agent");
+          expect(createdScope.provider).toBe("authorized-provider");
+          expect(createdScope.modelId).toBe("authorized-model");
+        }
+      );
     }
   );
 

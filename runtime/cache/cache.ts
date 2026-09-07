@@ -15,7 +15,15 @@ export class Cache<T = unknown> {
   get(key: string): T | undefined {
     const entry = this.store.get(key);
     if (!entry) return undefined;
-    if (entry.expiresAt !== undefined && entry.expiresAt < Date.now()) {
+    // P2 fix (26th independent review round, finding 7, "cache must expire
+    // at the deadline"): this used to compare with strict `<`, so an entry
+    // whose `expiresAt` exactly equalled `Date.now()` (including a
+    // `ttlMs: 0` entry read back within the same millisecond it was set)
+    // was judged NOT yet expired and served one more time. The stated
+    // guarantee is "expired at the deadline", not "expired strictly after
+    // it" — `expiresAt` IS the instant the entry stops being valid, so
+    // `now >= expiresAt` (not `now > expiresAt`) is the correct boundary.
+    if (entry.expiresAt !== undefined && Date.now() >= entry.expiresAt) {
       this.store.delete(key); // stale entries are never silently reused (section 77)
       return undefined;
     }

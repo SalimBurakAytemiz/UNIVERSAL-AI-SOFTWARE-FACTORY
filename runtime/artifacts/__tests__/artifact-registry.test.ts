@@ -56,4 +56,43 @@ describe("ArtifactRegistry", () => {
       expect(registry.findByClass("tests")[0]!.checksum).toBe("abc123");
     });
   });
+
+  describe(
+    "P1 targeted-audit fix (26th independent review round, same root class as finding 2, 'cost ledger state must " +
+      "be runtime-private'): the internal artifacts Map now uses a genuine ECMAScript #private field, not " +
+      "TypeScript's compile-time-only `private`",
+    () => {
+      it("the internal artifacts Map is not reachable as an ordinary JS property", () => {
+        const registry = new ArtifactRegistry();
+        registry.register({ id: "a1", artifactClass: "tests", path: "coverage/report.html", projectId: "proj-1" });
+
+        expect((registry as unknown as Record<string, unknown>).artifacts).toBeUndefined();
+        expect((registry as unknown as Record<string, unknown>)["artifacts"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private artifacts Map", () => {
+        const registry = new ArtifactRegistry();
+        registry.register({ id: "a1", artifactClass: "tests", path: "coverage/report.html", projectId: "proj-1" });
+
+        expect(Object.getOwnPropertyNames(registry)).not.toContain("artifacts");
+        expect(Reflect.ownKeys(registry).map(String)).not.toContain("artifacts");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot inject a fabricated evidence record via property access, bypassing register()", () => {
+        const registry = new ArtifactRegistry();
+        registry.register({ id: "a1", artifactClass: "tests", path: "coverage/report.html", projectId: "proj-1" });
+
+        const forged = (registry as unknown as Record<string, unknown>).artifacts as
+          | Map<string, { path: string }>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and mutate/inject into at all
+
+        const spread: Record<string, unknown> = { ...registry };
+        expect(spread.artifacts).toBeUndefined();
+
+        expect(registry.get("a1")!.path).toBe("coverage/report.html"); // untouched
+        expect(registry.get("forged-id")).toBeUndefined(); // no fabricated record exists
+      });
+    }
+  );
 });

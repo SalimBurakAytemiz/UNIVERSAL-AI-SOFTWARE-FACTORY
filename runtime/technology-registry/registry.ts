@@ -97,7 +97,24 @@ export class MissingTechnologyTransitionReasonError extends Error {
 }
 
 export class TechnologyRegistry {
-  private readonly technologies = new Map<string, TechnologyRecord>();
+  /**
+   * P1 targeted-audit fix (26th independent review round, same root class
+   * as finding 2, "cost ledger state must be runtime-private"): this Map
+   * used to be declared with TypeScript's compile-time-only `private` —
+   * the compiled JS leaves it an ordinary, enumerable instance property
+   * reachable via `(registry as any).technologies` or plain bracket
+   * access. Since `transitionLifecycle()`'s ENTIRE purpose (bölüm 53-54) is
+   * refusing to walk a DEPRECATED/FORBIDDEN technology back out to a
+   * recommendable lifecycle, a consumer with such access could bypass that
+   * governance rule completely — `(registry as any).technologies.set(id, {
+   * ...forbiddenRecord, lifecycle: "PREFERRED" })` un-bans a technology
+   * with no `InvalidTechnologyLifecycleTransitionError`, no `reason`, and
+   * no audit trail. A genuine ECMAScript private field (`#technologies`)
+   * closes this the same way `audit-log.ts`'s `#records` and
+   * `cost-engine.ts`'s `#entries`/`#reservations` already do: `as any`,
+   * bracket access, and every reflection API fail to reach it.
+   */
+  #technologies = new Map<string, TechnologyRecord>();
 
   constructor(private readonly auditLog?: AuditLog) {}
 
@@ -109,10 +126,10 @@ export class TechnologyRegistry {
    * yolu transitionLifecycle()'dır.
    */
   register(technology: TechnologyRecord): void {
-    if (this.technologies.has(technology.id)) {
+    if (this.#technologies.has(technology.id)) {
       throw new DuplicateTechnologyIdError(technology.id);
     }
-    this.technologies.set(technology.id, freezeRecord({ ...technology }));
+    this.#technologies.set(technology.id, freezeRecord({ ...technology }));
   }
 
   /**
@@ -123,7 +140,7 @@ export class TechnologyRegistry {
    * geçiş, varsa AuditLog'a kaydedilir.
    */
   transitionLifecycle(id: string, to: TechnologyLifecycle, reason: string): TechnologyRecord {
-    const current = this.technologies.get(id);
+    const current = this.#technologies.get(id);
     if (!current) {
       throw new TechnologyNotFoundError(id);
     }
@@ -135,7 +152,7 @@ export class TechnologyRegistry {
     }
 
     const updated = freezeRecord({ ...current, lifecycle: to });
-    this.technologies.set(id, updated);
+    this.#technologies.set(id, updated);
     this.auditLog?.append({
       type: "TECHNOLOGY_LIFECYCLE_TRANSITIONED",
       actor: "technology-registry",
@@ -146,7 +163,7 @@ export class TechnologyRegistry {
   }
 
   all(): readonly TechnologyRecord[] {
-    return [...this.technologies.values()].map((t) => freezeRecord(t));
+    return [...this.#technologies.values()].map((t) => freezeRecord(t));
   }
 
   findByCategory(category: TechnologyCategory): TechnologyRecord[] {

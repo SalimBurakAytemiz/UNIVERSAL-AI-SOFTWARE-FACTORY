@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PolicyEngine, lowRiskAllowRule, type PolicyRule } from "../policy-engine.js";
+import { InvalidRiskLevelError, PolicyEngine, lowRiskAllowRule, type PolicyRule } from "../policy-engine.js";
 import { ApprovalRequiredError, ApprovalWorkflow, DuplicateApprovalIdError, InvalidApprovalDecisionError } from "../approval.js";
 import { AuditLog } from "../../audit/audit-log.js";
 
@@ -260,6 +260,139 @@ describe("PolicyEngine", () => {
       expect(payload.action.actionType).toBe("read-file");
     });
   });
+
+  describe(
+    "P1 fix (26th independent review round, finding 4, 'reject invalid risk values before policy evaluation'): " +
+      "evaluate() validates risk is a genuine integer 0-5 inclusive BEFORE any rule runs, fail closed on anything " +
+      "else — closing the gap where runtime/deserialized input (never checked by the RiskLevel compile-time type) " +
+      "could satisfy a rule's numeric comparison without ever being a valid risk level",
+    () => {
+      it("BLOCKER regression, exact reproduction: risk -1 must not satisfy lowRiskAllowRule's <= comparison and receive ALLOW", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(2));
+
+        expect(() =>
+          engine.evaluate({ actionType: "x", risk: -1 as unknown as 0, description: "runtime-deserialized action" })
+        ).toThrow(InvalidRiskLevelError);
+      });
+
+      it.each([
+        ["a negative integer", -1],
+        ["a value above 5", 6],
+        ["a large out-of-range value", 999],
+        ["a fraction", 2.5],
+        ["NaN", NaN],
+        ["positive Infinity", Infinity],
+        ["negative Infinity", -Infinity],
+        ["a numeric string", "3"],
+        ["an arbitrary string", "high"],
+        ["null", null],
+        ["undefined", undefined],
+        ["a boolean", true],
+        ["an object", {}],
+        ["an array", [3]]
+      ])("rejects invalid risk class: %s", (_label, risk) => {
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(5)); // permissive — would ALLOW any genuinely valid risk 0-5
+        expect(() => engine.evaluate({ actionType: "x", risk: risk as unknown as 0, description: "d" })).toThrow(
+          InvalidRiskLevelError
+        );
+      });
+
+      it("negative zero is still a valid integer (0) and is accepted, not rejected", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(5));
+        expect(() => engine.evaluate({ actionType: "x", risk: -0 as unknown as 0, description: "d" })).not.toThrow();
+      });
+
+      it("every valid integer risk level 0 through 5 inclusive (both boundaries) is accepted and evaluated normally", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(5));
+        for (const risk of [0, 1, 2, 3, 4, 5] as const) {
+          expect(() => engine.evaluate({ actionType: "x", risk, description: "d" })).not.toThrow();
+        }
+      });
+
+      it("no rule is ever invoked when risk is invalid — the check happens before the rule loop, not as a rule itself", () => {
+        const engine = new PolicyEngine();
+        let ruleWasCalled = false;
+        engine.addRule({
+          name: "spy-rule",
+          priority: 1,
+          evaluate: () => {
+            ruleWasCalled = true;
+            return "ALLOW";
+          }
+        });
+
+        expect(() => engine.evaluate({ actionType: "x", risk: -1 as unknown as 0, description: "d" })).toThrow(
+          InvalidRiskLevelError
+        );
+        expect(ruleWasCalled).toBe(false);
+      });
+
+      it("an invalid risk is never audited as a decision — evaluate() throws before appending anything to the audit trail", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(lowRiskAllowRule(5));
+        const before = engine.auditTrail.all().length;
+
+        expect(() => engine.evaluate({ actionType: "x", risk: NaN as unknown as 0, description: "d" })).toThrow(
+          InvalidRiskLevelError
+        );
+
+        expect(engine.auditTrail.all().length).toBe(before);
+      });
+
+      it("an explicit DENY elsewhere in the system is not the mechanism here — invalid risk throws a distinct error type, never silently resolves to any PolicyDecision", () => {
+        const engine = new PolicyEngine(); // no rules at all -> would otherwise default-deny
+        let thrown: unknown;
+        try {
+          engine.evaluate({ actionType: "x", risk: Infinity as unknown as 0, description: "d" });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(thrown).toBeInstanceOf(InvalidRiskLevelError);
+        expect(thrown).not.toBeInstanceOf(TypeError);
+      });
+    }
+  );
+
+  describe(
+    "P1 targeted-audit fix (26th independent review round, same root class as finding 2, 'cost ledger state must " +
+      "be runtime-private'): the internal rules array now uses a genuine ECMAScript #private field, not " +
+      "TypeScript's compile-time-only `private`",
+    () => {
+      it("the internal rules array is not reachable as an ordinary JS property", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(denyRule("d", 1));
+
+        expect((engine as unknown as Record<string, unknown>).rules).toBeUndefined();
+        expect((engine as unknown as Record<string, unknown>)["rules"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private rules array", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(denyRule("d", 1));
+
+        expect(Object.getOwnPropertyNames(engine)).not.toContain("rules");
+        expect(Reflect.ownKeys(engine).map(String)).not.toContain("rules");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot strip a registered DENY rule via property access, defeating default-deny", () => {
+        const engine = new PolicyEngine();
+        engine.addRule(denyRule("mandatory-deny", 100));
+
+        const forged = (engine as unknown as Record<string, unknown>).rules as unknown[] | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and splice/clear at all
+
+        const spread: Record<string, unknown> = { ...engine };
+        expect(spread.rules).toBeUndefined();
+
+        // The registered DENY rule is still genuinely in force.
+        expect(engine.evaluate({ actionType: "x", risk: 0, description: "d" }).decision).toBe("DENY");
+      });
+    }
+  );
 });
 
 describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)", () => {

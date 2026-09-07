@@ -90,7 +90,11 @@ export class FileCache<T = unknown> {
     const all = this.loadAll();
     const entry = all.get(key);
     if (!entry) return undefined;
-    if (entry.expiresAt !== undefined && entry.expiresAt < Date.now()) {
+    // P2 fix (26th independent review round, finding 7, "cache must expire
+    // at the deadline"): identical boundary fix as cache.ts's Cache.get() —
+    // `now >= expiresAt`, not strict `<`, so `ttlMs: 0` and an exact
+    // now===expiresAt read are both correctly treated as already expired.
+    if (entry.expiresAt !== undefined && Date.now() >= entry.expiresAt) {
       // Süresi dolmuş girdi diskte de asla sessizce yeniden kullanılmaz —
       // ama bu bir MUTASYONdur, bu yüzden set() ile AYNI kilitli,
       // yeniden-okuyan yola gider (bkz. yukarıdaki sınıf fix notu): kilit
@@ -103,7 +107,9 @@ export class FileCache<T = unknown> {
       this.withLock(() => {
         const latest = this.loadAll();
         const latestEntry = latest.get(key);
-        if (latestEntry && latestEntry.expiresAt !== undefined && latestEntry.expiresAt < Date.now()) {
+        // Same >= boundary as the initial check above and cache.ts's
+        // Cache.get() — bkz. bu dosyadaki fix notu.
+        if (latestEntry && latestEntry.expiresAt !== undefined && Date.now() >= latestEntry.expiresAt) {
           latest.delete(key);
           this.saveAll(latest);
         }

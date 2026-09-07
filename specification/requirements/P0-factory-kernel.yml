@@ -655,6 +655,20 @@
     status this way. Verified via a temporary bypass (reverting to `private decisions`) — confirmed exactly the
     3 predicted tests failed, then reverted and re-confirmed all tests passing.
 
+    P1 fix (26th independent review round, finding 6, "active decisions cannot already name a successor"):
+    `describeInvalidPersistedDecision()` checked "SUPERSEDED requires supersededBy" but never the reverse —
+    a persisted record claiming `status: "ACTIVE"` while ALSO carrying a `supersededBy` is just as impossible
+    for `supersede()` to produce (it only ever sets both fields together, in the same assignment), yet was
+    silently accepted on load. Restoring such a record would let `hasActiveDecision()` report it active while
+    `supersededBy` points at a real, separate decision — two contradictory answers for "which decision is
+    currently active?" (bölüm 255). Added the symmetric check: `status === "ACTIVE" && supersededBy !==
+    undefined` is refused with `CorruptPersistedDecisionError`. Six new regression tests prove the exact
+    reproduction is refused, the existing SUPERSEDED-without-successor check still holds, valid ACTIVE/SUPERSEDED
+    records and multi-step chains still load, and the pre-existing cycle/missing-target graph regressions are
+    unaffected. Verified via a temporary bypass (gating the new check with `if (false && ...)`) — confirmed
+    exactly the 1 predicted BLOCKER test failed (39/40 otherwise passing), then reverted and re-confirmed 40/40
+    passing.
+
 - id: UASF-REQ-0011
   title: Assumption register
   description: Track assumptions with PROPOSED/ACCEPTED/REJECTED/VALIDATED/SUPERSEDED lifecycle.
@@ -848,6 +862,17 @@
     the governance transition guard) — confirmed the exact predicted 2 tests failed, then reverted and
     re-confirmed all passing.
 
+    P1 targeted-audit fix (26th independent review round, same root class as finding 2, "cost ledger state must
+    be runtime-private" — Codex's audit scope named this class explicitly): the internal `technologies` Map still
+    used TypeScript's compile-time-only `private` keyword, reachable at runtime via `(registry as
+    any).technologies`. Since `transitionLifecycle()`'s entire purpose is refusing to walk a DEPRECATED/FORBIDDEN
+    technology back to a recommendable lifecycle, this let a consumer bypass that governance rule completely with
+    no `reason`, no `InvalidTechnologyLifecycleTransitionError`, and no audit trail. Converted to a genuine
+    ECMAScript `#technologies` private field. Three new regression tests prove the field is unreachable via
+    property access or any reflection API, and that a plain JS consumer cannot un-forbid a technology this way.
+    Verified via a temporary bypass (reverting to `private technologies`) — confirmed exactly the 3 predicted
+    tests failed, then reverted and re-confirmed all tests passing.
+
 - id: UASF-REQ-0015
   title: Business capability registry (foundation)
   description: Registry entries for CRM/ERP/OMS/... with delivery_options (BUILD/INTEGRATE/REUSE/BUY_OR_SAAS/DEFER/NOT_REQUIRED).
@@ -1019,6 +1044,37 @@
     ORIGINAL, untouched action; mutating the action after `evaluate()` returns has no effect on the returned
     decision. Verified via a temporary bypass (using the raw `action` parameter instead of a frozen snapshot) —
     confirmed exactly the 3 predicted tests failed, then reverted and re-confirmed all tests passing.
+
+    P1 fix (26th independent review round, finding 4, "reject invalid risk values before policy evaluation"):
+    `PolicyAction.risk`'s TypeScript type (`RiskLevel = 0|1|2|3|4|5`) only constrains code the compiler can see —
+    it does nothing for a `PolicyAction` built from runtime/deserialized input (a JSON-parsed request body, a
+    persisted-then-restored action, or an `as PolicyAction` type assertion). Codex reproduced: `risk: -1`
+    satisfies `lowRiskAllowRule`'s `action.risk <= maxRisk` comparison (`-1 <= 2` is `true`) and receives ALLOW —
+    an action whose risk was never actually valid slipping through the cheapest, least-scrutinized rule in the
+    system; the same class of bug affects any rule reasoning numerically about an unvalidated `risk`
+    (`NaN`/`Infinity`/fractional/out-of-range/non-numeric values behave unpredictably in either direction).
+    Fixed: a new `assertValidRiskLevel()` runs as the VERY FIRST statement inside `evaluate()` — before the
+    `authoritativeAction` snapshot is even built — requiring `risk` to be a genuine integer 0-5 inclusive;
+    anything else (negative numbers, values above 5, fractions, NaN, Infinity, strings, null, undefined) throws
+    a new `InvalidRiskLevelError` immediately, fail closed, so NO rule (not even the first one evaluated) ever
+    observes an invalid risk. Twenty new regression tests prove: the exact `risk: -1` BLOCKER reproduction is
+    refused; every invalid class (14 cases via `it.each`) is refused; negative zero (a valid integer 0) is
+    correctly accepted, not rejected; the valid boundaries 0 and 5 both evaluate normally; no rule is ever
+    invoked and no audit entry is recorded when risk is invalid; and `InvalidRiskLevelError` is a distinct error
+    type, never silently resolving to any `PolicyDecision`. Verified via a temporary bypass (skipping the
+    validation call) — confirmed the exact predicted tests failed, then reverted and re-confirmed all passing.
+
+    P1 targeted-audit fix (26th independent review round, same root class as finding 2, "cost ledger state must
+    be runtime-private"): the internal `rules` array still used TypeScript's compile-time-only `private`
+    keyword. Since `rules` IS the entire default-deny enforcement surface (bölüm 147), `(engine as
+    any).rules.length = 0` or `.push(alwaysAllowRule)` from any caller holding a `PolicyEngine` reference could
+    silently strip every registered DENY rule or inject a rule that always wins — defeating the single most
+    important P0 guarantee with no trace in `evaluate()` itself. Converted to a genuine ECMAScript `#rules`
+    private field. Three new regression tests prove the field is unreachable via property access or any
+    reflection API, and that a plain JS consumer cannot strip a registered DENY rule this way (the rule is still
+    genuinely in force after the attempted property manipulation). Verified via a temporary bypass (reverting to
+    `private rules`) — confirmed exactly the 3 predicted tests failed, then reverted and re-confirmed all tests
+    passing.
 
 - id: UASF-REQ-0019
   title: Capability gateway (foundation)
@@ -1445,6 +1501,16 @@
     return value of register()/get()/allFor()/findByClass() throws and
     never changes the recorded evidence. Confirmed via git-stash that
     these tests fail on the pre-fix code.
+
+    P1 targeted-audit fix (26th independent review round, same root class as finding 2, "cost ledger state must
+    be runtime-private"): the internal `artifacts` Map still used TypeScript's compile-time-only `private`
+    keyword, reachable at runtime via `(registry as any).artifacts`. This let a consumer inject a fabricated
+    evidence record that never went through `register()`'s duplicate-id check, or silently swap an EXISTING
+    record's `path`/`checksum` — directly defeating "no claim without evidence" (bölüm 303). Converted to a
+    genuine ECMAScript `#artifacts` private field. Three new regression tests prove the field is unreachable via
+    property access or any reflection API, and that a plain JS consumer cannot inject/swap evidence this way.
+    Verified via a temporary bypass (reverting to `private artifacts`) — confirmed exactly the 3 predicted tests
+    failed, then reverted and re-confirmed all tests passing.
 
 - id: UASF-REQ-0024
   title: Model gateway
@@ -2219,6 +2285,43 @@
     separate temporary bypasses (disabling each ownership check independently) — confirmed the exact predicted
     21 tests (finding 4, including several pre-existing round-12/13 commit-ownership regressions) and 4 tests
     (finding 5) failed respectively, then both reverted and all tests re-confirmed passing.
+
+    P1 fix (26th independent review round, finding 2, "cost ledger state must be runtime-private"): `#entries`,
+    `#reservations`, and `#reservationSeq` still used TypeScript's compile-time-only `private` keyword — reachable
+    at runtime via `(engine as any).entries`/`.reservations`, letting a consumer push/delete/wipe spend entries or
+    fabricate/delete reservations directly, corrupting the "no silent spending" ledger with no trace in
+    `record()`/`createReservation()`. Converted all three fields to genuine ECMAScript private fields (same
+    pattern as `audit-log.ts`'s `#records`). Five new regression tests prove the fields are unreachable via
+    property access or any reflection API, and that a plain JS consumer cannot mutate authoritative entries or
+    reservations this way. Verified via a temporary bypass (reverting to `private entries`/`reservations`) —
+    confirmed exactly the predicted tests failed, then reverted and re-confirmed all tests passing.
+
+    P1 fix (26th independent review round, finding 3, "reservation ownership evidence must not be forgeable"):
+    `getReservation(id)` was a PUBLIC, unauthenticated lookup that returned a reservation's full `scope` — the
+    EXACT material `commitReservation()`/`releaseReservation()`'s ownership check compares a caller's supplied
+    `callerScope` against. An attacker who merely learned another caller's reservation id could call
+    `getReservation()` as reconnaissance, read the true scope, and construct a passing `callerScope` argument for
+    a subsequent release/commit — turning a read-only diagnostic API into an authorization bypass oracle. A
+    SECOND, related channel: `ReservationOwnershipMismatchError`'s thrown message interpolated the SAME
+    authoritative scope values, letting a wrong-guess attempt "probe and read the correct answer from the
+    rejection" just as effectively. Fixed: `getReservation()` now returns a new `ReservationView` type (`Omit
+    <LedgerReservation, "scope">`) — `id`/`amountUsd`/`status` only, scope omitted entirely; the error message
+    no longer discloses the true authoritative scope (only the caller's own rejected values), with a note that
+    the true scope remains cross-referenceable via the `BUDGET_RESERVATION_CREATED` audit event for a legitimate
+    reviewer (a channel deliberately left open, since `AuditLog` is a separate, `#private`-protected store never
+    returned to the calling/attacking code, unlike a return value or exception property). `budget.ts`'s three
+    remaining scope-audit-logging call sites were updated: `commit()`'s ownership-mismatch catch drops the
+    privileged read entirely; its success/general-failure paths substitute the caller's OWN already-confirmed
+    `entry` fields (`confirmedScope`) instead of the privileged `reservation.scope` read (safe, since ownership
+    was already validated to match `entry` before those paths run); `release()`'s `UnresolvedReconciliationError`
+    catch drops the scope-like field entirely, since ownership has not yet been checked at that point. Four new
+    regression tests prove: `getReservation()` no longer exposes `scope` (BLOCKER regression); neither the
+    release-mismatch nor the commit-mismatch error message discloses the true scope; and a legitimate retry still
+    succeeds afterward. A pre-existing test (verifying the mismatch audit event records the true scope) was
+    rewritten to verify a legitimate reviewer can still recover it via the `BUDGET_RESERVATION_CREATED` event,
+    joined by `reservationId`, rather than from the rejected caller's own return value. Verified via temporary
+    bypasses of both the `getReservation()` redaction and the error-message redaction independently — confirmed
+    the exact predicted tests failed in each case, then both reverted and all tests re-confirmed passing.
 
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
@@ -3070,6 +3173,28 @@
     — confirmed exactly the predicted smuggling-regression test failed, then reverted and re-confirmed all
     tests passing.
 
+    P2 fix (26th independent review round, finding 5, "detach values across project isolation views"): `set()`
+    stored the caller-supplied `value` REFERENCE directly — the same mutable object stored under two different
+    projects (or mutated by the caller after storing it) silently corrupted every project's bucket holding that
+    reference, breaching isolation without either project ever explicitly writing to the other's bucket. Fixed:
+    `set()` now stores `deepFreezeClone(value)` (runtime/util/immutable.ts, the same primitive `audit-log.ts`
+    uses) — a full `structuredClone()`-based deep copy, completely detached from the caller's object graph, then
+    deep-frozen. Three new regression tests prove: the same mutable object stored in projects A and B is
+    unaffected by later mutating the original; a value returned by `get()` cannot be mutated (throws TypeError)
+    or reach the authoritative copy; and two `set()` calls with the same input object at different times produce
+    independently-captured snapshots. Verified via a temporary bypass (storing the raw reference again) —
+    confirmed the exact predicted tests failed, then reverted and re-confirmed all tests passing.
+
+    P1 targeted-audit fix (26th independent review round, same root class as finding 2, "cost ledger state must
+    be runtime-private"): the internal `data` Map-of-Maps still used TypeScript's compile-time-only `private`
+    keyword. Since this class's entire purpose is that a view returned by `viewFor()` can reach only its own
+    bound project's bucket, `(store as any).data.get("other-project")` access would defeat isolation completely
+    by reading/writing ANY project's bucket directly, bypassing `viewFor()`'s capability model entirely.
+    Converted to a genuine ECMAScript `#data` private field. Three new regression tests prove the field is
+    unreachable via property access or any reflection API, and that a plain JS consumer holding the store (not a
+    view) cannot reach another project's bucket this way. Verified via a temporary bypass (reverting to `private
+    data`) — confirmed exactly the 3 predicted tests failed, then reverted and re-confirmed all tests passing.
+
 - id: UASF-REQ-0035
   title: Event-driven agent activation
   description: >
@@ -3689,6 +3814,22 @@
     ordinary liveness check and is recovered as confirmed-dead, since no
     real process holds it.
 
+    P2 fix (26th independent review round, finding 7, "cache must expire at the deadline"): `Cache.get()`
+    (cache.ts) and BOTH of `FileCache.get()`'s equivalent checks (file-cache.ts's initial synchronous check and
+    its lock-protected re-check) compared with strict `entry.expiresAt < Date.now()` — an entry whose
+    `expiresAt` exactly equalled `Date.now()` (including a `ttlMs: 0` entry read back within the same
+    millisecond it was set) was judged NOT yet expired and served one more time, contradicting the stated
+    guarantee that an entry stops being valid AT its expiry instant, not strictly after it. Fixed: all three
+    checks now compare `Date.now() >= entry.expiresAt`. Regression tests (using `vi.useFakeTimers()`/
+    `vi.setSystemTime()` for deterministic boundary control) prove, identically for both `Cache` and
+    `FileCache`: now < expiresAt is still valid; now === expiresAt is expired (BLOCKER regression); now >
+    expiresAt is expired; `ttlMs: 0` never survives its own expiration boundary even read back at the exact
+    same instant; and the expired entry is actually removed from the store (`size()` reflects the deletion).
+    `FileCache`'s cross-instance test additionally proves the lock-protected re-check path (not just the
+    initial in-process check) honors the same boundary on a durably-persisted entry. Verified via a temporary
+    bypass (reverting all three comparisons to strict `<`) — confirmed the exact predicted 3 tests (cache.ts)
+    and 4 tests (file-cache.ts) failed, then reverted and re-confirmed all 79 tests in runtime/cache/ passing.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
@@ -3972,6 +4113,28 @@
     bug found and fixed in the 10th round's earlier follow-up pass).
     README.md/AGENTS.md/CLAUDE.md's "22.12+" prose updated to "22.13+" to
     match.
+
+    P1 fix (26th independent review round, finding 1, "move runtime libraries out of devDependencies"): Codex
+    reproduced that `npm ci --omit=dev` (a real production-style install) removed `ajv` and `js-yaml` even
+    though runtime code imports them directly (`runtime/project-genome/genome.ts` imports `ajv`,
+    `runtime/cli/commands/baseline-status.ts` imports `js-yaml`) — the compiled CLI would crash with
+    `MODULE_NOT_FOUND` the moment anyone installed this package the way a real deployment does, since both
+    packages lived under `devDependencies` alongside genuinely dev-only tooling (`typescript`/`vitest`/`eslint`/
+    `tsx`). Fixed: moved `ajv` and `js-yaml` to a new top-level `dependencies` block in package.json (keeping
+    `@types/js-yaml` and the rest of the toolchain under `devDependencies`), regenerated package-lock.json
+    (`npm install --package-lock-only`) so the lockfile's own per-package `dev` flags match — confirmed `ajv`,
+    `js-yaml`, and their transitive deps (`fast-deep-equal`, `fast-uri`, `json-schema-traverse`, `argparse`) all
+    lost `"dev": true` in the lockfile. Per "do not merely make the test environment green," added a genuine
+    proof rather than a static check: `scripts/verify-production-install.mjs` (wired as `npm run
+    verify:production-install`) copies the ALREADY-BUILT `dist/` output plus package.json/package-lock.json into
+    an isolated temp directory, runs a REAL `npm ci --omit=dev` there, asserts `typescript`/`vitest`/`eslint` are
+    genuinely absent from the resulting `node_modules/` while `ajv`/`js-yaml` are genuinely present, then
+    actually RUNS the compiled CLI's `factory baseline status` (exercises the `js-yaml`-backed requirement-
+    registry parser) and dynamically imports the compiled `project-genome/genome.js` to exercise the ajv-backed
+    validator against both a well-formed and a malformed genome (accept + reject both verified) — all under the
+    same production-only install. Verified via a temporary bypass (moving `ajv`/`js-yaml` back to
+    `devDependencies` and regenerating the lockfile) — confirmed the proof script genuinely failed at the
+    "runtime dependency 'ajv' is MISSING" assertion, then fully reverted and re-confirmed the proof passes.
 
 - id: UASF-REQ-0041
   title: Baseline status command

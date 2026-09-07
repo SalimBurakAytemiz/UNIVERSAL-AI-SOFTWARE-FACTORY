@@ -124,6 +124,15 @@ export interface LedgerReservation {
   readonly status: ReservationLedgerStatus;
 }
 
+/**
+ * P1 fix (26th independent review round, finding 3, "reservation ownership
+ * evidence must not be forgeable"): the diagnostic/read view of a
+ * reservation returned by `getReservation()` — deliberately narrower than
+ * `LedgerReservation`. It omits `scope` entirely; see the fix note above
+ * `getReservation()` for why.
+ */
+export type ReservationView = Omit<LedgerReservation, "scope">;
+
 export class UnknownReservationError extends Error {
   constructor(reservationId: string) {
     super(
@@ -177,18 +186,43 @@ export class UnresolvedReconciliationError extends Error {
  * themselves (bkz. aşağıdaki metodlar), so it holds regardless of whether
  * the caller goes through `BudgetGuard` or talks to the ledger directly.
  */
+/**
+ * P1 fix (26th independent review round, finding 3, "reservation ownership
+ * evidence must not be forgeable"): this error's message used to interpolate
+ * the reservation's OWN authoritative ownership fields (taskId, projectId,
+ * agentId, provider, modelId) directly into the thrown message string —
+ * readable by WHOEVER calls `commitReservation()`/`releaseReservation()`
+ * and catches the error, including a caller who deliberately supplied a
+ * WRONG guess purely to harvest the true values back out of the rejection.
+ * Combined with `getReservation()` ALSO publicly exposing the same scope
+ * (bkz. aşağıdaki fix notu), a caller with no legitimate relationship to a
+ * reservation could learn its exact ownership two different ways — either
+ * read it directly, or provoke this error and parse the message — then
+ * replay it as `callerScope` on a follow-up call to pass the ownership
+ * check trivially. Fixed: the message now reports ONLY that a mismatch
+ * occurred and echoes back the CALLER'S OWN supplied values (information
+ * they already possessed — echoing it back discloses nothing new), never
+ * the reservation's true authoritative values. Legitimate forensic
+ * traceability is not lost: `BudgetGuard.reserve()`'s own
+ * `BUDGET_RESERVATION_CREATED` audit event already records the true scope
+ * at creation time in the SAME append-only, runtime-private `AuditLog`
+ * (bkz. audit/audit-log.ts'in `#records`'ı) — a legitimate reviewer with
+ * audit-log access can always join that event with a later mismatch event
+ * by `reservationId`; this error's own message simply stops being a second,
+ * directly-exploitable channel for the same information.
+ */
 export class ReservationOwnershipMismatchError extends Error {
-  constructor(operation: "commit" | "release", reservationId: string, reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership) {
+  constructor(operation: "commit" | "release", reservationId: string, _reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership) {
     super(
       `${operation}(reservationId=${reservationId}) supplied ownership (taskId=${String(suppliedScope.taskId)}, ` +
         `projectId=${String(suppliedScope.projectId)}, agentId=${String(suppliedScope.agentId)}, ` +
         `provider=${String(suppliedScope.provider)}, modelId=${String(suppliedScope.modelId)}) does not match ` +
-        `the reservation's OWN authoritative ownership (taskId=${String(reservationScope.taskId)}, ` +
-        `projectId=${String(reservationScope.projectId)}, agentId=${String(reservationScope.agentId)}, ` +
-        `provider=${String(reservationScope.provider)}, modelId=${String(reservationScope.modelId)}). ` +
-        `A reservation is the authoritative source of ownership for its own commit/release — this call was ` +
-        `rejected before any mutation. A reservation id alone is never sufficient to commit or release capacity ` +
-        `reserved under a different owner's scope.`
+        `the reservation's own authoritative ownership. A reservation is the authoritative source of ownership ` +
+        `for its own commit/release — this call was rejected before any mutation. A reservation id alone is ` +
+        `never sufficient to commit or release capacity reserved under a different owner's scope, and this ` +
+        `error deliberately does not disclose the reservation's true ownership details (see the fix note above) ` +
+        `— cross-reference this reservation's BUDGET_RESERVATION_CREATED audit event for that, if you have ` +
+        `legitimate access to the audit log.`
     );
     this.name = "ReservationOwnershipMismatchError";
   }
@@ -207,7 +241,34 @@ function ownershipMismatches(reservationScope: Readonly<ReservationOwnership>, s
 }
 
 export class CostEngine {
-  private readonly entries: CostEntry[] = [];
+  /**
+   * P1 fix (26th independent review round, finding 2, "cost ledger state
+   * must be runtime-private"): this array (and `#reservations`/
+   * `#reservationSeq` below) used to be declared with TypeScript's
+   * `private` keyword — compile-time only. Compiled JS leaves it an
+   * ordinary, enumerable instance property: `(engine as any).entries`, or
+   * plain bracket access (`engine["entries"]`), reaches it with no
+   * type-system escape hatch needed at all. A consumer holding a
+   * `CostEngine` reference could `.push()` a fabricated entry directly
+   * (recording spend that never went through `record()`'s own
+   * `assertValidMonetaryAmount()` gate — poisoning every total with an
+   * unvalidated NaN/negative amount), `.splice()` an already-recorded
+   * entry back out (silently discarding evidence of REAL spend — exactly
+   * the "no silent spending" invariant, baseline section 147, forbids in
+   * reverse), or reassign the array outright (`engine["entries"] = []`),
+   * wiping the entire cost history with no reconciliation, no audit trail,
+   * and no error. Fixed the same way `audit/audit-log.ts`'s `#records`
+   * (round 25, finding 9, and this round's own targeted-audit follow-ups
+   * on `decision-ledger.ts`/`assumption-register.ts`/`workers/registry.ts`/
+   * `models/registry.ts`) already are: genuine ECMAScript private class
+   * fields (`#entries`/`#reservations`/`#reservationSeq`), enforced by the
+   * JS runtime itself — `as any`, bracket access,
+   * `Object.getOwnPropertyNames()`, and `Reflect.ownKeys()` all fail to
+   * reach them, and any code outside this class body attempting
+   * `x.#entries` is a `SyntaxError` at PARSE time, not merely rejected at
+   * runtime.
+   */
+  #entries: CostEntry[] = [];
 
   /**
    * Bu ledger'a bağlı HER `BudgetGuard`'ın PAYLAŞTIĞI, tek/yetkili
@@ -218,11 +279,11 @@ export class CostEngine {
    * yalnızca ham depolama ve toplama sağlar, tıpkı `record()`/`totalFor()`
    * gibi.
    */
-  private readonly reservations = new Map<
+  #reservations = new Map<
     string,
     { scope: Readonly<ReservationOwnership>; amountUsd: number; status: ReservationLedgerStatus }
   >();
-  private reservationSeq = 0;
+  #reservationSeq = 0;
 
   /**
    * `now` enjekte edilebilir bir saat fonksiyonudur — varsayılan olarak
@@ -243,21 +304,21 @@ export class CostEngine {
     // totalInWindow) her zaman motorun kendi, asla dışarı sızmamış
     // kopyasını okur. Object.freeze, bu ayrımın atlanamamasını (örn.
     // "as any" ile alan ataması) TypeError'a çevirerek garanti eder.
-    this.entries.push(full);
+    this.#entries.push(full);
     return freezeRecord(full);
   }
 
   all(): readonly CostEntry[] {
-    return this.entries.map((e) => freezeRecord(e));
+    return this.#entries.map((e) => freezeRecord(e));
   }
 
   /** Belirli bir kapsam (görev/ajan/proje) için toplam maliyeti hesaplar. */
   totalFor(scope: CostScope): number {
-    return this.entries.filter((e) => matchesScope(e, scope)).reduce((sum, e) => sum + e.amountUsd, 0);
+    return this.#entries.filter((e) => matchesScope(e, scope)).reduce((sum, e) => sum + e.amountUsd, 0);
   }
 
   total(): number {
-    return this.entries.reduce((sum, e) => sum + e.amountUsd, 0);
+    return this.#entries.reduce((sum, e) => sum + e.amountUsd, 0);
   }
 
   /**
@@ -268,7 +329,7 @@ export class CostEngine {
    * olduğundan basit bir string karşılaştırması yeterlidir.
    */
   totalInWindow(scope: CostScope, sinceIso: string): number {
-    return this.entries
+    return this.#entries
       .filter((e) => matchesScope(e, scope) && e.timestamp >= sinceIso)
       .reduce((sum, e) => sum + e.amountUsd, 0);
   }
@@ -286,17 +347,41 @@ export class CostEngine {
    */
   createReservation(scope: ReservationOwnership, amountUsd: number): LedgerReservation {
     assertValidMonetaryAmount(amountUsd, "CostEngine.createReservation");
-    const id = `res-${++this.reservationSeq}`;
+    const id = `res-${++this.#reservationSeq}`;
     const frozenScope = freezeRecord({ ...scope });
-    this.reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
+    this.#reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
     return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
   }
 
-  /** Verilen id'deki rezervasyonun donmuş, ayrık bir anlık görüntüsü — bulunamazsa `undefined`. */
-  getReservation(id: string): LedgerReservation | undefined {
-    const r = this.reservations.get(id);
+  /**
+   * Verilen id'deki rezervasyonun donmuş, ayrık bir anlık görüntüsü —
+   * bulunamazsa `undefined`.
+   *
+   * P1 fix (26th independent review round, finding 3, "reservation
+   * ownership evidence must not be forgeable"): this used to return the
+   * FULL `LedgerReservation`, INCLUDING `scope` — the exact ownership data
+   * `commitReservation()`/`releaseReservation()` compare a caller-supplied
+   * scope against. Codex reproduced: caller B, merely knowing (or
+   * predicting — reservation ids are sequential, `res-1`, `res-2`, ...)
+   * caller A's reservation id, could call this PUBLIC method to read back
+   * A's authoritative scope with NO prior relationship to that reservation
+   * whatsoever, then replay it verbatim as `callerScope` to
+   * `releaseReservation(idA, learnedScope)` — passing the ownership check
+   * trivially, since the "proof" of ownership was handed to them by this
+   * very lookup. A read-only diagnostic method must never double as
+   * reusable authorization material. Fixed: the returned `ReservationView`
+   * omits `scope` — `id`/`amountUsd`/`status` remain visible (none of
+   * these are compared by `ownershipMismatches()`, so none of them let a
+   * caller forge ownership), but the one field that WOULD is no longer
+   * obtainable through this — or any other — public method. A legitimate
+   * caller does not need to look this up at all: it already knows its own
+   * scope, because it is the same scope it supplied to `reserve()` in the
+   * first place (bkz. `runtime/budget/budget.ts`'in `Reservation.scope`'ı).
+   */
+  getReservation(id: string): ReservationView | undefined {
+    const r = this.#reservations.get(id);
     if (!r) return undefined;
-    return freezeRecord({ id, scope: r.scope, amountUsd: r.amountUsd, status: r.status });
+    return freezeRecord({ id, amountUsd: r.amountUsd, status: r.status });
   }
 
   /**
@@ -308,7 +393,7 @@ export class CostEngine {
    * durum geçişidir, kendi başına bir "bulundu mu?" sözleşmesi değildir).
    */
   markReservationReconciliationFailed(id: string): void {
-    const r = this.reservations.get(id);
+    const r = this.#reservations.get(id);
     if (r) r.status = "RECONCILIATION_FAILED";
   }
 
@@ -355,7 +440,7 @@ export class CostEngine {
    * mantığı) rather than leaving it releasable.
    */
   commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
-    const reservation = this.reservations.get(id);
+    const reservation = this.#reservations.get(id);
     if (!reservation) {
       throw new UnknownReservationError(id);
     }
@@ -373,7 +458,7 @@ export class CostEngine {
       throw err;
     }
     const recorded = this.record(entry);
-    this.reservations.delete(id);
+    this.#reservations.delete(id);
     return recorded;
   }
 
@@ -404,7 +489,7 @@ export class CostEngine {
    * rejected.
    */
   releaseReservation(id: string, callerScope: ReservationOwnership): LedgerReservation {
-    const reservation = this.reservations.get(id);
+    const reservation = this.#reservations.get(id);
     if (!reservation) {
       throw new UnknownReservationError(id);
     }
@@ -414,7 +499,7 @@ export class CostEngine {
     if (ownershipMismatches(reservation.scope, callerScope)) {
       throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
     }
-    this.reservations.delete(id);
+    this.#reservations.delete(id);
     return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
   }
 
@@ -428,7 +513,7 @@ export class CostEngine {
    */
   reservedTotal(query: CostScope): number {
     let total = 0;
-    for (const reservation of this.reservations.values()) {
+    for (const reservation of this.#reservations.values()) {
       if (matchesScope(reservation.scope, query)) {
         total += reservation.amountUsd;
       }

@@ -144,4 +144,42 @@ describe("TechnologyRegistry", () => {
       expect(events[0]!.payload).toMatchObject({ id: "kotlin", from: "APPROVED", to: "PREFERRED" });
     });
   });
+
+  describe(
+    "P1 targeted-audit fix (26th independent review round, same root class as finding 2, 'cost ledger state must " +
+      "be runtime-private'): the internal technologies Map now uses a genuine ECMAScript #private field, not " +
+      "TypeScript's compile-time-only `private`",
+    () => {
+      it("the internal technologies Map is not reachable as an ordinary JS property", () => {
+        const registry = new TechnologyRegistry();
+        registry.register({ id: "typescript", category: "language", lifecycle: "PREFERRED" });
+
+        expect((registry as unknown as Record<string, unknown>).technologies).toBeUndefined();
+        expect((registry as unknown as Record<string, unknown>)["technologies"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private technologies Map", () => {
+        const registry = new TechnologyRegistry();
+        registry.register({ id: "typescript", category: "language", lifecycle: "PREFERRED" });
+
+        expect(Object.getOwnPropertyNames(registry)).not.toContain("technologies");
+        expect(Reflect.ownKeys(registry).map(String)).not.toContain("technologies");
+      });
+
+      it("REGRESSION: a plain JS consumer cannot un-forbid a technology via property access, bypassing transitionLifecycle()", () => {
+        const registry = new TechnologyRegistry();
+        registry.register({ id: "flash-4", category: "framework", lifecycle: "FORBIDDEN" });
+
+        const forged = (registry as unknown as Record<string, unknown>).technologies as
+          | Map<string, { lifecycle: string }>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and mutate at all
+
+        const spread: Record<string, unknown> = { ...registry };
+        expect(spread.technologies).toBeUndefined();
+
+        expect(registry.recommendable().map((t) => t.id)).not.toContain("flash-4"); // still forbidden
+      });
+    }
+  );
 });

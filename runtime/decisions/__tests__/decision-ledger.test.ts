@@ -418,4 +418,102 @@ describe("FounderDecisionLedger", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (26th independent review round, finding 6, 'active decisions cannot already name a successor'): " +
+      "a persisted record claiming status ACTIVE while also carrying a supersededBy is a contradiction " +
+      "supersede() itself can never produce — refused, not silently restored",
+    () => {
+      function fakeStore(data: unknown): StateStore {
+        return {
+          write: () => undefined,
+          read: () => data as never,
+          exists: () => true
+        };
+      }
+
+      it("BLOCKER regression, exact reproduction: a persisted ACTIVE record that also names a supersededBy is refused", () => {
+        const store = fakeStore([
+          {
+            decisionId: "d1",
+            project: "proj-a",
+            decision: "Use PostgreSQL",
+            source: "s",
+            status: "ACTIVE",
+            createdAt: new Date().toISOString(),
+            supersededBy: "d2" // contradictory: still ACTIVE, but already named as superseded
+          },
+          {
+            decisionId: "d2",
+            project: "proj-a",
+            decision: "Use MySQL",
+            source: "s",
+            status: "ACTIVE",
+            createdAt: new Date().toISOString()
+          }
+        ]);
+
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("a SUPERSEDED record with no supersededBy is STILL refused (the reverse combination, unchanged by this fix)", () => {
+        const store = fakeStore([
+          { decisionId: "d1", project: "p", decision: "d", source: "s", status: "SUPERSEDED", createdAt: "x" }
+        ]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("a valid, genuinely ACTIVE record with no supersededBy at all loads normally", () => {
+        const store = fakeStore([
+          { decisionId: "d1", project: "p", decision: "d", source: "s", status: "ACTIVE", createdAt: "x" }
+        ]);
+        const ledger = FounderDecisionLedger.loadFrom(store, "decisions.json");
+        expect(ledger.get("d1")!.status).toBe("ACTIVE");
+        expect(ledger.get("d1")!.supersededBy).toBeUndefined();
+      });
+
+      it("a valid SUPERSEDED -> ACTIVE chain (A superseded by B, B still active) loads normally", () => {
+        const store = fakeStore([
+          {
+            decisionId: "a",
+            project: "p",
+            decision: "old",
+            source: "s",
+            status: "SUPERSEDED",
+            createdAt: "x",
+            supersededBy: "b"
+          },
+          { decisionId: "b", project: "p", decision: "new", source: "s", status: "ACTIVE", createdAt: "y" }
+        ]);
+        const ledger = FounderDecisionLedger.loadFrom(store, "decisions.json");
+        expect(ledger.get("a")!.status).toBe("SUPERSEDED");
+        expect(ledger.get("a")!.supersededBy).toBe("b");
+        expect(ledger.get("b")!.status).toBe("ACTIVE");
+        expect(ledger.get("b")!.supersededBy).toBeUndefined();
+      });
+
+      it("a multi-step valid chain (A -> B -> C, C still active) loads normally — this fix does not disturb existing valid-chain handling", () => {
+        const store = fakeStore([
+          { decisionId: "a", project: "p", decision: "d1", source: "s", status: "SUPERSEDED", createdAt: "1", supersededBy: "b" },
+          { decisionId: "b", project: "p", decision: "d2", source: "s", status: "SUPERSEDED", createdAt: "2", supersededBy: "c" },
+          { decisionId: "c", project: "p", decision: "d3", source: "s", status: "ACTIVE", createdAt: "3" }
+        ]);
+        const ledger = FounderDecisionLedger.loadFrom(store, "decisions.json");
+        expect(ledger.get("c")!.status).toBe("ACTIVE");
+      });
+
+      it("existing cycle/missing-target graph regressions remain passing alongside the new ACTIVE+supersededBy check", () => {
+        const missingTarget = fakeStore([
+          { decisionId: "a", project: "p", decision: "d", source: "s", status: "SUPERSEDED", createdAt: "1", supersededBy: "ghost" }
+        ]);
+        expect(() => FounderDecisionLedger.loadFrom(missingTarget, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+
+        const cycle = fakeStore([
+          { decisionId: "a", project: "p", decision: "d1", source: "s", status: "SUPERSEDED", createdAt: "1", supersededBy: "b" },
+          { decisionId: "b", project: "p", decision: "d2", source: "s", status: "SUPERSEDED", createdAt: "2", supersededBy: "a" }
+        ]);
+        expect(() => FounderDecisionLedger.loadFrom(cycle, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+    }
+  );
 });

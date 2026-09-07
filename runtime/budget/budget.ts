@@ -545,12 +545,26 @@ export class BudgetGuard {
       recorded = this.costEngine.commitReservation(reservationId, entry);
     } catch (err) {
       if (err instanceof ReservationOwnershipMismatchError) {
+        // P1 fix (26th independent review round, finding 3, "reservation
+        // ownership evidence must not be forgeable"): this event used to
+        // include `reservedScope: reservation.scope` — the reservation's
+        // TRUE authoritative ownership, read via `getReservation()` BEFORE
+        // this call even knew whether `reservationId` legitimately belongs
+        // to this caller. `getReservation()` no longer returns `scope` at
+        // all (bkz. cost-engine.ts'in üstündeki fix notu), so that read is
+        // no longer possible here — and it would have been exactly as
+        // exploitable as calling `getReservation()` directly, since this
+        // method's own `reservationId` parameter is attacker-controlled
+        // input. Only the CALLER'S OWN supplied values are recorded now
+        // (they already possess this data — echoing it back discloses
+        // nothing new); a legitimate reviewer can still recover the true
+        // scope by cross-referencing this reservation's own
+        // `BUDGET_RESERVATION_CREATED` audit event by `reservationId`.
         this.auditLog?.append({
           type: "BUDGET_RESERVATION_OWNERSHIP_MISMATCH",
           actor: "budget-guard",
           payload: {
             reservationId,
-            reservedScope: reservation.scope,
             suppliedTaskId: entry.taskId,
             suppliedProjectId: entry.projectId,
             suppliedAgentId: entry.agentId,
@@ -561,12 +575,22 @@ export class BudgetGuard {
         });
         throw err;
       }
+      // Ownership already matched `entry` at this point — `commitReservation()`
+      // checks ownership BEFORE validating the amount — so `entry`'s own
+      // identity fields are provably the reservation's authoritative scope
+      // here, safe to log without any privileged read.
       this.auditLog?.append({
         type: "BUDGET_RESERVATION_COMMIT_FAILED",
         actor: "budget-guard",
         payload: {
           reservationId,
-          reservedScope: reservation.scope,
+          confirmedScope: {
+            taskId: entry.taskId,
+            projectId: entry.projectId,
+            agentId: entry.agentId,
+            provider: entry.provider,
+            modelId: entry.modelId
+          },
           reservedAmountUsd: reservation.amountUsd,
           attemptedActualAmountUsd: entry.amountUsd,
           reason: err instanceof Error ? err.message : String(err)
@@ -585,7 +609,13 @@ export class BudgetGuard {
       actor: "budget-guard",
       payload: {
         reservationId,
-        reservedScope: reservation.scope,
+        confirmedScope: {
+          taskId: entry.taskId,
+          projectId: entry.projectId,
+          agentId: entry.agentId,
+          provider: entry.provider,
+          modelId: entry.modelId
+        },
         reservedAmountUsd: reservation.amountUsd,
         actualAmountUsd: entry.amountUsd,
         entry: recorded,
@@ -650,11 +680,23 @@ export class BudgetGuard {
       released = this.costEngine.releaseReservation(reservationId, callerScope);
     } catch (err) {
       if (err instanceof UnresolvedReconciliationError) {
+        // P1 fix (26th independent review round, finding 3, "reservation
+        // ownership evidence must not be forgeable"): this used to log
+        // `scope: reservation?.scope` — the reservation's TRUE
+        // authoritative ownership, obtained via `getReservation()`. At
+        // this point in `releaseReservation()`, ownership has NOT even
+        // been checked yet (the RECONCILIATION_FAILED check runs BEFORE
+        // the ownership check) — so this read happened regardless of
+        // whether `callerScope` was legitimate, handing the true scope to
+        // ANY caller who merely names a RECONCILIATION_FAILED reservation
+        // id. `getReservation()` no longer returns `scope` at all (bkz.
+        // cost-engine.ts), closing this read entirely; `amountUsd` remains
+        // safe to log (it plays no role in the ownership check).
         const reservation = this.costEngine.getReservation(reservationId);
         this.auditLog?.append({
           type: "BUDGET_RESERVATION_RELEASE_REJECTED_UNRESOLVED",
           actor: "budget-guard",
-          payload: { reservationId, scope: reservation?.scope, amountUsd: reservation?.amountUsd },
+          payload: { reservationId, amountUsd: reservation?.amountUsd },
           timestamp: this.now().toISOString()
         });
       } else if (err instanceof ReservationOwnershipMismatchError) {

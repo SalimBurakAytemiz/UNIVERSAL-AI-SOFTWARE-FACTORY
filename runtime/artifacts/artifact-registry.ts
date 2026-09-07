@@ -57,28 +57,41 @@ export interface RegisterArtifactInput {
  * frozen, detached snapshot.
  */
 export class ArtifactRegistry {
-  private readonly artifacts = new Map<string, ArtifactRecord>();
+  /**
+   * P1 targeted-audit fix (26th independent review round, same root class
+   * as finding 2, "cost ledger state must be runtime-private"): a
+   * compile-time-only `private` Map leaves an ordinary, enumerable
+   * instance property in the emitted JS — `(registry as any).artifacts.set(
+   * id, forgedRecord)` could inject a fabricated evidence record that
+   * never went through `register()`'s duplicate-id check, or silently swap
+   * an EXISTING record's `path`/`checksum`, directly defeating "no claim
+   * without evidence" (bölüm 303: the record backing a claim must be
+   * exactly what was registered — see this class's own fix note above).
+   * A genuine ECMAScript private field (`#artifacts`) closes this the same
+   * way `audit-log.ts`'s `#records` already does.
+   */
+  #artifacts = new Map<string, ArtifactRecord>();
 
   /** Aynı id ile iki kez kayıt, sessizce üzerine yazmak yerine reddedilir. */
   register(input: RegisterArtifactInput): ArtifactRecord {
-    if (this.artifacts.has(input.id)) {
+    if (this.#artifacts.has(input.id)) {
       throw new DuplicateArtifactError(input.id);
     }
     const record: ArtifactRecord = { ...input, createdAt: new Date().toISOString() };
-    this.artifacts.set(input.id, record);
+    this.#artifacts.set(input.id, record);
     return freezeRecord(record);
   }
 
   get(id: string): ArtifactRecord | undefined {
-    const record = this.artifacts.get(id);
+    const record = this.#artifacts.get(id);
     return record ? freezeRecord(record) : undefined;
   }
 
   allFor(projectId: string): readonly ArtifactRecord[] {
-    return [...this.artifacts.values()].filter((a) => a.projectId === projectId).map((a) => freezeRecord(a));
+    return [...this.#artifacts.values()].filter((a) => a.projectId === projectId).map((a) => freezeRecord(a));
   }
 
   findByClass(artifactClass: ArtifactClass): readonly ArtifactRecord[] {
-    return [...this.artifacts.values()].filter((a) => a.artifactClass === artifactClass).map((a) => freezeRecord(a));
+    return [...this.#artifacts.values()].filter((a) => a.artifactClass === artifactClass).map((a) => freezeRecord(a));
   }
 }

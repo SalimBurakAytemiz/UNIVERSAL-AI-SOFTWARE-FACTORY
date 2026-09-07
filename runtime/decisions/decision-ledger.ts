@@ -73,6 +73,25 @@ function describeInvalidPersistedDecision(value: unknown): string | undefined {
   if (candidate.status === "SUPERSEDED" && !isNonEmptyDecisionString(candidate.supersededBy)) {
     return "SUPERSEDED record is missing 'supersededBy' — supersede() never produces one without the other";
   }
+  // P1 fix (26th independent review round, finding 6, "active decisions
+  // cannot already name a successor"): the reverse combination was never
+  // checked — a persisted record claiming `status: "ACTIVE"` while ALSO
+  // carrying a `supersededBy` is JUST as impossible for the live API to
+  // produce as the opposite (missing-supersededBy-on-SUPERSEDED) case
+  // above: `supersede()` (bkz. aşağıdaki metot) only ever sets
+  // `supersededBy` in the SAME assignment that also flips `status` to
+  // `"SUPERSEDED"` — there is no code path where a record is BOTH
+  // currently ACTIVE (still eligible to be superseded again) AND already
+  // names the decision that superseded it (a contradiction: if it were
+  // truly superseded, it would BE `"SUPERSEDED"`, not `"ACTIVE"`).
+  // Restoring such a record would let `hasActiveDecision()` report it as
+  // active while `allFor()`/manual inspection sees a `supersededBy`
+  // pointing at a REAL, separate decision — "which decision is currently
+  // active, and why?" (baseline section 255) would have two contradictory
+  // answers for the SAME decision id.
+  if (candidate.status === "ACTIVE" && candidate.supersededBy !== undefined) {
+    return "ACTIVE record must not carry a 'supersededBy' — supersede() only ever sets it together with status: SUPERSEDED";
+  }
   return undefined;
 }
 

@@ -121,4 +121,110 @@ describe("ProjectIsolationStore", () => {
       });
     }
   );
+
+  describe(
+    "P2 fix (26th independent review round, finding 5, 'detach values across project isolation views'): stored " +
+      "values are deep-cloned and deep-frozen on set(), so a caller-owned mutable object can never be used to " +
+      "silently mutate a project's stored data from outside, or to leak a mutation across projects",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: the SAME mutable object stored separately in project A and " +
+          "project B — mutating the original object afterward changes NEITHER stored copy",
+        () => {
+          interface Payload {
+            count: number;
+            nested: { flag: boolean };
+          }
+          const store = new ProjectIsolationStore<Payload>();
+          const shared: Payload = { count: 1, nested: { flag: false } };
+
+          store.viewFor("proj-a").set("k", shared);
+          store.viewFor("proj-b").set("k", shared);
+
+          // Mutate the ORIGINAL object (including a nested field) after
+          // both projects have already stored it.
+          shared.count = 999;
+          shared.nested.flag = true;
+
+          const storedA = store.viewFor("proj-a").get("k");
+          const storedB = store.viewFor("proj-b").get("k");
+          expect(storedA).toEqual({ count: 1, nested: { flag: false } });
+          expect(storedB).toEqual({ count: 1, nested: { flag: false } });
+        }
+      );
+
+      it("mutating a value RETURNED by get() cannot reach the store's own authoritative copy or leak into another project", () => {
+        interface Payload {
+          items: string[];
+        }
+        const store = new ProjectIsolationStore<Payload>();
+        store.viewFor("proj-a").set("k", { items: ["only-for-a"] });
+
+        const returned = store.viewFor("proj-a").get("k")!;
+        expect(() => {
+          (returned as { items: string[] }).items.push("smuggled");
+        }).toThrow(TypeError); // deep-frozen: even the nested array rejects mutation
+        expect(() => {
+          (returned as unknown as { items: unknown }).items = [];
+        }).toThrow(TypeError);
+
+        // Reading again returns the same, still-untouched authoritative data.
+        expect(store.viewFor("proj-a").get("k")).toEqual({ items: ["only-for-a"] });
+        expect(store.viewFor("proj-b").get("k")).toBeUndefined();
+      });
+
+      it("two independent set() calls with the SAME input object produce two independently mutable-safe stored copies, not a shared reference", () => {
+        const store = new ProjectIsolationStore<{ n: number }>();
+        const original = { n: 1 };
+
+        store.viewFor("proj-a").set("k", original);
+        original.n = 2;
+        store.viewFor("proj-b").set("k", original); // stores the object as it is NOW (n=2)
+        original.n = 3; // mutate again after both sets
+
+        expect(store.viewFor("proj-a").get("k")).toEqual({ n: 1 }); // captured at A's set() time
+        expect(store.viewFor("proj-b").get("k")).toEqual({ n: 2 }); // captured at B's set() time, unaffected by the later n=3
+      });
+    }
+  );
+
+  describe(
+    "P1 targeted-audit fix (26th independent review round, same root class as finding 2, 'cost ledger state must " +
+      "be runtime-private'): the internal data Map now uses a genuine ECMAScript #private field, not TypeScript's " +
+      "compile-time-only `private`",
+    () => {
+      it("the internal data Map is not reachable as an ordinary JS property", () => {
+        const store = new ProjectIsolationStore<string>();
+        store.viewFor("proj-a").set("k", "v");
+
+        expect((store as unknown as Record<string, unknown>).data).toBeUndefined();
+        expect((store as unknown as Record<string, unknown>)["data"]).toBeUndefined();
+      });
+
+      it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private data Map", () => {
+        const store = new ProjectIsolationStore<string>();
+        store.viewFor("proj-a").set("k", "v");
+
+        expect(Object.getOwnPropertyNames(store)).not.toContain("data");
+        expect(Reflect.ownKeys(store).map(String)).not.toContain("data");
+      });
+
+      it("REGRESSION: a plain JS consumer holding the STORE (not a view) cannot reach another project's bucket via property access, defeating default deny", () => {
+        const store = new ProjectIsolationStore<string>();
+        store.viewFor("proj-a").set("secret", "only for proj-a");
+
+        const forged = (store as unknown as Record<string, unknown>).data as
+          | Map<string, Map<string, string>>
+          | undefined;
+        expect(forged).toBeUndefined(); // there is nothing to reach in and read another project's bucket from
+
+        const spread: Record<string, unknown> = { ...store };
+        expect(spread.data).toBeUndefined();
+
+        // proj-a's data is still reachable ONLY through its own view.
+        expect(store.viewFor("proj-a").get("secret")).toBe("only for proj-a");
+        expect(store.viewFor("proj-b").get("secret")).toBeUndefined();
+      });
+    }
+  );
 });

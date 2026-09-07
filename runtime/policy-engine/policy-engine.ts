@@ -46,13 +46,71 @@ export interface PolicyEvaluationResult {
 
 export const RISK_5_APPROVAL_RULE_NAME = "risk-5-requires-approval";
 
+/**
+ * P1 fix (26th independent review round, finding 4, "reject invalid risk
+ * values before policy evaluation"): `PolicyAction.risk`'s TypeScript type
+ * (`RiskLevel = 0|1|2|3|4|5`) only constrains code the compiler can see —
+ * it does nothing for a `PolicyAction` built from runtime/deserialized
+ * input (a JSON-parsed request body, a persisted-then-restored action, or
+ * any `as PolicyAction` type assertion), where `risk` can legally be ANY
+ * JS value at runtime. Codex reproduced: `risk: -1` satisfies
+ * `lowRiskAllowRule`'s `action.risk <= maxRisk` comparison (`-1 <= 2` is
+ * `true`) and receives ALLOW — an action whose risk was never actually a
+ * valid level slipping through the CHEAPEST, least-scrutinized rule in the
+ * system. The SAME class of bug affects every OTHER rule a caller might
+ * register: a `NaN`/`Infinity`/fractional/out-of-range/non-numeric `risk`
+ * makes numeric comparisons behave unpredictably (`NaN <= x` is always
+ * `false`, silently defeating a LOW-risk allow rule but NOT restoring the
+ * risk-5-requires-approval floor below, since `authoritativeAction.risk >=
+ * 5` is ALSO `false` for `NaN`) — no rule can be trusted to reason
+ * correctly about a value that was never actually validated to be a real
+ * risk level in the first place. Fixed: `risk` is validated to be a genuine
+ * integer 0-5 inclusive BEFORE the authoritative action snapshot is even
+ * built, so NO rule — not even the very first one evaluated — ever
+ * observes an invalid `risk`. Fail closed (baseline section 147): an
+ * invalid `risk` throws immediately rather than being coerced, clamped, or
+ * silently treated as any particular decision.
+ */
+export class InvalidRiskLevelError extends Error {
+  constructor(risk: unknown) {
+    super(
+      `Invalid risk level: ${typeof risk === "number" ? risk : JSON.stringify(risk)} (typeof ${typeof risk}). ` +
+        `A PolicyAction's risk must be an integer 0-5 inclusive (baseline section 148, "Policy Engine") — ` +
+        `negative numbers, values above 5, fractions, NaN, Infinity, strings, null, undefined, and any other ` +
+        `non-integer value are all rejected BEFORE any policy rule runs, so no rule can be tricked into ` +
+        `misjudging an action whose risk was never actually valid.`
+    );
+    this.name = "InvalidRiskLevelError";
+  }
+}
+
+function assertValidRiskLevel(risk: unknown): asserts risk is RiskLevel {
+  if (typeof risk !== "number" || !Number.isInteger(risk) || risk < 0 || risk > 5) {
+    throw new InvalidRiskLevelError(risk);
+  }
+}
+
 export class PolicyEngine {
-  private readonly rules: PolicyRule[] = [];
+  /**
+   * P1 targeted-audit fix (26th independent review round, same root class
+   * as finding 2, "cost ledger state must be runtime-private"): this array
+   * used to be declared with TypeScript's compile-time-only `private` — in
+   * the emitted JS it is an ordinary, enumerable instance property. Since
+   * `rules` IS the entire default-deny enforcement surface (bölüm 147:
+   * "Politika motoru olmadan hiçbir riskli eylem doğrudan yürütülemez"),
+   * `(engine as any).rules.length = 0` or `.push(alwaysAllowRule)` from any
+   * caller holding a `PolicyEngine` reference would silently strip every
+   * registered DENY rule or inject a rule that always wins — defeating the
+   * single most important P0 guarantee with no trace in `evaluate()`
+   * itself. A genuine ECMAScript private field (`#rules`) closes this the
+   * same way `approval.ts`'s `#requests` already does for approval state.
+   */
+  #rules: PolicyRule[] = [];
 
   constructor(private readonly auditLog: AuditLog = new AuditLog()) {}
 
   addRule(rule: PolicyRule): void {
-    this.rules.push(rule);
+    this.#rules.push(rule);
   }
 
   get auditTrail(): AuditLog {
@@ -91,8 +149,14 @@ export class PolicyEngine {
    * reference to the same object.
    */
   evaluate(action: PolicyAction): PolicyEvaluationResult {
+    // P1 fix (26th independent review round, finding 4, "reject invalid
+    // risk values before policy evaluation"): validated BEFORE the
+    // authoritative snapshot is even built — bkz. `assertValidRiskLevel()`
+    // ve `InvalidRiskLevelError`'ın üstündeki fix notu. Fail closed: an
+    // invalid `risk` never reaches a single rule, not even the first one.
+    assertValidRiskLevel(action.risk);
     const authoritativeAction: PolicyAction = freezeRecord({ ...action });
-    const ordered = [...this.rules].sort((a, b) => b.priority - a.priority);
+    const ordered = [...this.#rules].sort((a, b) => b.priority - a.priority);
 
     // P1 fix (7th independent review round, "higher-priority ALLOW bypasses
     // matching DENY"): the previous loop `break`-ed at the FIRST rule that
