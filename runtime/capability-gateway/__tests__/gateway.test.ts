@@ -558,4 +558,120 @@ describe("CapabilityGateway", () => {
       );
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 9, 'snapshot approval id before consumption'): " +
+      "approval.approvalId is read exactly once and that SAME id is used for lookup, action binding, " +
+      "beginExecution, completeExecution/failExecution, and audit evidence",
+    () => {
+      const action = { actionType: "production-deploy", risk: 5 as const, description: "deploy to prod" };
+
+      it(
+        "BLOCKER regression, exact reproduction: an approvalId getter answering approval A's id for the match " +
+          "check and a DIFFERENT approval B's id afterward must not let A authorize while B is silently consumed",
+        async () => {
+          const policy = new PolicyEngine(); // default-deny -> risk 5 -> APPROVAL_REQUIRED
+          const approvals = new ApprovalWorkflow();
+          approvals.requestFor("id-a", action);
+          approvals.approve("id-a", "founder@example.com");
+          // "id-b" is a COMPLETELY unrelated, also-APPROVED request that
+          // this call never matched against `action` at all.
+          approvals.requestFor("id-b", { actionType: "unrelated-action", risk: 5, description: "something else" });
+          approvals.approve("id-b", "founder@example.com");
+
+          const gateway = new CapabilityGateway(policy, approvals);
+          const execute = vi.fn(() => "deployed");
+
+          let reads = 0;
+          const approvalRef = {
+            get approvalId() {
+              reads += 1;
+              // If authorize() ever re-read this after the initial
+              // lookup/match, it would return a DIFFERENT approval's id
+              // for beginExecution()/completeExecution() than the one
+              // actually matched and authorized the action.
+              return reads === 1 ? "id-a" : "id-b";
+            }
+          };
+
+          const result = await gateway.authorize(action, execute, approvalRef);
+
+          expect(reads).toBe(1); // approvalId is consulted exactly once
+          expect(result).toBe("deployed");
+          // The approval that GENUINELY matched the action is the one
+          // consumed — it reaches EXECUTED.
+          expect(approvals.get("id-a")!.status).toBe("EXECUTED");
+          // The unrelated approval is completely untouched — never
+          // begun, never completed, never failed.
+          expect(approvals.get("id-b")!.status).toBe("APPROVED");
+        }
+      );
+
+      it("BLOCKER regression (failure path): the SAME captured id is used for failExecution() even if approvalId would answer differently by then", async () => {
+        const policy = new PolicyEngine();
+        const approvals = new ApprovalWorkflow();
+        approvals.requestFor("id-a-fail", action);
+        approvals.approve("id-a-fail", "founder@example.com");
+        approvals.requestFor("id-b-fail", { actionType: "unrelated-action", risk: 5, description: "something else" });
+        approvals.approve("id-b-fail", "founder@example.com");
+
+        const gateway = new CapabilityGateway(policy, approvals);
+        const boom = new Error("provider call failed");
+        const execute = vi.fn(() => {
+          throw boom;
+        });
+
+        let reads = 0;
+        const approvalRef = {
+          get approvalId() {
+            reads += 1;
+            return reads === 1 ? "id-a-fail" : "id-b-fail";
+          }
+        };
+
+        await expect(gateway.authorize(action, execute, approvalRef)).rejects.toBe(boom);
+        expect(reads).toBe(1);
+        expect(approvals.get("id-a-fail")!.status).toBe("EXECUTION_FAILED");
+        expect(approvals.get("id-b-fail")!.status).toBe("APPROVED"); // untouched
+      });
+
+      it("Proxy-wrapped ApprovalReference: approvalId is read at most once across the whole authorize() call", async () => {
+        const policy = new PolicyEngine();
+        const approvals = new ApprovalWorkflow();
+        approvals.requestFor("id-proxy", action);
+        approvals.approve("id-proxy", "founder@example.com");
+        const gateway = new CapabilityGateway(policy, approvals);
+
+        const reads: Record<string, number> = {};
+        const target = { approvalId: "id-proxy" };
+        const proxied = new Proxy(target, {
+          get(t, prop, receiver) {
+            reads[String(prop)] = (reads[String(prop)] ?? 0) + 1;
+            return Reflect.get(t, prop, receiver);
+          }
+        });
+
+        const result = await gateway.authorize(action, () => "deployed", proxied);
+        expect(reads.approvalId).toBe(1);
+        expect(result).toBe("deployed");
+      });
+
+      it("a mismatch error message still names the correct (single-read) approvalId, not a possibly-different later read", async () => {
+        const policy = new PolicyEngine();
+        const approvals = new ApprovalWorkflow(); // "id-unknown" never requested
+        const gateway = new CapabilityGateway(policy, approvals);
+
+        let reads = 0;
+        const approvalRef = {
+          get approvalId() {
+            reads += 1;
+            return reads === 1 ? "id-unknown" : "some-other-id";
+          }
+        };
+
+        await expect(gateway.authorize(action, () => "never", approvalRef)).rejects.toThrow(/id-unknown/);
+        expect(reads).toBe(1);
+      });
+    }
+  );
 });

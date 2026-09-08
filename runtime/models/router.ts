@@ -115,7 +115,26 @@ export interface RouteAndExecuteResult {
 }
 
 export class CheapestCapableModelRouter {
-  constructor(private readonly registry: ModelRegistry) {}
+  /**
+   * P1 targeted-audit fix (28th independent review round, root-class B
+   * sweep, "TypeScript private used for authoritative mutable state" —
+   * same class as `policy-engine.ts`'s `#auditLog`/`budget.ts`'s
+   * `#costEngine`): still declared with TypeScript's compile-time-only
+   * `private` — `(router as any).registry = attackerControlledRegistry`
+   * from any caller holding a `CheapestCapableModelRouter` reference would
+   * silently substitute the ENTIRE authoritative model registry every
+   * `selectModel()`/`routeAndExecute()` call consults, bypassing
+   * `ModelRegistry`'s own duplicate-id/price-validation guarantees and the
+   * "cheapest capable model" invariant (bölüm 62) itself — the substituted
+   * registry could report any price/tier/capabilities it likes for any
+   * `modelId`. Fixed the same way those other authoritative dependencies
+   * already are.
+   */
+  #registry: ModelRegistry;
+
+  constructor(registry: ModelRegistry) {
+    this.#registry = registry;
+  }
 
   /**
    * Verilen görev için en ucuz yeterli modeli seçer. Asla "mevcut en güçlü
@@ -126,13 +145,38 @@ export class CheapestCapableModelRouter {
     const requiredTier = minTierOverride ?? minTierForRisk(request.risk);
     const minRank = tierRank(requiredTier);
 
-    const candidates = this.registry
-      .findCapable(request.requiredCapabilities)
-      .filter((m) => tierRank(m.tier) >= minRank);
+    const capable = this.#registry.findCapable(request.requiredCapabilities);
 
-    if (candidates.length === 0) {
+    // P1 fix (28th independent review round, finding 14, "initial routing
+    // must use the lowest sufficient tier"): this used to filter candidates
+    // to `tierRank(m.tier) >= minRank` (every tier AT OR ABOVE the floor)
+    // and then reduce for cheapest COST across ALL of them combined. Model
+    // prices are registry DATA (bölüm 60), not something this code can
+    // assume is monotonically increasing with tier — a PREMIUM model priced
+    // below a STANDARD one (a mispriced/promotional entry, or simply a
+    // provider's own pricing quirk) would win that reduce, so a trivial
+    // task could initially select a premium-tier model purely because it
+    // happened to be the cheapest NUMBER in the pool, even though a
+    // LOCAL_FREE/STANDARD model was fully sufficient — the exact "cheapest
+    // capable model" invariant (bölüm 62) this class exists to enforce.
+    // Fixed: find the LOWEST tier (walking up from the risk floor) that has
+    // at least one capable candidate, restrict the candidate pool to THAT
+    // tier ONLY, and optimize cost strictly within it. Cost is never
+    // compared ACROSS tiers.
+    let selectedTier: ModelTier | undefined;
+    for (let rank = minRank; rank < TIER_ORDER.length; rank++) {
+      const tier = TIER_ORDER[rank]!;
+      if (capable.some((m) => m.tier === tier)) {
+        selectedTier = tier;
+        break;
+      }
+    }
+
+    if (selectedTier === undefined) {
       throw new NoCapableModelError(request, requiredTier);
     }
+
+    const candidates = capable.filter((m) => m.tier === selectedTier);
 
     const cheapest = candidates.reduce((best, current) =>
       current.costPerCall < best.costPerCall ? current : best

@@ -73,4 +73,47 @@ describe("ServiceCatalog", () => {
       expect(catalog.get("svc-1")!.status).toBe("HEALTHY");
     });
   });
+
+  describe(
+    "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+      "mutable state'): ServiceCatalog's services Map is also a genuine #private field now",
+    () => {
+      it("services is not reachable as an ordinary JS property", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "svc-1", name: "A", kind: "service", purpose: "p", status: "HEALTHY" });
+
+        expect((catalog as unknown as Record<string, unknown>).services).toBeUndefined();
+        expect(Object.getOwnPropertyNames(catalog)).not.toContain("services");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 12's root class, 'snapshot registry records before " +
+      "validation/storage'): register() reads record.id exactly once, then the duplicate check and the Map key " +
+      "both use that SAME snapshot",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed id answering a NON-colliding value for the duplicate check and a DIFFERENT (colliding) value afterward must not corrupt the store", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "existing", name: "Existing", kind: "service", purpose: "p", status: "HEALTHY" });
+
+        let reads = 0;
+        const hostile = {
+          get id() {
+            reads += 1;
+            return reads === 1 ? "new-one" : "existing";
+          },
+          name: "Hostile",
+          kind: "service" as const,
+          purpose: "p",
+          status: "DOWN" as const
+        };
+
+        catalog.register(hostile);
+        expect(reads).toBe(1); // id consulted exactly once
+        expect(catalog.get("existing")!.status).toBe("HEALTHY"); // untouched
+        expect(catalog.get("new-one")!.status).toBe("DOWN");
+      });
+    }
+  );
 });

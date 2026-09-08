@@ -30,6 +30,7 @@ import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js"
 import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import type { BudgetGuard } from "../budget/budget.js";
 import { freezeRecord } from "../util/immutable.js";
+import type { AuditLog } from "../audit/audit-log.js";
 
 export interface ModelInvocationRequest {
   readonly prompt: string;
@@ -118,6 +119,35 @@ export class UnknownProviderError extends Error {
   }
 }
 
+/**
+ * P1 fix (28th independent review round, finding 13, "reject duplicate
+ * provider registration"): `registerProvider()` used to call
+ * `this.#providers.set(provider.id, provider)` unconditionally — a SECOND
+ * `registerProvider()` call for the same `id` silently REPLACED the
+ * authoritative adapter every subsequent `invoke()` dispatches real
+ * provider calls through (bkz. `#rawInvoke`'s `this.#providers.get(model.provider)`).
+ * Since a provider is the ONLY thing standing between an authorized,
+ * budget-reserved invocation and an ACTUAL external side effect/spend, a
+ * caller (or a compromised/buggy startup path) able to swap the adapter
+ * bound to a live id after the fact could silently redirect every future
+ * "trusted" model call for that provider id to a completely different
+ * implementation, with zero audit trail of the swap ever happening —
+ * exactly the "no silent architectural deletion" class this repo's
+ * constitutional rules (bölüm 147) forbid. Fixed: registering an already-
+ * bound id now fails closed; a caller that genuinely needs to replace an
+ * adapter must do so through the separately named, explicitly audited
+ * `replaceProvider()` below.
+ */
+export class DuplicateProviderIdError extends Error {
+  constructor(id: string) {
+    super(
+      `Provider id '${id}' is already registered. registerProvider() never silently replaces an existing ` +
+        `adapter — use ModelGateway.replaceProvider() for an explicit, audited replacement.`
+    );
+    this.name = "DuplicateProviderIdError";
+  }
+}
+
 export class ModelGateway {
   // Gerçek ECMAScript private alan (`#`), TypeScript'in `private`
   // anahtar kelimesinden BİLEREK farklı: `private` yalnızca DERLEME
@@ -149,12 +179,51 @@ export class ModelGateway {
    */
   readonly #approvals: ApprovalWorkflow;
 
-  constructor(approvals: ApprovalWorkflow = new ApprovalWorkflow()) {
+  /**
+   * P1 fix (28th independent review round, finding 13): optional, injected
+   * ONCE at construction — the same "trust established once, by whoever
+   * assembles the system" model as `#approvals` above. Used only to record
+   * the explicit, audited `replaceProvider()` swap below; ordinary
+   * `registerProvider()` never touches it.
+   */
+  readonly #auditLog?: AuditLog;
+
+  constructor(approvals: ApprovalWorkflow = new ApprovalWorkflow(), auditLog?: AuditLog) {
     this.#approvals = approvals;
+    this.#auditLog = auditLog;
   }
 
+  /**
+   * P1 fix (28th independent review round, finding 13, "reject duplicate
+   * provider registration"): fails closed on a colliding id instead of
+   * silently replacing the authoritative adapter — bkz. `DuplicateProviderIdError`
+   * fix notu yukarıda.
+   */
   registerProvider(provider: ModelProvider): void {
+    if (this.#providers.has(provider.id)) {
+      throw new DuplicateProviderIdError(provider.id);
+    }
     this.#providers.set(provider.id, provider);
+  }
+
+  /**
+   * `registerProvider()`'ın aksine, var olan bir adaptörü KASITLI ve
+   * DENETLENEBİLİR şekilde değiştirmenin TEK yolu budur — bkz.
+   * `DuplicateProviderIdError`'ın fix notu. Bilinmeyen bir id'yi
+   * değiştirmeye çalışmak da reddedilir (bu bir "replace" değil, gizlenmiş
+   * bir "register" olurdu); `registerProvider()` kullanılmalıdır.
+   */
+  replaceProvider(provider: ModelProvider): void {
+    if (!this.#providers.has(provider.id)) {
+      throw new UnknownProviderError(provider.id);
+    }
+    this.#providers.set(provider.id, provider);
+    this.#auditLog?.append({
+      type: "MODEL_PROVIDER_REPLACED",
+      actor: "ModelGateway",
+      payload: { providerId: provider.id },
+      timestamp: new Date().toISOString()
+    });
   }
 
   hasProvider(id: string): boolean {

@@ -191,11 +191,25 @@ export class AssumptionRegister {
   #assumptions = new Map<string, MutableAssumption>();
 
   propose(input: ProposeAssumptionInput): Assumption {
-    if (this.#assumptions.has(input.id)) {
-      throw new DuplicateAssumptionIdError(input.id);
+    // P1 fix (28th independent review round, finding 12, "snapshot
+    // registry records before validation/storage" — same root class as
+    // models/registry.ts's register()): `input.id` used to be read from
+    // the caller's own object at THREE separate points — the
+    // `.has()` duplicate check, the `{ ...input }` spread that builds the
+    // stored record, and the `.set(input.id, ...)` Map key. A
+    // getter/Proxy-backed `input` could answer a non-colliding id for the
+    // duplicate check, then a DIFFERENT id for the spread/Map-key reads —
+    // storing a record whose own `.id` field disagrees with the Map key
+    // it is actually stored under, or silently bypassing the duplicate
+    // check entirely. Fixed: `input` is spread into `snapshot` FIRST,
+    // reading every property exactly once; the duplicate check, the
+    // stored record, and the Map key all derive from this SAME snapshot.
+    const snapshot: ProposeAssumptionInput = { ...input };
+    if (this.#assumptions.has(snapshot.id)) {
+      throw new DuplicateAssumptionIdError(snapshot.id);
     }
-    const assumption: MutableAssumption = { ...input, status: "PROPOSED", createdAt: new Date().toISOString() };
-    this.#assumptions.set(input.id, assumption);
+    const assumption: MutableAssumption = { ...snapshot, status: "PROPOSED", createdAt: new Date().toISOString() };
+    this.#assumptions.set(snapshot.id, assumption);
     return freezeRecord(assumption);
   }
 

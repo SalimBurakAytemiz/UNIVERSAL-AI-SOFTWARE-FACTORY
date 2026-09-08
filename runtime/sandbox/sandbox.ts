@@ -391,12 +391,39 @@ export async function withTimeout<T>(operation: (signal: AbortSignal) => Promise
   }, ms);
 
   try {
-    return await operation(controller.signal);
+    const value = await operation(controller.signal);
+    // P1 fix (28th independent review round, finding 3, "preserve timeout
+    // failure after deadline"): this check used to exist ONLY in the
+    // `catch` block below — an `operation` that ignores its `signal`
+    // (never honors cancellation) and eventually RESOLVES successfully,
+    // even after the deadline already fired and `timedOut` was already
+    // `true`, used to have that late success value returned here
+    // completely UNCHECKED, silently overwriting the timeout outcome the
+    // caller was entitled to see. Once the deadline is exceeded, that
+    // outcome is authoritative and must never be overwritten by whatever
+    // the operation eventually does — a late resolve is treated exactly
+    // like a late reject (below): both throw `SandboxTimeoutError`,
+    // never silently returning a value produced after the caller was
+    // already told "this timed out." A genuinely cancellable operation
+    // (one that honors `signal`) never reaches this branch in the first
+    // place, since it settles (by rejecting via the abort) before or at
+    // the same moment `timedOut` is set — this branch exists specifically
+    // for the non-cooperative case this function has always documented it
+    // cannot force-cancel.
+    if (timedOut) {
+      throw new SandboxTimeoutError(ms);
+    }
+    return value;
   } catch (err) {
     // The operation settled (rejected) as a DIRECT, observed consequence
     // of the abort this function itself issued — genuine termination, not
     // abandoned waiting. Any OTHER rejection (the operation failing for
-    // its own, unrelated reasons) is never masked as a timeout.
+    // its own, unrelated reasons) is never masked as a timeout, UNLESS the
+    // deadline had already passed by the time it rejected — in which case
+    // the timeout outcome is still authoritative (same reasoning as the
+    // resolve path above): whatever caused the rejection happened only
+    // because the operation kept running past a deadline that was already
+    // exceeded, so it is reported as the timeout it genuinely is.
     if (timedOut) {
       throw new SandboxTimeoutError(ms);
     }

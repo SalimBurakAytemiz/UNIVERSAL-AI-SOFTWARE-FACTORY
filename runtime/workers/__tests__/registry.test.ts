@@ -269,4 +269,51 @@ describe("WorkerRegistry", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 12, 'snapshot registry records before validation/storage'): " +
+      "register() reads every field of the caller-owned record exactly once, then validates/dedupes/stores that " +
+      "SAME snapshot",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed id that answers a NON-colliding value for the duplicate check and a DIFFERENT (colliding) value afterward must not corrupt the store", () => {
+        const registry = new WorkerRegistry();
+        registry.register({ id: "existing", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+
+        let reads = 0;
+        const hostile = {
+          get id() {
+            reads += 1;
+            return reads === 1 ? "new-one" : "existing";
+          },
+          workerClass: "gpu" as const,
+          capabilities: ["gpu"],
+          costPerMinuteUsd: 0.5,
+          status: "IDLE" as const
+        };
+
+        registry.register(hostile);
+        expect(reads).toBe(1); // id consulted exactly once
+        expect(registry.all().map((w) => w.id).sort()).toEqual(["existing", "new-one"]);
+      });
+
+      it("a getter-backed costPerMinuteUsd answering validly then invalidly is still rejected consistently (validation and storage never disagree)", () => {
+        const registry = new WorkerRegistry();
+        let reads = 0;
+        const hostile = {
+          id: "w-hostile",
+          workerClass: "linux-general" as const,
+          capabilities: ["cpu"],
+          get costPerMinuteUsd() {
+            reads += 1;
+            return reads === 1 ? 0.01 : NaN;
+          },
+          status: "IDLE" as const
+        };
+
+        registry.register(hostile);
+        expect(reads).toBe(1);
+        expect(registry.all()[0]!.costPerMinuteUsd).toBe(0.01);
+      });
+    }
+  );
 });

@@ -4,6 +4,7 @@
 
 import { randomBytes } from "node:crypto";
 import { freezeRecord } from "../util/immutable.js";
+import type { StateStore } from "../state/file-store.js";
 
 export class InvalidMonetaryAmountError extends Error {
   constructor(context: string, amount: number) {
@@ -229,6 +230,154 @@ export class ReservationOwnershipMismatchError extends Error {
   }
 }
 
+/**
+ * P1 fix (28th independent review round, finding 4, "persist cost entries
+ * and reservations across restarts"): committed spend (`#entries`) and
+ * open/protected reservations (`#reservations`) used to exist ONLY in
+ * this class's in-memory state — a process restart (deploy, crash,
+ * scheduled restart) silently lost the ENTIRE cost ledger: every already-
+ * incurred, genuinely-spent dollar simply vanished from every future
+ * ceiling check (baseline section 147's "no silent spending" cuts both
+ * ways — losing evidence of REAL spend is just as much a violation as
+ * fabricating spend that never happened), daily/monthly windows reset to
+ * zero regardless of what was truly spent earlier that period, and any
+ * `RECONCILIATION_FAILED` reservation (protecting capacity because a
+ * provider call may already have incurred real, unresolved cost) lost its
+ * protection entirely, becoming silently releasable again after restart.
+ * Fixed with an OPTIONAL `persistence: { store: StateStore; path: string }`
+ * constructor parameter — using the SAME `StateStore` abstraction
+ * `runtime/state/file-store.ts` already provides for `project-lifecycle/
+ * orchestrator.ts`'s own durable state (bölüm 275/277), not a new
+ * persistence mechanism. When supplied: the constructor synchronously
+ * restores any existing persisted state (validated — see
+ * `assertValidPersistedCostState()` below, fail closed on anything
+ * malformed) BEFORE this instance is usable, and every mutating operation
+ * (`record()`/`createReservation()`/`commitReservation()`/
+ * `releaseReservation()`/`markReservationReconciliationFailed()`)
+ * synchronously persists the updated state afterward via the SAME
+ * atomic-write `FileStateStore.write()` this codebase's other durable
+ * state already relies on (temp-file-then-rename, so a crash mid-write
+ * can never corrupt the previously-good durable file). Omitting
+ * `persistence` preserves the exact prior in-memory-only behavior for any
+ * caller (tests, ephemeral single-process usage) that does not need
+ * cross-restart durability — this is an additive, backward-compatible
+ * constructor parameter; none of the 200+ existing `new CostEngine()`/
+ * `new CostEngine(now)` call sites change.
+ */
+export class CorruptCostStateError extends Error {
+  constructor(reason: string) {
+    super(
+      `Refusing to restore persisted cost-engine state: ${reason}. Malformed/corrupt persisted cost state ` +
+        `fails closed (baseline section 147, 277) rather than being silently discarded or coerced — silently ` +
+        `discarding it would make genuinely-incurred, already-recorded spend disappear, and silently coercing ` +
+        `it risks poisoning every future ceiling check with garbage.`
+    );
+    this.name = "CorruptCostStateError";
+  }
+}
+
+interface PersistedCostEntry {
+  readonly taskId: string;
+  readonly agentId?: string;
+  readonly projectId?: string;
+  readonly provider: string;
+  readonly modelId: string;
+  readonly amountUsd: number;
+  readonly timestamp: string;
+}
+
+interface PersistedReservation {
+  readonly id: string;
+  readonly scope: ReservationOwnership;
+  readonly amountUsd: number;
+  readonly status: ReservationLedgerStatus;
+}
+
+interface PersistedCostState {
+  readonly entries: readonly PersistedCostEntry[];
+  readonly reservations: readonly PersistedReservation[];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertValidPersistedScope(scope: unknown, context: string): asserts scope is ReservationOwnership {
+  if (!isPlainObject(scope)) {
+    throw new CorruptCostStateError(`${context}.scope is not a plain object`);
+  }
+  for (const key of ["taskId", "agentId", "projectId", "provider", "modelId"]) {
+    const value = scope[key];
+    if (value !== undefined && typeof value !== "string") {
+      throw new CorruptCostStateError(`${context}.scope.${key} is neither a string nor undefined`);
+    }
+  }
+}
+
+/**
+ * Restore edilen JSON'ın gerçekten geçerli bir `PersistedCostState` olduğunu
+ * doğrular — bir dosya sistemi/deserileştirme hatası, elle düzenleme veya
+ * eski/uyumsuz bir şema ASLA sessizce kabul edilip toplamları zehirlemez
+ * (bkz. bu sınıfın üstündeki fix notu, "no silent spending" hem yönde de
+ * geçerlidir).
+ */
+function assertValidPersistedCostState(data: unknown): asserts data is PersistedCostState {
+  if (!isPlainObject(data)) {
+    throw new CorruptCostStateError("root value is not a plain object");
+  }
+  if (!Array.isArray(data.entries)) {
+    throw new CorruptCostStateError("'entries' is not an array");
+  }
+  if (!Array.isArray(data.reservations)) {
+    throw new CorruptCostStateError("'reservations' is not an array");
+  }
+  data.entries.forEach((entry: unknown, index: number) => {
+    if (!isPlainObject(entry)) {
+      throw new CorruptCostStateError(`entries[${index}] is not a plain object`);
+    }
+    if (typeof entry.taskId !== "string" || entry.taskId.length === 0) {
+      throw new CorruptCostStateError(`entries[${index}].taskId is not a non-empty string`);
+    }
+    if (typeof entry.provider !== "string" || entry.provider.length === 0) {
+      throw new CorruptCostStateError(`entries[${index}].provider is not a non-empty string`);
+    }
+    if (typeof entry.modelId !== "string" || entry.modelId.length === 0) {
+      throw new CorruptCostStateError(`entries[${index}].modelId is not a non-empty string`);
+    }
+    if (typeof entry.timestamp !== "string" || Number.isNaN(Date.parse(entry.timestamp))) {
+      throw new CorruptCostStateError(`entries[${index}].timestamp is not a valid ISO timestamp string`);
+    }
+    if (entry.agentId !== undefined && typeof entry.agentId !== "string") {
+      throw new CorruptCostStateError(`entries[${index}].agentId is neither a string nor undefined`);
+    }
+    if (entry.projectId !== undefined && typeof entry.projectId !== "string") {
+      throw new CorruptCostStateError(`entries[${index}].projectId is neither a string nor undefined`);
+    }
+    try {
+      assertValidMonetaryAmount(entry.amountUsd as number, `restored entries[${index}]`);
+    } catch (err) {
+      throw new CorruptCostStateError(`entries[${index}].amountUsd is invalid (${String(err)})`);
+    }
+  });
+  data.reservations.forEach((reservation: unknown, index: number) => {
+    if (!isPlainObject(reservation)) {
+      throw new CorruptCostStateError(`reservations[${index}] is not a plain object`);
+    }
+    if (typeof reservation.id !== "string" || reservation.id.length === 0) {
+      throw new CorruptCostStateError(`reservations[${index}].id is not a non-empty string`);
+    }
+    assertValidPersistedScope(reservation.scope, `reservations[${index}]`);
+    try {
+      assertValidMonetaryAmount(reservation.amountUsd as number, `restored reservations[${index}]`);
+    } catch (err) {
+      throw new CorruptCostStateError(`reservations[${index}].amountUsd is invalid (${String(err)})`);
+    }
+    if (reservation.status !== "ACTIVE" && reservation.status !== "RECONCILIATION_FAILED") {
+      throw new CorruptCostStateError(`reservations[${index}].status is neither "ACTIVE" nor "RECONCILIATION_FAILED"`);
+    }
+  });
+}
+
 function ownershipMismatches(reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership): boolean {
   const reservedProvider = reservationScope.provider;
   const reservedModelId = reservationScope.modelId;
@@ -291,8 +440,72 @@ export class CostEngine {
    * gerçek zamanı kullanır, ancak testler (özellikle günlük/aylık bütçe
    * sıfırlanma senaryoları) belirli bir ana "sabitlenmiş" kayıtlar
    * üretebilmek için bunu değiştirebilir (bkz. runtime/budget/budget.ts).
+   *
+   * P1 fix (28th independent review round, finding 6, "make cost ledger
+   * clock runtime-private" — same root class as this file's own `#entries`/
+   * `#reservations`/`#reservationSeq`, round 26 finding 2): this used to be
+   * a TypeScript compile-time-only `private readonly` constructor-parameter
+   * property — an ordinary, enumerable instance property in the emitted
+   * JS. `(engine as any).now = () => new Date("2099-01-01")` from any
+   * caller holding a `CostEngine` reference would silently backdate/
+   * future-date every subsequently recorded `CostEntry.timestamp`, which
+   * `totalInWindow()`'s daily/monthly ceiling queries compare directly —
+   * an attacker could make every future spend appear to fall outside the
+   * current period (or, backdating, poison a PAST period's total).
+   * Converted to a genuine ECMAScript `#now` private field.
    */
-  constructor(private readonly now: () => Date = () => new Date()) {}
+  readonly #now: () => Date;
+
+  /**
+   * P1 fix (28th independent review round, finding 4, "persist cost
+   * entries and reservations across restarts"): when supplied, this
+   * ledger's mutating state is durably synchronized to `persistence.store`
+   * — see the fix note above this class for the full rationale.
+   */
+  readonly #persistenceStore?: StateStore;
+  readonly #persistencePath?: string;
+
+  constructor(now: () => Date = () => new Date(), persistence?: { readonly store: StateStore; readonly path: string }) {
+    this.#now = now;
+    if (persistence) {
+      this.#persistenceStore = persistence.store;
+      this.#persistencePath = persistence.path;
+      const restored: unknown = persistence.store.read(persistence.path);
+      if (restored !== undefined) {
+        assertValidPersistedCostState(restored);
+        this.#entries = restored.entries.map((e) => freezeRecord({ ...e }));
+        let maxSeq = 0;
+        for (const r of restored.reservations) {
+          this.#reservations.set(r.id, { scope: freezeRecord({ ...r.scope }), amountUsd: r.amountUsd, status: r.status });
+          const match = /^res-(\d+)-/.exec(r.id);
+          if (match) maxSeq = Math.max(maxSeq, Number(match[1]));
+        }
+        this.#reservationSeq = maxSeq;
+      }
+    }
+  }
+
+  /**
+   * Bu motorun mutasyona uğrayan HER durumunu (`#entries`/`#reservations`)
+   * yapılandırılmış kalıcı depoya senkron olarak yazar — `persistence`
+   * enjekte edilmediyse hiçbir şey yapmaz (eski, yalnızca-bellek içi
+   * davranış korunur). `FileStateStore.write()`'ın ATOMİK (geçici dosya +
+   * rename) yazma garantisi sayesinde, bu çağrı sırasında bir çökme,
+   * bilinen-son-iyi kalıcı durumu ASLA bozamaz (bkz. file-store.ts).
+   */
+  #persist(): void {
+    if (!this.#persistenceStore || this.#persistencePath === undefined) return;
+    const data: PersistedCostState = {
+      entries: this.#entries,
+      reservations: [...this.#reservations.entries()].map(([id, r]) => ({
+        id,
+        scope: r.scope,
+        amountUsd: r.amountUsd,
+        status: r.status
+      }))
+    };
+    this.#persistenceStore.write(this.#persistencePath, data);
+  }
 
   record(entry: Omit<CostEntry, "timestamp">): CostEntry {
     // P1 fix (27th independent review round, finding 7, "snapshot spend
@@ -310,7 +523,7 @@ export class CostEngine {
     // Doğrudan record() çağrıları da (BudgetGuard'ı atlayan çağrılar dahil)
     // korunur — bozuk bir tutarın toplamlara sızmasına asla izin verilmez.
     assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.record(taskId=${snapshot.taskId})`);
-    const full: CostEntry = { ...snapshot, timestamp: this.now().toISOString() };
+    const full: CostEntry = { ...snapshot, timestamp: this.#now().toISOString() };
     // İç diziye eklenen nesne İLE dışarı döndürülen nesne KASITLI OLARAK
     // aynı referans DEĞİLDİR: çağıran döndürülen kaydı (ör. amountUsd'yi
     // NaN'a) mutasyona uğratsa bile, iç toplamlar (total/totalFor/
@@ -318,6 +531,7 @@ export class CostEngine {
     // kopyasını okur. Object.freeze, bu ayrımın atlanamamasını (örn.
     // "as any" ile alan ataması) TypeError'a çevirerek garanti eder.
     this.#entries.push(full);
+    this.#persist();
     return freezeRecord(full);
   }
 
@@ -393,6 +607,7 @@ export class CostEngine {
     const id = `res-${++this.#reservationSeq}-${randomBytes(16).toString("hex")}`;
     const frozenScope = freezeRecord({ ...scope });
     this.#reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
+    this.#persist();
     return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
   }
 
@@ -437,7 +652,10 @@ export class CostEngine {
    */
   markReservationReconciliationFailed(id: string): void {
     const r = this.#reservations.get(id);
-    if (r) r.status = "RECONCILIATION_FAILED";
+    if (r) {
+      r.status = "RECONCILIATION_FAILED";
+      this.#persist();
+    }
   }
 
   /**
@@ -501,19 +719,41 @@ export class CostEngine {
     const snapshot: Omit<CostEntry, "timestamp"> = { ...entry };
     if (ownershipMismatches(reservation.scope, snapshot)) {
       reservation.status = "RECONCILIATION_FAILED";
+      this.#persist();
       throw new ReservationOwnershipMismatchError("commit", id, reservation.scope, snapshot);
     }
+    // P1 fix (28th independent review round, finding 10, "every failed
+    // commit must enter RECONCILIATION_FAILED"): this used to validate
+    // `snapshot.amountUsd` in its OWN try/catch, protecting the
+    // reservation ONLY against that ONE specific failure mode — a failure
+    // from ANY other cause during the actual recording step (`record()`
+    // itself, including its own — now persistence-backed, bkz. bu
+    // dosyanın üstündeki fix notu — write, which can fail for reasons
+    // entirely unrelated to the amount, e.g. a durable-storage I/O error)
+    // fell OUTSIDE any try/catch entirely: the reservation would be left
+    // "ACTIVE" — releasable, and NOT protected — even though the provider
+    // call this reservation exists to protect against may already have
+    // incurred real cost by the time `commitReservation()` was called at
+    // all. The entire "attempt to actually record this cost" step is now
+    // ONE try/catch: ANY failure inside it — amount validation (still
+    // enforced, now via `record()`'s own internal check, so no longer
+    // duplicated here) OR a persistence-layer failure OR any other cause —
+    // marks this reservation RECONCILIATION_FAILED and preserves it
+    // (never deleted), exactly the same fail-safe outcome regardless of
+    // WHICH step inside recording failed.
+    let recorded: CostEntry;
     try {
-      assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.commitReservation(id=${id})`);
+      recorded = this.record(snapshot);
     } catch (err) {
-      // Doğrulama BAŞARISIZ olursa rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED"
-      // olarak işaretlenip KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard)
-      // kendi audit/hata işleme mantığı bu hatayı zaten sarmalar.
+      // Rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED" olarak işaretlenip
+      // KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard) kendi audit/
+      // hata işleme mantığı bu hatayı zaten sarmalar.
       reservation.status = "RECONCILIATION_FAILED";
+      this.#persist();
       throw err;
     }
-    const recorded = this.record(snapshot);
     this.#reservations.delete(id);
+    this.#persist();
     return recorded;
   }
 
@@ -555,6 +795,7 @@ export class CostEngine {
       throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
     }
     this.#reservations.delete(id);
+    this.#persist();
     return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
   }
 

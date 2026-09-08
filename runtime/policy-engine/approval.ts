@@ -152,7 +152,20 @@ export class DuplicateApprovalIdError extends Error {
 export class ApprovalWorkflow {
   #requests = new Map<string, MutableApprovalRequest>();
 
-  constructor(private readonly auditLog?: AuditLog) {}
+  /**
+   * P1 fix (28th independent review round, root-class B sweep, "TypeScript
+   * private used for authoritative mutable state" — same class as finding
+   * 1 above, in this same file): this was still a TS-compile-time-only
+   * `private readonly` constructor-parameter property. Replacing it via
+   * `(workflow as any).auditLog = { append: () => {} }` would silently
+   * suppress every future `APPROVAL_*` audit event with no trace. Converted
+   * to a genuine ECMAScript `#auditLog` private field.
+   */
+  #auditLog?: AuditLog;
+
+  constructor(auditLog?: AuditLog) {
+    this.#auditLog = auditLog;
+  }
 
   request(id: string, actionDescription: string, risk: number): ApprovalRequest {
     if (this.#requests.has(id)) {
@@ -215,7 +228,7 @@ export class ApprovalWorkflow {
    */
   approve(id: string, decidedBy: string, evidenceRef?: string): ApprovalRequest {
     assertValidApprover(decidedBy);
-    const req = this.mustGet(id);
+    const req = this.#mustGet(id);
     if (req.status !== "PENDING") {
       throw new Error(`Cannot approve request ${id}: status is ${req.status}, not PENDING`);
     }
@@ -229,7 +242,7 @@ export class ApprovalWorkflow {
 
   reject(id: string, decidedBy: string, evidenceRef?: string): ApprovalRequest {
     assertValidApprover(decidedBy);
-    const req = this.mustGet(id);
+    const req = this.#mustGet(id);
     if (req.status !== "PENDING") {
       throw new Error(`Cannot reject request ${id}: status is ${req.status}, not PENDING`);
     }
@@ -272,7 +285,7 @@ export class ApprovalWorkflow {
           "REQUEST_CHANGES would be indistinguishable from an unexplained REJECT."
       );
     }
-    const req = this.mustGet(id);
+    const req = this.#mustGet(id);
     if (req.status !== "PENDING") {
       throw new Error(`Cannot request changes on request ${id}: status is ${req.status}, not PENDING`);
     }
@@ -329,7 +342,7 @@ export class ApprovalWorkflow {
    * close.
    */
   beginExecution(id: string): ApprovalRequest {
-    const req = this.mustGet(id);
+    const req = this.#mustGet(id);
     if (req.status !== "APPROVED") {
       throw new ApprovalRequiredError(
         `Action ${id} cannot begin execution: status is ${req.status}, requires APPROVED`
@@ -342,7 +355,7 @@ export class ApprovalWorkflow {
 
   /** EXECUTING -> EXECUTED. Call ONLY after the real work this approval authorized has genuinely succeeded. */
   completeExecution(id: string): ApprovalRequest {
-    const req = this.mustGet(id);
+    const req = this.#mustGet(id);
     if (req.status !== "EXECUTING") {
       throw new ApprovalRequiredError(
         `Action ${id} cannot complete execution: status is ${req.status}, requires EXECUTING`
@@ -355,7 +368,7 @@ export class ApprovalWorkflow {
 
   /** EXECUTING -> EXECUTION_FAILED (terminal for this id — bkz. üstteki fix notu, "valid retry semantics"). */
   failExecution(id: string, reason?: string): ApprovalRequest {
-    const req = this.mustGet(id);
+    const req = this.#mustGet(id);
     if (req.status !== "EXECUTING") {
       throw new ApprovalRequiredError(
         `Action ${id} cannot fail execution: status is ${req.status}, requires EXECUTING`
@@ -394,14 +407,33 @@ export class ApprovalWorkflow {
     return [...this.#requests.values()].map((r) => freezeRecord(r));
   }
 
-  private mustGet(id: string): MutableApprovalRequest {
+  /**
+   * P1 fix (28th independent review round, finding 1, "hide mutable
+   * approval lookup helpers at runtime"): this used to be declared with
+   * TypeScript's compile-time-only `private` keyword — an ordinary,
+   * enumerable instance method in the emitted JS. It returns the ACTUAL
+   * mutable record stored in `#requests` (deliberately, for internal use —
+   * `approve()`/`reject()`/`requestChanges()`/`beginExecution()`/
+   * `completeExecution()`/`failExecution()` all mutate that exact object
+   * to perform their state transition), never a frozen copy. Because
+   * `private` is not real runtime privacy, `(workflow as
+   * any).mustGet(id).status = "APPROVED"` from ANY caller holding a
+   * `ApprovalWorkflow` reference could reach this method directly and
+   * mutate a PENDING request straight to APPROVED (or any other status)
+   * with NO reviewer-identity check and NO audit-log entry — completely
+   * bypassing every public method's guarantees. Converted to a genuine
+   * ECMAScript private method (`#mustGet`) — `as any`, bracket access, and
+   * every reflection API fail to reach it, and code outside this class
+   * body attempting `x.#mustGet(...)` is a `SyntaxError` at PARSE time.
+   */
+  #mustGet(id: string): MutableApprovalRequest {
     const req = this.#requests.get(id);
     if (!req) throw new Error(`No approval request found for id ${id}`);
     return req;
   }
 
   private audit(type: string, req: MutableApprovalRequest): void {
-    this.auditLog?.append({
+    this.#auditLog?.append({
       type,
       actor: req.decidedBy ?? "approval-workflow",
       payload: {

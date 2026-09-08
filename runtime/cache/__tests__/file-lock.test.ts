@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, existsSync, 
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
-import { acquireFileLock, FileLockTimeoutError, sanitizeReclaimToken } from "../file-lock.js";
+import { acquireFileLock, FileLockTimeoutError, InvalidFileLockOptionsError, sanitizeReclaimToken } from "../file-lock.js";
 
 // P2 fix (22nd independent review round, "validate lock metadata before
 // using owner PID"): Codex reproduced that syntactically valid JSON with
@@ -402,6 +402,84 @@ describe(
       // file) must survive completely untouched.
       expect(existsSync(canaryPath)).toBe(true);
       expect(readFileSync(canaryPath, "utf8")).toBe("must-survive-if-the-fix-works");
+    });
+  }
+);
+
+describe(
+  "P1 fix (28th independent review round, finding 11, 'validate file-lock timing options'): timeoutMs/staleMs/" +
+    "pollIntervalMs are validated BEFORE any acquisition/retry logic runs — an invalid value fails closed " +
+    "immediately instead of silently disabling timeout/staleness/backoff protection",
+  () => {
+    function freshLockDir(): string {
+      const root = mkdtempSync(join(tmpdir(), "uasf-file-lock-timing-"));
+      tempDirs.push(root);
+      return join(root, "cache.lock");
+    }
+
+    describe("timeoutMs", () => {
+      it.each([NaN, Infinity, -Infinity, -1])("rejects %s", (bad) => {
+        expect(() => acquireFileLock(freshLockDir(), { timeoutMs: bad })).toThrow(InvalidFileLockOptionsError);
+      });
+
+      it("accepts 0 (try once, never wait)", () => {
+        const lockDirPath = freshLockDir();
+        const release = acquireFileLock(lockDirPath, { timeoutMs: 0 });
+        release();
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: NaN used to disable the timeout entirely (Date.now() >= NaN is " +
+          "always false) — now it is rejected immediately instead of hanging",
+        () => {
+          const lockDirPath = freshLockDir();
+          // Hold the lock in this same process so a second attempt must contend.
+          const release = acquireFileLock(lockDirPath);
+          try {
+            expect(() => acquireFileLock(lockDirPath, { timeoutMs: NaN, pollIntervalMs: 5 })).toThrow(
+              InvalidFileLockOptionsError
+            );
+          } finally {
+            release();
+          }
+        }
+      );
+    });
+
+    describe("staleMs", () => {
+      it.each([NaN, Infinity, -Infinity, 0, -1])("rejects %s", (bad) => {
+        expect(() => acquireFileLock(freshLockDir(), { staleMs: bad })).toThrow(InvalidFileLockOptionsError);
+      });
+
+      it("accepts a genuine positive value", () => {
+        const lockDirPath = freshLockDir();
+        const release = acquireFileLock(lockDirPath, { staleMs: 1000 });
+        release();
+      });
+    });
+
+    describe("pollIntervalMs", () => {
+      it.each([NaN, Infinity, -Infinity, 0, -1])("rejects %s", (bad) => {
+        expect(() => acquireFileLock(freshLockDir(), { pollIntervalMs: bad })).toThrow(InvalidFileLockOptionsError);
+      });
+
+      it("accepts a genuine positive value", () => {
+        const lockDirPath = freshLockDir();
+        const release = acquireFileLock(lockDirPath, { pollIntervalMs: 5 });
+        release();
+      });
+    });
+
+    it("validation happens BEFORE any filesystem mutation — no lock directory is created for an invalid option", () => {
+      const lockDirPath = freshLockDir();
+      expect(() => acquireFileLock(lockDirPath, { timeoutMs: NaN })).toThrow(InvalidFileLockOptionsError);
+      expect(existsSync(lockDirPath)).toBe(false);
+    });
+
+    it("the default options (no FileLockOptions supplied at all) remain valid (no regression for the common case)", () => {
+      const lockDirPath = freshLockDir();
+      const release = acquireFileLock(lockDirPath);
+      release();
     });
   }
 );

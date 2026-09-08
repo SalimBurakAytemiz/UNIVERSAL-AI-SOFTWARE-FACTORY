@@ -116,6 +116,22 @@ export class ModelRegistry {
   #models: ModelRecord[] = [];
 
   register(model: ModelRecord): void {
+    // P1 fix (28th independent review round, finding 12, "snapshot
+    // registry records before validation/storage"): `model` used to be
+    // read from the caller's own object at THREE separate points —
+    // `model.costPerCall` (validation), `model.modelId` (duplicate check,
+    // twice — the `.some()` predicate and the error constructor), and
+    // finally every property again via `{ ...model }` (the copy actually
+    // stored). A getter/Proxy-backed `model` could answer a valid
+    // `costPerCall`/a non-colliding `modelId` for the first two reads,
+    // then a COMPLETELY different (invalid, or duplicate-colliding) value
+    // for the final stored copy — poisoning `this.#models` with a record
+    // that was never actually validated or checked for duplicates. Fixed:
+    // `model` is spread into `snapshot` FIRST — reading every property
+    // exactly once — and validation, the duplicate check, and the stored
+    // copy all derive from this SAME snapshot; `model` itself is never
+    // read again.
+    const snapshot: ModelRecord = { ...model };
     // P2 fix (7th independent review round, "invalid model prices corrupt
     // cheapest-capable routing"): önceden `costPerCall` HİÇ doğrulanmadan
     // kabul ediliyordu. `NaN`, "en ucuz" karşılaştırmalarında (`x < NaN`,
@@ -125,13 +141,13 @@ export class ModelRegistry {
     // (`assertValidMonetaryAmount`, cost-engine.ts) BURADA da kullanılır —
     // ayrı/farklı bir kural icat edilmez — ve reddedilen bir kayıt asla
     // `this.#models` dizisine ULAŞMAZ (fail closed, mutasyondan önce kontrol).
-    assertValidMonetaryAmount(model.costPerCall, `ModelRegistry.register(modelId=${model.modelId})`);
+    assertValidMonetaryAmount(snapshot.costPerCall, `ModelRegistry.register(modelId=${snapshot.modelId})`);
     // P2 targeted-audit fix (9th independent review round): reject an id
     // collision BEFORE any mutation — see DuplicateModelIdError above.
-    if (this.#models.some((m) => m.modelId === model.modelId)) {
-      throw new DuplicateModelIdError(model.modelId);
+    if (this.#models.some((m) => m.modelId === snapshot.modelId)) {
+      throw new DuplicateModelIdError(snapshot.modelId);
     }
-    this.#models.push(freezeRecord({ ...model }));
+    this.#models.push(freezeRecord(snapshot));
   }
 
   all(): readonly ModelRecord[] {

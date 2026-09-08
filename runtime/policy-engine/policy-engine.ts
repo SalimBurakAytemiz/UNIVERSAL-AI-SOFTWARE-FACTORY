@@ -90,6 +90,53 @@ function assertValidRiskLevel(risk: unknown): asserts risk is RiskLevel {
   }
 }
 
+const VALID_POLICY_DECISIONS: ReadonlySet<string> = new Set<PolicyDecision>(["ALLOW", "DENY", "APPROVAL_REQUIRED"]);
+
+/**
+ * P1 fix (28th independent review round, finding 2, "reject invalid
+ * policy-rule decisions"): `PolicyRule.evaluate()`'s TypeScript return type
+ * (`PolicyDecision | null`) only constrains code the compiler can see — a
+ * `PolicyRule` is arbitrary, caller-registered code (`addRule()`, possibly
+ * loaded from a plugin or deserialized configuration), and nothing at
+ * runtime stops its `evaluate()` from returning a typo'd string (`"ALOW"`),
+ * an unrelated string, an object, a number, or any other malformed value.
+ * Before this fix, `evaluate()`'s loop treated ANY non-null, non-`"DENY"`
+ * result as `bestNonDeny` — including a value that is not a genuine
+ * `PolicyDecision` at all — and returned it verbatim as
+ * `PolicyEvaluationResult.decision`. Codex reproduced the real
+ * consequence: `CapabilityGateway.authorize()` only branches on
+ * `result.decision === "DENY"` and `=== "APPROVAL_REQUIRED"`; a decision of
+ * `"ALOW"` (or any other malformed value) matches NEITHER branch and falls
+ * through to unconditionally calling `execute()` — a single typo or
+ * malformed plugin result in a rule silently ALLOWS an action that was
+ * never genuinely decided ALLOW by anything, the exact opposite of
+ * default-deny (baseline section 147). Fixed: every non-null rule result is
+ * validated against the authoritative `PolicyDecision` enum THE MOMENT the
+ * rule returns it — before it can influence `denyMatch`/`bestNonDeny` at
+ * all — and an invalid result throws `InvalidPolicyDecisionError`
+ * immediately, fail closed, naming the offending rule so the caller can
+ * find and fix it.
+ */
+export class InvalidPolicyDecisionError extends Error {
+  constructor(ruleName: string, decision: unknown) {
+    super(
+      `Policy rule '${ruleName}' returned an invalid decision: ${
+        typeof decision === "string" ? JSON.stringify(decision) : String(decision)
+      } (typeof ${typeof decision}). A PolicyRule.evaluate() must return exactly "ALLOW", "DENY", ` +
+        `"APPROVAL_REQUIRED", or null (baseline section 148, "Policy Engine") — any other value is rejected ` +
+        `BEFORE it can influence any authorization decision, so a typo'd or malformed plugin result can never ` +
+        `silently fall through to an unintended ALLOW.`
+    );
+    this.name = "InvalidPolicyDecisionError";
+  }
+}
+
+function assertValidPolicyDecision(ruleName: string, decision: unknown): asserts decision is PolicyDecision {
+  if (typeof decision !== "string" || !VALID_POLICY_DECISIONS.has(decision)) {
+    throw new InvalidPolicyDecisionError(ruleName, decision);
+  }
+}
+
 export class PolicyEngine {
   /**
    * P1 targeted-audit fix (26th independent review round, same root class
@@ -107,7 +154,24 @@ export class PolicyEngine {
    */
   #rules: PolicyRule[] = [];
 
-  constructor(private readonly auditLog: AuditLog = new AuditLog()) {}
+  /**
+   * P1 targeted-audit fix (28th independent review round, root-class B
+   * sweep, "TypeScript private used for authoritative mutable state" —
+   * same class as `#rules` above): still declared with TypeScript's
+   * compile-time-only `private` — `(engine as any).auditLog = fakeAuditLog`
+   * from any caller holding a `PolicyEngine` reference would silently
+   * swap out the ENTIRE audit trail this engine records every evaluation
+   * into (bkz. `evaluate()`'s `this.auditLog.append(...)` below and the
+   * `auditTrail` getter), letting every subsequent policy decision go
+   * completely unrecorded with no trace of the swap — directly undermining
+   * "no claim without evidence" (bölüm 303) for the single most important
+   * P0 decision surface. Fixed the same way `#rules` already is.
+   */
+  #auditLog: AuditLog;
+
+  constructor(auditLog: AuditLog = new AuditLog()) {
+    this.#auditLog = auditLog;
+  }
 
   /**
    * P1 fix (27th independent review round, finding 2, "detach registered
@@ -137,7 +201,7 @@ export class PolicyEngine {
   }
 
   get auditTrail(): AuditLog {
-    return this.auditLog;
+    return this.#auditLog;
   }
 
   /**
@@ -218,8 +282,9 @@ export class PolicyEngine {
     let bestNonDeny: { readonly decision: PolicyDecision; readonly rule: string } | null = null;
 
     for (const rule of ordered) {
-      const result = rule.evaluate(authoritativeAction);
+      const result: unknown = rule.evaluate(authoritativeAction);
       if (result === null) continue;
+      assertValidPolicyDecision(rule.name, result);
       if (result === "DENY") {
         if (denyMatch === null) denyMatch = { rule: rule.name };
       } else if (bestNonDeny === null) {
@@ -254,7 +319,7 @@ export class PolicyEngine {
       matchedRule = RISK_5_APPROVAL_RULE_NAME;
     }
 
-    this.auditLog.append({
+    this.#auditLog.append({
       type: "POLICY_DECISION",
       actor: "policy-engine",
       payload: { action: authoritativeAction, decision, matchedRule },

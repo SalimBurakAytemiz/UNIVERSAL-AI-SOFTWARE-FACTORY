@@ -56,7 +56,23 @@ const WORKER_CLASS_EXCESS_WEIGHT: Readonly<Record<WorkerClass, number>> = {
 };
 
 export class ResourceAwareScheduler {
-  constructor(private readonly registry: WorkerRegistry) {}
+  /**
+   * P1 targeted-audit fix (28th independent review round, root-class B
+   * sweep, "TypeScript private used for authoritative mutable state" —
+   * same class as `models/router.ts`'s `#registry`): still declared with
+   * TypeScript's compile-time-only `private` — `(scheduler as any).registry
+   * = attackerControlledRegistry` from any caller holding a
+   * `ResourceAwareScheduler` reference would silently substitute the
+   * ENTIRE authoritative worker pool `selectWorker()` consults, bypassing
+   * `WorkerRegistry`'s own duplicate-id/price-validation guarantees and the
+   * "smallest sufficient worker" invariant (bölüm 83) itself. Fixed the
+   * same way `models/router.ts`'s equivalent field already is.
+   */
+  #registry: WorkerRegistry;
+
+  constructor(registry: WorkerRegistry) {
+    this.#registry = registry;
+  }
 
   /**
    * Sıralama (bölüm 83, "SMALLEST SUFFICIENT WORKER"), her adım BİR
@@ -71,7 +87,7 @@ export class ResourceAwareScheduler {
    * ayırt edici (tie-breaker).
    */
   selectWorker(requirement: TaskWorkerRequirement): WorkerRecord {
-    const candidates = this.registry
+    const candidates = this.#registry
       .findCapable(requirement.requiredCapabilities)
       .filter((w) => w.status === "IDLE");
 

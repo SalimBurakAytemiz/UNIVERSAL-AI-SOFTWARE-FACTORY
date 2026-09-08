@@ -60,6 +60,59 @@ function isSensitiveKey(key: string): boolean {
 }
 
 /**
+ * P1 fix (28th independent review round, finding 5, "redact credentials
+ * embedded inside string values"): everything above this point redacts
+ * based ONLY on a field's KEY name (`isSensitiveKey()`) — a caller that
+ * logs a perfectly innocuous-sounding field (`description`, `message`,
+ * `debugInfo`, a raw HTTP request/response dump) whose STRING VALUE
+ * happens to CONTAIN an `Authorization: Bearer ...` header, a bare bearer
+ * token, a `user:password@host` URL, or a `password=...`/`api_key: ...`
+ * style assignment sailed straight through to the sink completely
+ * unredacted — the never-log-secrets guarantee (baseline section 124,
+ * Public Proof E section 307) only ever covered the OUTER shape of a log
+ * call, never text a caller happened to embed inside an otherwise-ordinary
+ * string. Fixed: every STRING value (regardless of which key it lives
+ * under, and at ANY nesting depth — `redact()` below routes every string
+ * through this) is scanned for these specific secret-shaped patterns and
+ * has ONLY the credential-bearing portion replaced with `[REDACTED]`,
+ * preserving the surrounding, genuinely useful log text. A key ALREADY
+ * flagged sensitive by `isSensitiveKey()` continues to redact its ENTIRE
+ * value (the stronger guarantee) rather than being pattern-scanned — this
+ * function exists for the field names that `isSensitiveKey()` cannot see
+ * are dangerous because the danger lives inside ordinary prose, not the
+ * key.
+ */
+const SECRET_ASSIGNMENT_PATTERN =
+  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|secret|password|credential)(\s*[:=]\s*)(['"]?)([^\s'",;]+)\3/gi;
+const URL_USERINFO_PATTERN = /(:\/\/[^/\s:@]+):([^/\s:@]+)@/g;
+const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)(\S+(?:\s+\S+)?)/gi;
+const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)(\S+)/gi;
+const BARE_BEARER_TOKEN_PATTERN = /\bbearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
+
+function redactSecretsInString(text: string): string {
+  return text
+    // "Authorization: <scheme> <value...>" — redacts the ENTIRE credential
+    // portion after the header name, whatever scheme/format it uses,
+    // BEFORE the narrower bare-Bearer pattern below runs (so it is never
+    // double-matched/left partially redacted).
+    .replace(AUTHORIZATION_HEADER_PATTERN, "$1[REDACTED]")
+    // A bare "Bearer <token>" with no preceding "Authorization:" label —
+    // e.g. copied directly from a header value into a log message.
+    .replace(BARE_BEARER_TOKEN_PATTERN, "Bearer [REDACTED]")
+    // "Cookie: <value>" headers (session identifiers, auth cookies).
+    .replace(COOKIE_HEADER_PATTERN, "$1[REDACTED]")
+    // Common "key = value" / "key: value" secret assignment forms embedded
+    // anywhere in a larger string (e.g. inside a logged command line, a
+    // dumped config snippet, or a raw request body excerpt).
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, label: string, sep: string, quote: string) => `${label}${sep}${quote}[REDACTED]${quote}`)
+    // Credentials embedded in a URL's userinfo section
+    // (`https://user:hunter2@host/...`) — the username is left visible
+    // (often not secret, e.g. a service account name), only the password
+    // portion is redacted.
+    .replace(URL_USERINFO_PATTERN, "$1:[REDACTED]@");
+}
+
+/**
  * P2 cross-cutting fix (6th independent review round targeted audit,
  * "prototype-sensitive dictionary keys" — same class as the FileCache
  * `__proto__` finding): `LogFields` is an arbitrary-string-keyed
@@ -98,6 +151,17 @@ function isSensitiveKey(key: string): boolean {
 function redact(value: unknown): unknown {
   if (typeof value === "function") {
     return "[FUNCTION_REMOVED]";
+  }
+  // P1 fix (28th independent review round, finding 5, "redact credentials
+  // embedded inside string values"): every string, at any depth, is
+  // scanned for the secret-shaped patterns above — see the fix note
+  // above `redactSecretsInString()`. This runs BEFORE the key-based check
+  // one level up (`isSensitiveKey(key) ? "[REDACTED]" : redact(val)`), so
+  // a sensitive KEY's value still gets the stronger full-value redaction;
+  // this only ever adds coverage for values under an innocuous-looking
+  // key.
+  if (typeof value === "string") {
+    return redactSecretsInString(value);
   }
   if (Array.isArray(value)) {
     return value.map(redact);

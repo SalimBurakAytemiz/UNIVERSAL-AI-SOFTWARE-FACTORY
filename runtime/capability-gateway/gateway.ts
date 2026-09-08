@@ -197,9 +197,30 @@ export class CapabilityGateway {
       if (!approval) {
         throw new CapabilityApprovalRequiredError(authoritativeAction);
       }
-      const request = this.#approvals.get(approval.approvalId);
+      // P1 fix (28th independent review round, finding 9, "snapshot
+      // approval id before consumption" — same root class as this file's
+      // own round-27 finding 4, just for `approval.approvalId` instead of
+      // `action`): `approval.approvalId` used to be read SEPARATELY at
+      // EVERY use site below (the lookup, the mismatch-error message,
+      // `beginExecution()`, and `completeExecution()`/`failExecution()`)
+      // — up to four separate reads of a caller-owned `ApprovalReference`
+      // object that, if getter/Proxy-backed, need not agree. A hostile or
+      // merely buggy `approval` could answer approval A's id for the
+      // lookup/match check and `beginExecution()` (genuinely claiming and
+      // locking A), then answer a COMPLETELY DIFFERENT approval B's id for
+      // `completeExecution()`/`failExecution()` — wrongly transitioning B
+      // (which this call never actually matched, evaluated, or executed
+      // anything for) while leaving A permanently stuck in EXECUTING,
+      // never reaching a terminal state at all. Fixed: `approvalId` is
+      // read into a local `const` exactly ONCE, as the very first thing
+      // done with `approval` — every reference below (lookup, error
+      // message, `beginExecution`, `completeExecution`/`failExecution`,
+      // and the audit trail those methods themselves record) uses this
+      // SAME captured string, never `approval.approvalId` again.
+      const approvalId = approval.approvalId;
+      const request = this.#approvals.get(approvalId);
       if (!request || !isBoundToExactAction(request, authoritativeAction)) {
-        throw new ApprovalEvidenceMismatchError(authoritativeAction, approval.approvalId, request);
+        throw new ApprovalEvidenceMismatchError(authoritativeAction, approvalId, request);
       }
       // P1 fix (27th independent review round, finding 5, "finalize
       // approval only after successful execution"): `execute()` used to
@@ -215,13 +236,13 @@ export class CapabilityGateway {
       // error is captured via `failExecution()` (EXECUTING ->
       // EXECUTION_FAILED, an honest, terminal failure record) and
       // RE-THROWN, never swallowed.
-      this.#approvals.beginExecution(approval.approvalId);
+      this.#approvals.beginExecution(approvalId);
       try {
         const value = await execute();
-        this.#approvals.completeExecution(approval.approvalId);
+        this.#approvals.completeExecution(approvalId);
         return value;
       } catch (err) {
-        this.#approvals.failExecution(approval.approvalId, err instanceof Error ? err.message : String(err));
+        this.#approvals.failExecution(approvalId, err instanceof Error ? err.message : String(err));
         throw err;
       }
     }

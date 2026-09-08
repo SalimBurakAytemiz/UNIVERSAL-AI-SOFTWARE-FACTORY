@@ -61,4 +61,18 @@ describe("BusinessCapabilityRegistry", () => {
       expect(registry.findApplicable("game")).toHaveLength(0);
     });
   });
+
+  describe(
+    "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+      "mutable state'): BusinessCapabilityRegistry's capabilities Map is also a genuine #private field now",
+    () => {
+      it("capabilities is not reachable as an ordinary JS property", () => {
+        const registry = new BusinessCapabilityRegistry();
+        registry.register({ id: "identity", purpose: "p", projectFamilies: ["web"], dependencies: [], deliveryOptions: ["BUILD"] });
+
+        expect((registry as unknown as Record<string, unknown>).capabilities).toBeUndefined();
+        expect(Object.getOwnPropertyNames(registry)).not.toContain("capabilities");
+      });
+    }
+  );
 });

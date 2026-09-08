@@ -52,6 +52,70 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_STALE_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 15;
 
+/**
+ * P1 fix (28th independent review round, finding 11, "validate file-lock
+ * timing options"): `timeoutMs`/`staleMs`/`pollIntervalMs` used to be
+ * consumed directly from caller-supplied (possibly runtime/deserialized —
+ * e.g. loaded from a JSON config file, or built from a value that
+ * survived a `JSON.parse`) input with NO validation at all. Each invalid
+ * value silently DISABLES the exact protection this module exists to
+ * provide, rather than merely misbehaving:
+ *   - `timeoutMs: NaN` -> `deadline = Date.now() + NaN` is `NaN`, and
+ *     `Date.now() >= NaN` is ALWAYS `false` — the unconditional timeout
+ *     check at the bottom of the acquisition loop NEVER fires, so
+ *     `acquireFileLock()` waits forever instead of throwing
+ *     `FileLockTimeoutError`, exactly the "kilit sonsuza kadar
+ *     çalışır bırakılamaz" guarantee this file's own header comment
+ *     documents.
+ *   - `staleMs: NaN` (or negative) -> `isLockStale()`'s
+ *     `Date.now() - stat.mtimeMs > staleMs` comparison is unreliable
+ *     (`> NaN` is always `false`; a negative threshold makes EVERY lock
+ *     look instantly stale) — either permanently disabling reclaim of a
+ *     genuinely abandoned lock, or reclaiming a live one instantly.
+ *   - `pollIntervalMs: 0` or negative -> `sleepSync()`'s own `if (ms <= 0)
+ *     return;` guard makes it a genuine no-op, turning the retry loop into
+ *     an uncontrolled tight busy-loop — the EXACT "asla sıkı (busy) döngüye
+ *     girme" invariant this module's own comments repeatedly document as
+ *     load-bearing.
+ * Fixed: every timing option is validated as a genuine, finite number
+ * within an architecture-appropriate bound BEFORE any acquisition/retry
+ * logic runs — `NaN`/`Infinity`/`-Infinity`/negative/non-number values
+ * all fail closed immediately, naming the offending option, rather than
+ * silently disabling timeout/staleness/backoff behavior.
+ */
+export class InvalidFileLockOptionsError extends Error {
+  constructor(option: "timeoutMs" | "staleMs" | "pollIntervalMs", value: unknown, requirement: string) {
+    super(
+      `Invalid FileLockOptions.${option}: ${typeof value === "number" ? value : JSON.stringify(value)} ` +
+        `(typeof ${typeof value}). ${requirement} A file lock's timing configuration is rejected BEFORE any ` +
+        `acquisition/retry logic runs — an invalid value would otherwise silently disable timeout, staleness, ` +
+        `or backoff protection instead of merely misbehaving.`
+    );
+    this.name = "InvalidFileLockOptionsError";
+  }
+}
+
+function assertValidLockTimingOptions(timeoutMs: number, staleMs: number, pollIntervalMs: number): void {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new InvalidFileLockOptionsError(
+      "timeoutMs",
+      timeoutMs,
+      "timeoutMs must be a finite number >= 0 (0 means 'try once, never wait')."
+    );
+  }
+  if (!Number.isFinite(staleMs) || staleMs <= 0) {
+    throw new InvalidFileLockOptionsError("staleMs", staleMs, "staleMs must be a finite number > 0.");
+  }
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new InvalidFileLockOptionsError(
+      "pollIntervalMs",
+      pollIntervalMs,
+      "pollIntervalMs must be a finite number > 0 (a zero/negative interval turns the retry loop into an " +
+        "uncontrolled busy-loop)."
+    );
+  }
+}
+
 interface LockMeta {
   readonly pid: number;
   readonly token: string;
@@ -555,6 +619,10 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  // P1 fix (28th independent review round, finding 11, "validate file-lock
+  // timing options"): validated BEFORE any acquisition/retry logic runs —
+  // bkz. `assertValidLockTimingOptions()`'ın üstündeki fix notu.
+  assertValidLockTimingOptions(timeoutMs, staleMs, pollIntervalMs);
   const metaPath = join(lockDirPath, "owner.json");
   const token = randomBytes(8).toString("hex");
   const deadline = Date.now() + timeoutMs;

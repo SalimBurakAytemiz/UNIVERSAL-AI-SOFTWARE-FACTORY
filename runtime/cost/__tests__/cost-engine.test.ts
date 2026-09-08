@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  CorruptCostStateError,
   CostEngine,
   InvalidMonetaryAmountError,
   ReservationOwnershipMismatchError,
@@ -8,6 +12,7 @@ import {
   assertValidMonetaryAmount,
   exceedsMonetaryAmount
 } from "../cost-engine.js";
+import { FileStateStore, type StateStore } from "../../state/file-store.js";
 
 describe("CostEngine", () => {
   it("accumulates cost entries and reports totals scoped by task", () => {
@@ -604,6 +609,277 @@ describe("CostEngine", () => {
         expect((engine as unknown as { listReservations?: unknown }).listReservations).toBeUndefined();
         expect((engine as unknown as { allReservations?: unknown }).allReservations).toBeUndefined();
         expect(typeof engine.reservedTotal({})).toBe("number");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 4, 'persist cost entries and reservations across " +
+      "restarts'): an optional persistence store makes committed spend and open reservations survive a genuine " +
+      "restart (a fresh CostEngine instance backed by the same durable file)",
+    () => {
+      let tempRoot: string;
+
+      it("committed spend genuinely survives a fresh CostEngine instance pointed at the same durable file (real restart proof, real FileStateStore, real temp directory)", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-restart-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+
+          const before = new CostEngine(() => new Date(), { store, path: statePath });
+          before.record({ taskId: "t1", projectId: "p1", provider: "mock", modelId: "m1", amountUsd: 0.75 });
+          before.record({ taskId: "t2", projectId: "p1", provider: "mock", modelId: "m1", amountUsd: 0.25 });
+          expect(before.total()).toBeCloseTo(1.0);
+
+          // A GENUINELY NEW instance — simulates a process restart. No
+          // reference to `before` is shared; only the durable file path is.
+          const after = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(after.total()).toBeCloseTo(1.0);
+          expect(after.totalFor({ projectId: "p1" })).toBeCloseTo(1.0);
+          expect(after.all()).toHaveLength(2);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("open ACTIVE reservations genuinely survive a restart, still protecting their capacity via reservedTotal()", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-restart-reservation-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+
+          const before = new CostEngine(() => new Date(), { store, path: statePath });
+          const reservation = before.createReservation({ taskId: "t1", projectId: "p1" }, 0.4);
+
+          const after = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(after.reservedTotal({ projectId: "p1" })).toBeCloseTo(0.4);
+
+          // The restored reservation is genuinely operable — commit succeeds
+          // under the SAME ownership scope it was created under.
+          const recorded = after.commitReservation(reservation.id, {
+            taskId: "t1",
+            projectId: "p1",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.4
+          });
+          expect(recorded.amountUsd).toBeCloseTo(0.4);
+          expect(after.reservedTotal({ projectId: "p1" })).toBe(0);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("a RECONCILIATION_FAILED reservation remains protected (still rejects release()) after a restart", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-restart-reconciliation-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+
+          const before = new CostEngine(() => new Date(), { store, path: statePath });
+          const reservation = before.createReservation({ taskId: "t1" }, 1);
+          // Force RECONCILIATION_FAILED via an ownership mismatch on commit.
+          expect(() =>
+            before.commitReservation(reservation.id, {
+              taskId: "WRONG-TASK",
+              provider: "mock",
+              modelId: "m1",
+              amountUsd: 1
+            })
+          ).toThrow(ReservationOwnershipMismatchError);
+
+          const after = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(() => after.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
+          // Still protected — reservedTotal() still counts it.
+          expect(after.reservedTotal({ taskId: "t1" })).toBeCloseTo(1);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("daily/monthly-style window totals (totalInWindow) survive a restart using the restored entries' real timestamps", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-restart-window-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const fixedNow = new Date("2024-06-15T12:00:00.000Z");
+
+          const before = new CostEngine(() => fixedNow, { store, path: statePath });
+          before.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 2 });
+
+          const after = new CostEngine(() => new Date("2024-06-15T18:00:00.000Z"), { store, path: statePath });
+          expect(after.totalInWindow({ taskId: "t1" }, "2024-06-15T00:00:00.000Z")).toBeCloseTo(2);
+          // A window starting AFTER the restored entry's real timestamp
+          // correctly excludes it — the restored timestamp is genuine, not
+          // reset to "now" on restore.
+          expect(after.totalInWindow({ taskId: "t1" }, "2024-06-15T13:00:00.000Z")).toBe(0);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("no persistence supplied at all preserves the exact prior in-memory-only behavior (backward compatible)", () => {
+        const engine = new CostEngine();
+        engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 });
+        expect(engine.total()).toBe(1);
+        // No store/path was ever touched — nothing to assert beyond "this
+        // still works exactly as it always did."
+      });
+
+      it("malformed persisted cost state fails closed (CorruptCostStateError), never silently discarded or coerced", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-corrupt-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          store.write(statePath, { entries: "not-an-array", reservations: [] });
+
+          expect(() => new CostEngine(() => new Date(), { store, path: statePath })).toThrow(CorruptCostStateError);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it.each([
+        ["entries is missing", { reservations: [] }],
+        ["reservations is missing", { entries: [] }],
+        ["an entry has an invalid amountUsd", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: NaN, timestamp: new Date().toISOString() }], reservations: [] }],
+        ["an entry has a negative amountUsd", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: -1, timestamp: new Date().toISOString() }], reservations: [] }],
+        ["an entry is missing taskId", { entries: [{ provider: "p", modelId: "m", amountUsd: 1, timestamp: new Date().toISOString() }], reservations: [] }],
+        ["an entry has an invalid timestamp", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: 1, timestamp: "not-a-date" }], reservations: [] }],
+        ["a reservation has an invalid status", { entries: [], reservations: [{ id: "res-1-abc", scope: {}, amountUsd: 1, status: "MADE_UP_STATUS" }] }],
+        ["a reservation has an invalid amountUsd", { entries: [], reservations: [{ id: "res-1-abc", scope: {}, amountUsd: Infinity, status: "ACTIVE" }] }],
+        ["a reservation's scope is not an object", { entries: [], reservations: [{ id: "res-1-abc", scope: "not-an-object", amountUsd: 1, status: "ACTIVE" }] }]
+      ])("rejects malformed persisted state: %s", (_label, malformed) => {
+        const fakeStore: StateStore = {
+          write: () => {},
+          read: () => malformed as never,
+          exists: () => true
+        };
+        expect(() => new CostEngine(() => new Date(), { store: fakeStore, path: "irrelevant.json" })).toThrow(
+          CorruptCostStateError
+        );
+      });
+
+      it("a fresh, never-before-used persistence path (no file yet) starts with genuinely empty state, not an error", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-fresh-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "never-written.json");
+          const engine = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(engine.total()).toBe(0);
+          expect(engine.all()).toHaveLength(0);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 6, 'make cost ledger clock runtime-private'): #now is a " +
+      "genuine ECMAScript private field, not TypeScript's compile-time-only `private readonly`",
+    () => {
+      it("now is not reachable as an ordinary JS property", () => {
+        const engine = new CostEngine();
+        expect((engine as unknown as Record<string, unknown>).now).toBeUndefined();
+      });
+
+      it("no reflection API exposes the private clock", () => {
+        const engine = new CostEngine();
+        expect(Object.getOwnPropertyNames(engine)).not.toContain("now");
+        expect(Reflect.ownKeys(engine).map(String)).not.toContain("now");
+      });
+
+      it("REGRESSION: a forged clock replacement is an inert stray property — recorded timestamps still use the REAL injected clock", () => {
+        const fixedNow = new Date("2024-01-01T00:00:00.000Z");
+        const engine = new CostEngine(() => fixedNow);
+
+        (engine as unknown as Record<string, unknown>).now = () => new Date("2099-01-01T00:00:00.000Z");
+        const spread: Record<string, unknown> = { ...engine };
+        expect(typeof spread.now).toBe("function"); // an inert stray property, nothing more
+
+        engine.record({ taskId: "t", provider: "mock", modelId: "m1", amountUsd: 1 });
+        const [entry] = engine.all();
+        expect(entry!.timestamp).toBe(fixedNow.toISOString());
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 10, 'every failed commit must enter RECONCILIATION_FAILED'): " +
+      "ANY failure while actually recording a commit — not only amount-validation failure — protects the " +
+      "reservation",
+    () => {
+      /**
+       * Fails ONLY the Nth write onward (1-indexed) — lets the test set up a
+       * reservation normally (its own `createReservation()` persist succeeds)
+       * before the SPECIFIC write inside `commitReservation()`'s `record()`
+       * call is the one that fails.
+       */
+      function storeThatFailsFromWrite(failFromCall: number): StateStore {
+        let calls = 0;
+        return {
+          write: () => {
+            calls += 1;
+            if (calls >= failFromCall) {
+              throw new Error("simulated durable-storage I/O failure");
+            }
+          },
+          read: () => undefined,
+          exists: () => false
+        };
+      }
+
+      it("BLOCKER regression: a failure from the underlying persistence layer during commitReservation() marks the reservation RECONCILIATION_FAILED, never leaving it ACTIVE-and-releasable", () => {
+        const failingStore = storeThatFailsFromWrite(2); // 1st write: createReservation (succeeds); 2nd: commit's record() (fails)
+        const engine = new CostEngine(() => new Date(), { store: failingStore, path: "irrelevant.json" });
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).toThrow();
+
+        // The reservation must NOT be silently releasable after this —
+        // it is RECONCILIATION_FAILED, since the persistence failure
+        // happened AFTER record()'s own in-memory push, so a real cost
+        // may already be reflected in this process's own totals.
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
+      });
+
+      it("the reservation's protected capacity (reservedTotal) survives a recording failure unrelated to the amount", () => {
+        const failingStore = storeThatFailsFromWrite(2);
+        const engine = new CostEngine(() => new Date(), { store: failingStore, path: "irrelevant.json" });
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).toThrow();
+
+        expect(engine.reservedTotal({ taskId: "t1" })).toBeCloseTo(1);
+      });
+
+      it("an amount-validation failure (the pre-existing, narrower case) still marks RECONCILIATION_FAILED (no regression)", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: NaN })
+        ).toThrow(InvalidMonetaryAmountError);
+
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
+      });
+
+      it("a genuinely successful commit (no persistence configured) still deletes the reservation normally (no regression for the happy path)", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0);
       });
     }
   );

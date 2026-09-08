@@ -387,4 +387,116 @@ describe("Logger", () => {
       expect(parsed.headers.toJSON).toBe("[FUNCTION_REMOVED]");
     });
   });
+
+  describe(
+    "P1 fix (28th independent review round, finding 5, 'redact credentials embedded inside string values'): " +
+      "secret-shaped CONTENT inside an ordinary string value is redacted even though the field's own KEY name " +
+      "is completely innocuous",
+    () => {
+      it("BLOCKER regression, exact reproduction: an 'Authorization: Bearer ...' header embedded inside a plain 'description' field", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "curl -H 'Authorization: Bearer fake-embedded-token-should-not-appear' https://api.example.com" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-token-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        // The surrounding, genuinely useful log text is preserved.
+        expect(line).toContain("curl");
+        expect(line).toContain("https://api.example.com");
+      });
+
+      it("redacts a bare 'Bearer <token>' with no preceding 'Authorization:' label, inside an innocuous field", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "debug",
+          message: "sent header value Bearer fake-bare-token-should-not-appear to upstream" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-bare-token-should-not-appear");
+        expect(line).toContain("Bearer [REDACTED]");
+      });
+
+      it("redacts provider/API credentials embedded in a URL's userinfo section, preserving the username", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "outbound.call",
+          targetUrl: "https://svc-account:fake-embedded-password-should-not-appear@internal.example.com/api" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-password-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("svc-account"); // username preserved — often not itself secret
+        expect(line).toContain("internal.example.com/api");
+      });
+
+      it.each([
+        ["password=", "password=fake-embedded-secret-should-not-appear"], // secret-scan:allow (fake fixture value)
+        ["api_key:", "api_key: fake-embedded-secret-should-not-appear"], // secret-scan:allow (fake fixture value)
+        ["api-key=", "api-key=fake-embedded-secret-should-not-appear"], // secret-scan:allow (fake fixture value)
+        ["secret=", "secret=fake-embedded-secret-should-not-appear"] // secret-scan:allow (fake fixture value)
+      ])("redacts a common secret assignment form embedded in prose text: %s", (_label, snippet) => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "config.dump",
+          rawConfigLine: `export SOME_VAR=1; ${snippet}; export OTHER=2`
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-secret-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        // Surrounding, non-secret text is preserved.
+        expect(line).toContain("SOME_VAR=1");
+        expect(line).toContain("OTHER=2");
+      });
+
+      it("redacts secret-shaped content nested inside an array of strings", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "batch.request",
+          requestLines: ["GET /health", "Authorization: Bearer fake-nested-array-token-should-not-appear"] // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-nested-array-token-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("GET /health");
+      });
+
+      it("does not redact ordinary, non-secret-shaped log text (no false positives on normal messages)", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "task.completed",
+          description: "Bootstrap finished for project 'shop-1' in 240ms with no errors."
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("[REDACTED]");
+        expect(line).toContain("Bootstrap finished for project 'shop-1' in 240ms with no errors.");
+      });
+
+      it("a field whose KEY is already sensitive still gets the STRONGER full-value redaction (no regression — key-based redaction is not weakened to pattern-only)", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          apiKey: "just some innocuous-looking string with no recognizable secret pattern inside it" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("innocuous-looking string");
+        expect(line).toContain("[REDACTED]");
+      });
+    }
+  );
 });

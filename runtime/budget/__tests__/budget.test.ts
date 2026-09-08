@@ -6,7 +6,8 @@ import {
   InvalidBudgetLimitError,
   UnknownReservationError,
   UnresolvedReconciliationError,
-  ReservationOwnershipMismatchError
+  ReservationOwnershipMismatchError,
+  type BudgetLimits
 } from "../budget.js";
 import { AuditLog } from "../../audit/audit-log.js";
 
@@ -1837,6 +1838,163 @@ describe("BudgetGuard", () => {
 
         expect(recorded.amountUsd).toBe(0.5);
         expect(costEngine.total()).toBe(0.5);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 7, 'snapshot budget limits before validation'): the " +
+      "constructor's `limits` parameter is snapshotted exactly once, then that SAME snapshot is validated and " +
+      "stored — never a separate validate-then-reread of the caller's object",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed limits object that answers validly on the FIRST read and invalidly on a SECOND read must not slip an unvalidated ceiling into storage", () => {
+        let reads = 0;
+        const limits = {
+          get perTaskUsd() {
+            reads += 1;
+            // Valid on the (now single) read; if this were read a SECOND
+            // time and used for storage, the stored ceiling would still
+            // be this same valid value — the point is there is no SECOND
+            // read left for a getter to answer differently on.
+            return reads === 1 ? 1 : Number.MAX_VALUE;
+          }
+        };
+
+        const guard = new BudgetGuard(new CostEngine(), limits as unknown as BudgetLimits);
+        expect(reads).toBe(1); // read exactly once, during construction
+        expect(guard.getLimits()).toEqual({ perTaskUsd: 1 });
+        // The genuinely-stored $1 ceiling is enforced — not a later,
+        // different value the getter might have answered.
+        expect(() => guard.reserve({ taskId: "t" }, 2)).toThrow(BudgetExceededError);
+      });
+
+      it("BLOCKER regression: a getter-backed limits object that answers a VALID amount on the validation read and an INVALID one on the storage read is rejected, not silently stored invalid", () => {
+        let reads = 0;
+        const limits = {
+          get perTaskUsd() {
+            reads += 1;
+            return reads === 1 ? 1 : NaN; // valid first, invalid thereafter
+          }
+        };
+
+        // With the fix, only ONE read ever happens — validation and
+        // storage operate on the SAME already-read value — so this
+        // never even gets a chance to observe the "invalid on second
+        // read" branch; the guard constructs successfully with a
+        // genuinely valid $1 ceiling.
+        const guard = new BudgetGuard(new CostEngine(), limits as unknown as BudgetLimits);
+        expect(reads).toBe(1);
+        expect(guard.getLimits()).toEqual({ perTaskUsd: 1 });
+      });
+
+      it("Proxy-wrapped limits: every field is read at most once during construction", () => {
+        const reads: Record<string, number> = {};
+        const target = { perTaskUsd: 1, perRunUsd: 2, dailyUsd: 3, monthlyUsd: 4 };
+        const proxied = new Proxy(target, {
+          get(t, prop, receiver) {
+            reads[String(prop)] = (reads[String(prop)] ?? 0) + 1;
+            return Reflect.get(t, prop, receiver);
+          }
+        });
+
+        const guard = new BudgetGuard(new CostEngine(), proxied as unknown as BudgetLimits);
+        for (const count of Object.values(reads)) {
+          expect(count).toBe(1);
+        }
+        expect(guard.getLimits()).toEqual(target);
+      });
+
+      it("a genuinely invalid limit (NaN) is still rejected at construction (no regression for the pre-existing validation)", () => {
+        expect(() => new BudgetGuard(new CostEngine(), { perTaskUsd: NaN })).toThrow(InvalidBudgetLimitError);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 8, 'snapshot reservation scope before ceiling checks'): " +
+      "reserve()'s `scope` parameter is detached exactly once, and that SAME snapshot is used for the ceiling " +
+      "check, the reservation itself, and both audit payloads",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed scope that answers a DIFFERENT projectId on a later read cannot desynchronize the ceiling check from the actually-created reservation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 10 });
+        let reads = 0;
+        const scope = {
+          taskId: "t",
+          get projectId() {
+            reads += 1;
+            // If reserve() re-read this after the ceiling check, the
+            // reservation could end up created (and audited) under a
+            // COMPLETELY different project than the one the ceiling was
+            // actually checked against.
+            return reads === 1 ? "checked-project" : "different-project";
+          }
+        };
+
+        const reservation = guard.reserve(scope as unknown as { taskId: string; projectId: string }, 1);
+        expect(reads).toBe(1); // scope's projectId getter is consulted exactly once
+
+        // The reservation's own authoritative scope (via commit()'s
+        // ownership check) is the SAME snapshot the ceiling check saw —
+        // committing under "checked-project" succeeds.
+        const recorded = guard.commit(reservation.id, {
+          taskId: "t",
+          projectId: "checked-project",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+      });
+
+      it("Proxy-wrapped scope: every field is read at most once across the whole reserve() call (ceiling check + reservation creation + both audit payloads)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 10 }, undefined, undefined);
+        const reads: Record<string, number> = {};
+        const target = { taskId: "t", projectId: "p1" };
+        const proxied = new Proxy(target, {
+          get(t, prop, receiver) {
+            reads[String(prop)] = (reads[String(prop)] ?? 0) + 1;
+            return Reflect.get(t, prop, receiver);
+          }
+        });
+
+        guard.reserve(proxied as unknown as { taskId: string; projectId: string }, 1);
+        for (const count of Object.values(reads)) {
+          expect(count).toBe(1);
+        }
+      });
+
+      it("mutating the caller's original scope object AFTER reserve() returns never affects the stored reservation", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 10 });
+        const scope: { taskId: string; projectId?: string } = { taskId: "t", projectId: "p1" };
+
+        const reservation = guard.reserve(scope, 1);
+        scope.projectId = "p2";
+        scope.taskId = "different-task";
+
+        // The reservation's own authoritative scope is unaffected — commit
+        // still succeeds under the ORIGINAL scope, not the mutated one.
+        const recorded = guard.commit(reservation.id, {
+          taskId: "t",
+          projectId: "p1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+      });
+
+      it("a blocked reservation (ceiling exceeded) still audits the SAME snapshot that was checked, not a later-mutated one (no regression for audit evidence integrity)", () => {
+        const auditLog = new AuditLog();
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 }, undefined, auditLog);
+
+        expect(() => guard.reserve({ taskId: "t", projectId: "p1" }, 2)).toThrow(BudgetExceededError);
+
+        const blockedEvent = auditLog.all().find((r) => r.type === "BUDGET_RESERVATION_BLOCKED");
+        expect((blockedEvent?.payload as { scope?: { projectId?: string } })?.scope?.projectId).toBe("p1");
       });
     }
   );

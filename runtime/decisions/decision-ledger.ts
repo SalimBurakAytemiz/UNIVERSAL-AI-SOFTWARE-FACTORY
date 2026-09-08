@@ -141,6 +141,41 @@ function describeInvalidPersistedDecisionGraph(
     }
   }
 
+  // P1 fix (28th independent review round, finding 15, "reject merged
+  // persisted supersession chains"): the per-edge checks above validate
+  // each record's OWN `supersededBy` target in isolation, but never check
+  // whether that SAME target is claimed as the replacement by more than one
+  // predecessor (A -> C, B -> C). The live API makes this impossible to
+  // produce: `supersede()` creates its replacement via `record()`, which
+  // itself rejects a colliding `decisionId` (`DuplicateDecisionError`) — so
+  // a successor id can only ever have been assigned to ONE predecessor's
+  // `supersededBy`. A persisted file claiming two independent predecessors
+  // for the same successor is therefore not a valid lifecycle chain (a
+  // single decision cannot simultaneously BE the authoritative replacement
+  // for two unrelated prior decisions) — restoring it would leave "which
+  // decision superseded X?" with two contradictory answers, exactly what
+  // baseline section 255 (Decision Explainability) requires to never
+  // happen. Reject the whole batch before any record reaches authoritative
+  // state, same fail-closed philosophy as every other check in this
+  // function.
+  const incomingCount = new Map<string, number>();
+  for (const record of records) {
+    if (record.supersededBy === undefined) continue;
+    incomingCount.set(record.supersededBy, (incomingCount.get(record.supersededBy) ?? 0) + 1);
+  }
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    if (record.supersededBy === undefined) continue;
+    if ((incomingCount.get(record.supersededBy) ?? 0) > 1) {
+      return {
+        index: i,
+        reason:
+          `supersededBy '${record.supersededBy}' is claimed as the replacement by more than one predecessor — ` +
+          `merged supersession chains are not a valid lifecycle (supersede() never assigns the same successor twice)`
+      };
+    }
+  }
+
   // Cycle detection over the supersededBy edges (A -> B means A was
   // superseded by B). Standard three-color DFS: WHITE = unvisited, GRAY =
   // on the current path, BLACK = fully resolved with no cycle found.

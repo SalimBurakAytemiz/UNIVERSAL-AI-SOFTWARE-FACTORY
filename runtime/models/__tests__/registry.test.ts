@@ -287,4 +287,61 @@ describe("ModelRegistry", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 12, 'snapshot registry records before validation/storage'): " +
+      "register() reads every field of the caller-owned record exactly once, then validates/dedupes/stores that " +
+      "SAME snapshot",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed modelId that answers a NON-colliding id for the duplicate check and a DIFFERENT (colliding) id for storage must not poison the registry with a mismatched record", () => {
+        const registry = new ModelRegistry();
+        registry.register(baseModel({ modelId: "existing" }));
+
+        let reads = 0;
+        const hostile = {
+          provider: "mock",
+          get modelId() {
+            reads += 1;
+            // Non-colliding on the (now single) read used for both the
+            // duplicate check AND the stored record.
+            return reads === 1 ? "new-id" : "existing";
+          },
+          tier: "STANDARD" as const,
+          costPerCall: 0.01,
+          capabilities: ["classification"],
+          status: "ACTIVE" as const
+        };
+
+        registry.register(hostile);
+        expect(reads).toBe(1); // modelId consulted exactly once
+
+        // The registry now genuinely has TWO distinct models — "existing"
+        // and "new-id" — never a corrupted/duplicate-under-the-hood state.
+        expect(registry.all().map((m) => m.modelId).sort()).toEqual(["existing", "new-id"]);
+      });
+
+      it("a getter-backed costPerCall answering validly then invalidly is still rejected (validation and storage never disagree)", () => {
+        const registry = new ModelRegistry();
+        let reads = 0;
+        const hostile = {
+          provider: "mock",
+          modelId: "m-hostile",
+          tier: "STANDARD" as const,
+          get costPerCall() {
+            reads += 1;
+            return reads === 1 ? 0.01 : NaN;
+          },
+          capabilities: ["classification"],
+          status: "ACTIVE" as const
+        };
+
+        // With the fix, only ONE read happens — the registered record
+        // genuinely has the valid $0.01 price, since validation and
+        // storage share the same snapshot.
+        registry.register(hostile);
+        expect(reads).toBe(1);
+        expect(registry.all()[0]!.costPerCall).toBe(0.01);
+      });
+    }
+  );
 });

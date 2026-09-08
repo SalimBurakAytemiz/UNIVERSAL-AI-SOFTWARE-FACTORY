@@ -294,10 +294,28 @@ export class BudgetGuard {
    * never observe a partially-updated state.
    */
   constructor(costEngine: CostEngine, limits: BudgetLimits, now: () => Date = () => new Date(), auditLog?: AuditLog) {
-    // Yanlış yapılandırılmış bir tavan (NaN/Infinity/negatif), kurulum
-    // anında hemen reddedilir — ilk harcama denemesine kadar beklenmez.
-    assertValidBudgetLimits(limits);
-    this.#limits = freezeRecord({ ...limits });
+    // P1 fix (28th independent review round, finding 7, "snapshot budget
+    // limits before validation" — same root class as round 27's finding 1
+    // [policy-engine.ts risk validation] and finding 7 [budget.ts spend
+    // entries]): `limits` used to be validated DIRECTLY
+    // (`assertValidBudgetLimits(limits)`, reading `limits.perTaskUsd`/
+    // `.perRunUsd`/`.dailyUsd`/`.monthlyUsd` from the caller's own object),
+    // then read AGAIN one line below via `freezeRecord({ ...limits })` — two
+    // SEPARATE reads of a caller-owned object that, if getter/Proxy-backed,
+    // need not agree. A getter answering a valid ceiling (e.g. `perTaskUsd:
+    // 1`) on the validation read and a wildly different one (e.g.
+    // `Number.MAX_VALUE`, or an invalid NaN/negative value the constructor
+    // was supposed to reject) on the snapshot read would pass validation
+    // against a value that never ends up stored, while the REAL ceiling
+    // every future `reserve()`/`spend()` call enforces was never actually
+    // validated. Fixed: `limits` is spread into `snapshot` FIRST — a
+    // genuine, static plain object, reading every property exactly ONCE —
+    // and `assertValidBudgetLimits(snapshot)` validates that SAME object,
+    // which is then the ONE frozen and stored; the caller's original
+    // `limits` parameter is never read again after this one spread.
+    const snapshot: BudgetLimits = { ...limits };
+    assertValidBudgetLimits(snapshot);
+    this.#limits = freezeRecord(snapshot);
     this.#costEngine = costEngine;
     this.#now = now;
     this.#auditLog = auditLog;
@@ -502,25 +520,44 @@ export class BudgetGuard {
    * provider'ı ASLA çağırmamalıdır.
    */
   reserve(scope: ReservationOwnership, amountUsd: number): Reservation {
+    // P1 fix (28th independent review round, finding 8, "snapshot
+    // reservation scope before ceiling checks" — same root class as
+    // finding 7 above and round 27's finding 7): `scope` used to be read
+    // MULTIPLE separate times from the caller's own object — once (or
+    // twice) for the `BUDGET_INVALID_AMOUNT_REJECTED`/
+    // `BUDGET_RESERVATION_BLOCKED` audit payloads, again inside
+    // `buildCeilingChecks(scope, amountUsd)`'s own scope matching, again
+    // inside `costEngine.createReservation(scope, amountUsd)`'s own
+    // `{ ...scope }` spread, and again in the final
+    // `BUDGET_RESERVATION_CREATED` audit payload. A getter/Proxy-backed
+    // `scope` could answer differently across these reads — e.g. passing
+    // the ceiling check under one `projectId` while the reservation is
+    // actually created (and its audit trail recorded) under a completely
+    // different one. Fixed: `scope` is spread into `snapshot` — a genuine,
+    // static plain object — as the VERY FIRST thing this method does;
+    // every stage below (ceiling checks, reservation creation, both audit
+    // payloads) uses this SAME snapshot, never the original `scope`
+    // parameter again.
+    const snapshot: ReservationOwnership = { ...scope };
     try {
       assertValidMonetaryAmount(amountUsd, "BudgetGuard.reserve");
     } catch (err) {
       this.#auditLog?.append({
         type: "BUDGET_INVALID_AMOUNT_REJECTED",
         actor: "budget-guard",
-        payload: { scope, amountUsd, reason: err instanceof Error ? err.message : String(err) },
+        payload: { scope: snapshot, amountUsd, reason: err instanceof Error ? err.message : String(err) },
         timestamp: this.#now().toISOString()
       });
       throw err;
     }
 
-    const checks = this.buildCeilingChecks(scope, amountUsd);
+    const checks = this.buildCeilingChecks(snapshot, amountUsd);
     for (const check of checks) {
       if (exceedsMonetaryAmount(check.projected, check.limit)) {
         this.#auditLog?.append({
           type: "BUDGET_RESERVATION_BLOCKED",
           actor: "budget-guard",
-          payload: { scope, amountUsd, ...check },
+          payload: { scope: snapshot, amountUsd, ...check },
           timestamp: this.#now().toISOString()
         });
         throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
@@ -531,12 +568,12 @@ export class BudgetGuard {
     // `this.#costEngine`'in KENDİSİNDE oluşturulur — artık bu sınıfın
     // kendi özel bir Map'inde DEĞİL (bkz. bu sınıfın üstündeki 16th
     // independent review round fix notu).
-    const created = this.#costEngine.createReservation(scope, amountUsd);
+    const created = this.#costEngine.createReservation(snapshot, amountUsd);
 
     this.#auditLog?.append({
       type: "BUDGET_RESERVATION_CREATED",
       actor: "budget-guard",
-      payload: { reservationId: created.id, scope, amountUsd, checks },
+      payload: { reservationId: created.id, scope: snapshot, amountUsd, checks },
       timestamp: this.#now().toISOString()
     });
 

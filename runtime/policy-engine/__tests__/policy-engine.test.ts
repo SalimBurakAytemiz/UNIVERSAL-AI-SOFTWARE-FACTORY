@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { InvalidRiskLevelError, PolicyEngine, lowRiskAllowRule, type PolicyRule } from "../policy-engine.js";
+import {
+  InvalidPolicyDecisionError,
+  InvalidRiskLevelError,
+  PolicyEngine,
+  lowRiskAllowRule,
+  type PolicyDecision,
+  type PolicyRule
+} from "../policy-engine.js";
 import { ApprovalRequiredError, ApprovalWorkflow, DuplicateApprovalIdError, InvalidApprovalDecisionError } from "../approval.js";
 import { AuditLog } from "../../audit/audit-log.js";
 
@@ -552,6 +559,96 @@ describe("PolicyEngine", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 2, 'reject invalid policy-rule decisions'): any non-null " +
+      "rule result is validated against the authoritative PolicyDecision enum before it can influence anything",
+    () => {
+      it("BLOCKER regression, exact reproduction: a typo'd decision ('ALOW') must not silently fall through to ALLOW", () => {
+        const engine = new PolicyEngine();
+        const typoRule: PolicyRule = { name: "typo-rule", priority: 1, evaluate: () => "ALOW" as unknown as PolicyDecision };
+        engine.addRule(typoRule);
+
+        expect(() => engine.evaluate({ actionType: "x", risk: 0, description: "d" })).toThrow(InvalidPolicyDecisionError);
+      });
+
+      it.each([
+        ["unknown string", "MAYBE"],
+        ["object", { decision: "ALLOW" }],
+        ["number", 1],
+        ["boolean", true],
+        ["empty string", ""],
+        ["array", ["ALLOW"]]
+      ])("rejects a malformed plugin result: %s", (_label, malformed) => {
+        const engine = new PolicyEngine();
+        const rule: PolicyRule = { name: "malformed-rule", priority: 1, evaluate: () => malformed as unknown as PolicyDecision };
+        engine.addRule(rule);
+
+        expect(() => engine.evaluate({ actionType: "x", risk: 0, description: "d" })).toThrow(InvalidPolicyDecisionError);
+      });
+
+      it("the error names the offending rule", () => {
+        const engine = new PolicyEngine();
+        const rule: PolicyRule = { name: "the-bad-one", priority: 1, evaluate: () => "ALOW" as unknown as PolicyDecision };
+        engine.addRule(rule);
+
+        expect(() => engine.evaluate({ actionType: "x", risk: 0, description: "d" })).toThrow(/the-bad-one/);
+      });
+
+      it("null is still a legal 'no opinion' result and does not throw", () => {
+        const engine = new PolicyEngine();
+        engine.addRule({ name: "abstain", priority: 1, evaluate: () => null });
+        engine.addRule(lowRiskAllowRule(2));
+
+        const result = engine.evaluate({ actionType: "x", risk: 1, description: "d" });
+        expect(result.decision).toBe("ALLOW");
+      });
+
+      it("all three genuine decisions (ALLOW/DENY/APPROVAL_REQUIRED) still pass validation and evaluate normally", () => {
+        for (const decision of ["ALLOW", "DENY", "APPROVAL_REQUIRED"] as const) {
+          const engine = new PolicyEngine();
+          engine.addRule({ name: "genuine", priority: 1, evaluate: () => decision });
+          const result = engine.evaluate({ actionType: "x", risk: 0, description: "d" });
+          expect(result.decision).toBe(decision);
+        }
+      });
+
+      it("an invalid decision from a LOWER-priority rule still throws, even when a higher-priority rule already matched", () => {
+        const engine = new PolicyEngine();
+        engine.addRule({ name: "high-allow", priority: 10, evaluate: () => "ALLOW" });
+        engine.addRule({ name: "low-malformed", priority: 1, evaluate: () => "ALOW" as unknown as PolicyDecision });
+
+        // The loop deliberately never breaks early (DENY-precedence fix, 7th
+        // round) — every rule is evaluated, so a malformed result anywhere
+        // in the rule set is caught, not just when it happens to be the
+        // first/only one evaluated.
+        expect(() => engine.evaluate({ actionType: "x", risk: 0, description: "d" })).toThrow(InvalidPolicyDecisionError);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+      "mutable state'): PolicyEngine's auditLog is also a genuine #private field now",
+    () => {
+      it("auditLog is not reachable as an ordinary JS property, and a forged replacement never suppresses the real audit trail", () => {
+        const realAuditLog = new AuditLog();
+        const engine = new PolicyEngine(realAuditLog);
+        const asRecord = engine as unknown as Record<string, unknown>;
+        expect(asRecord.auditLog).toBeUndefined();
+
+        const forgedAuditLog = { append: () => {} };
+        asRecord.auditLog = forgedAuditLog;
+        const spread: Record<string, unknown> = { ...engine };
+        expect(spread.auditLog).toBe(forgedAuditLog); // an inert stray property, nothing more
+
+        engine.addRule(lowRiskAllowRule(5));
+        engine.evaluate({ actionType: "x", risk: 0, description: "d" });
+        expect(realAuditLog.all().some((r) => r.type === "POLICY_DECISION")).toBe(true);
+        expect(engine.auditTrail).toBe(realAuditLog);
+      });
+    }
+  );
 });
 
 describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)", () => {
@@ -955,4 +1052,71 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       expect(forged.requests).toBeUndefined();
     });
   });
+
+  describe(
+    "P1 fix (28th independent review round, finding 1, 'hide mutable approval lookup helpers at runtime'): " +
+      "the internal mustGet() lookup helper is now a genuine #private method, not TypeScript's compile-time-only " +
+      "`private`",
+    () => {
+      it("mustGet is not reachable as an ordinary JS property/method (BLOCKER regression)", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("mg-1", "Deploy to production", 5);
+
+        const asAny = workflow as unknown as { mustGet?: (id: string) => { status: string } };
+        expect(asAny.mustGet).toBeUndefined();
+
+        // Before the fix, this call would have returned the ACTUAL mutable
+        // internal record — mutating its `status` directly would flip
+        // PENDING -> APPROVED with no reviewer identity, no audit event,
+        // and no approve() call at all. There is no such method to call now.
+        expect(() => asAny.mustGet?.("mg-1")).not.toThrow();
+        expect(asAny.mustGet).toBeUndefined();
+      });
+
+      it("no reflection API exposes mustGet", () => {
+        const workflow = new ApprovalWorkflow();
+        expect(Object.getOwnPropertyNames(workflow)).not.toContain("mustGet");
+        expect(Reflect.ownKeys(workflow).map(String)).not.toContain("mustGet");
+        const proto = Object.getPrototypeOf(workflow) as object;
+        expect(Object.getOwnPropertyNames(proto)).not.toContain("mustGet");
+      });
+
+      it("a request genuinely stays PENDING (never silently APPROVED) since the mutable-record escape hatch no longer exists", () => {
+        const workflow = new ApprovalWorkflow();
+        workflow.request("mg-2", "Deploy to production", 5);
+
+        // Simulates the exact pre-fix attack this finding describes:
+        // reaching mustGet() via a forged/any-typed reference and mutating
+        // the record it returned directly.
+        const forged = workflow as unknown as Record<string, unknown>;
+        if (typeof forged.mustGet === "function") {
+          const record = (forged.mustGet as (id: string) => { status: string })("mg-2");
+          record.status = "APPROVED";
+        }
+
+        expect(workflow.get("mg-2")!.status).toBe("PENDING");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+      "mutable state'): ApprovalWorkflow's auditLog is also a genuine #private field now",
+    () => {
+      it("auditLog is not reachable as an ordinary JS property, and a forged replacement never suppresses the real audit trail", () => {
+        const realAuditLog = new AuditLog();
+        const workflow = new ApprovalWorkflow(realAuditLog);
+        const asRecord = workflow as unknown as Record<string, unknown>;
+        expect(asRecord.auditLog).toBeUndefined();
+
+        const forgedAuditLog = { append: () => {} };
+        asRecord.auditLog = forgedAuditLog;
+        const spread: Record<string, unknown> = { ...workflow };
+        expect(spread.auditLog).toBe(forgedAuditLog); // an inert stray property, nothing more
+
+        workflow.request("mg-3", "Deploy to production", 5);
+        expect(realAuditLog.all().some((r) => r.type === "APPROVAL_REQUESTED")).toBe(true);
+      });
+    }
+  );
 });

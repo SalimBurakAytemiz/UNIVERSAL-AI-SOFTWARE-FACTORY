@@ -24,18 +24,28 @@ export interface BusinessCapabilityRecord {
  * (runtime/util/immutable.ts), consistent with every other P0 registry.
  */
 export class BusinessCapabilityRegistry {
-  private readonly capabilities = new Map<string, BusinessCapabilityRecord>();
+  /**
+   * P1 targeted-audit fix (28th independent review round, root-class B
+   * sweep, "TypeScript private used for authoritative mutable state" —
+   * same class already fixed in every other P0 registry): still declared
+   * with TypeScript's compile-time-only `private` — an ordinary,
+   * enumerable instance property in the compiled JS, reachable via
+   * `(registry as any).capabilities` with no type-system escape hatch
+   * needed. Fixed the same way every other P0 registry already is.
+   */
+  #capabilities = new Map<string, BusinessCapabilityRecord>();
 
   register(capability: BusinessCapabilityRecord): void {
-    this.capabilities.set(capability.id, freezeRecord({ ...capability }));
+    const snapshot: BusinessCapabilityRecord = { ...capability };
+    this.#capabilities.set(snapshot.id, freezeRecord(snapshot));
   }
 
   all(): readonly BusinessCapabilityRecord[] {
-    return [...this.capabilities.values()].map((c) => freezeRecord(c));
+    return [...this.#capabilities.values()].map((c) => freezeRecord(c));
   }
 
   get(id: string): BusinessCapabilityRecord | undefined {
-    const capability = this.capabilities.get(id);
+    const capability = this.#capabilities.get(id);
     return capability ? freezeRecord(capability) : undefined;
   }
 

@@ -702,4 +702,43 @@ describe("withTimeout", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 3, 'preserve timeout failure after deadline'): once the " +
+      "deadline has been exceeded, a LATER successful settlement must not silently overwrite the timeout outcome",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a non-cooperative operation that ignores its AbortSignal and " +
+          "eventually RESOLVES successfully after the deadline still surfaces as SandboxTimeoutError, never the " +
+          "late resolved value",
+        async () => {
+          // Deliberately ignores `signal` entirely — simulates an
+          // operation that cannot honor cancellation — and resolves
+          // successfully well AFTER the timeout deadline.
+          const operation = () => new Promise<string>((resolve) => setTimeout(() => resolve("late success"), 60));
+          await expect(withTimeout(operation, 15)).rejects.toThrow(SandboxTimeoutError);
+        }
+      );
+
+      it("the timedOut flag is checked on the RESOLVE path, not only the reject path (both settlement shapes are covered)", async () => {
+        let resolveLate!: (value: string) => void;
+        const pending = new Promise<string>((resolve) => {
+          resolveLate = resolve;
+        });
+        const operation = () => pending;
+
+        const call = withTimeout(operation, 15);
+        // Let the deadline genuinely fire before the operation ever settles.
+        await new Promise((r) => setTimeout(r, 40));
+        resolveLate("resolved after the deadline already fired");
+
+        await expect(call).rejects.toThrow(SandboxTimeoutError);
+      });
+
+      it("an operation that settles BEFORE the deadline still returns its genuine value normally (no regression for the happy path)", async () => {
+        const operation = () => new Promise<string>((resolve) => setTimeout(() => resolve("on time"), 5));
+        await expect(withTimeout(operation, 200)).resolves.toBe("on time");
+      });
+    }
+  );
 });

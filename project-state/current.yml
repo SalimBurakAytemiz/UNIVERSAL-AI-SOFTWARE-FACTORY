@@ -982,6 +982,30 @@ factory:
     NOT move to P1, does NOT declare P0 complete, and does NOT invoke Codex itself. P0 remains
     BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN.
 
+    Round 28 (fresh independent Codex review, consolidated closure batch, FIFTEEN findings — 13 P1, 2 P2 — plus
+    an explicitly-scoped root-class hardening sweep): all fifteen findings fixed (approval-lookup runtime
+    privacy; invalid policy-rule decisions now fail closed; sandbox timeout preserved after the deadline even on
+    a late resolve; cost-engine entries/reservations now durably persisted with real restart proofs and a
+    private clock; every failed commit now enters RECONCILIATION_FAILED; secrets embedded inside arbitrary log
+    string values are now redacted, not just flagged property names; budget limits and reservation scope are now
+    snapshotted exactly once before validation; approval ids are snapshotted once before consumption; file-lock
+    timing options are validated before entering the acquisition loop (the NaN-timeout case was a genuine
+    indefinite hang under bypass, not just a failing test); all five id-keyed P0 registries now snapshot the
+    caller's record once before validating/storing it; duplicate provider registration now fails closed with a
+    separate audited replaceProvider() for genuine swaps; initial model routing now restricts to the lowest
+    sufficient tier before ever comparing cost; persisted decision-supersession graphs now reject a successor
+    claimed by two different predecessors). The root-class sweep (same five classes named in the review prompt,
+    not broadened into unrelated architecture) found five further genuine TypeScript-private-only authoritative
+    state instances beyond the fifteen — policy-engine's auditLog, the router's and scheduler's registry
+    references, and the service-catalog/business-capability-registry internal Maps — all converted to genuine
+    #-private the same way every other P0 dependency already is. All 20 fixes carry deterministic regression
+    tests, each verified via a genuine temporary in-place bypass reproducing the exact predicted failure, then
+    fully reverted. 1041/1041 tests passing (+216 net new), full required sequence green (lint, typecheck,
+    build, validate:requirements, secret-scan, Factory Doctor, verify:production-install, all 9 P0 proofs). Per
+    explicit instruction, this round does NOT merge, does NOT move to P1, does NOT declare P0 complete, does NOT
+    invoke Codex itself, and did NOT create a new branch. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next
+    independent Codex review to return CLEAN.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -3673,6 +3697,48 @@ completed_milestones:
     round), Factory Doctor (READY on all checks), all 9 P0 proofs (13
     assertions) — all clean, stable across repeated runs, no orphaned
     processes, no leftover TEMP-BYPASS markers anywhere in the tree.
+  - >-
+    Round 28 (fresh independent Codex review, consolidated closure batch, FIFTEEN findings — 13 P1, 2 P2 — plus
+    an explicitly-scoped root-class hardening sweep): fixed runtime-private approval lookup helpers
+    (`approval.ts`'s `#mustGet`/`#auditLog`); reject invalid policy-rule decisions before they can influence
+    authorization (`policy-engine.ts`'s `assertValidPolicyDecision()`); preserve a sandbox timeout even when the
+    raced operation later settles successfully (`sandbox.ts`'s `withTimeout()` now re-checks `timedOut` on both
+    the resolve and reject paths); persist cost entries/reservations across restarts via an optional
+    `StateStore`-backed layer with real cross-instance restart proofs, plus a genuinely private clock, plus every
+    commit-failure path (not just amount mismatch) now marking RECONCILIATION_FAILED (`cost-engine.ts`); redact
+    credentials embedded inside arbitrary log string values, not just flagged property names (`logger.ts`'s
+    `redactSecretsInString()`); snapshot budget limits and reservation scope exactly once before
+    validating/using them (`budget.ts`'s constructor and `reserve()`); snapshot the approval id exactly once
+    before consumption (`capability-gateway/gateway.ts`'s `authorize()`); validate file-lock timing options
+    before entering the acquisition loop — the NaN-timeout bypass reproduction was a genuine indefinite hang,
+    confirmed via `timeout 60` (`file-lock.ts`'s `assertValidLockTimingOptions()`); apply the identical
+    "snapshot the caller's record once, then validate/dedupe/store from that snapshot" fix across all five
+    id-keyed P0 registries — models, assumptions, artifacts, technology (whose `auditLog` was also still
+    TypeScript-only-private, fixed alongside it), and workers; reject duplicate provider registration with a
+    separately-named, audited `replaceProvider()` for genuine swaps (`models/gateway.ts`'s
+    `DuplicateProviderIdError`); restrict initial model routing to the lowest sufficient tier before ever
+    comparing cost, closing a path where a mispriced PREMIUM model cheaper than a sufficient STANDARD one could
+    be selected for a trivial task (`models/router.ts`'s `selectModel()`); and reject a persisted decision-
+    supersession graph where a successor is claimed by two different predecessors (`decision-ledger.ts`'s
+    incoming-edge cardinality check). A narrow, explicitly-scoped root-class audit for the five review-named
+    trust-boundary classes (not broadened into unrelated architecture) found five further genuine TypeScript-
+    private-only authoritative-state instances beyond the fifteen: `policy-engine.ts`'s constructor-injected
+    `auditLog`; `models/router.ts`'s `CheapestCapableModelRouter` and `scheduler.ts`'s `ResourceAwareScheduler`'s
+    constructor-injected `registry` references (either substitutable via a bare property write, redirecting
+    routing/scheduling to an attacker-controlled model/worker pool); and `service-catalog/service-catalog.ts`'s
+    `services` Map (also carrying the SAME validate-then-reread TOCTOU as the registry findings — its
+    `register()` now snapshots the caller's record once too) and `business-capability-registry/registry.ts`'s
+    `capabilities` Map. All 20 fixes (15 reported + 5 swept) carry deterministic regression tests and were
+    verified via a genuine temporary in-place bypass reproducing the exact predicted failure (or a genuine hang,
+    for the file-lock case), then fully reverted and reconfirmed clean (grep for the bypass marker returning
+    empty in every touched file). No status raised on any requirement beyond what real evidence supports — every
+    touched requirement was already UNIT_TESTED or PROOF_VERIFIED, and these are hardening fixes to already-
+    tested requirements, not first implementations. Re-ran the full required sequence: lint, typecheck, build,
+    1041/1041 tests (44 files, +216 net new), validate:requirements (42 schema-valid records), history-and-
+    current-tree-aware secret-scan (PASS), Factory Doctor (READY), `npm run verify:production-install` (PASS —
+    compiled CLI and ajv-backed genome validator both work under a real `npm ci --omit=dev` install with zero
+    devDependencies present), all 9 P0 proofs (13 assertions) — all clean, no orphaned processes, no leftover
+    TEMP-BYPASS markers anywhere in the tree.
 
 known_limitations:
   - >-
@@ -4226,6 +4292,38 @@ blockers:
     BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit instruction,
     this round does not merge, does not move to P1, does not declare P0 complete, and does not invoke Codex
     itself.
+  - >-
+    Awaiting a 29th independent (Codex) re-review of the pushed fixes — round 28 (Founder-forwarded consolidated
+    closure batch) found FIFTEEN NEW findings (13 P1, 2 P2): `approval.ts`'s `mustGet()`/`#auditLog` reachable as
+    ordinary JS; `policy-engine.ts`'s `evaluate()` accepting any non-null rule result, including a typo'd or
+    malformed value, as if it were a genuine decision; `sandbox.ts`'s `withTimeout()` letting a late successful
+    settlement overwrite an already-recorded timeout; `cost-engine.ts`'s committed spend/reservations existing
+    only in memory (lost on restart) plus its clock still TypeScript-`private`-only plus commit failures other
+    than amount-mismatch not entering RECONCILIATION_FAILED; `logger.ts` redacting only by property name, missing
+    secrets embedded inside arbitrary string values (Authorization headers, URLs); `budget.ts`'s constructor and
+    `reserve()` validating one read of caller-owned `limits`/`scope` then storing a separately re-read value;
+    `capability-gateway/gateway.ts`'s `authorize()` reading `approval.approvalId` at multiple separate points
+    instead of one snapshot; `file-lock.ts` never validating `timeoutMs`/`staleMs`/`pollIntervalMs` before
+    entering the acquisition loop; all five id-keyed P0 registries (models, assumptions, artifacts, technology,
+    workers) reading a caller's record at multiple separate points across validation/dedupe/storage instead of
+    one snapshot; `models/gateway.ts`'s `registerProvider()` silently replacing an existing provider id;
+    `models/router.ts`'s `selectModel()` comparing cost across ALL sufficient tiers combined instead of
+    restricting to the lowest one first; and `decision-ledger.ts`'s persisted-graph validator not checking
+    incoming-edge cardinality, allowing a merged predecessor chain (A -> C, B -> C) to be restored. All fifteen
+    fixed, tested, and verified per the full required sequence: lint, typecheck, build, 1041/1041 tests,
+    validate:requirements, history-aware secret-scan, Factory Doctor, `npm run verify:production-install`, all 9
+    P0 proofs. All fifteen root causes, fixes, and regression evidence are detailed in `completed_milestones`'s
+    round-28 entries, the touched files' own fix-note comments, and the round-28 closure summary in
+    `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0042). A narrow, explicitly-scoped root-class
+    audit for the five review-named trust-boundary classes found five further genuine TypeScript-private-only
+    instances beyond the fifteen — `policy-engine.ts`'s `auditLog`, `models/router.ts`'s and `scheduler.ts`'s
+    constructor-injected `registry` references, and `service-catalog.ts`'s/`business-capability-registry.ts`'s
+    internal Maps (service-catalog's `register()` also carried the same validate-then-reread TOCTOU as the
+    registry findings) — all found and fixed proactively during that same audit, same as rounds 25/26/27's
+    precedent. Tested (1041/1041 tests, +216 net new across all 20 fixes) and verified per the full required
+    sequence. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per
+    explicit instruction, this round does not merge, does not move to P1, does not declare P0 complete, does not
+    invoke Codex itself, and did not create a new branch.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -4243,6 +4341,79 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 28). A fresh,
+  independent Codex review of the complete branch found FIFTEEN
+  actionable findings (13 priority-P1, 2 priority-P2) and required them
+  fixed as ONE consolidated closure batch, plus a narrow, explicitly-
+  scoped root-class hardening sweep for five named trust-boundary
+  classes. All fifteen findings were fixed: (1) `approval.ts`'s internal
+  `mustGet()`/`#auditLog` converted to genuine `#`-private; (2)
+  `policy-engine.ts` gained `assertValidPolicyDecision()`, rejecting any
+  rule result that isn't exactly ALLOW/DENY/APPROVAL_REQUIRED before it
+  can influence a decision; (3) `sandbox.ts`'s `withTimeout()` now
+  re-checks `timedOut` after BOTH the resolve and reject settlement
+  paths, so a late successful operation can never overwrite a genuine
+  timeout; (4)/(6)/(10) `cost-engine.ts` gained real `StateStore`-backed
+  persistence for entries/reservations (with real restart/new-instance
+  proofs), a genuinely private `#now` clock, and every commit-failure
+  path (not just amount-validation) now marks a reservation
+  RECONCILIATION_FAILED; (5) `logger.ts` gained `redactSecretsInString()`,
+  catching credentials embedded inside arbitrary string values
+  (Authorization/Bearer/Cookie headers, secret-assignment forms, URL
+  userinfo), not just flagged property names; (7)/(8) `budget.ts`'s
+  constructor and `reserve()` now snapshot caller-owned `limits`/`scope`
+  into a plain object exactly once before validating/using them; (9)
+  `capability-gateway/gateway.ts`'s `authorize()` now captures
+  `approval.approvalId` into a local const once, closing a getter/Proxy
+  path that could let approval A authorize execution while approval B is
+  consumed; (11) `file-lock.ts` gained `assertValidLockTimingOptions()` —
+  the NaN-timeout bypass reproduction was a genuine indefinite hang, not
+  merely a failing test; (12) the same "snapshot once, then
+  validate/dedupe/store from that snapshot" fix applied across all five
+  id-keyed P0 registries (models, assumptions, artifacts, technology,
+  workers — technology-registry's `auditLog` was also still
+  TypeScript-only-private, fixed alongside it); (13) `models/gateway.ts`
+  gained `DuplicateProviderIdError` — `registerProvider()` now fails
+  closed on a colliding id instead of silently replacing the
+  authoritative adapter, with a separately-named, audited
+  `replaceProvider()` for genuine replacement; (14) `models/router.ts`'s
+  `selectModel()` now finds the LOWEST sufficient tier with any capable
+  candidate and restricts the pool to THAT tier before optimizing cost —
+  cost is never compared across tiers, closing a path where a mispriced
+  PREMIUM model cheaper than a sufficient STANDARD one could be selected
+  for a trivial task; (15) `decision-ledger.ts`'s persisted-graph
+  validator gained an incoming-edge cardinality check rejecting a
+  successor id claimed by two different predecessors (A -> C, B -> C).
+  The root-class sweep (TypeScript `private` used for authoritative
+  mutable state) found five further genuine instances beyond the
+  fifteen: `policy-engine.ts`'s `auditLog`, `models/router.ts`'s and
+  `scheduler.ts`'s constructor-injected `registry` fields, and
+  `service-catalog.ts`'s/`business-capability-registry.ts`'s internal
+  Maps (service-catalog's `register()` also had the same
+  validate-then-reread TOCTOU as finding 12) — all converted to genuine
+  `#`-private the same way every other P0 dependency already is. All 20
+  total fixes carry deterministic regression tests and were verified via
+  a genuine temporary in-place bypass reproducing the exact predicted
+  failure (or a genuine hang, for the file-lock case), then fully
+  reverted and reconfirmed clean. Full required sequence re-run and
+  green: lint, typecheck, build, 1041/1041 tests (+216 net new),
+  validate:requirements (42 records), history-aware secret-scan,
+  Factory Doctor (READY), `npm run verify:production-install`, all 9 P0
+  proofs (13 assertions). Requirement registry updated (UASF-REQ-0042's
+  notes gained the round 28 closure summary) from this real evidence
+  only — no status raised beyond what is genuinely supported, since
+  every touched requirement was already UNIT_TESTED or PROOF_VERIFIED
+  and this round's fixes are hardening, not first implementations. Do
+  not proceed to further P0 feature work, merge, move to P1, or declare
+  P0 complete until an independent (Codex) re-review of this diff
+  confirms no blocking P0 finding remains — per explicit Founder
+  instruction, this session does not invoke Codex itself, and did not
+  create a new branch (all work stayed on
+  claude/ai-factory-baseline-v1-seawq7). If/when that comes back clean,
+  resume from the prior exact_next_action below.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 27). A fresh,
   independent Codex review of the complete branch (forwarded by the
   Founder) found TEN actionable findings (9 priority-P1, 1 priority-P2)

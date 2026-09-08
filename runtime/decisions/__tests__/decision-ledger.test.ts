@@ -354,6 +354,61 @@ describe("FounderDecisionLedger", () => {
       expect(restored.get("b")?.supersededBy).toBe("c");
       expect(restored.hasActiveDecision("c")).toBe(true);
     });
+  });
+
+  describe(
+    "P1 fix (28th independent review round, finding 15, 'reject merged persisted supersession chains'): " +
+      "a successor id claimed by more than one predecessor (A -> C, B -> C) is not a valid lifecycle chain",
+    () => {
+      function fakeStore(data: unknown): StateStore {
+        return {
+          write: () => undefined,
+          read: () => data as never,
+          exists: () => true
+        };
+      }
+
+      it("BLOCKER regression, exact reproduction: rejects two independent predecessors (A, B) both naming the SAME successor (C)", () => {
+        const store = fakeStore([
+          { decisionId: "a", project: "p", decision: "d-a", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "c" },
+          { decisionId: "b", project: "p", decision: "d-b", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "c" },
+          { decisionId: "c", project: "p", decision: "d-c", source: "s", status: "ACTIVE", createdAt: "x" }
+        ]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("rejects a merge even when the two predecessors sit at different points in otherwise-valid chains", () => {
+        const store = fakeStore([
+          { decisionId: "a", project: "p", decision: "d-a", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+          { decisionId: "b", project: "p", decision: "d-b", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "final" },
+          { decisionId: "x", project: "p", decision: "d-x", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "final" },
+          { decisionId: "final", project: "p", decision: "d-final", source: "s", status: "ACTIVE", createdAt: "x" }
+        ]);
+        expect(() => FounderDecisionLedger.loadFrom(store, "decisions.json")).toThrow(CorruptPersistedDecisionError);
+      });
+
+      it("does not reject a genuinely valid chain where each successor has exactly one predecessor", () => {
+        const store = fakeStore([
+          { decisionId: "a", project: "p", decision: "d-a", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "b" },
+          { decisionId: "b", project: "p", decision: "d-b", source: "s", status: "ACTIVE", createdAt: "x" },
+          { decisionId: "c", project: "p", decision: "d-c", source: "s", status: "SUPERSEDED", createdAt: "x", supersededBy: "d" },
+          { decisionId: "d", project: "p", decision: "d-d", source: "s", status: "ACTIVE", createdAt: "x" }
+        ]);
+        const restored = FounderDecisionLedger.loadFrom(store, "decisions.json");
+        expect(restored.get("a")?.supersededBy).toBe("b");
+        expect(restored.get("c")?.supersededBy).toBe("d");
+      });
+    }
+  );
+
+  describe("P2 fix (24th independent review round, 'validate persisted supersession graph') continued", () => {
+    function fakeStore(data: unknown): StateStore {
+      return {
+        write: () => undefined,
+        read: () => data as never,
+        exists: () => true
+      };
+    }
 
     it(
       "REGRESSION (same root class as assumption-register.ts's 'restored assumptions must be detached'): " +

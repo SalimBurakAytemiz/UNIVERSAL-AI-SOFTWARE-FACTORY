@@ -72,13 +72,28 @@ export class ArtifactRegistry {
    */
   #artifacts = new Map<string, ArtifactRecord>();
 
-  /** Aynı id ile iki kez kayıt, sessizce üzerine yazmak yerine reddedilir. */
+  /**
+   * Aynı id ile iki kez kayıt, sessizce üzerine yazmak yerine reddedilir.
+   *
+   * P1 fix (28th independent review round, finding 12, "snapshot registry
+   * records before validation/storage" — same root class as models/
+   * registry.ts's register()): `input.id` used to be read from the
+   * caller's own object at THREE separate points — the `.has()` duplicate
+   * check, the `{ ...input }` spread building the stored record, and the
+   * `.set(input.id, ...)` Map key. A getter/Proxy-backed `input` could
+   * answer a non-colliding id for the duplicate check and a DIFFERENT one
+   * for the actual storage, defeating the duplicate-id guarantee this
+   * method exists to provide. Fixed: `input` is spread into `snapshot`
+   * FIRST, reading every property exactly once; the duplicate check, the
+   * stored record, and the Map key all derive from this SAME snapshot.
+   */
   register(input: RegisterArtifactInput): ArtifactRecord {
-    if (this.#artifacts.has(input.id)) {
-      throw new DuplicateArtifactError(input.id);
+    const snapshot: RegisterArtifactInput = { ...input };
+    if (this.#artifacts.has(snapshot.id)) {
+      throw new DuplicateArtifactError(snapshot.id);
     }
-    const record: ArtifactRecord = { ...input, createdAt: new Date().toISOString() };
-    this.#artifacts.set(input.id, record);
+    const record: ArtifactRecord = { ...snapshot, createdAt: new Date().toISOString() };
+    this.#artifacts.set(snapshot.id, record);
     return freezeRecord(record);
   }
 

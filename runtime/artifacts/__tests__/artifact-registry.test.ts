@@ -95,4 +95,33 @@ describe("ArtifactRegistry", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 12, 'snapshot registry records before validation/storage'): " +
+      "register() reads input.id exactly once, then the duplicate check, the stored record, and the Map key all " +
+      "use that SAME snapshot",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed id that answers a NON-colliding value for the duplicate check and a DIFFERENT (colliding) value afterward must not corrupt the store", () => {
+        const registry = new ArtifactRegistry();
+        registry.register({ id: "existing", artifactClass: "docs", path: "README.md", projectId: "proj-1" });
+
+        let reads = 0;
+        const hostile = {
+          get id() {
+            reads += 1;
+            return reads === 1 ? "new-one" : "existing";
+          },
+          artifactClass: "docs" as const,
+          path: "HOSTILE.md",
+          projectId: "proj-1"
+        };
+
+        const result = registry.register(hostile);
+        expect(reads).toBe(1); // id consulted exactly once
+        expect(result.id).toBe("new-one");
+        expect(registry.get("new-one")!.path).toBe("HOSTILE.md");
+        expect(registry.get("existing")!.path).toBe("README.md"); // untouched
+      });
+    }
+  );
 });

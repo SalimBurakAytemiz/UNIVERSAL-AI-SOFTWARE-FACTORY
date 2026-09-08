@@ -182,4 +182,52 @@ describe("TechnologyRegistry", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 12, 'snapshot registry records before validation/storage'): " +
+      "register() reads technology.id exactly once, then the duplicate check and the Map key both use that SAME " +
+      "snapshot",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed id that answers a NON-colliding value for the duplicate check and a DIFFERENT (colliding) value afterward must not corrupt the store", () => {
+        const registry = new TechnologyRegistry();
+        registry.register({ id: "existing", category: "language", lifecycle: "PREFERRED" });
+
+        let reads = 0;
+        const hostile = {
+          get id() {
+            reads += 1;
+            return reads === 1 ? "new-one" : "existing";
+          },
+          category: "framework" as const,
+          lifecycle: "FORBIDDEN" as const
+        };
+
+        registry.register(hostile);
+        expect(reads).toBe(1); // id consulted exactly once
+        expect(registry.recommendable().map((t) => t.id)).toEqual(["existing"]); // "new-one" is FORBIDDEN, "existing" untouched
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+      "mutable state'): TechnologyRegistry's auditLog is also a genuine #private field now",
+    () => {
+      it("auditLog is not reachable as an ordinary JS property, and a forged replacement never suppresses the real audit trail", () => {
+        const realAuditLog = new AuditLog();
+        const registry = new TechnologyRegistry(realAuditLog);
+        const asRecord = registry as unknown as Record<string, unknown>;
+        expect(asRecord.auditLog).toBeUndefined();
+
+        const forgedAuditLog = { append: () => {} };
+        asRecord.auditLog = forgedAuditLog;
+        const spread: Record<string, unknown> = { ...registry };
+        expect(spread.auditLog).toBe(forgedAuditLog); // an inert stray property, nothing more
+
+        registry.register({ id: "t1", category: "language", lifecycle: "PREFERRED" });
+        registry.transitionLifecycle("t1", "DEPRECATED", "superseded by t2");
+        expect(realAuditLog.all().some((r) => r.type === "TECHNOLOGY_LIFECYCLE_TRANSITIONED")).toBe(true);
+      });
+    }
+  );
 });

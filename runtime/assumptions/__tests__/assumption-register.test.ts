@@ -418,4 +418,34 @@ describe("AssumptionRegister", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (28th independent review round, finding 12, 'snapshot registry records before validation/storage'): " +
+      "propose() reads input.id exactly once, then the duplicate check, the stored record, and the Map key all " +
+      "use that SAME snapshot",
+    () => {
+      it("BLOCKER regression, exact reproduction: a getter-backed id that answers a NON-colliding value for the duplicate check and a DIFFERENT (colliding) value afterward must not corrupt the store", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "existing", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+        let reads = 0;
+        const hostile = {
+          get id() {
+            reads += 1;
+            return reads === 1 ? "new-one" : "existing";
+          },
+          description: "hostile",
+          reason: "r",
+          impact: "LOW" as const,
+          source: "s"
+        };
+
+        const result = register.propose(hostile);
+        expect(reads).toBe(1); // id consulted exactly once
+        expect(result.id).toBe("new-one");
+        expect(register.get("new-one")).toBeDefined();
+        expect(register.get("existing")!.description).toBe("d"); // untouched
+      });
+    }
+  );
 });

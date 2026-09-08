@@ -961,3 +961,162 @@ describe(
     });
   }
 );
+
+describe(
+  "P1 fix (28th independent review round, finding 14, 'initial routing must use the lowest sufficient tier')",
+  () => {
+    it("BLOCKER regression, exact reproduction: a mispriced PREMIUM model cheaper than a sufficient STANDARD model must NOT be selected for a lower-risk task", () => {
+      const registry = new ModelRegistry();
+      // A pricing anomaly: the PREMIUM-tier model is numerically cheaper
+      // than the STANDARD-tier one. Model prices are registry DATA, not
+      // something the router may assume increases with tier.
+      registry.register({
+        provider: "mock",
+        modelId: "mispriced-standard",
+        tier: "STANDARD",
+        costPerCall: 0.05,
+        capabilities: ["implementation"],
+        status: "ACTIVE"
+      });
+      registry.register({
+        provider: "mock",
+        modelId: "mispriced-premium",
+        tier: "PREMIUM",
+        costPerCall: 0.01,
+        capabilities: ["implementation"],
+        status: "ACTIVE"
+      });
+
+      const router = new CheapestCapableModelRouter(registry);
+      // risk 3 -> minTierForRisk == STANDARD, which already has a capable candidate.
+      const decision = router.selectModel({
+        taskId: "should-stay-standard",
+        risk: 3,
+        requiredCapabilities: ["implementation"]
+      });
+
+      // The globally cheapest candidate is PREMIUM, but STANDARD is
+      // ALREADY sufficient — the router must never reach into a higher
+      // tier just because it is numerically cheaper.
+      expect(decision.model.tier).toBe("STANDARD");
+      expect(decision.model.modelId).toBe("mispriced-standard");
+    });
+
+    it("a trivial task never reaches PREMIUM even when PREMIUM is the cheapest model in the entire registry", () => {
+      const registry = new ModelRegistry();
+      registry.register({
+        provider: "mock",
+        modelId: "cheap-mock",
+        tier: "MOCK",
+        costPerCall: 0.02,
+        capabilities: ["tagging"],
+        status: "ACTIVE"
+      });
+      registry.register({
+        provider: "mock",
+        modelId: "free-premium-anomaly",
+        tier: "PREMIUM",
+        costPerCall: 0, // cheaper than the MOCK model above
+        capabilities: ["tagging"],
+        status: "ACTIVE"
+      });
+
+      const router = new CheapestCapableModelRouter(registry);
+      const decision = router.selectModel({
+        taskId: "trivial-tagging-2",
+        risk: 0,
+        requiredCapabilities: ["tagging"]
+      });
+
+      expect(decision.model.tier).toBe("MOCK");
+      expect(decision.model.modelId).toBe("cheap-mock");
+    });
+
+    it("still selects the cheapest candidate WITHIN the lowest sufficient tier when multiple exist at that tier", () => {
+      const registry = new ModelRegistry();
+      registry.register({
+        provider: "mock",
+        modelId: "standard-a",
+        tier: "STANDARD",
+        costPerCall: 0.03,
+        capabilities: ["implementation"],
+        status: "ACTIVE"
+      });
+      registry.register({
+        provider: "mock",
+        modelId: "standard-b",
+        tier: "STANDARD",
+        costPerCall: 0.01,
+        capabilities: ["implementation"],
+        status: "ACTIVE"
+      });
+      registry.register({
+        provider: "mock",
+        modelId: "premium-c",
+        tier: "PREMIUM",
+        costPerCall: 0.005,
+        capabilities: ["implementation"],
+        status: "ACTIVE"
+      });
+
+      const router = new CheapestCapableModelRouter(registry);
+      const decision = router.selectModel({
+        taskId: "within-tier-cheapest",
+        risk: 3,
+        requiredCapabilities: ["implementation"]
+      });
+
+      expect(decision.model.tier).toBe("STANDARD");
+      expect(decision.model.modelId).toBe("standard-b");
+    });
+
+    it("does escalate into a higher tier when the lowest sufficient tier has no capable candidate at all", () => {
+      const registry = new ModelRegistry();
+      registry.register({
+        provider: "mock",
+        modelId: "only-premium",
+        tier: "PREMIUM",
+        costPerCall: 0.3,
+        capabilities: ["rare-capability"],
+        status: "ACTIVE"
+      });
+
+      const router = new CheapestCapableModelRouter(registry);
+      const decision = router.selectModel({
+        taskId: "no-standard-available",
+        risk: 0,
+        requiredCapabilities: ["rare-capability"]
+      });
+
+      expect(decision.model.tier).toBe("PREMIUM");
+      expect(decision.model.modelId).toBe("only-premium");
+    });
+  }
+);
+
+describe(
+  "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+    "mutable state'): CheapestCapableModelRouter's registry is also a genuine #private field now",
+  () => {
+    it("registry is not reachable as an ordinary JS property, and a forged replacement cannot substitute the authoritative model registry", () => {
+      const realRegistry = createDefaultModelRegistry();
+      const router = new CheapestCapableModelRouter(realRegistry);
+
+      const asRecord = router as unknown as Record<string, unknown>;
+      expect(asRecord.registry).toBeUndefined();
+
+      const forgedRegistry = {
+        findCapable: () => [
+          { provider: "hijacked", modelId: "hijacked-model", tier: "MOCK", costPerCall: 0, capabilities: ["tagging"], status: "ACTIVE" }
+        ]
+      };
+      asRecord.registry = forgedRegistry;
+      const spread: Record<string, unknown> = { ...router };
+      expect(spread.registry).toBe(forgedRegistry); // an inert stray property, nothing more
+
+      // selectModel() still consults the REAL registry, not the forged one.
+      const decision = router.selectModel({ taskId: "t1", risk: 0, requiredCapabilities: ["tagging"] });
+      expect(decision.model.modelId).toBe("mock-classifier");
+    });
+  }
+);

@@ -46,20 +46,48 @@ export class ServiceNotFoundError extends Error {
  * döndürür.
  */
 export class ServiceCatalog {
-  private readonly services = new Map<string, MutableServiceRecord>();
+  /**
+   * P1 targeted-audit fix (28th independent review round, root-class B
+   * sweep, "TypeScript private used for authoritative mutable state" —
+   * same class already fixed in models/registry.ts, workers/registry.ts,
+   * technology-registry/registry.ts, artifact-registry.ts, and
+   * assumption-register.ts): still declared with TypeScript's compile-time
+   * -only `private` — `(catalog as any).services` reaches an ordinary,
+   * enumerable instance property in the compiled JS, letting a caller
+   * inject a fabricated record (bypassing `register()`'s duplicate-id
+   * check) or flip a service's `status`/`owner` in place, bypassing
+   * `updateStatus()` and baseline section 127's ownership-audit query
+   * (`findUnowned()`). Fixed the same way every other P0 registry already
+   * is.
+   */
+  #services = new Map<string, MutableServiceRecord>();
 
+  /**
+   * P1 fix (28th independent review round, root-class A sweep,
+   * "validate-then-reread" — same class as finding 12's registry fixes):
+   * `record.id` used to be read from the caller's own object at THREE
+   * separate points — the `.has()` duplicate check, the `.set()` Map key,
+   * and the `{ ...record }` spread's own property enumeration. A getter/
+   * Proxy-backed `record` could answer a non-colliding id for the
+   * duplicate check and a DIFFERENT (colliding) id afterward, corrupting
+   * the store the same way finding 12 described. Fixed: `record` is
+   * spread into `snapshot` FIRST, reading every property exactly once; the
+   * duplicate check and the stored copy both derive from this SAME
+   * snapshot.
+   */
   register(record: ServiceRecord): void {
-    if (this.services.has(record.id)) throw new DuplicateServiceError(record.id);
-    this.services.set(record.id, { ...record });
+    const snapshot: ServiceRecord = { ...record };
+    if (this.#services.has(snapshot.id)) throw new DuplicateServiceError(snapshot.id);
+    this.#services.set(snapshot.id, { ...snapshot });
   }
 
   get(id: string): ServiceRecord | undefined {
-    const record = this.services.get(id);
+    const record = this.#services.get(id);
     return record ? freezeRecord(record) : undefined;
   }
 
   all(): readonly ServiceRecord[] {
-    return [...this.services.values()].map((s) => freezeRecord(s));
+    return [...this.#services.values()].map((s) => freezeRecord(s));
   }
 
   findByStatus(status: ServiceHealth): readonly ServiceRecord[] {
@@ -72,7 +100,7 @@ export class ServiceCatalog {
   }
 
   updateStatus(id: string, status: ServiceHealth): ServiceRecord {
-    const record = this.services.get(id);
+    const record = this.#services.get(id);
     if (!record) throw new ServiceNotFoundError(id);
     record.status = status;
     return freezeRecord(record);

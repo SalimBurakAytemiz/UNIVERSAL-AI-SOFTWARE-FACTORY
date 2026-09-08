@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { ModelGateway, UnknownProviderError, type ModelInvocationResponse } from "../gateway.js";
+import { ModelGateway, UnknownProviderError, DuplicateProviderIdError, type ModelInvocationResponse } from "../gateway.js";
+import { AuditLog } from "../../audit/audit-log.js";
 import { createDefaultModelRegistry } from "../registry.js";
 import { MockProvider } from "../providers/mock-provider.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
@@ -1166,6 +1167,78 @@ describe("ModelGateway + MockProvider", () => {
           })
         ).rejects.toThrow(ApprovalEvidenceMismatchError);
         expect(provider.invocationCount).toBe(0);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (28th independent review round, finding 13, 'reject duplicate provider registration'): " +
+      "registerProvider() fails closed on a colliding id instead of silently replacing the authoritative adapter",
+    () => {
+      it("BLOCKER regression, exact reproduction: registering a second adapter for an already-bound id must not silently redirect real invocations", async () => {
+        const gateway = new ModelGateway();
+        const legit = new MockProvider();
+        gateway.registerProvider(legit);
+
+        const rogue: ModelProvider = {
+          id: "mock",
+          invoke: async () => ({ modelId: "hijacked", provider: "mock", costUsd: 999, output: "hijacked" })
+        };
+
+        expect(() => gateway.registerProvider(rogue)).toThrow(DuplicateProviderIdError);
+
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!;
+        const response = await gateway.invoke(
+          model,
+          { prompt: "hello" },
+          { policy: permissivePolicy(), budget: permissiveBudget(), risk: 0, taskId: "t1" }
+        );
+        // The original, legitimately-registered adapter is still the one actually invoked.
+        expect(response.output).toContain("hello");
+        expect(response.costUsd).toBe(model.costPerCall);
+      });
+
+      it("names the offending provider id in the thrown error", () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        try {
+          gateway.registerProvider(new MockProvider());
+          expect.unreachable("expected registerProvider to throw");
+        } catch (err) {
+          expect(err).toBeInstanceOf(DuplicateProviderIdError);
+          expect((err as Error).message).toContain("mock");
+        }
+      });
+
+      it("registering distinct provider ids on the same gateway is unaffected", () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const other: ModelProvider = { id: "other", invoke: async () => ({ modelId: "m", provider: "other", costUsd: 0, output: "" }) };
+        expect(() => gateway.registerProvider(other)).not.toThrow();
+        expect(gateway.hasProvider("mock")).toBe(true);
+        expect(gateway.hasProvider("other")).toBe(true);
+      });
+
+      it("replaceProvider() performs the swap explicitly and records an audited event", () => {
+        const auditLog = new AuditLog();
+        const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        const replacement: ModelProvider = {
+          id: "mock",
+          invoke: async () => ({ modelId: "m", provider: "mock", costUsd: 0, output: "replacement" })
+        };
+        expect(() => gateway.replaceProvider(replacement)).not.toThrow();
+
+        const events = auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED");
+        expect(events).toHaveLength(1);
+        expect(events[0]!.payload).toMatchObject({ providerId: "mock" });
+      });
+
+      it("replaceProvider() rejects replacing an id that was never registered (it is not a disguised register())", () => {
+        const gateway = new ModelGateway();
+        expect(() => gateway.replaceProvider(new MockProvider())).toThrow(UnknownProviderError);
       });
     }
   );

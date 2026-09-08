@@ -77,4 +77,28 @@ describe("ResourceAwareScheduler", () => {
       expect(worker.id).toBe("cpu-cheap"); // same weight tier as mac-cheap, but strictly cheaper
     });
   });
+
+  describe(
+    "P1 fix (28th independent review round, root-class B sweep, 'TypeScript private used for authoritative " +
+      "mutable state'): ResourceAwareScheduler's registry is also a genuine #private field now",
+    () => {
+      it("registry is not reachable as an ordinary JS property, and a forged replacement cannot substitute the authoritative worker pool", () => {
+        const realRegistry = new WorkerRegistry();
+        realRegistry.register({ id: "w1", workerClass: "linux-general", capabilities: ["cpu"], costPerMinuteUsd: 0.01, status: "IDLE" });
+        const scheduler = new ResourceAwareScheduler(realRegistry);
+
+        const asRecord = scheduler as unknown as Record<string, unknown>;
+        expect(asRecord.registry).toBeUndefined();
+
+        const forgedRegistry = { findCapable: () => [{ id: "hijacked", workerClass: "gpu", capabilities: ["cpu"], costPerMinuteUsd: 0, status: "IDLE" }] };
+        asRecord.registry = forgedRegistry;
+        const spread: Record<string, unknown> = { ...scheduler };
+        expect(spread.registry).toBe(forgedRegistry); // an inert stray property, nothing more
+
+        // selectWorker() still consults the REAL registry, not the forged one.
+        const worker = scheduler.selectWorker({ taskId: "t1", requiredCapabilities: ["cpu"] });
+        expect(worker.id).toBe("w1");
+      });
+    }
+  );
 });

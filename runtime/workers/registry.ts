@@ -96,6 +96,19 @@ export class WorkerRegistry {
   #workers: MutableWorkerRecord[] = [];
 
   register(worker: WorkerRecord): void {
+    // P1 fix (28th independent review round, finding 12, "snapshot
+    // registry records before validation/storage" — same root class as
+    // models/registry.ts's register()): `worker` used to be read from the
+    // caller's own object at multiple separate points — `costPerMinuteUsd`
+    // (validation), `id` (duplicate check, twice), and finally every
+    // property again via the final `{ ...worker, capabilities: [...] }`
+    // spread. A getter/Proxy-backed `worker` could answer validly for the
+    // first reads and differently (invalid, or duplicate-colliding) for
+    // the final stored copy. Fixed: `worker` is spread into `snapshot`
+    // FIRST, reading every property exactly once; validation, the
+    // duplicate check, and the stored copy all derive from this SAME
+    // snapshot.
+    const snapshot: WorkerRecord = { ...worker, capabilities: [...worker.capabilities] };
     // P2 targeted-audit fix (7th independent review round, same class as
     // "invalid model prices corrupt cheapest-capable routing" — models/
     // registry.ts): `scheduler.ts` runs the IDENTICAL cheapest-of-candidates
@@ -104,14 +117,14 @@ export class WorkerRegistry {
     // `costPerMinuteUsd` corrupts that comparison exactly as an unvalidated
     // `costPerCall` corrupted model routing — the SAME centralized
     // validator is reused here, not a divergent rule.
-    assertValidMonetaryAmount(worker.costPerMinuteUsd, `WorkerRegistry.register(id=${worker.id})`);
+    assertValidMonetaryAmount(snapshot.costPerMinuteUsd, `WorkerRegistry.register(id=${snapshot.id})`);
     // P2 fix (9th independent review round, "duplicate worker identities
     // break authoritative status"): reject an id collision BEFORE any
     // mutation — see DuplicateWorkerIdError above.
-    if (this.#workers.some((w) => w.id === worker.id)) {
-      throw new DuplicateWorkerIdError(worker.id);
+    if (this.#workers.some((w) => w.id === snapshot.id)) {
+      throw new DuplicateWorkerIdError(snapshot.id);
     }
-    this.#workers.push({ ...worker, capabilities: [...worker.capabilities] });
+    this.#workers.push(snapshot);
   }
 
   all(): readonly WorkerRecord[] {

@@ -116,7 +116,21 @@ export class TechnologyRegistry {
    */
   #technologies = new Map<string, TechnologyRecord>();
 
-  constructor(private readonly auditLog?: AuditLog) {}
+  /**
+   * P1 fix (28th independent review round, root-class B sweep, "TypeScript
+   * private used for authoritative mutable state" — same class as this
+   * round's finding 6 [cost-engine.ts's clock] and finding 1's audit-log
+   * follow-up [approval.ts]): this was still a TS-compile-time-only
+   * `private readonly` constructor-parameter property. Replacing it via
+   * `(registry as any).auditLog = { append: () => {} }` would silently
+   * suppress every future audit event this registry records. Converted to
+   * a genuine ECMAScript `#auditLog` private field.
+   */
+  #auditLog?: AuditLog;
+
+  constructor(auditLog?: AuditLog) {
+    this.#auditLog = auditLog;
+  }
 
   /**
    * Yeni bir teknoloji kaydeder — YALNIZCA yeni bir id için. Aynı id ile
@@ -124,12 +138,24 @@ export class TechnologyRegistry {
    * (FORBIDDEN bir teknolojiyi PREFERRED bir kayıtla SESSİZCE değiştirmek
    * dahil) reddedilir; mevcut bir kaydın lifecycle'ını değiştirmenin TEK
    * yolu transitionLifecycle()'dır.
+   *
+   * P1 fix (28th independent review round, finding 12, "snapshot registry
+   * records before validation/storage" — same root class as models/
+   * registry.ts's register()): `technology.id` used to be read from the
+   * caller's own object at THREE separate points — the `.has()` duplicate
+   * check, the `{ ...technology }` spread, and the `.set(technology.id,
+   * ...)` Map key. A getter/Proxy-backed `technology` could answer a
+   * non-colliding id for the duplicate check and a DIFFERENT one for the
+   * actual storage. Fixed: `technology` is spread into `snapshot` FIRST,
+   * reading every property exactly once; the duplicate check and the Map
+   * key both derive from this SAME snapshot.
    */
   register(technology: TechnologyRecord): void {
-    if (this.#technologies.has(technology.id)) {
-      throw new DuplicateTechnologyIdError(technology.id);
+    const snapshot: TechnologyRecord = { ...technology };
+    if (this.#technologies.has(snapshot.id)) {
+      throw new DuplicateTechnologyIdError(snapshot.id);
     }
-    this.#technologies.set(technology.id, freezeRecord({ ...technology }));
+    this.#technologies.set(snapshot.id, freezeRecord(snapshot));
   }
 
   /**
@@ -153,7 +179,7 @@ export class TechnologyRegistry {
 
     const updated = freezeRecord({ ...current, lifecycle: to });
     this.#technologies.set(id, updated);
-    this.auditLog?.append({
+    this.#auditLog?.append({
       type: "TECHNOLOGY_LIFECYCLE_TRANSITIONED",
       actor: "technology-registry",
       payload: { id, from: current.lifecycle, to, reason },
