@@ -67,10 +67,27 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       mkdirSync(requirementsDir, { recursive: true });
       // A genuine, on-disk requirement record claiming UNIT_TESTED with zero
       // evidence of any kind — a real traceability violation, not a
-      // caller-fabricated claim.
+      // caller-fabricated claim. Schema-valid (32nd independent review
+      // round, finding 4, "fail closed on empty or malformed requirement
+      // registries" — the runtime loader now also enforces
+      // schemas/requirement.schema.json, so this fixture must satisfy it
+      // to exercise the TRACEABILITY check specifically, not the loader's
+      // own malformed-registry rejection).
       writeFileSync(
         join(requirementsDir, "broken.yml"),
-        "- id: FAKE-REQ-0001\n  status: UNIT_TESTED\n  implementation_refs: []\n  test_refs: []\n  proof_refs: []\n"
+        [
+          "- id: UASF-REQ-9001",
+          "  title: Fixture requirement with no real evidence",
+          "  description: Deliberately claims UNIT_TESTED with zero backing evidence.",
+          "  source_baseline: 'BASELINE-V1 section 0 (test fixture)'",
+          "  category: P0",
+          "  priority: LOW",
+          "  status: UNIT_TESTED",
+          "  implementation_refs: []",
+          "  test_refs: []",
+          "  proof_refs: []",
+          ""
+        ].join("\n")
       );
       const policy = new PolicyEngine();
       policy.addRule(lowRiskAllowRule(2));
@@ -1980,6 +1997,89 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         expect(existsSync(join(tempRoot, projectId, "project-genome", "genome.json"))).toBe(true);
         expect(existsSync(join(tempRoot, projectId, "organization", "organization.json"))).toBe(true);
         expect(existsSync(result.statePath)).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (32nd independent review round, finding 8, 'persist the actual policy outcome'): the durable " +
+      "bootstrap record must never rewrite a genuine APPROVAL_REQUIRED-then-approved decision into ALLOW",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a risk-5 approved bootstrap persists policyDecision " +
+          "APPROVAL_REQUIRED (never ALLOW), with separate, truthful approval evidence and a success outcome",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-policy-outcome-"));
+          const policy = new PolicyEngine();
+          policy.addRule({
+            name: "allow-model-invoke",
+            priority: 10,
+            evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+          });
+
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(new MockProvider());
+          const costEngine = new CostEngine();
+
+          const projectId = "proj-policy-outcome";
+          const approvals = new ApprovalWorkflow();
+          const approvalId = "approval-policy-outcome";
+          approvals.requestFor(approvalId, {
+            actionType: "project.scaffold",
+            risk: 5,
+            description: `Scaffold Project OS for '${projectId}'`,
+            projectId
+          });
+          approvals.approve(approvalId, "founder@example.com");
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            costEngine,
+            risk: 5,
+            approvals,
+            approvalId
+          });
+
+          const freshStore = new FileStateStore();
+          const persistedState = freshStore.read<{
+            policyDecision: string;
+            approval: { required: boolean; approvalId?: string; consumed?: boolean };
+            executionOutcome: string;
+          }>(result.statePath);
+
+          expect(persistedState?.policyDecision).toBe("APPROVAL_REQUIRED");
+          expect(persistedState?.policyDecision).not.toBe("ALLOW");
+          expect(persistedState?.approval).toEqual({ required: true, approvalId, consumed: true });
+          expect(persistedState?.executionOutcome).toBe("SUCCESS");
+        }
+      );
+
+      it("no regression: a genuinely low-risk (ALLOW) bootstrap still persists policyDecision ALLOW with approval.required false", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-policy-outcome-allow-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome("proj-allow-outcome"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        });
+
+        const freshStore = new FileStateStore();
+        const persistedState = freshStore.read<{
+          policyDecision: string;
+          approval: { required: boolean };
+          executionOutcome: string;
+        }>(result.statePath);
+
+        expect(persistedState?.policyDecision).toBe("ALLOW");
+        expect(persistedState?.approval).toEqual({ required: false });
+        expect(persistedState?.executionOutcome).toBe("SUCCESS");
       });
     }
   );

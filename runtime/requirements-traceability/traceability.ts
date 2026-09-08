@@ -6,7 +6,7 @@
 // "no unsupported upgrades" kuralının denetlenebilir hâlidir.
 
 import { existsSync } from "node:fs";
-import { assertWithinRoot } from "../sandbox/sandbox.js";
+import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 
 export type RequirementStatus =
   | "DEFINED"
@@ -116,12 +116,51 @@ function looksLikeFilePath(ref: string): boolean {
  * There is no longer a "trust it, it's just an old-style note" carve-out;
  * every evidence-backed status claim in this registry must be backed by a
  * real, checkable artifact, full stop.
+ *
+ * P1 fix (32nd independent review round, finding 5, "canonicalize evidence
+ * paths with filesystem-aware confinement"): `assertWithinRoot()` is
+ * PURELY LEXICAL — it reasons only about the path STRING (via
+ * `path.resolve()`/`path.relative()`), never touching the actual
+ * filesystem, and its own doc comment explicitly documents this as a known
+ * limitation (bkz. `sandbox.ts`'in `assertWithinRoot()`'ın üstündeki not:
+ * "bu yalnızca SÖZDİZİMSEL bir kontroldür... symlink ise, bu fonksiyon
+ * bunu YAKALAYAMAZ"). Codex reproduced exactly the attack that limitation
+ * predicts: a requirement registry under attacker (or merely careless)
+ * control could place an in-repository symlink — e.g.
+ * `repo/proofs/evidence -> /etc/passwd` or any other path OUTSIDE the
+ * repository — and reference it as a `proof_refs` entry; `assertWithinRoot()`
+ * only ever checks that the SYMLINK'S OWN PATH lexically sits inside
+ * `rootDir` (it does, by construction), never where that symlink actually
+ * POINTS, so the subsequent `existsSync(resolved)` check follows the
+ * symlink to genuinely-existing content outside the repository and reports
+ * PROOF_VERIFIED-grade evidence for a file this Factory's own registry
+ * neither owns nor controls — exactly the class of defect `sandbox.ts`'s
+ * `assertFilesystemConfinement()` was already built, and hardened across
+ * three prior rounds (5th: dangling/final-destination symlinks; 6th:
+ * project-root alias; 7th: hard-link aliases), specifically to close for
+ * `project-lifecycle/orchestrator.ts`'s own scaffold writes. Fixed: this
+ * function now calls that SAME, already-proven filesystem-aware primitive
+ * instead of the lexical-only one — it resolves both `rootDir` and `ref`
+ * to their REAL (symlink-followed) canonical locations via
+ * `canonicalizeNearestExisting()`, and rejects (fail closed, caught below
+ * exactly like a lexical escape already was) whenever the real, resolved
+ * relative path differs from the lexical one — precisely the symlink-
+ * escape and project-root-alias cases the finding requires. A dangling or
+ * genuinely nonexistent ref is unaffected (bkz. `canonicalizeNearestExisting()`'s
+ * own contract: it resolves as far as a real ancestor exists, then the
+ * unchanged `existsSync(resolved)` call below still correctly reports "no
+ * evidence" for it) — "reject missing targets" was already this function's
+ * behavior and remains so. A genuinely-existing, non-symlinked evidence
+ * file OR directory (this registry legitimately uses both — see the real,
+ * on-disk `specification/requirements/*.yml` registry itself) continues to
+ * verify exactly as before; only a path whose REAL location differs from
+ * its apparent one is newly rejected.
  */
 function isVerifiedEvidenceRef(ref: string, rootDir: string): boolean {
   if (!looksLikeFilePath(ref)) return false;
   let resolved: string;
   try {
-    resolved = assertWithinRoot(rootDir, ref);
+    resolved = assertFilesystemConfinement(rootDir, ref);
   } catch {
     return false;
   }

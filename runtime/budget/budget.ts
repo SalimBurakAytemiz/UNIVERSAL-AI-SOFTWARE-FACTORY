@@ -160,6 +160,39 @@ function startOfUtcMonth(date: Date): string {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString();
 }
 
+/**
+ * P1 fix (32nd independent review round, finding 7, "reject lossy audit
+ * values before hashing"): `audit/audit-log.ts`'s `assertJsonCompatibleValue()`
+ * now REJECTS non-finite numbers (NaN/Infinity/-Infinity) outright — round
+ * 31's own deliberate exemption for exactly these values (reasoning that
+ * `JSON.stringify()`'s collapse-to-`null` was an already-accepted, non-
+ * fabricating lossiness) is REVERSED by this round's finding: any two
+ * DIFFERENT actual amounts among NaN/Infinity/-Infinity/genuinely-`null`
+ * all hash IDENTICALLY (all four collapse to the SAME `null` under
+ * `JSON.stringify()`), so the hash cannot actually distinguish "a NaN
+ * amount was rejected" from "an Infinity amount was rejected" from "a
+ * literal `null` was logged" — precisely the "hash does not authenticate
+ * the semantic payload actually supplied" defect the finding names. The
+ * call sites below (`assertWithinBudget()`/`reserve()`/`commit()`)
+ * deliberately log a REJECTED invalid amount as forensic evidence of
+ * EXACTLY what was rejected (bkz. `BUDGET_INVALID_AMOUNT_REJECTED`/
+ * `BUDGET_RESERVATION_COMMIT_FAILED`'ın kendi fix notları) — that forensic
+ * value must not simply be DROPPED to satisfy the new strict contract
+ * (baseline section 147/242's "no silent spending"/"tamper-evident audit"
+ * both cut against silently losing evidence of what was rejected). Fixed:
+ * a rejected amount is now logged via its `String()` representation
+ * (`"NaN"`, `"Infinity"`, `"-Infinity"`, or the ordinary decimal form for a
+ * genuinely finite-but-otherwise-invalid amount, e.g. a negative number) —
+ * a plain string is always JSON-safe and unambiguous (unlike the number
+ * itself, no two distinct rejected values can ever collapse to the same
+ * logged string), so the SAME forensic distinguishability round 31 wanted
+ * to preserve is now achieved WITHOUT relying on a hashing/serialization
+ * exemption this round's finding requires removed entirely.
+ */
+function forensicAmountForAudit(amountUsd: number): string | number {
+  return Number.isFinite(amountUsd) ? amountUsd : String(amountUsd);
+}
+
 export class BudgetGuard {
   /**
    * P1 fix (4th independent review round): eskiden constructor,
@@ -444,7 +477,11 @@ export class BudgetGuard {
       this.#auditLog?.append({
         type: "BUDGET_INVALID_AMOUNT_REJECTED",
         actor: "budget-guard",
-        payload: { scope, projectedAmountUsd, reason: err instanceof Error ? err.message : String(err) },
+        payload: {
+          scope,
+          projectedAmountUsd: forensicAmountForAudit(projectedAmountUsd),
+          reason: err instanceof Error ? err.message : String(err)
+        },
         timestamp: this.#now().toISOString()
       });
       throw err;
@@ -587,7 +624,11 @@ export class BudgetGuard {
       this.#auditLog?.append({
         type: "BUDGET_INVALID_AMOUNT_REJECTED",
         actor: "budget-guard",
-        payload: { scope: snapshot, amountUsd, reason: err instanceof Error ? err.message : String(err) },
+        payload: {
+          scope: snapshot,
+          amountUsd: forensicAmountForAudit(amountUsd),
+          reason: err instanceof Error ? err.message : String(err)
+        },
         timestamp: this.#now().toISOString()
       });
       throw err;
@@ -792,7 +833,7 @@ export class BudgetGuard {
             modelId: snapshot.modelId
           },
           reservedAmountUsd: reservation.amountUsd,
-          attemptedActualAmountUsd: snapshot.amountUsd,
+          attemptedActualAmountUsd: forensicAmountForAudit(snapshot.amountUsd),
           reason: err instanceof Error ? err.message : String(err)
         },
         timestamp: this.#now().toISOString()

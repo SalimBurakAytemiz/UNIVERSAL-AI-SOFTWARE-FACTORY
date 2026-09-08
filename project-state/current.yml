@@ -3953,6 +3953,76 @@ completed_milestones:
     secret-scan (PASS), Factory Doctor (READY), `npm run verify:production-install` (PASS), all 9 P0 proofs (13
     assertions) — all clean, no orphaned processes, no leftover TEMP-BYPASS markers anywhere in the tree.
 
+    Round 32 (fresh, independent Codex closure review, consolidated batch of NINE priority-P1/P2 findings, plus
+    a narrow, explicitly-scoped root-class audit for the same nine classes): (1) `cost-engine.ts`'s public
+    `record()` no longer accepts a caller-forgeable `reservationId` — a new private `#recordCommitted()` is the
+    ONLY path that may attach one, reachable exclusively from `commitReservation()` after it verifies a genuine,
+    matching reservation. (2) `telemetry/logger.ts`'s `SECRET_ASSIGNMENT_PATTERN` now gives quoted and unquoted
+    values independent regex alternatives, closing a gap where a quoted value containing a space/comma/semicolon
+    escaped redaction entirely. (3) `sandbox.ts`'s `withTimeout()` now also compares an authoritative
+    `Date.now() >= deadlineAt` independently of its timer-set flag, closing an event-loop-starvation gap where a
+    synchronous, overdue operation's own microtask continuation could run before the overdue timer's macrotask.
+    (4) `cli/commands/baseline-status.ts`'s `loadRequirementsFromDir()` now fails closed (dedicated
+    `EmptyRequirementRegistryError`/`MalformedRequirementRegistryError`) on an empty directory, a non-array
+    document, or zero aggregate records, and additionally schema-validates every record via ajv against
+    `schemas/requirement.schema.json`. (5) `requirements-traceability/traceability.ts`'s `isVerifiedEvidenceRef()`
+    now uses the symlink-aware `assertFilesystemConfinement()` instead of the purely lexical `assertWithinRoot()`,
+    closing a path where an in-repository symlink pointing outside the repo could satisfy a PROOF_VERIFIED-grade
+    evidence claim. (6) `models/gateway.ts`'s `registerProvider()`/`replaceProvider()` now snapshot
+    `provider.id` into a local `const` exactly once, closing a TOCTOU where a getter-backed provider could answer
+    a fresh id for the duplicate check and an already-trusted id for the actual store. (7) `audit/audit-log.ts`
+    now rejects non-finite numbers (NaN/Infinity/-Infinity) outright — reversing round 31's own deliberate
+    exemption, since all three collapse to the identical `JSON.stringify()` output as a literal `null`; the
+    `budget.ts` call sites that logged such values as forensic evidence now log a `String()` representation
+    instead via a new `forensicAmountForAudit()` helper (bare `undefined` remains accepted — rejecting it broke
+    ~98 pre-existing, legitimate audit invariants across other files, documented honestly rather than silently
+    narrowed). (8) `project-lifecycle/orchestrator.ts`'s bootstrap write no longer hardcodes
+    `policyDecision: "ALLOW"` — `CapabilityGateway.authorize()` gained an additive `onDecision` callback exposing
+    the true evaluated decision, so a risk-5-approved bootstrap now truthfully persists `APPROVAL_REQUIRED` with
+    separate `approval`/`executionOutcome` fields, never rewriting it into ALLOW. (9) `service-catalog.ts`'s
+    `findUnowned()` now uses the shared `isNonBlankIdentity()` validator instead of a plain truthy check, so a
+    whitespace-only owner string is correctly classified as unowned. All nine fixes carry deterministic
+    regression tests (including exact BLOCKER reproductions using the literal scenarios from the review),
+    verified via genuine temporary in-place bypass reproducing the exact predicted failure, then fully reverted
+    and reconfirmed clean. The root-class audit (limited to these nine exact classes, not broadened into
+    unrelated architecture) found NO further genuine instances beyond the nine reported. Re-ran the full
+    required sequence: lint, typecheck, build, 1193/1193 tests (44 files, +48 net new), validate:requirements
+    (42 schema-valid records), history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY), `npm
+    run verify:production-install` (PASS), all 9 P0 proofs — all clean, no orphaned processes, no leftover
+    TEMP-BYPASS markers anywhere in the tree.
+  - >-
+    Round 32 (fresh, independent Codex closure review, consolidated batch of NINE priority-P1/P2 findings, plus
+    a narrow, explicitly-scoped root-class audit for the same nine classes): (1) `cost-engine.ts`'s public
+    `record()` no longer accepts a caller-forgeable `reservationId`; only the private `#recordCommitted()`,
+    reachable exclusively from `commitReservation()` after it verifies a genuine matching reservation, may
+    attach one. (2) `telemetry/logger.ts`'s `SECRET_ASSIGNMENT_PATTERN` now gives quoted and unquoted values
+    independent regex alternatives, closing a gap where a quoted value containing a space/comma/semicolon
+    escaped redaction entirely. (3) `sandbox.ts`'s `withTimeout()` now also compares an authoritative
+    `Date.now() >= deadlineAt` independently of its timer-set flag, closing an event-loop-starvation gap.
+    (4) `cli/commands/baseline-status.ts`'s `loadRequirementsFromDir()` now fails closed on an empty directory,
+    a non-array document, or zero aggregate records, and schema-validates every record via ajv against
+    `schemas/requirement.schema.json`. (5) `requirements-traceability/traceability.ts`'s `isVerifiedEvidenceRef()`
+    now uses the symlink-aware `assertFilesystemConfinement()` instead of the purely lexical `assertWithinRoot()`.
+    (6) `models/gateway.ts`'s `registerProvider()`/`replaceProvider()` now snapshot `provider.id` into a local
+    `const` exactly once, closing a TOCTOU on a getter-backed provider. (7) `audit/audit-log.ts` now rejects
+    non-finite numbers (NaN/Infinity/-Infinity) outright, reversing round 31's own exemption since all three
+    collapse to the identical `JSON.stringify()` output as `null`; `budget.ts`'s forensic-logging call sites now
+    use a new `forensicAmountForAudit()` `String()` helper instead. (8) `project-lifecycle/orchestrator.ts`'s
+    bootstrap write no longer hardcodes `policyDecision: "ALLOW"` — `CapabilityGateway.authorize()` gained an
+    additive `onDecision` callback exposing the true evaluated decision, persisted honestly alongside separate
+    `approval`/`executionOutcome` fields. (9) `service-catalog.ts`'s `findUnowned()` now uses the shared
+    `isNonBlankIdentity()` validator instead of a plain truthy check, so a whitespace-only owner is correctly
+    classified as unowned. All nine fixes carry deterministic regression tests (including exact BLOCKER
+    reproductions using the literal scenarios from the review) and were verified via genuine temporary in-place
+    bypass reproducing the exact predicted failure, then fully reverted and reconfirmed clean. A narrow,
+    explicitly-scoped root-class audit for these same nine classes found NO further genuine instances anywhere
+    in P0. Tested (1193/1193 tests, +48 net new across all nine fixes) and verified per the full required
+    sequence: lint, typecheck, build, test, validate:requirements, history-and-current-tree-aware secret-scan,
+    Factory Doctor, `npm run verify:production-install`, all 9 P0 proofs. P0 remains BLOCKED_PENDING_REVIEW,
+    awaiting the next (33rd) independent Codex review to return CLEAN. Per explicit instruction, this round does
+    not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself, and did not
+    create a new branch.
+
 known_limitations:
   - >-
     Only ONE integrated pipeline exists (project bootstrap: Genome ->
@@ -4610,6 +4680,28 @@ blockers:
     BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit instruction,
     this round does not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself,
     and did not create a new branch.
+  - >-
+    Awaiting a 33rd independent (Codex) re-review of the pushed fixes — round 32 (Founder-forwarded consolidated
+    closure batch) found NINE NEW findings (all P1/P2): a caller-forgeable `reservationId` in `cost-engine.ts`'s
+    public `record()`; a delimiter-sensitive secret-redaction regex in `telemetry/logger.ts` that a quoted value
+    containing a space/comma/semicolon could escape entirely; a `sandbox.ts` timeout relying only on a
+    delayed-timer flag, vulnerable to event-loop starvation; `cli/commands/baseline-status.ts`'s requirement
+    loader silently treating an empty/malformed registry as "zero issues"; a lexical-only (`assertWithinRoot()`)
+    evidence-path check in `requirements-traceability/traceability.ts` vulnerable to an in-repository symlink
+    escape; a TOCTOU on `provider.id` in `models/gateway.ts`'s `registerProvider()`/`replaceProvider()`; a
+    lossy audit-hash collision in `audit/audit-log.ts` where NaN/Infinity/-Infinity/null all serialize
+    identically; `project-lifecycle/orchestrator.ts` hardcoding `policyDecision: "ALLOW"` regardless of the
+    actual evaluated decision; and a whitespace-only-owner truthy-check bug in `service-catalog.ts`'s
+    `findUnowned()`. All nine fixed, tested, and verified per the full required sequence: lint, typecheck, build,
+    1193/1193 tests, validate:requirements, history-and-current-tree-aware secret-scan, Factory Doctor, `npm run
+    verify:production-install`, all 9 P0 proofs. All nine root causes, fixes, and regression evidence are
+    detailed in `completed_milestones`'s round-32 entry, the touched files' own fix-note comments, and the
+    round-32 closure summary in `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0042). A narrow,
+    explicitly-scoped root-class audit for the same nine classes found no further genuine instances. Tested
+    (1193/1193 tests, +48 net new across all nine fixes) and verified per the full required sequence. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit instruction,
+    this round does not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself,
+    and did not create a new branch.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -4627,6 +4719,99 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 32). A fresh,
+  independent Codex review of the complete branch (forwarded by the
+  Founder) found NINE actionable findings (P1/P2) and required them fixed
+  as ONE consolidated closure batch, plus a narrow, explicitly-scoped
+  root-class audit for the same nine classes. All nine findings were
+  fixed: (1) `cost-engine.ts`'s public `record()` no longer accepts a
+  caller-forgeable `reservationId` — only the private `#recordCommitted()`,
+  reachable exclusively from `commitReservation()` after it verifies a
+  genuine matching reservation, may attach one, closing a path where a
+  forged $0 entry naming a real reservation's id could make the
+  idempotent-commit path treat it as already satisfied and silently
+  discard the real reservation without recording genuine cost; (2)
+  `telemetry/logger.ts`'s `SECRET_ASSIGNMENT_PATTERN` now gives quoted and
+  unquoted values independent regex alternatives (instead of one shared
+  capture group), closing a gap where a quoted secret value containing a
+  space/comma/semicolon (e.g. `password="two words"`) escaped redaction
+  entirely, and added bare `token` to the label alternation; (3)
+  `sandbox.ts`'s `withTimeout()` now also compares an authoritative
+  `Date.now() >= deadlineAt`, captured before the operation starts,
+  independently of its `setTimeout`-set flag — closing an event-loop-
+  starvation gap where a synchronous, overdue operation's own microtask
+  continuation could run before the timer's own overdue macrotask ever
+  fired, letting it be reported as on-time; (4)
+  `cli/commands/baseline-status.ts`'s `loadRequirementsFromDir()` now
+  fails closed with dedicated `EmptyRequirementRegistryError`/
+  `MalformedRequirementRegistryError` errors on an empty directory, a
+  non-array document, or zero aggregate records, and additionally
+  schema-validates every record via ajv against
+  `schemas/requirement.schema.json` — closing a path where a loader
+  failure could be silently mistaken for "zero traceability issues" by
+  bootstrap's own preflight check; (5)
+  `requirements-traceability/traceability.ts`'s `isVerifiedEvidenceRef()`
+  now uses the symlink-aware `assertFilesystemConfinement()` instead of
+  the purely lexical `assertWithinRoot()`, closing a path where an
+  in-repository symlink pointing outside the repository could satisfy a
+  PROOF_VERIFIED-grade evidence claim; (6) `models/gateway.ts`'s
+  `registerProvider()`/`replaceProvider()` now snapshot `provider.id` into
+  a local `const` exactly once (and `captureProviderBinding()` takes `id`
+  as a required parameter rather than re-reading it), closing a TOCTOU
+  where a getter/Proxy-backed provider could answer a fresh id for the
+  duplicate check and an already-trusted id for the actual store; (7)
+  `audit/audit-log.ts`'s `assertJsonCompatibleValue()` now rejects
+  non-finite numbers (NaN/Infinity/-Infinity) outright — reversing round
+  31's own deliberate exemption, since Codex correctly identified that all
+  three collapse to the SAME `JSON.stringify()` output as a literal
+  `null`, so the hash could never actually distinguish which one was
+  logged; the three `budget.ts` call sites that deliberately logged a
+  rejected invalid amount as forensic evidence now use a new
+  `forensicAmountForAudit()` helper's `String()` representation instead
+  (bare `undefined` remains accepted — empirically, rejecting it broke
+  ~98 pre-existing, legitimate audit invariants across
+  `approval.ts`/`policy-engine.ts`/`router.ts`/`gateway.ts`, documented
+  honestly rather than silently narrowed); (8)
+  `project-lifecycle/orchestrator.ts`'s bootstrap write no longer
+  hardcodes `policyDecision: "ALLOW"` — `CapabilityGateway.authorize()`
+  gained an additive, optional `onDecision` callback exposing the SAME
+  authoritative `PolicyEvaluationResult` it just computed, so a risk-5
+  bootstrap that succeeds via a genuine, consumed approval now truthfully
+  persists `APPROVAL_REQUIRED` (never rewritten into ALLOW), alongside
+  separate `approval: { required, approvalId, consumed }` and
+  `executionOutcome: "SUCCESS"` fields; (9) `service-catalog.ts`'s
+  `findUnowned()` now uses the shared `isNonBlankIdentity()` validator
+  (the same one `approval.ts`/`assumption-register.ts` already use for
+  approver/confirmer identities) instead of a plain truthy check, so a
+  whitespace-only owner string (`"   "`) is correctly classified as
+  unowned instead of evading the bölüm 127 ownership audit. All nine
+  fixes carry deterministic regression tests (including exact BLOCKER
+  reproductions using the literal scenarios from the review) and were
+  verified via a genuine temporary in-place bypass reproducing the exact
+  predicted failure, then fully reverted and reconfirmed clean. The
+  root-class audit (limited to these nine exact classes, not broadened
+  into unrelated architecture) found NO further genuine instances beyond
+  the nine reported — every other ledger/registry file, every
+  `setTimeout`-based timeout path, every `assertWithinRoot()` call site,
+  every `gateway.authorize()` call site, every identity/owner truthy-
+  check, and `scripts/secret-scan.mjs`'s own regexes were individually
+  examined and found already correct or genuinely inapplicable. Re-ran
+  the full required sequence: lint, typecheck, build, 1193/1193 tests (44
+  files, +48 net new — the same pre-existing, timing-sensitive
+  `secret-scan.test.mjs` git-history-scan test flaked once under load and
+  was reconfirmed genuinely passing on retry, not a functional
+  regression), validate:requirements (42 schema-valid records),
+  history-and-current-tree-aware secret-scan (PASS), Factory Doctor
+  (READY), `npm run verify:production-install` (PASS), all 9 P0 proofs.
+  No status raised on any requirement beyond what real evidence supports.
+  P0 remains BLOCKED_PENDING_REVIEW, awaiting the next (33rd) independent
+  Codex review to return INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit
+  instruction, this round does NOT merge, does NOT move to P1, does NOT
+  declare P0 complete, does NOT invoke Codex itself, and did NOT create a
+  new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 31). A fresh,
   independent Codex review of the complete branch (forwarded by the
   Founder) found SEVEN actionable findings (4 priority-P1, 3 priority-P2)

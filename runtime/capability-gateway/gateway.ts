@@ -4,7 +4,7 @@
 // çağrılmadan bir eylemin gerçek fonksiyonu (execute) hiçbir zaman
 // çalıştırılmaz.
 
-import type { PolicyAction, PolicyEngine } from "../policy-engine/policy-engine.js";
+import type { PolicyAction, PolicyEngine, PolicyEvaluationResult } from "../policy-engine/policy-engine.js";
 import { ApprovalWorkflow, type ApprovalRequest } from "../policy-engine/approval.js";
 
 export class CapabilityDeniedError extends Error {
@@ -166,8 +166,41 @@ export class CapabilityGateway {
    * sees `EXECUTED`, not `APPROVED`, fails the match, and throws
    * `ApprovalEvidenceMismatchError` instead of ALSO proceeding.
    */
-  async authorize<T>(action: PolicyAction, execute: () => Promise<T> | T, approval?: ApprovalReference): Promise<T> {
+  /**
+   * P1 fix (32nd independent review round, finding 8, "persist the actual
+   * policy outcome"): `authorize()` used to return ONLY `execute()`'s own
+   * value — nothing about the ACTUAL, authoritative decision this method's
+   * OWN `this.#policy.evaluate(action)` call just made was ever observable
+   * by the caller. `project-lifecycle/orchestrator.ts`'s `bootstrapProject()`
+   * (this method's own caller for `project.scaffold`) had to GUESS at what
+   * decision must have occurred, and guessed wrong: it unconditionally
+   * hardcoded `policyDecision: "ALLOW"` into its durable state record,
+   * reasoning "if `authorize()` didn't throw, it must have been ALLOW" —
+   * but a risk-5 action that reaches this point via a genuinely APPROVED
+   * approval ALSO doesn't throw, despite `evaluate()` having returned
+   * `APPROVAL_REQUIRED`, not `ALLOW`. That silently REWRITES a real
+   * APPROVAL_REQUIRED-then-approved authorization history into a false
+   * "no approval was ever needed" ALLOW record — exactly the falsified-
+   * authorization-history defect this finding names. Fixed: an optional
+   * `onDecision` callback, invoked with the SAME authoritative
+   * `PolicyEvaluationResult` this method itself just computed, immediately
+   * after `evaluate()` runs and BEFORE any DENY/APPROVAL_REQUIRED branching
+   * — so a caller that cares (like `bootstrapProject()`) can capture the
+   * TRUE decision and persist it honestly, while every pre-existing caller
+   * that omits this parameter sees ZERO behavior change (a purely additive,
+   * backward-compatible parameter, matching this codebase's established
+   * pattern for extending an authorization surface without touching
+   * existing call sites — e.g. `runId`/`agentId`'s own additions
+   * elsewhere).
+   */
+  async authorize<T>(
+    action: PolicyAction,
+    execute: () => Promise<T> | T,
+    approval?: ApprovalReference,
+    onDecision?: (result: PolicyEvaluationResult) => void
+  ): Promise<T> {
     const result = this.#policy.evaluate(action);
+    onDecision?.(result);
     // P1 fix (27th independent review round, finding 4, "bind approval to
     // the policy-evaluated action"): every reference below uses
     // `authoritativeAction` (the EXACT frozen snapshot `this.#policy`

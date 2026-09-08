@@ -82,8 +82,39 @@ function isSensitiveKey(key: string): boolean {
  * are dangerous because the danger lives inside ordinary prose, not the
  * key.
  */
+/**
+ * P1 fix (32nd independent review round, finding 2, "redact quoted secrets
+ * containing delimiters"): the previous pattern captured the value as a
+ * single group `(['"]?)([^\s'",;]+)\3` — an OPTIONAL opening quote followed
+ * by a value that itself EXCLUDES whitespace/quote/comma/semicolon, then
+ * required the SAME captured quote (`\3`, empty when none was captured) to
+ * appear immediately after. For a genuinely quoted value that legitimately
+ * CONTAINS one of those excluded characters — `password="two words"`,
+ * `API_KEY="abc,def"`, `token="abc;def"`, `secret='value with spaces'` —
+ * this could never match at all: the value group cannot consume the
+ * delimiter, so it stops short of the closing quote, and the backreference
+ * then fails to find that quote immediately following; backtracking to the
+ * "no opening quote" alternative fails equally, since the literal quote
+ * character sitting right after `=`/`:` is ALSO excluded from the value
+ * class. With no possible match, `redactSecretsInString()` leaves the
+ * ENTIRE assignment — quotes and secret value both — completely
+ * unredacted, exactly the scenario baseline section 124/307 ("never log
+ * secrets") forbids. Fixed by giving quoted and unquoted values genuinely
+ * SEPARATE alternatives instead of forcing one class to serve both: the
+ * quoted branch (`(["'])((?:(?!\3)[^\\]|\\.)*)\3`) matches EVERY character
+ * up to — but not including — the matching closing quote of the SAME kind
+ * that opened it (so a double-quoted value may freely contain an
+ * unescaped `'`, and vice versa; a backslash-escaped quote inside the
+ * value is also honored via `\\.`), never stopping early at whitespace/
+ * comma/semicolon; the unquoted branch (`[^\s'",;]+`) is preserved
+ * VERBATIM for the pre-existing, already-tested unquoted case. `token`
+ * (bare, not just `access_token`/`refresh_token`) is also added to the
+ * label alternation — the finding's own reproduction scenario names it
+ * directly, and it was otherwise the one common credential-shaped label
+ * this pattern's alternation did not yet recognize at all.
+ */
 const SECRET_ASSIGNMENT_PATTERN =
-  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|secret|password|credential)(\s*[:=]\s*)(['"]?)([^\s'",;]+)\3/gi;
+  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|token|secret|password|credential)(\s*[:=]\s*)(?:(["'])((?:(?!\3)[^\\]|\\.)*)\3|([^\s'",;]+))/gi;
 const URL_USERINFO_PATTERN = /(:\/\/[^/\s:@]+):([^/\s:@]+)@/g;
 /**
  * P1 fix (29th independent review round, finding 4, "redact complete
@@ -161,8 +192,15 @@ function redactSecretsInString(text: string): string {
     .replace(COOKIE_HEADER_PATTERN, "$1[REDACTED]")
     // Common "key = value" / "key: value" secret assignment forms embedded
     // anywhere in a larger string (e.g. inside a logged command line, a
-    // dumped config snippet, or a raw request body excerpt).
-    .replace(SECRET_ASSIGNMENT_PATTERN, (_match, label: string, sep: string, quote: string) => `${label}${sep}${quote}[REDACTED]${quote}`)
+    // dumped config snippet, or a raw request body excerpt). `quote` is
+    // only defined when the QUOTED branch matched (bkz. `SECRET_ASSIGNMENT_PATTERN`'in
+    // üstündeki fix notu) — the unquoted branch has no quote characters to
+    // preserve around `[REDACTED]`.
+    .replace(
+      SECRET_ASSIGNMENT_PATTERN,
+      (_match, label: string, sep: string, quote: string | undefined) =>
+        quote !== undefined ? `${label}${sep}${quote}[REDACTED]${quote}` : `${label}${sep}[REDACTED]`
+    )
     // Credentials embedded in a URL's userinfo section
     // (`https://user:hunter2@host/...`) — the username is left visible
     // (often not secret, e.g. a service account name), only the password

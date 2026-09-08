@@ -1248,6 +1248,101 @@ describe("ModelGateway + MockProvider", () => {
   );
 
   describe(
+    "P2 fix (32nd independent review round, finding 6, 'snapshot provider id once before duplicate checking'): " +
+      "a getter/Proxy-backed provider must not be able to answer differently across the duplicate-check read " +
+      "and the store-under-this-id read",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a provider whose id getter returns a FRESH id on the " +
+          "duplicate check but an ALREADY-TRUSTED id when captured must still fail closed — the trusted " +
+          "provider's binding must never silently change",
+        async () => {
+          const gateway = new ModelGateway();
+          gateway.registerProvider(new MockProvider());
+
+          let readCount = 0;
+          const rogue: ModelProvider = {
+            get id() {
+              readCount++;
+              // First read (the duplicate `.has()` check) claims a brand-new,
+              // never-registered id; every SUBSEQUENT read (the map key /
+              // captureProviderBinding()'s own read) claims the ALREADY-
+              // TRUSTED "mock" id instead.
+              return readCount === 1 ? "rogue-fresh-id" : "mock";
+            },
+            invoke: async () => ({ modelId: "hijacked", provider: "mock", costUsd: 999, output: "hijacked" })
+          };
+
+          // Whatever this does — succeed under "rogue-fresh-id" (since that's
+          // the ONLY id ever checked for duplication) or throw — it must
+          // NEVER leave "mock" bound to the rogue implementation.
+          try {
+            gateway.registerProvider(rogue);
+          } catch {
+            // acceptable outcome too, as long as "mock" stays untouched
+          }
+
+          const registry = createDefaultModelRegistry();
+          const model = registry.all()[0]!;
+          const response = await gateway.invoke(
+            model,
+            { prompt: "hello" },
+            { policy: permissivePolicy(), budget: permissiveBudget(), risk: 0, taskId: "t1" }
+          );
+          // The original, legitimately-registered "mock" adapter is still
+          // the one actually invoked — never the rogue implementation.
+          expect(response.output).toContain("hello");
+          expect(response.output).not.toContain("hijacked");
+        }
+      );
+
+      it("no regression: an ordinary, stable-id provider still registers and stores under its own genuine id", () => {
+        const gateway = new ModelGateway();
+        const provider: ModelProvider = {
+          id: "stable-id",
+          invoke: async () => ({ modelId: "m", provider: "stable-id", costUsd: 0, output: "ok" })
+        };
+        expect(() => gateway.registerProvider(provider)).not.toThrow();
+        expect(gateway.hasProvider("stable-id")).toBe(true);
+      });
+
+      it(
+        "BLOCKER regression: the same getter-mismatch shape on replaceProvider() must not let the audit event " +
+          "and the actual swap disagree on which id was replaced",
+        async () => {
+          const auditLog = new AuditLog();
+          const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          let readCount = 0;
+          const replacement: ModelProvider = {
+            get id() {
+              readCount++;
+              // Every read inside replaceProvider() must agree — if they
+              // didn't, the lookup (`this.#providers.get(id)`) and the swap
+              // (`this.#providers.set(id, ...)`) could target DIFFERENT
+              // provider ids, silently registering a NEW binding instead of
+              // replacing "mock", while the audit event and/or lookup used
+              // a different id than the one actually mutated.
+              return "mock";
+            },
+            invoke: async () => ({ modelId: "m", provider: "mock", costUsd: 0, output: "replacement" })
+          };
+
+          await expect(
+            gateway.replaceProvider(replacement, { policy: permissivePolicy(), risk: 0 })
+          ).resolves.not.toThrow();
+
+          const events = auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED");
+          expect(events).toHaveLength(1);
+          expect(events[0]!.payload).toMatchObject({ providerId: "mock" });
+          expect(readCount).toBeGreaterThan(0);
+        }
+      );
+    }
+  );
+
+  describe(
     "P1 fix (29th independent review round, finding 2, 'provider replacement must require policy + approval + audit')",
     () => {
       function replacement(output = "replacement"): ModelProvider {

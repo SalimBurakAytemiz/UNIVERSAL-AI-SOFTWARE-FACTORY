@@ -80,9 +80,21 @@ interface ProviderBinding {
   readonly implementationName: string;
 }
 
-function captureProviderBinding(provider: ModelProvider): ProviderBinding {
+/**
+ * P1 fix (32nd independent review round, finding 6, "snapshot provider id
+ * once before duplicate checking"): this used to read `provider.id` ITSELF
+ * (rather than accepting it as a parameter) — meaning every CALLER
+ * (`registerProvider()`/`replaceProvider()`) that ALSO needed the id for
+ * its own duplicate-check/lookup read it a SECOND time, separately, before
+ * ever calling this function. See those methods' own fix notes for the
+ * exploit this enabled; `id` is now REQUIRED here specifically so the sole
+ * source of truth for "which id does this binding get filed under" is
+ * whatever the CALLER already captured once, never a fresh, independent
+ * read of a caller-owned (potentially getter/Proxy-backed) `provider.id`.
+ */
+function captureProviderBinding(provider: ModelProvider, id: string): ProviderBinding {
   return Object.freeze({
-    id: provider.id,
+    id,
     invoke: provider.invoke.bind(provider),
     implementationName: provider.constructor?.name ?? "unknown"
   });
@@ -302,11 +314,36 @@ export class ModelGateway {
    * silently replacing the authoritative adapter — bkz. `DuplicateProviderIdError`
    * fix notu yukarıda.
    */
+  /**
+   * P1 fix (32nd independent review round, finding 6, "snapshot provider id
+   * once before duplicate checking"): `provider.id` used to be reread
+   * independently for the `#providers.has()` duplicate check, the
+   * `DuplicateProviderIdError` message, the `#providers.set()` map key, AND
+   * (inside `captureProviderBinding()`) the stored binding's own `id`
+   * field — FOUR separate reads of a caller-owned property. Codex
+   * reproduced: a getter/Proxy-backed `provider` (`get id() { ... }`) could
+   * return a genuinely-unused id on its FIRST read (passing the
+   * `has()`/duplicate check cleanly) and then return an ALREADY-TRUSTED,
+   * live id (e.g. `"openai"`) on a LATER read — the map would then be
+   * `.set()` under the trusted id, silently overwriting/aliasing the
+   * genuine provider a caller had every reason to believe was still
+   * authoritative, with the duplicate check having verified NOTHING about
+   * the id actually used to store it. Fixed: `id` is read EXACTLY ONCE,
+   * into a genuine local `const`, before the duplicate check even runs —
+   * the check, the error message, the map key, and the captured binding
+   * (via `captureProviderBinding(provider, id)`'s now-required parameter)
+   * all derive from this SAME snapshot, so no later read of
+   * `provider.id` can ever diverge from the id this method just verified
+   * was not already registered. The explicit, governed `replaceProvider()`
+   * path remains the only way to swap an existing id's binding (bkz. o
+   * metodun kendi, aynı sınıftan fix notu).
+   */
   registerProvider(provider: ModelProvider): void {
-    if (this.#providers.has(provider.id)) {
-      throw new DuplicateProviderIdError(provider.id);
+    const id = provider.id;
+    if (this.#providers.has(id)) {
+      throw new DuplicateProviderIdError(id);
     }
-    this.#providers.set(provider.id, captureProviderBinding(provider));
+    this.#providers.set(id, captureProviderBinding(provider, id));
   }
 
   /**
@@ -344,12 +381,23 @@ export class ModelGateway {
    * happened, not merely a same-instance no-op.
    */
   async replaceProvider(provider: ModelProvider, context: ProviderReplacementContext): Promise<void> {
-    const existingProvider = this.#providers.get(provider.id);
+    // P1 fix (32nd independent review round, finding 6, "snapshot provider
+    // id once before duplicate checking" — same root class as
+    // `registerProvider()`'s own fix above, applied here too since this
+    // method ALSO reads `provider.id` repeatedly): `id` is now read exactly
+    // once, and every subsequent use below (the existing-provider lookup,
+    // the "unknown provider" error, the description default, the audit
+    // payload, and the final `#providers.set()`/`captureProviderBinding()`
+    // call) derives from this SAME snapshot — a getter/Proxy-backed
+    // `provider` cannot answer differently at the lookup step than it does
+    // at the swap step.
+    const id = provider.id;
+    const existingProvider = this.#providers.get(id);
     if (!existingProvider) {
-      throw new UnknownProviderError(provider.id);
+      throw new UnknownProviderError(id);
     }
     if (!this.#auditLog) {
-      throw new ProviderReplacementAuditRequiredError(provider.id);
+      throw new ProviderReplacementAuditRequiredError(id);
     }
     const auditLog = this.#auditLog;
     const capabilityGateway = new CapabilityGateway(context.policy, this.#approvals);
@@ -359,7 +407,7 @@ export class ModelGateway {
       {
         actionType: "model.provider.replace",
         risk: context.risk,
-        description: context.description ?? `Replace provider adapter '${provider.id}'`,
+        description: context.description ?? `Replace provider adapter '${id}'`,
         projectId: context.projectId
       },
       () => {
@@ -386,13 +434,13 @@ export class ModelGateway {
           type: "MODEL_PROVIDER_REPLACED",
           actor: "ModelGateway",
           payload: {
-            providerId: provider.id,
+            providerId: id,
             previousImplementation: existingProvider.implementationName,
             newImplementation: provider.constructor?.name ?? "unknown"
           },
           timestamp: new Date().toISOString()
         });
-        this.#providers.set(provider.id, captureProviderBinding(provider));
+        this.#providers.set(id, captureProviderBinding(provider, id));
       },
       approvalReference
     );

@@ -1268,4 +1268,93 @@ describe("CostEngine", () => {
       });
     }
   );
+
+  describe("P1 fix (32nd independent review round, finding 1, \"reservation id must not be caller-forgeable\")", () => {
+    it("BLOCKER: a forged reservationId passed to the public record() cannot satisfy a real, later reservation commit", () => {
+      const engine = new CostEngine();
+      const reservation = engine.createReservation({ taskId: "t1", provider: "mock", modelId: "m1" }, 1);
+
+      // Attacker (or any ordinary direct caller, since record() bypassing
+      // BudgetGuard is an explicitly supported path) attempts to forge a
+      // $0 entry claiming it already satisfies the real, still-open $1
+      // reservation, by supplying the reservation's own real id.
+      // `reservationId` is intentionally not part of record()'s public
+      // parameter type — `as never` simulates a caller who bypasses the
+      // type system (as any / plain JS) to attempt the forgery anyway.
+      engine.record({
+        taskId: "attacker-task",
+        provider: "mock",
+        modelId: "m1",
+        amountUsd: 0,
+        reservationId: reservation.id
+      } as never);
+
+      // The real reservation must still be open and unaffected by the forgery.
+      expect(engine.getReservation(reservation.id)?.status).toBe("ACTIVE");
+      expect(engine.reservedTotal({ taskId: "t1" })).toBe(1);
+
+      // The actual provider cost must still be reconcilable through the
+      // real commit path — it must NOT find the forged entry and treat the
+      // reservation as already committed.
+      const recorded = engine.commitReservation(reservation.id, {
+        taskId: "t1",
+        provider: "mock",
+        modelId: "m1",
+        amountUsd: 0.95
+      });
+      expect(recorded.amountUsd).toBe(0.95);
+      expect(recorded.reservationId).toBe(reservation.id);
+      expect(engine.getReservation(reservation.id)).toBeUndefined();
+      // Total reflects the forged $0 entry (an ordinary, validly-recorded,
+      // reservationId-less cost entry — record() itself is still a
+      // legitimate direct-recording path) PLUS the real $0.95 commit.
+      expect(engine.total()).toBeCloseTo(0.95);
+    });
+
+    it("BLOCKER: record() never attaches a reservationId even if a caller-owned object exposes one via a getter", () => {
+      const engine = new CostEngine();
+      const reservation = engine.createReservation({ taskId: "t1", provider: "mock", modelId: "m1" }, 1);
+      const forgedEntry = {
+        taskId: "attacker-task",
+        provider: "mock",
+        modelId: "m1",
+        amountUsd: 0
+      };
+      Object.defineProperty(forgedEntry, "reservationId", {
+        enumerable: true,
+        get: () => reservation.id
+      });
+      const recorded = engine.record(forgedEntry as never);
+      expect(recorded.reservationId).toBeUndefined();
+      expect(engine.getReservation(reservation.id)?.status).toBe("ACTIVE");
+    });
+
+    it("no regression: a genuine commitReservation() retry on the SAME id remains idempotent", () => {
+      const engine = new CostEngine();
+      const reservation = engine.createReservation({ taskId: "t1", provider: "mock", modelId: "m1" }, 1);
+      const first = engine.commitReservation(reservation.id, {
+        taskId: "t1",
+        provider: "mock",
+        modelId: "m1",
+        amountUsd: 0.5
+      });
+      const retry = engine.commitReservation(reservation.id, {
+        taskId: "t1",
+        provider: "mock",
+        modelId: "m1",
+        amountUsd: 0.5
+      });
+      expect(retry.timestamp).toBe(first.timestamp);
+      expect(engine.total()).toBeCloseTo(0.5);
+      expect(engine.all().filter((e) => e.reservationId === reservation.id)).toHaveLength(1);
+    });
+
+    it("no regression: an ordinary direct record() call (no reservation involved at all) is unaffected", () => {
+      const engine = new CostEngine();
+      const entry = engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.25 });
+      expect(entry.amountUsd).toBe(0.25);
+      expect(entry.reservationId).toBeUndefined();
+      expect(engine.total()).toBeCloseTo(0.25);
+    });
+  });
 });

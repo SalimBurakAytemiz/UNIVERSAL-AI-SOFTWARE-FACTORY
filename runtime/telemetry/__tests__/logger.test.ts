@@ -501,6 +501,80 @@ describe("Logger", () => {
   );
 
   describe(
+    "P1 fix (32nd independent review round, finding 2, 'redact quoted secrets containing delimiters'): " +
+      "a quoted secret assignment whose value legitimately contains a space/comma/semicolon must still be " +
+      "fully redacted, not silently left unmatched",
+    () => {
+      it.each([
+        ["double-quoted value containing a space", 'password="two words"', "two words"],
+        ["double-quoted value containing a comma", 'API_KEY="abc,def"', "abc,def"],
+        ["double-quoted value containing a semicolon", 'token="abc;def"', "abc;def"],
+        ["single-quoted value containing spaces", "secret='value with spaces'", "value with spaces"]
+      ])("BLOCKER regression, exact reproduction from the review: %s", (_label, snippet, secretSubstring) => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "config.dump",
+          rawConfigLine: `export SOME_VAR=1; ${snippet}; export OTHER=2`
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain(secretSubstring);
+        expect(line).toContain("[REDACTED]");
+        // Surrounding, non-secret text — including the OUTER quote
+        // characters themselves — is preserved.
+        expect(line).toContain("SOME_VAR=1");
+        expect(line).toContain("OTHER=2");
+      });
+
+      it("no regression: the pre-existing UNQUOTED assignment form is still redacted exactly as before", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "config.dump",
+          rawConfigLine: "export SOME_VAR=1; password=fake-embedded-secret-should-not-appear; export OTHER=2" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-secret-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("SOME_VAR=1");
+        expect(line).toContain("OTHER=2");
+      });
+
+      it("preserves the actual quote characters around the redacted placeholder, not just the value", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "config.dump",
+          rawConfigLine: 'password="secret value here"'
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        // JSON.stringify() escapes the embedded double quotes as \" — the
+        // redacted representation still preserves them AROUND the
+        // placeholder, not just the bare word REDACTED.
+        expect(line).toContain('password=\\"[REDACTED]\\"');
+      });
+
+      it("no regression: does not redact ordinary quoted, non-secret-shaped prose", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "task.completed",
+          description: 'Bootstrap finished for project "shop-1" in 240ms with no errors.'
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("[REDACTED]");
+        expect(line).toContain("Bootstrap finished for project");
+        expect(line).toContain("shop-1");
+        expect(line).toContain("240ms with no errors.");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (29th independent review round, finding 4, 'redact complete credential-bearing header values'): " +
       "multi-component/multi-segment header values are redacted through their COMPLETE value boundary, not just " +
       "the first one or two tokens",

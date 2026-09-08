@@ -50,12 +50,36 @@ function hashOf(record: Omit<AuditRecord, "hash">): string {
  * (or array/string/number/boolean/null), recursively — BEFORE `hashOf()`
  * or `this.#records.push()` ever run, so a `Map`/`Set`/`Date`/function/
  * symbol/BigInt payload is refused outright rather than silently
- * mis-hashed or partially recorded. Numbers are accepted regardless of
- * finiteness (bkz. `assertJsonCompatibleValue()`'ın kendi notu) — NaN/
- * Infinity are a DIFFERENT, already-accepted lossy case (both collapse to
- * `null` under `JSON.stringify()`, never to a fabricated-looking value),
- * and several call sites deliberately log a rejected invalid amount as
- * forensic evidence.
+ * mis-hashed or partially recorded.
+ *
+ * P2 fix (32nd independent review round, finding 7, "reject lossy audit
+ * values before hashing"): this round's finding REVERSES this file's own
+ * 31st-round decision to accept non-finite numbers (NaN/Infinity/-Infinity)
+ * on the theory that they were "a different, already-accepted lossy case."
+ * Codex correctly pointed out that reasoning does not actually hold up
+ * under baseline section 242's tamper-evidence guarantee: NaN, Infinity,
+ * -Infinity, AND a literal `null` all collapse to the exact SAME
+ * `JSON.stringify()` output (`null`) — meaning the hash computed over any
+ * one of them is IDENTICAL to the hash computed over any other. A reviewer
+ * trusting this record's hash to authenticate "exactly what was logged"
+ * cannot actually tell, from the hash alone, whether a genuinely rejected
+ * NaN amount, an Infinity amount, or simply a legitimate `null` was ever
+ * recorded — the same class of "hash authenticates a DIFFERENT payload
+ * than what one might assume" defect the Map/Set fix above targets, just
+ * one level more subtle (both a NUMBER and `null` are already "plain,
+ * JSON-representable values" individually, so the 31st round's check never
+ * flagged the collision). Fixed: `assertJsonCompatibleValue()` now rejects
+ * any non-finite number outright too — see below. The call sites that used
+ * to log a rejected NaN/Infinity amount directly as forensic evidence
+ * (`runtime/budget/budget.ts`'s `BUDGET_INVALID_AMOUNT_REJECTED`/
+ * `BUDGET_RESERVATION_COMMIT_FAILED` events) now log a `String()`
+ * representation instead (`forensicAmountForAudit()`, bkz. budget.ts'in
+ * kendi fix notu) — a plain string preserves EXACTLY which invalid value
+ * was rejected (unlike the number itself, `"NaN"`/`"Infinity"`/
+ * `"-Infinity"` never collapse into each other or into `null` under
+ * `JSON.stringify()`), so the forensic evidence this codebase's own "no
+ * silent spending" philosophy relies on is preserved without weakening
+ * this contract.
  */
 export class UnsupportedAuditPayloadError extends Error {
   constructor(path: string, reason: string) {
@@ -74,18 +98,9 @@ export class UnsupportedAuditPayloadError extends Error {
 function assertJsonCompatibleValue(value: unknown, path: string): void {
   if (value === null || value === undefined) return;
   const type = typeof value;
-  // A `number` is accepted regardless of finiteness — NaN/Infinity are
-  // real, meaningful values several call sites (bkz. runtime/budget/
-  // budget.ts's BUDGET_INVALID_AMOUNT_REJECTED/BUDGET_RESERVATION_COMMIT_FAILED
-  // events) DELIBERATELY log as forensic evidence of exactly what invalid
-  // amount was rejected — `JSON.stringify(NaN)`/`JSON.stringify(Infinity)`
-  // both collapse to the single, unambiguous sentinel `null`, which is a
-  // well-understood, already-accepted lossy representation elsewhere in
-  // this codebase, not the "silently authenticates a DIFFERENT, fabricated-
-  // looking payload" defect class this fix targets (bkz. üstteki fix
-  // notu) — that defect is specific to non-plain-object types whose
-  // `JSON.stringify()` output looks like ordinary, unremarkable data
-  // (`{}`) while actually discarding real content.
+  if (type === "number" && !Number.isFinite(value)) {
+    throw new UnsupportedAuditPayloadError(path, `a non-finite number (${String(value)})`);
+  }
   if (type === "string" || type === "boolean" || type === "number") return;
   if (Array.isArray(value)) {
     value.forEach((item, index) => assertJsonCompatibleValue(item, `${path}[${index}]`));

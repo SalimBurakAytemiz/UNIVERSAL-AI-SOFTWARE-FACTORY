@@ -760,7 +760,50 @@ export class CostEngine {
     this.#persistenceStore.write(this.#persistencePath, data);
   }
 
-  record(entry: Omit<CostEntry, "timestamp">): CostEntry {
+  /**
+   * P1 fix (32nd independent review round, finding 1, "reservation id must
+   * not be caller-forgeable"): this method's parameter type used to be
+   * `Omit<CostEntry, "timestamp">` — which STILL includes `reservationId`
+   * (an OPTIONAL field on `CostEntry`, so `Omit<..., "timestamp">` does not
+   * remove it). Codex reproduced: any ordinary caller holding a
+   * `CostEngine` reference (this method has always been public — direct
+   * `record()` calls bypassing `BudgetGuard` entirely are an explicitly
+   * supported, already-documented path, see this method's own prior fix
+   * notes) could call `record({ ..., amountUsd: 0, reservationId: realId })`
+   * where `realId` is a genuine, currently-ACTIVE reservation's id (learned
+   * legitimately, e.g. as the caller who created it) — `#commitReservationInner()`'s
+   * idempotency check (`this.#entries.find((e) => e.reservationId === id)`,
+   * added 29th round finding 1 specifically to make a RETRY of a real commit
+   * safe) cannot distinguish that forged $0 entry from a genuine prior
+   * commit: the next legitimate `commitReservation(realId, actualEntry)`
+   * call finds the forged entry, treats it as "already committed", silently
+   * DELETES the real reservation, and NEVER records the actual incurred
+   * cost — the exact "silent spending" bölüm 147 forbids (a genuine
+   * provider cost simply vanishes, protected capacity is freed for nothing).
+   * Fixed at the type AND the runtime boundary: `record()`'s public
+   * parameter type no longer includes `reservationId` at all, and — since
+   * TypeScript's structural typing does not stop a caller who holds a
+   * WIDER-typed variable from passing an extra property through at runtime
+   * regardless of the parameter's declared type — the snapshot below is
+   * built as an explicit field-by-field copy that NEVER reads
+   * `entry.reservationId`, so even a caller that manages to pass one (via
+   * `as any`, a wider-typed variable, or plain JS with no type checking at
+   * all) has it silently ignored, never reaching `#entries`. The ONLY path
+   * that may attach a `reservationId` to a `CostEntry` is the private
+   * `#recordCommitted()` below, callable exclusively from
+   * `#commitReservationInner()` — the one place that has ALREADY validated
+   * the reservation exists, is not already committed, and matches the
+   * caller's ownership scope. Ordinary cost recording (this method) and
+   * reservation-commit recording (`#recordCommitted()`) are now two
+   * genuinely separate code paths sharing only their validation/persistence
+   * plumbing, exactly as the finding requires — no forged `reservationId`
+   * can ever satisfy or remove a real reservation, and a genuine retry of
+   * `commitReservation()` on the SAME id remains exactly as idempotent as
+   * the 29th round's fix made it (the idempotency check itself, and the
+   * entries it matches against, are unchanged — only which callers may
+   * PRODUCE a `reservationId`-bearing entry has narrowed).
+   */
+  record(entry: Omit<CostEntry, "timestamp" | "reservationId">): CostEntry {
     // P1 fix (27th independent review round, finding 7, "snapshot spend
     // entries before checking them" — same root class as
     // runtime/budget/budget.ts's `spend()`/`commit()`): `entry.amountUsd`
@@ -768,14 +811,35 @@ export class CostEngine {
     // below via the `{ ...entry, timestamp }` spread — two separate reads
     // of a caller-owned object that, if getter/Proxy-backed, need not
     // agree. A validated-small/valid amount could differ from the amount
-    // that actually ends up durably recorded. Fixed: `entry` is spread
-    // into `snapshot` FIRST — a genuine, static plain object — reading
-    // every property exactly once; validation and the recorded `full`
-    // entry both derive from this SAME snapshot.
-    const snapshot: Omit<CostEntry, "timestamp"> = { ...entry };
+    // that actually ends up durably recorded. Fixed: every field is read
+    // ONCE into `snapshot` — a genuine, static plain object, and one that
+    // deliberately never reads `entry.reservationId` (see this method's own
+    // fix note above) — so validation and the recorded `full` entry both
+    // derive from this SAME, reservationId-free snapshot.
+    const snapshot: Omit<CostEntry, "timestamp" | "reservationId"> = {
+      taskId: entry.taskId,
+      agentId: entry.agentId,
+      projectId: entry.projectId,
+      runId: entry.runId,
+      provider: entry.provider,
+      modelId: entry.modelId,
+      amountUsd: entry.amountUsd
+    };
     // Doğrudan record() çağrıları da (BudgetGuard'ı atlayan çağrılar dahil)
     // korunur — bozuk bir tutarın toplamlara sızmasına asla izin verilmez.
     assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.record(taskId=${snapshot.taskId})`);
+    return this.#recordSnapshot(snapshot, undefined);
+  }
+
+  /**
+   * Ortak yazma/kalıcılaştırma yolu — hem genel `record()` (her zaman
+   * `reservationId: undefined`) hem de `#commitReservationInner()`'ın
+   * ÖZEL `#recordCommitted()`'ı (her zaman ZATEN doğrulanmış, gerçek bir
+   * rezervasyonun kimliğiyle) TARAFINDAN kullanılır — bkz. `record()`'un
+   * üstündeki fix notu. `reservationId` parametresi BU dosyanın DIŞINDAN
+   * asla erişilemez.
+   */
+  #recordSnapshot(snapshot: Omit<CostEntry, "timestamp" | "reservationId">, reservationId: string | undefined): CostEntry {
     // P1 fix (30th independent review round, finding 3, "serialize
     // persistent cost-ledger updates"): the actual mutation (push + persist)
     // now runs inside `#withDurableMutation()` — bkz. bu sınıfın üstündeki
@@ -783,7 +847,7 @@ export class CostEngine {
     // recorded entries are always re-synced into memory FIRST, never
     // clobbered by this call's own (otherwise potentially stale) write.
     return this.#withDurableMutation(() => {
-      const full: CostEntry = { ...snapshot, timestamp: this.#now().toISOString() };
+      const full: CostEntry = { ...snapshot, reservationId, timestamp: this.#now().toISOString() };
       // İç diziye eklenen nesne İLE dışarı döndürülen nesne KASITLI OLARAK
       // aynı referans DEĞİLDİR: çağıran döndürülen kaydı (ör. amountUsd'yi
       // NaN'a) mutasyona uğratsa bile, iç toplamlar (total/totalFor/
@@ -794,6 +858,18 @@ export class CostEngine {
       this.#persist();
       return freezeRecord(full);
     });
+  }
+
+  /**
+   * `#commitReservationInner()` TARAFINDAN, YALNIZCA zaten var olduğu,
+   * henüz commit edilmediği VE çağıranın sahiplik kapsamıyla eşleştiği
+   * doğrulanmış GERÇEK bir rezervasyon için çağrılır — bkz. `record()`'un
+   * üstündeki fix notu. Genel `record()` API'sinin ASLA erişemediği tek
+   * yol budur.
+   */
+  #recordCommitted(snapshot: Omit<CostEntry, "timestamp" | "reservationId">, reservationId: string): CostEntry {
+    assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.commitReservation(taskId=${snapshot.taskId})`);
+    return this.#recordSnapshot(snapshot, reservationId);
   }
 
   all(): readonly CostEntry[] {
@@ -1031,7 +1107,7 @@ export class CostEngine {
    * that inner `record()` call a no-op re-lock/re-sync — see its own fix
    * note above.
    */
-  #commitReservationInner(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
+  #commitReservationInner(id: string, entry: Omit<CostEntry, "timestamp" | "reservationId">): CostEntry {
     const alreadyCommitted = this.#entries.find((e) => e.reservationId === id);
     if (alreadyCommitted) {
       // P1 fix (30th independent review round, finding 2, "persist
@@ -1081,7 +1157,24 @@ export class CostEngine {
     // even its identity, for the record ultimately kept) answer
     // differently by the time anything is actually recorded. `snapshot`
     // is a genuine, static copy — read once, used everywhere below.
-    const snapshot: Omit<CostEntry, "timestamp"> = { ...entry };
+    // P1 fix (32nd independent review round, finding 1, "reservation id
+    // must not be caller-forgeable"): `snapshot` deliberately never reads
+    // `entry.reservationId` (mirroring `record()`'s own fix note above) —
+    // this method's caller-supplied `entry` is never itself trusted to
+    // carry a `reservationId`; the ONLY reservationId that can ever attach
+    // to the resulting `CostEntry` is `id`, the parameter this method was
+    // actually invoked with (which `commitReservation()` binds ONLY after
+    // `#reservations.get(id)` above already proved a genuine, matching
+    // reservation exists).
+    const snapshot: Omit<CostEntry, "timestamp" | "reservationId"> = {
+      taskId: entry.taskId,
+      agentId: entry.agentId,
+      projectId: entry.projectId,
+      runId: entry.runId,
+      provider: entry.provider,
+      modelId: entry.modelId,
+      amountUsd: entry.amountUsd
+    };
     if (ownershipMismatches(reservation.scope, snapshot)) {
       reservation.status = "RECONCILIATION_FAILED";
       this.#persist();
@@ -1108,7 +1201,20 @@ export class CostEngine {
     // WHICH step inside recording failed.
     let recorded: CostEntry;
     try {
-      recorded = this.record({ ...snapshot, reservationId: id });
+      // P1 fix (32nd independent review round, finding 1, "reservation id
+      // must not be caller-forgeable"): this used to call the PUBLIC
+      // `record()` with a caller-shaped `{ ...snapshot, reservationId: id }`
+      // object — the record-level `reservationId` field this method
+      // attaches was correct HERE (this call site legitimately knows `id`
+      // is real), but going through the SAME public entry point ordinary
+      // callers use meant nothing distinguished a legitimate internal
+      // commit from an external caller who separately learned/forged a
+      // real reservation's id and called `record()` directly with it (bkz.
+      // `record()`'un üstündeki fix notu). `#recordCommitted()` is a
+      // private method reachable ONLY from here — after `#reservations.get(id)`
+      // and the ownership-match check above have ALREADY proven this is a
+      // genuine, currently-open reservation belonging to this caller.
+      recorded = this.#recordCommitted(snapshot, id);
     } catch (err) {
       // Rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED" olarak işaretlenip
       // KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard) kendi audit/
@@ -1122,7 +1228,7 @@ export class CostEngine {
     return recorded;
   }
 
-  commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
+  commitReservation(id: string, entry: Omit<CostEntry, "timestamp" | "reservationId">): CostEntry {
     return this.#withDurableMutation(() => this.#commitReservationInner(id, entry));
   }
 

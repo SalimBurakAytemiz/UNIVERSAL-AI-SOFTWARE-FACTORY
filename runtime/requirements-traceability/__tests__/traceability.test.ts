@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -245,6 +245,110 @@ describe(
             proofRefs: ["also/does/not/exist", "runtime/real.ts"]
           }
         ],
+        root
+      );
+      expect(issues).toHaveLength(0);
+    });
+  }
+);
+
+describe(
+  "P1 fix (32nd independent review round, finding 5, 'canonicalize evidence paths with filesystem-aware " +
+    "confinement'): a lexically-inside-the-root symlink that actually points OUTSIDE the repository must " +
+    "never satisfy an evidence-backed status claim",
+  () => {
+    let tempRoot: string;
+
+    afterEach(() => {
+      if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    function makeRoot(): string {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-symlink-"));
+      return tempRoot;
+    }
+
+    it(
+      "BLOCKER regression, exact reproduction: repo/proofs/evidence -> symlink to a REAL file OUTSIDE the " +
+        "repository is rejected, even though it lexically resolves inside the root and genuinely exists",
+      () => {
+        const root = makeRoot();
+        const outsideDir = mkdtempSync(join(tmpdir(), "uasf-traceability-outside-"));
+        const outsideFile = join(outsideDir, "secret-outside-file.txt");
+        writeFileSync(outsideFile, "genuinely exists, but must never count as this repo's own evidence");
+        try {
+          mkdirSync(join(root, "proofs"), { recursive: true });
+          symlinkSync(outsideFile, join(root, "proofs", "evidence"));
+
+          const issues = detectTraceabilityIssues(
+            [
+              {
+                id: "R16",
+                status: "PROOF_VERIFIED",
+                implementationRefs: ["proofs/evidence"],
+                testRefs: ["proofs/evidence"],
+                proofRefs: ["proofs/evidence"]
+              }
+            ],
+            root
+          );
+          expect(issues.map((i) => i.issue).sort()).toEqual(
+            ["MISSING_IMPLEMENTATION_REFS", "MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort()
+          );
+        } finally {
+          rmSync(outsideDir, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it("BLOCKER regression: a symlinked DIRECTORY pointing outside the repository is also rejected", () => {
+      const root = makeRoot();
+      const outsideDir = mkdtempSync(join(tmpdir(), "uasf-traceability-outside-dir-"));
+      writeFileSync(join(outsideDir, "marker.txt"), "outside");
+      try {
+        symlinkSync(outsideDir, join(root, "linked-proofs"));
+
+        const issues = detectTraceabilityIssues(
+          [{ id: "R17", status: "IMPLEMENTATION_IN_PROGRESS", implementationRefs: ["linked-proofs"], testRefs: [], proofRefs: [] }],
+          root
+        );
+        expect(issues.map((i) => i.issue)).toEqual(["MISSING_IMPLEMENTATION_REFS"]);
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it(
+      "no regression (matches assertFilesystemConfinement's own pre-existing, round-6 'project-root alias' " +
+        "semantics): a symlink is rejected as evidence even when it happens to point at a REAL location INSIDE " +
+        "the same repository root — a caller must reference the real path directly, not an alias of it",
+      () => {
+        const root = makeRoot();
+        mkdirSync(join(root, "runtime"), { recursive: true });
+        writeFileSync(join(root, "runtime", "real.ts"), "// real, inside the repo");
+        symlinkSync(join(root, "runtime", "real.ts"), join(root, "alias.ts"));
+
+        const issues = detectTraceabilityIssues(
+          [{ id: "R18", status: "IMPLEMENTATION_IN_PROGRESS", implementationRefs: ["alias.ts"], testRefs: [], proofRefs: [] }],
+          root
+        );
+        expect(issues.map((i) => i.issue)).toEqual(["MISSING_IMPLEMENTATION_REFS"]);
+
+        // The REAL, non-aliased path is unaffected and still verifies normally.
+        const noIssues = detectTraceabilityIssues(
+          [{ id: "R18b", status: "IMPLEMENTATION_IN_PROGRESS", implementationRefs: ["runtime/real.ts"], testRefs: [], proofRefs: [] }],
+          root
+        );
+        expect(noIssues).toHaveLength(0);
+      }
+    );
+
+    it("no regression: an ordinary, non-symlinked directory reference still counts as evidence (the real registry relies on this)", () => {
+      const root = makeRoot();
+      mkdirSync(join(root, "runtime", "widget"), { recursive: true });
+
+      const issues = detectTraceabilityIssues(
+        [{ id: "R19", status: "IMPLEMENTATION_IN_PROGRESS", implementationRefs: ["runtime/widget"], testRefs: [], proofRefs: [] }],
         root
       );
       expect(issues).toHaveLength(0);

@@ -674,4 +674,72 @@ describe("CapabilityGateway", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (32nd independent review round, finding 8, 'persist the actual policy outcome'): authorize() " +
+      "exposes the TRUE, authoritative decision via an optional onDecision callback, so a caller can persist " +
+      "it honestly instead of guessing 'no throw means ALLOW'",
+    () => {
+      it("onDecision receives ALLOW for an action a rule genuinely allows", async () => {
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const gateway = new CapabilityGateway(policy);
+
+        let observed: string | undefined;
+        const result = await gateway.authorize(
+          { actionType: "low.risk.action", risk: 1, description: "x" },
+          () => "ok",
+          undefined,
+          (r) => {
+            observed = r.decision;
+          }
+        );
+        expect(observed).toBe("ALLOW");
+        expect(result).toBe("ok");
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: onDecision receives APPROVAL_REQUIRED — never ALLOW — for a " +
+          "risk-5 action that only succeeds because a genuine approval was consumed",
+        async () => {
+          const policy = new PolicyEngine();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new CapabilityGateway(policy, approvals);
+          const action = { actionType: "risky.action", risk: 5 as const, description: "y" };
+          approvals.requestFor("appr-1", action);
+          approvals.approve("appr-1", "founder@example.com");
+
+          let observed: string | undefined;
+          const result = await gateway.authorize(action, () => "executed", { approvalId: "appr-1" }, (r) => {
+            observed = r.decision;
+          });
+          expect(observed).toBe("APPROVAL_REQUIRED");
+          expect(observed).not.toBe("ALLOW");
+          expect(result).toBe("executed");
+        }
+      );
+
+      it("onDecision still fires (with DENY) even though authorize() then throws — a caller can observe why", async () => {
+        const policy = new PolicyEngine();
+        policy.addRule({ name: "deny-all", priority: 10, evaluate: () => "DENY" });
+        const gateway = new CapabilityGateway(policy);
+
+        let observed: string | undefined;
+        await expect(
+          gateway.authorize({ actionType: "x", risk: 1, description: "x" }, () => "never", undefined, (r) => {
+            observed = r.decision;
+          })
+        ).rejects.toThrow(CapabilityDeniedError);
+        expect(observed).toBe("DENY");
+      });
+
+      it("no regression: omitting onDecision entirely behaves exactly as before", async () => {
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const gateway = new CapabilityGateway(policy);
+        const result = await gateway.authorize({ actionType: "x", risk: 1, description: "x" }, () => "ok");
+        expect(result).toBe("ok");
+      });
+    }
+  );
 });

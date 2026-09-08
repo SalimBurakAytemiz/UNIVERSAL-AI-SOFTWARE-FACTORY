@@ -32,6 +32,44 @@ describe("ServiceCatalog", () => {
     expect(unowned[0]!.id).toBe("svc-2");
   });
 
+  describe(
+    "P2 fix (32nd independent review round, finding 9, 'whitespace-only service owners are unowned'): a " +
+      "truthy-but-blank owner string must not evade findUnowned()'s ownership audit",
+    () => {
+      it("BLOCKER regression, exact reproduction: owner: '   ' is classified as unowned", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "svc-1", name: "Fake-owned", kind: "service", purpose: "p", owner: "   ", status: "HEALTHY" });
+        const unowned = catalog.findUnowned();
+        expect(unowned).toHaveLength(1);
+        expect(unowned[0]!.id).toBe("svc-1");
+      });
+
+      it("a tab/newline-only owner is also classified as unowned", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "svc-1", name: "Fake-owned", kind: "service", purpose: "p", owner: "\t\n", status: "HEALTHY" });
+        expect(catalog.findUnowned().map((s) => s.id)).toEqual(["svc-1"]);
+      });
+
+      it("an empty-string owner remains classified as unowned (no regression)", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "svc-1", name: "Empty-owned", kind: "service", purpose: "p", owner: "", status: "HEALTHY" });
+        expect(catalog.findUnowned().map((s) => s.id)).toEqual(["svc-1"]);
+      });
+
+      it("no regression: a genuine, non-blank owner (even with surrounding whitespace) is NOT flagged as unowned", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "svc-1", name: "Owned", kind: "service", purpose: "p", owner: "  team-a  ", status: "HEALTHY" });
+        expect(catalog.findUnowned()).toHaveLength(0);
+      });
+
+      it("register() does NOT silently normalize/trim a blank owner into a fabricated valid one — the raw value is preserved", () => {
+        const catalog = new ServiceCatalog();
+        catalog.register({ id: "svc-1", name: "Blank", kind: "service", purpose: "p", owner: "   ", status: "HEALTHY" });
+        expect(catalog.get("svc-1")?.owner).toBe("   ");
+      });
+    }
+  );
+
   it("updateStatus mutates health and throws for an unknown id", () => {
     const catalog = new ServiceCatalog();
     catalog.register({ id: "svc-1", name: "A", kind: "service", purpose: "p", status: "HEALTHY" });

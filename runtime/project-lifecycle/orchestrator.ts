@@ -30,7 +30,7 @@ import { scaffoldProjectOs, type ScaffoldResult } from "../project-os/scaffold.j
 import { CapabilityGateway, type ApprovalReference } from "../capability-gateway/gateway.js";
 import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
-import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
+import type { PolicyDecision, PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
 import type { ModelRegistry } from "../models/registry.js";
 import { CheapestCapableModelRouter, type RoutingDecision } from "../models/router.js";
 import { ModelGateway, type ModelInvocationResponse } from "../models/gateway.js";
@@ -471,7 +471,19 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   let invocationResponse!: ModelInvocationResponse;
   let statePath!: string;
   let totalCostUsd!: number;
-  const scaffold = await gateway.authorize(scaffoldAction, async () => {
+  // P1 fix (32nd independent review round, finding 8, "persist the actual
+  // policy outcome"): captured from `gateway.authorize()`'s new
+  // `onDecision` callback (bkz. capability-gateway/gateway.ts'in üstündeki
+  // fix notu) — the SAME authoritative `PolicyEvaluationResult.decision`
+  // `this.#policy.evaluate()` itself produced, never a value this function
+  // GUESSES from "authorize() didn't throw." A risk-5 action that only
+  // succeeds via a genuinely consumed approval evaluates to
+  // `APPROVAL_REQUIRED`, not `ALLOW` — the durable record below must say
+  // so truthfully.
+  let evaluatedPolicyDecision!: PolicyDecision;
+  const scaffold = await gateway.authorize(
+    scaffoldAction,
+    async () => {
     invocationResponse = await modelGateway.invoke(
       modelDecision.model,
       {
@@ -517,9 +529,37 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
       bootstrappedAt: new Date().toISOString(),
       projectId: genome.project.id,
       organizationTeams: organization.teams,
-      // Bu noktaya ulaşıldıysa gateway.authorize() zaten ALLOW vermiştir —
-      // aksi halde yukarıda fırlatırdı (bkz. capability-gateway/gateway.ts).
-      policyDecision: "ALLOW",
+      // P1 fix (32nd independent review round, finding 8, "persist the
+      // actual policy outcome"): this field used to be unconditionally
+      // hardcoded to `"ALLOW"`, reasoning "if gateway.authorize() didn't
+      // throw, it must have been ALLOW" — but a risk-5 action that reaches
+      // this point via a genuinely APPROVED approval ALSO doesn't throw,
+      // despite the policy engine having actually decided
+      // `APPROVAL_REQUIRED`. `evaluatedPolicyDecision` is the TRUE decision
+      // `gateway.authorize()`'s own `onDecision` callback observed (bkz.
+      // yukarıdaki fix notu ve capability-gateway/gateway.ts'in kendi fix
+      // notu) — never rewritten into ALLOW merely because approval later
+      // succeeded, so a reviewer reading this record sees the genuine
+      // authorization history, not a falsified one.
+      policyDecision: evaluatedPolicyDecision,
+      // P1 fix (32nd independent review round, finding 8): approval
+      // requirement/result/identity are now recorded SEPARATELY from the
+      // policy decision itself, rather than being implied (or erased) by
+      // it. `evaluatedPolicyDecision === "APPROVAL_REQUIRED"` is the ONLY
+      // way this callback could still be running (bkz.
+      // capability-gateway/gateway.ts'in `authorize()`'ı: a DENY, or an
+      // APPROVAL_REQUIRED with no valid approval, throws BEFORE this
+      // callback ever runs) — so reaching this line already proves a
+      // genuine, matching, APPROVED approval was consumed.
+      approval:
+        evaluatedPolicyDecision === "APPROVAL_REQUIRED"
+          ? { required: true, approvalId: approvalReference!.approvalId, consumed: true }
+          : { required: false },
+      // The write we are inside of only ever runs to completion on genuine
+      // success — a thrown error anywhere above is caught by
+      // `gateway.authorize()`'s own `failExecution()` path (bkz. round 31
+      // finding 3's fix notu) and this record is never written at all.
+      executionOutcome: "SUCCESS",
       selectedModel: {
         modelId: modelDecision.model.modelId,
         tier: modelDecision.model.tier,
@@ -533,7 +573,12 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     });
 
     return scaffoldResult;
-  }, approvalReference);
+    },
+    approvalReference,
+    (result) => {
+      evaluatedPolicyDecision = result.decision;
+    }
+  );
 
   return { genome, organization, scaffold, modelDecision, statePath, totalCostUsd };
 }

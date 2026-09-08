@@ -295,18 +295,6 @@ describe("AuditLog", () => {
         );
       });
 
-      it("no regression: NaN/Infinity amounts are still accepted (deliberately logged as forensic evidence of a rejected invalid amount elsewhere in this codebase)", () => {
-        const log = new AuditLog();
-        const record = log.append({
-          type: "BUDGET_INVALID_AMOUNT_REJECTED",
-          actor: "budget-guard",
-          payload: { projectedAmountUsd: NaN, other: Infinity },
-          timestamp: new Date().toISOString()
-        });
-        expect(log.all()).toHaveLength(1);
-        expect(record.hash).toBeTruthy();
-      });
-
       it("no regression: an ordinary plain-object/array/string/number/boolean/null payload still hashes deterministically and matches a hand-computed SHA-256 of its own canonical JSON", () => {
         const log = new AuditLog();
         const timestamp = "2026-01-01T00:00:00.000Z";
@@ -331,6 +319,93 @@ describe("AuditLog", () => {
           .digest("hex");
         expect(record.hash).toBe(expectedHash);
         expect(log.verifyIntegrity()).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P2 fix (32nd independent review round, finding 7, 'reject lossy audit values before hashing'): the 31st " +
+      "round's own exemption for non-finite numbers is REVERSED here — NaN/Infinity/-Infinity all collapse to " +
+      "the SAME JSON.stringify() sentinel (null), so the hash cannot actually distinguish which one was logged",
+    () => {
+      it("BLOCKER regression, exact reproduction: a NaN payload value is rejected before append", () => {
+        const log = new AuditLog();
+        expect(() =>
+          log.append({
+            type: "BAD",
+            actor: "x",
+            payload: { amountUsd: NaN },
+            timestamp: new Date().toISOString()
+          })
+        ).toThrow(UnsupportedAuditPayloadError);
+        expect(log.all()).toHaveLength(0);
+      });
+
+      it("BLOCKER regression: a positive Infinity payload value is rejected before append", () => {
+        const log = new AuditLog();
+        expect(() =>
+          log.append({
+            type: "BAD",
+            actor: "x",
+            payload: { amountUsd: Infinity },
+            timestamp: new Date().toISOString()
+          })
+        ).toThrow(UnsupportedAuditPayloadError);
+        expect(log.all()).toHaveLength(0);
+      });
+
+      it("BLOCKER regression: a negative Infinity payload value is rejected before append", () => {
+        const log = new AuditLog();
+        expect(() =>
+          log.append({
+            type: "BAD",
+            actor: "x",
+            payload: { amountUsd: -Infinity },
+            timestamp: new Date().toISOString()
+          })
+        ).toThrow(UnsupportedAuditPayloadError);
+        expect(log.all()).toHaveLength(0);
+      });
+
+      it("a non-finite number nested arbitrarily deep inside an otherwise-plain payload is still caught", () => {
+        const log = new AuditLog();
+        expect(() =>
+          log.append({
+            type: "BAD",
+            actor: "x",
+            payload: { outer: { list: [{ inner: NaN }] } },
+            timestamp: new Date().toISOString()
+          })
+        ).toThrow(UnsupportedAuditPayloadError);
+      });
+
+      it(
+        "root-cause proof: NaN, Infinity, -Infinity, and a literal null all collapse to the IDENTICAL " +
+          "JSON.stringify() output — this is exactly why the hash could not distinguish them before this fix",
+        () => {
+          expect(JSON.stringify({ v: NaN })).toBe(JSON.stringify({ v: null }));
+          expect(JSON.stringify({ v: Infinity })).toBe(JSON.stringify({ v: null }));
+          expect(JSON.stringify({ v: -Infinity })).toBe(JSON.stringify({ v: null }));
+        }
+      );
+
+      it("no regression: a genuinely finite number (including negative/zero/fractional) is still accepted", () => {
+        const log = new AuditLog();
+        const record = log.append({
+          type: "OK",
+          actor: "x",
+          payload: { a: -5, b: 0, c: 3.14159 },
+          timestamp: new Date().toISOString()
+        });
+        expect(log.all()).toHaveLength(1);
+        expect(record.hash).toBeTruthy();
+      });
+
+      it("no regression: a literal null payload value remains accepted (it is not a number at all)", () => {
+        const log = new AuditLog();
+        expect(() =>
+          log.append({ type: "OK", actor: "x", payload: { v: null }, timestamp: new Date().toISOString() })
+        ).not.toThrow();
       });
     }
   );

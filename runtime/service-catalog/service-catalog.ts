@@ -4,6 +4,7 @@
 // burada `findUnowned()` ile denetlenebilir bir sorguya dönüşür.
 
 import { freezeRecord } from "../util/immutable.js";
+import { isNonBlankIdentity } from "../util/identity.js";
 
 export type ServiceKind = "service" | "integration";
 export type ServiceHealth = "HEALTHY" | "DEGRADED" | "DOWN" | "UNKNOWN";
@@ -94,9 +95,30 @@ export class ServiceCatalog {
     return this.all().filter((s) => s.status === status);
   }
 
-  /** Sahibi olmayan (owner alanı boş) kayıtları döndürür — bölüm 127 denetimi. */
+  /**
+   * Sahibi olmayan (owner alanı boş VEYA yalnızca boşluk karakterlerinden
+   * oluşan) kayıtları döndürür — bölüm 127 denetimi.
+   *
+   * P2 fix (32nd independent review round, finding 9, "whitespace-only
+   * service owners are unowned"): eskiden `!s.owner` kullanılıyordu — bir
+   * JS string için `!` yalnızca BOŞ string (`""`) için `true` döner;
+   * `owner: "   "` (yalnızca boşluk) GERÇEK bir DEĞER olarak TRUTHY'dir, bu
+   * yüzden `!s.owner` bunu YANLIŞLIKLA "sahiplenilmiş" sayardı — anlamlı
+   * hiçbir kimlik taşımayan bir servis, bölüm 127'nin "her üretim
+   * servisinin GERÇEK bir sahibi olmalıdır" denetiminden görünmez şekilde
+   * kaçardı. Fixed: bu dosyanın kendi kaydettiği bir alan icat etmek yerine,
+   * `runtime/util/identity.ts`'nin ZATEN var olan, tek-kaynak
+   * `isNonBlankIdentity()` doğrulayıcısı yeniden kullanılır (23rd
+   * independent review round'un "reject blank founder confirmation
+   * identities" fix'i — approval.ts/assumption-register.ts'in ZATEN
+   * kullandığı AYNI "anlamlı kimlik" tanımı) — `owner` alanı SESSİZCE
+   * trim'lenip GEÇERLİ bir sahiplik olarak normalize EDİLMEZ (bu, anlamsız
+   * bir kimliği geçerliymiş gibi göstermek olurdu); yalnızca DENETİM
+   * SORGUSU (`findUnowned()`), boşluk-yalnızca bir `owner`'ı DOĞRU şekilde
+   * "eksik" olarak sınıflandırır.
+   */
   findUnowned(): readonly ServiceRecord[] {
-    return this.all().filter((s) => !s.owner);
+    return this.all().filter((s) => !isNonBlankIdentity(s.owner));
   }
 
   updateStatus(id: string, status: ServiceHealth): ServiceRecord {

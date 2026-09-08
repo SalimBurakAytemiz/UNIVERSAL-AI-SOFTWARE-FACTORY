@@ -382,9 +382,42 @@ export class SandboxTimeoutError extends Error {
  * returning early anyway; it keeps waiting for the real settlement rather
  * than reporting a termination that never happened.
  */
+/**
+ * P1 fix (32nd independent review round, finding 3, "enforce timeout
+ * against the actual deadline"): `timedOut` used to be set ONLY inside the
+ * `setTimeout` callback below — a MACROTASK that Node's event loop can only
+ * run once it is free. Codex reproduced: if `operation`'s own work
+ * synchronously blocks the event loop PAST `ms` (e.g. a tight CPU-bound
+ * loop, or any synchronous call that takes longer than the timeout) and
+ * THEN settles, the `await operation(...)` continuation resumes as a
+ * MICROTASK — which Node always fully drains BEFORE advancing to the next
+ * macrotask phase (where the overdue `setTimeout` callback is still
+ * waiting). That ordering means this function's own resolve/reject
+ * handling below could run and read `timedOut` as still `false` — genuinely
+ * PAST the real deadline in wall-clock terms — and return the operation's
+ * result as a success, even though bölüm 87's whole promise is that an
+ * operation can never be allowed to run (or be reported as having
+ * succeeded) past its budgeted time. The bug was trusting a FLAG that only
+ * a delayed timer callback could set, rather than the actual elapsed time.
+ * Fixed: `deadlineAt` captures the authoritative wall-clock deadline
+ * (`Date.now() + ms`) BEFORE `operation` is ever invoked, and both the
+ * resolve and reject paths below compare `Date.now()` against it directly
+ * — independently of whether the `setTimeout` callback has had a chance to
+ * run yet. `timedOut` (still set by the timer, and still what triggers the
+ * actual `controller.abort()` for a cooperative operation) is now only ONE
+ * of two ways this function can conclude "the deadline was exceeded" — the
+ * OTHER is a fresh, trusted clock read taken at the moment of settlement,
+ * which cannot be starved by event-loop congestion the way a pending timer
+ * callback can. A genuinely cancellable operation that honors `signal`
+ * still settles (via the abort) at essentially the same moment `timedOut`
+ * flips, so this changes nothing for the cooperative case already covered
+ * by the 27th/28th round fixes above — this closes ONLY the non-cooperative,
+ * event-loop-starvation gap the flag-only check could not see.
+ */
 export async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const controller = new AbortController();
   let timedOut = false;
+  const deadlineAt = Date.now() + ms;
   const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
     timedOut = true;
     controller.abort(new SandboxTimeoutError(ms));
@@ -410,7 +443,14 @@ export async function withTimeout<T>(operation: (signal: AbortSignal) => Promise
     // the same moment `timedOut` is set — this branch exists specifically
     // for the non-cooperative case this function has always documented it
     // cannot force-cancel.
-    if (timedOut) {
+    //
+    // P1 fix (32nd independent review round, finding 3): `timedOut` alone
+    // is no longer trusted here — bkz. bu fonksiyonun üstündeki fix notu —
+    // `Date.now() >= deadlineAt` independently catches the case where the
+    // deadline has genuinely already passed but the timer callback simply
+    // has not run yet (event-loop starvation by the operation's own
+    // synchronous work).
+    if (timedOut || Date.now() >= deadlineAt) {
       throw new SandboxTimeoutError(ms);
     }
     return value;
@@ -424,7 +464,13 @@ export async function withTimeout<T>(operation: (signal: AbortSignal) => Promise
     // resolve path above): whatever caused the rejection happened only
     // because the operation kept running past a deadline that was already
     // exceeded, so it is reported as the timeout it genuinely is.
-    if (timedOut) {
+    //
+    // P1 fix (32nd independent review round, finding 3): same authoritative
+    // clock check as the resolve path above — a synchronous, event-loop-
+    // starving `operation` that eventually REJECTS past its real deadline
+    // (rather than resolving) must be reported as a timeout too, even if
+    // the timer callback itself has not yet run.
+    if (timedOut || Date.now() >= deadlineAt) {
       throw new SandboxTimeoutError(ms);
     }
     throw err;

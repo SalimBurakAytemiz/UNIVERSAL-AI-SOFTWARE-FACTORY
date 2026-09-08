@@ -741,4 +741,53 @@ describe("withTimeout", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (32nd independent review round, finding 3, 'enforce timeout against the actual deadline'): a " +
+      "deadline that is genuinely exceeded must be honored even when the setTimeout callback itself has not " +
+      "yet had a chance to run, because the operation's own synchronous work starved the event loop",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a 100ms synchronous, event-loop-starving operation with a " +
+          "10ms timeout MUST timeout, never silently succeed",
+        async () => {
+          const operation = async () => {
+            const start = Date.now();
+            // Synchronously starves the event loop — no `await` inside
+            // this busy-wait, so the pending `setTimeout` callback (the
+            // ONLY thing that used to ever set `timedOut`) genuinely
+            // cannot run until this loop returns control, well past the
+            // 10ms deadline.
+            while (Date.now() - start < 100) {
+              // busy-wait
+            }
+            return "should never be observably returned";
+          };
+          await expect(withTimeout(operation, 10)).rejects.toThrow(SandboxTimeoutError);
+        }
+      );
+
+      it("BLOCKER regression: the same event-loop-starving shape on the REJECT path is also reported as a timeout, not the operation's own late error", async () => {
+        const operation = async () => {
+          const start = Date.now();
+          while (Date.now() - start < 100) {
+            // busy-wait past the deadline
+          }
+          throw new Error("genuine failure, but only discovered after starving past the deadline");
+        };
+        await expect(withTimeout(operation, 10)).rejects.toThrow(SandboxTimeoutError);
+      });
+
+      it("no regression: an operation that starves the event loop for LESS than the timeout still succeeds normally", async () => {
+        const operation = async () => {
+          const start = Date.now();
+          while (Date.now() - start < 5) {
+            // short busy-wait, genuinely within budget
+          }
+          return "on time despite being synchronous";
+        };
+        await expect(withTimeout(operation, 500)).resolves.toBe("on time despite being synchronous");
+      });
+    }
+  );
 });
