@@ -73,16 +73,60 @@ export interface CostEntry {
   readonly taskId: string;
   readonly agentId?: string;
   readonly projectId?: string;
+  /**
+   * P1 fix (29th independent review round, finding 7, "per-run budget must
+   * be scoped to the actual run"): mirrors how `agentId`/`projectId` were
+   * each added as an OPTIONAL ownership dimension in earlier rounds —
+   * `runId` is the same kind of minimal, additive primitive, threaded ONLY
+   * as far as `CostEngine`/`BudgetGuard` need it to scope a ceiling
+   * correctly. See `CostScope.runId`'s fix note below for the full
+   * rationale, and `budget.ts`'s `buildCeilingChecks()` for the actual
+   * `perRunUsd` fix this enables.
+   */
+  readonly runId?: string;
   readonly provider: string;
   readonly modelId: string;
   readonly amountUsd: number;
   readonly timestamp: string;
+  /**
+   * P1 fix (29th independent review round, finding 1, "make persisted cost
+   * commits atomic/idempotent"): set ONLY by `commitReservation()` (never
+   * by a direct `record()` call outside a reservation) to the reservation's
+   * OWN id — the durable identity `commitReservation()` uses to recognize
+   * "this reservation's real cost was already recorded" on a retry. See
+   * `commitReservation()`'s fix note below for the full rationale.
+   */
+  readonly reservationId?: string;
 }
 
+/**
+ * P1 fix (29th independent review round, finding 7, "per-run budget must
+ * be scoped to the actual run"): Codex reproduced `BudgetGuard`'s
+ * `perRunUsd` ceiling check (bkz. `runtime/budget/budget.ts`'s
+ * `buildCeilingChecks()`) summing `this.#costEngine.total()` — the
+ * ENTIRE shared, durable ledger's cumulative lifetime spend, across EVERY
+ * invocation that has EVER used this `CostEngine` instance, not just the
+ * current run — meaning a SECOND run sharing the same durable ledger
+ * (the ordinary, intended way this repo's `CostEngine` persists across
+ * process restarts, bkz. bu dosyanın round 28 fix notu) starts with
+ * ZERO fresh `perRunUsd` capacity of its own; it inherits whatever the
+ * FIRST run already spent, even though "per RUN" (bölüm 70-72) is
+ * explicitly meant to bound a single supervised iteration, not the
+ * ledger's entire lifetime. `runId` is the missing ownership dimension
+ * that lets a caller who DOES have a genuine run identity scope a
+ * reservation/entry to it — added the SAME additive, optional way
+ * `agentId`/`projectId` already were: every EXISTING caller that never
+ * supplies `runId` sees `matchesScope()`'s `runId` check degrade to
+ * "matches everything" (bkz. aşağıdaki `matchesScope()`), so `perRunUsd`'s
+ * behavior is UNCHANGED for any caller not yet passing one — this is
+ * additive plumbing, not a forced behavior change on 200+ existing call
+ * sites, matching this exact same class's prior `agentId` addition.
+ */
 export interface CostScope {
   readonly taskId?: string;
   readonly agentId?: string;
   readonly projectId?: string;
+  readonly runId?: string;
 }
 
 /**
@@ -280,10 +324,12 @@ interface PersistedCostEntry {
   readonly taskId: string;
   readonly agentId?: string;
   readonly projectId?: string;
+  readonly runId?: string;
   readonly provider: string;
   readonly modelId: string;
   readonly amountUsd: number;
   readonly timestamp: string;
+  readonly reservationId?: string;
 }
 
 interface PersistedReservation {
@@ -306,7 +352,7 @@ function assertValidPersistedScope(scope: unknown, context: string): asserts sco
   if (!isPlainObject(scope)) {
     throw new CorruptCostStateError(`${context}.scope is not a plain object`);
   }
-  for (const key of ["taskId", "agentId", "projectId", "provider", "modelId"]) {
+  for (const key of ["taskId", "agentId", "projectId", "runId", "provider", "modelId"]) {
     const value = scope[key];
     if (value !== undefined && typeof value !== "string") {
       throw new CorruptCostStateError(`${context}.scope.${key} is neither a string nor undefined`);
@@ -344,14 +390,23 @@ function assertValidPersistedCostState(data: unknown): asserts data is Persisted
     if (typeof entry.modelId !== "string" || entry.modelId.length === 0) {
       throw new CorruptCostStateError(`entries[${index}].modelId is not a non-empty string`);
     }
-    if (typeof entry.timestamp !== "string" || Number.isNaN(Date.parse(entry.timestamp))) {
-      throw new CorruptCostStateError(`entries[${index}].timestamp is not a valid ISO timestamp string`);
+    if (typeof entry.timestamp !== "string" || !isCanonicalIsoTimestamp(entry.timestamp)) {
+      throw new CorruptCostStateError(
+        `entries[${index}].timestamp is not a canonical ISO-8601 timestamp string ` +
+          `(must exactly match Date.prototype.toISOString()'s own output format)`
+      );
     }
     if (entry.agentId !== undefined && typeof entry.agentId !== "string") {
       throw new CorruptCostStateError(`entries[${index}].agentId is neither a string nor undefined`);
     }
     if (entry.projectId !== undefined && typeof entry.projectId !== "string") {
       throw new CorruptCostStateError(`entries[${index}].projectId is neither a string nor undefined`);
+    }
+    if (entry.runId !== undefined && typeof entry.runId !== "string") {
+      throw new CorruptCostStateError(`entries[${index}].runId is neither a string nor undefined`);
+    }
+    if (entry.reservationId !== undefined && typeof entry.reservationId !== "string") {
+      throw new CorruptCostStateError(`entries[${index}].reservationId is neither a string nor undefined`);
     }
     try {
       assertValidMonetaryAmount(entry.amountUsd as number, `restored entries[${index}]`);
@@ -376,6 +431,37 @@ function assertValidPersistedCostState(data: unknown): asserts data is Persisted
       throw new CorruptCostStateError(`reservations[${index}].status is neither "ACTIVE" nor "RECONCILIATION_FAILED"`);
     }
   });
+}
+
+/**
+ * P1 fix (29th independent review round, finding 6, "persisted cost
+ * timestamps must be canonical"): the previous check
+ * (`!Number.isNaN(Date.parse(entry.timestamp))`) only proved the string
+ * was SOME date `Date.parse()` happens to understand — `Date.parse()`
+ * accepts a wide, implementation-defined range of non-ISO-8601 formats
+ * (date-only strings, space instead of "T", missing milliseconds/timezone,
+ * locale-ish forms), several of which are ALSO fed into engine-specific
+ * fallback parsing with no cross-engine guarantee. `totalInWindow()`
+ * (bkz. aşağıdaki metot) does a plain LEXICAL (string) comparison —
+ * `e.timestamp >= sinceIso` — which is only chronologically correct when
+ * EVERY timestamp shares the exact canonical form `record()` itself always
+ * produces (`Date.prototype.toISOString()`: `YYYY-MM-DDTHH:mm:ss.sssZ`).
+ * A persisted entry in ANY other Date.parse-able-but-differently-shaped
+ * form (e.g. a date-only string, or a timezone-offset instead of `Z`)
+ * could sort BEFORE `sinceIso` lexically even though it genuinely falls
+ * WITHIN the current day/month — silently vanishing from daily/monthly
+ * budget ceiling totals despite being real, already-incurred spend
+ * (baseline section 147's "no silent spending" cuts both ways — see this
+ * file's own persistence fix note above). Fixed: a persisted timestamp is
+ * now required to be in EXACTLY the canonical form — verified by a
+ * round-trip (`new Date(value).toISOString() === value`), which only ever
+ * holds for a string already in that one canonical shape — rather than
+ * merely "parseable somehow." Fail closed on anything else, per this
+ * file's established persisted-state philosophy.
+ */
+function isCanonicalIsoTimestamp(value: string): boolean {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
 function ownershipMismatches(reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership): boolean {
@@ -700,7 +786,59 @@ export class CostEngine {
    * not, aynı bir gerçek provider çağrısının zaten olmuş olabileceği
    * mantığı) rather than leaving it releasable.
    */
+  /**
+   * P1 fix (29th independent review round, finding 1, "make persisted cost
+   * commits atomic/idempotent"): Codex reproduced a real double-spend
+   * window: `record()` below PUSHES the incurred cost into `#entries`
+   * (in-memory) and only THEN calls `#persist()` — if THAT persist call
+   * throws (a durable-storage I/O error), the in-memory push has ALREADY
+   * happened, `record()`'s exception still propagates, this method's own
+   * catch marks the reservation `RECONCILIATION_FAILED` and attempts its
+   * OWN `#persist()` (which may itself fail too), then rethrows. Nothing
+   * about `commitReservation()` ever checked the reservation's OWN status
+   * before proceeding, so `UnresolvedReconciliationError` (which DOES
+   * block a RECONCILIATION_FAILED reservation from `releaseReservation()`)
+   * never protected `commitReservation()` itself — exactly the "retry
+   * commit() on this same reservation id" path `UnresolvedReconciliationError`'s
+   * own message documents as "the only safe path forward" would, without
+   * this fix, call `record()` a SECOND time for the SAME real-world
+   * provider cost, pushing a SECOND `CostEntry` — the same durable dollar
+   * amount counted twice in every future ceiling check. The same failure
+   * shape also exists one step later: if `record()`'s OWN persist call
+   * happens to succeed but THIS method's later `this.#reservations.delete(id);
+   * this.#persist();` fails, the reservation lingers (never removed) even
+   * though its cost was already durably recorded — a caller retrying
+   * `commitReservation(id, ...)` on that lingering reservation would ALSO
+   * double-record. Fixed via idempotency keyed on a durable identity: every
+   * entry `commitReservation()` ever records is tagged with the
+   * reservation's OWN id (`reservationId`, persisted alongside the entry —
+   * bkz. `CostEntry.reservationId`'s fix note above). Before doing ANYTHING
+   * else, this method checks whether `id` already has a matching entry in
+   * `#entries` — if so, the real cost was ALREADY recorded (durably, since
+   * an entry only ever reaches `#entries` via a `record()` call that itself
+   * persists successfully OR whose failure was already handled by a PRIOR
+   * commitReservation() attempt's own catch-block persist), so this call is
+   * a retry: it returns the SAME already-recorded entry (never records a
+   * second one) and — since the earlier attempt's REMOVAL step is what may
+   * have failed — opportunistically finishes removing the now-redundant
+   * reservation if it is still present, giving that removal another chance
+   * to durably persist. This makes retrying commitReservation() on the SAME
+   * id safe to call any number of times: the real cost is recorded exactly
+   * once, and the reservation's RECONCILIATION_FAILED protection (bkz.
+   * aşağıdaki catch bloğu) remains fully intact for the genuine "record()
+   * never actually succeeded yet" case, where this idempotency check finds
+   * nothing and the normal commit path runs exactly as before.
+   */
   commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
+    const alreadyCommitted = this.#entries.find((e) => e.reservationId === id);
+    if (alreadyCommitted) {
+      if (this.#reservations.has(id)) {
+        this.#reservations.delete(id);
+        this.#persist();
+      }
+      return freezeRecord(alreadyCommitted);
+    }
+
     const reservation = this.#reservations.get(id);
     if (!reservation) {
       throw new UnknownReservationError(id);
@@ -743,7 +881,7 @@ export class CostEngine {
     // WHICH step inside recording failed.
     let recorded: CostEntry;
     try {
-      recorded = this.record(snapshot);
+      recorded = this.record({ ...snapshot, reservationId: id });
     } catch (err) {
       // Rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED" olarak işaretlenip
       // KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard) kendi audit/
@@ -822,6 +960,7 @@ function matchesScope(entry: CostScope, scope: CostScope): boolean {
   return (
     (scope.taskId === undefined || entry.taskId === scope.taskId) &&
     (scope.agentId === undefined || entry.agentId === scope.agentId) &&
-    (scope.projectId === undefined || entry.projectId === scope.projectId)
+    (scope.projectId === undefined || entry.projectId === scope.projectId) &&
+    (scope.runId === undefined || entry.runId === scope.runId)
   );
 }

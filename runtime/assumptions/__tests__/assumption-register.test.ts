@@ -448,4 +448,65 @@ describe("AssumptionRegister", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (29th independent review round, finding 3, 'assumption authoritative lookup must be runtime-" +
+      "private'): the internal mustGet() lookup helper is now a genuine #private method, not TypeScript's " +
+      "compile-time-only `private`",
+    () => {
+      it("mustGet is not reachable as an ordinary JS property/method (BLOCKER regression)", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a1", description: "d", reason: "r", impact: "HIGH", source: "s" });
+
+        const asAny = register as unknown as { mustGet?: (id: string) => { status: string; confirmedBy?: string } };
+        expect(asAny.mustGet).toBeUndefined();
+
+        // Before the fix, this call would have returned the ACTUAL mutable
+        // internal record — mutating its `status`/`confirmedBy` directly
+        // would flip a HIGH-impact assumption to ACCEPTED with no Founder
+        // confirmation, no accept() call, and no FounderConfirmationRequiredError
+        // ever thrown. There is no such method to call now.
+        expect(() => asAny.mustGet?.("a1")).not.toThrow();
+        expect(asAny.mustGet).toBeUndefined();
+      });
+
+      it("no reflection API exposes mustGet", () => {
+        const register = new AssumptionRegister();
+        expect(Object.getOwnPropertyNames(register)).not.toContain("mustGet");
+        expect(Reflect.ownKeys(register).map(String)).not.toContain("mustGet");
+        const proto = Object.getPrototypeOf(register) as object;
+        expect(Object.getOwnPropertyNames(proto)).not.toContain("mustGet");
+      });
+
+      it("BLOCKER regression: a HIGH-impact assumption cannot be pushed to ACCEPTED (with no confirmedBy) via the former mutable-record escape hatch", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a2", description: "d", reason: "r", impact: "HIGH", source: "s" });
+
+        // Simulates the exact pre-fix attack this finding describes:
+        // reaching mustGet() via a forged/any-typed reference and mutating
+        // the record it returned directly, bypassing accept()'s Founder-
+        // confirmation gate entirely.
+        const forged = register as unknown as Record<string, unknown>;
+        if (typeof forged.mustGet === "function") {
+          const record = (forged.mustGet as (id: string) => { status: string; confirmedBy?: string })("a2");
+          record.status = "ACCEPTED";
+        }
+
+        expect(register.get("a2")!.status).toBe("PROPOSED");
+        expect(register.get("a2")!.confirmedBy).toBeUndefined();
+      });
+
+      it("HIGH-impact assumptions still can only become ACCEPTED through the validated Founder-confirmation transition (no regression)", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a3", description: "d", reason: "r", impact: "HIGH", source: "s" });
+
+        expect(() => register.accept("a3")).toThrow(FounderConfirmationRequiredError);
+        expect(register.get("a3")!.status).toBe("PROPOSED");
+
+        const accepted = register.accept("a3", "founder@example.com");
+        expect(accepted.status).toBe("ACCEPTED");
+        expect(accepted.confirmedBy).toBe("founder@example.com");
+      });
+    }
+  );
 });

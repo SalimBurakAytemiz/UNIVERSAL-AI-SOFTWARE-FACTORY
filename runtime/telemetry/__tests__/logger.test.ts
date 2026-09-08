@@ -499,4 +499,110 @@ describe("Logger", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (29th independent review round, finding 4, 'redact complete credential-bearing header values'): " +
+      "multi-component/multi-segment header values are redacted through their COMPLETE value boundary, not just " +
+      "the first one or two tokens",
+    () => {
+      it("BLOCKER regression, exact reproduction: 'Cookie: a=abc; sessionid=SECRET' fully redacts the trailing session id, not just the first pair", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "Cookie: a=abc; sessionid=SECRET" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("SECRET");
+        expect(line).not.toContain("a=abc");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("redacts a 'Set-Cookie: ...' response header through its complete value", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.response",
+          description: "Set-Cookie: session=fake-session-value-should-not-appear; Path=/; HttpOnly" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-session-value-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("BLOCKER regression, exact reproduction: 'Authorization: Digest ...' redacts every comma-separated sub-field, including the trailing response value", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description:
+            'Authorization: Digest username="alice", realm="example.com", nonce="xyz", response="fake-digest-response-should-not-appear"' // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-digest-response-should-not-appear");
+        expect(line).not.toContain("xyz");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("BLOCKER regression, exact reproduction: 'Authorization: AWS ...' redacts the trailing Signature component, not just the scheme/Credential prefix", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description:
+            "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20220830/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fake-signature-should-not-appear" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-signature-should-not-appear");
+        expect(line).not.toContain("AKIAIOSFODNN7EXAMPLE"); // secret-scan:allow (AWS's own well-known documentation-example key id, not a real secret)
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("redacts a 'Proxy-Authorization: ...' header through its complete value", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "Proxy-Authorization: Basic fake-proxy-credential-should-not-appear" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-proxy-credential-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("no regression: the 28th round's shell-quoted 'curl -H ...' embedded-header case still preserves trailing, unrelated log text after the closing quote", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "curl -H 'Authorization: Bearer fake-embedded-token-should-not-appear' https://api.example.com" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-token-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("curl");
+        expect(line).toContain("https://api.example.com");
+      });
+
+      it("preserves useful non-secret logging text that appears BEFORE a redacted header on the same line", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "incoming request headers dump: Cookie: session=fake-value-should-not-appear" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).toContain("incoming request headers dump:");
+        expect(line).not.toContain("fake-value-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+      });
+    }
+  );
 });

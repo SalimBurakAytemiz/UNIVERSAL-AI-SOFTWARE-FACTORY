@@ -63,6 +63,66 @@ describe("BudgetGuard", () => {
     expect(costEngine.total()).toBe(0.6);
   });
 
+  describe(
+    "P1 fix (29th independent review round, finding 7, 'per-run budget must be scoped to the actual run'): " +
+      "perRunUsd must not sum spend belonging to a DIFFERENT run from the same shared durable ledger",
+    () => {
+      it("BLOCKER regression, exact reproduction: Run A exhausts perRunUsd, then Run B gets its own fresh full allowance", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        // Run A spends its full perRunUsd ceiling.
+        guard.spend({ taskId: "a1", runId: "run-a", provider: "mock", modelId: "m1", amountUsd: 1 });
+        // Without the fix, this next spend (Run A trying to go over) is correctly blocked...
+        expect(() =>
+          guard.spend({ taskId: "a2", runId: "run-a", provider: "mock", modelId: "m1", amountUsd: 0.01 })
+        ).toThrow(BudgetExceededError);
+
+        // ...but Run B (a genuinely DIFFERENT run, sharing the SAME CostEngine/BudgetGuard) must
+        // receive its OWN fresh perRunUsd allowance — it must NOT inherit Run A's exhausted capacity.
+        expect(() =>
+          guard.spend({ taskId: "b1", runId: "run-b", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).not.toThrow();
+        expect(costEngine.totalFor({ runId: "run-a" })).toBe(1);
+        expect(costEngine.totalFor({ runId: "run-b" })).toBe(1);
+      });
+
+      it("daily/monthly/project totals still aggregate spend across ALL runs (unaffected by per-run scoping)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1, dailyUsd: 10 });
+
+        guard.spend({ taskId: "a1", runId: "run-a", projectId: "p1", provider: "mock", modelId: "m1", amountUsd: 1 });
+        guard.spend({ taskId: "b1", runId: "run-b", projectId: "p1", provider: "mock", modelId: "m1", amountUsd: 1 });
+
+        // The shared ledger's global/day/project totals still see BOTH runs combined.
+        expect(costEngine.total()).toBe(2);
+        expect(costEngine.totalFor({ projectId: "p1" })).toBe(2);
+      });
+
+      it("same-run concurrent spending still shares one ceiling (no regression from the runId scoping)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        guard.spend({ taskId: "a1", runId: "run-a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(() =>
+          guard.spend({ taskId: "a2", runId: "run-a", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(BudgetExceededError);
+        expect(costEngine.totalFor({ runId: "run-a" })).toBe(0.6);
+      });
+
+      it("backward compatibility: no runId supplied preserves the EXACT prior global-sum perRunUsd behavior", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        guard.spend({ taskId: "a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(() => guard.spend({ taskId: "b", provider: "mock", modelId: "m1", amountUsd: 0.6 })).toThrow(
+          BudgetExceededError
+        );
+        expect(costEngine.total()).toBe(0.6);
+      });
+    }
+  );
+
   describe("dailyUsd ceiling (real enforcement, not just a defined field)", () => {
     it("blocks spending that would exceed the daily ceiling within the same UTC day", () => {
       const clock = makeClock("2026-03-10T08:00:00.000Z");

@@ -5,7 +5,13 @@
 import { loadRequirementsFromDir } from "./baseline-status.js";
 import { adaptRequirementRecord, detectTraceabilityIssues, type TraceabilityIssue } from "../../requirements-traceability/traceability.js";
 
-export function traceRequirements(requirementsDir: string): TraceabilityIssue[] {
+/**
+ * P1 fix (29th independent review round, finding 5, "proof references must
+ * resolve to real evidence"): `rootDir` — the repository root every
+ * repository-relative evidence path is resolved against — is now a
+ * required parameter, threaded straight to `detectTraceabilityIssues()`.
+ */
+export function traceRequirements(requirementsDir: string, rootDir: string): TraceabilityIssue[] {
   const records = loadRequirementsFromDir(requirementsDir);
   const traceable = records.map((r) =>
     adaptRequirementRecord({
@@ -16,5 +22,5 @@ export function traceRequirements(requirementsDir: string): TraceabilityIssue[] 
       proof_refs: r.proof_refs as string[] | undefined
     })
   );
-  return detectTraceabilityIssues(traceable);
+  return detectTraceabilityIssues(traceable, rootDir);
 }

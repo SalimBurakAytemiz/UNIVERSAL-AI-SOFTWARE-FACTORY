@@ -746,6 +746,9 @@ describe("CostEngine", () => {
         ["an entry has a negative amountUsd", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: -1, timestamp: new Date().toISOString() }], reservations: [] }],
         ["an entry is missing taskId", { entries: [{ provider: "p", modelId: "m", amountUsd: 1, timestamp: new Date().toISOString() }], reservations: [] }],
         ["an entry has an invalid timestamp", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: 1, timestamp: "not-a-date" }], reservations: [] }],
+        ["an entry has a Date.parse-able but non-canonical date-only timestamp", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: 1, timestamp: "2024-01-15" }], reservations: [] }],
+        ["an entry has a Date.parse-able but non-canonical space-separated timestamp", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: 1, timestamp: "2024-01-15 10:00:00" }], reservations: [] }],
+        ["an entry has a Date.parse-able but non-canonical timezone-offset timestamp", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: 1, timestamp: "2024-01-15T10:00:00+05:00" }], reservations: [] }],
         ["a reservation has an invalid status", { entries: [], reservations: [{ id: "res-1-abc", scope: {}, amountUsd: 1, status: "MADE_UP_STATUS" }] }],
         ["a reservation has an invalid amountUsd", { entries: [], reservations: [{ id: "res-1-abc", scope: {}, amountUsd: Infinity, status: "ACTIVE" }] }],
         ["a reservation's scope is not an object", { entries: [], reservations: [{ id: "res-1-abc", scope: "not-an-object", amountUsd: 1, status: "ACTIVE" }] }]
@@ -880,6 +883,202 @@ describe("CostEngine", () => {
         });
         expect(recorded.amountUsd).toBe(1);
         expect(engine.reservedTotal({ taskId: "t1" })).toBe(0);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (29th independent review round, finding 1, 'make persisted cost commits atomic/idempotent'): " +
+      "retrying commitReservation() after a persistence failure never records the same real cost twice",
+    () => {
+      /**
+       * A real, working in-memory StateStore whose `write()` throws on ONE
+       * specific call number (1-indexed across the store's lifetime), then
+       * behaves normally (actually durably storing the value) on every
+       * other call — lets a test simulate "the Nth write attempt hit a
+       * transient I/O failure" while still supporting a genuine retry that
+       * succeeds afterward, and a genuine restart read-back.
+       */
+      function storeThatFailsOnceOnCall(failOnCall: number): StateStore {
+        let calls = 0;
+        const data = new Map<string, unknown>();
+        return {
+          write: (path, value) => {
+            calls += 1;
+            if (calls === failOnCall) {
+              throw new Error("simulated transient durable-storage I/O failure");
+            }
+            data.set(path, value);
+          },
+          read: <T>(path: string) => data.get(path) as T | undefined,
+          exists: (path) => data.has(path)
+        };
+      }
+
+      it("BLOCKER regression, exact reproduction: provider incurs cost -> persistence fails -> retry reconciliation -> final committed amount appears EXACTLY ONCE", () => {
+        // 1st write: createReservation (succeeds). 2nd write: the FIRST
+        // commitReservation() attempt's internal record() persist (fails —
+        // simulating "provider incurred cost, but writing that down failed").
+        const store = storeThatFailsOnceOnCall(2);
+        const engine = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        // First attempt: record() pushes the entry in-memory, its own
+        // persist() throws, commitReservation()'s catch marks
+        // RECONCILIATION_FAILED and its own persist() (the 3rd write call)
+        // succeeds this time — durable state already reflects the entry.
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).toThrow();
+
+        // Retry reconciliation on the SAME reservation id, exactly as
+        // UnresolvedReconciliationError's own message instructs.
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+
+        // The real cost was recorded EXACTLY ONCE — not twice.
+        const matching = engine.all().filter((e) => e.taskId === "t1" && e.provider === "mock");
+        expect(matching).toHaveLength(1);
+        expect(engine.total()).toBe(1);
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0);
+      });
+
+      it("a retry after the reservation-REMOVAL step (not the record() step) failed is also idempotent, not a double record", () => {
+        // 1st write: createReservation (succeeds). 2nd write: record()'s
+        // OWN persist (succeeds — the cost is durably recorded). 3rd
+        // write: commitReservation()'s post-record() reservation-deletion
+        // persist (fails) — the reservation lingers even though its cost
+        // was already durably recorded.
+        const store = storeThatFailsOnceOnCall(3);
+        const engine = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).toThrow();
+
+        // A caller retrying on the still-lingering reservation id must get
+        // back the SAME already-recorded entry, not a fresh duplicate.
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+        expect(engine.all().filter((e) => e.taskId === "t1")).toHaveLength(1);
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0);
+      });
+
+      it("restart proof: after the retry resolves, a FRESH CostEngine instance restored from the same durable store shows the cost exactly once and no lingering reservation", () => {
+        const store = storeThatFailsOnceOnCall(2);
+        const engine = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).toThrow();
+        engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 });
+
+        // Simulate a real process restart: a brand new CostEngine instance
+        // pointed at the SAME durable store/path.
+        const restarted = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+        expect(restarted.all().filter((e) => e.taskId === "t1")).toHaveLength(1);
+        expect(restarted.total()).toBe(1);
+        expect(restarted.reservedTotal({ taskId: "t1" })).toBe(0);
+      });
+
+      it("retrying a call whose reservation truly never recorded anything (record() never succeeded even once) still goes through the normal path and records exactly once", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+        expect(engine.all()).toHaveLength(1);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (29th independent review round, finding 6, 'persisted cost timestamps must be canonical'): a " +
+      "restored timestamp must exactly match Date.prototype.toISOString()'s own canonical format, not merely " +
+      "be Date.parse-able",
+    () => {
+      let tempRoot: string;
+
+      function fakeStoreWithData(data: unknown): StateStore {
+        return { write: () => {}, read: () => data as never, exists: () => true };
+      }
+
+      it("BLOCKER regression, exact reproduction: a Date.parse-able but non-canonical timestamp representing TODAY must not silently disappear from daily-window accounting", () => {
+        // "2024-06-15" (date-only) is genuinely Date.parse-able and refers
+        // to a real moment within the "2024-06-15" UTC day window, but its
+        // STRING form sorts lexically BEFORE "2024-06-15T00:00:00.000Z"
+        // (the canonical form totalInWindow()'s string comparison expects)
+        // — before this fix, such an entry could be silently excluded from
+        // a same-day window query despite being real, already-incurred
+        // spend within that exact day.
+        const malformed = fakeStoreWithData({
+          entries: [{ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 5, timestamp: "2024-06-15" }],
+          reservations: []
+        });
+        expect(() => new CostEngine(() => new Date(), { store: malformed, path: "irrelevant.json" })).toThrow(
+          CorruptCostStateError
+        );
+      });
+
+      it.each([
+        ["date-only, no time component", "2024-06-15"],
+        ["space separator instead of 'T'", "2024-06-15 10:00:00.000Z"],
+        ["timezone offset instead of 'Z'", "2024-06-15T10:00:00.000+00:00"],
+        ["missing milliseconds", "2024-06-15T10:00:00Z"],
+        ["completely unparseable garbage", "not-a-real-timestamp"]
+      ])("rejects a non-canonical timestamp: %s", (_label, timestamp) => {
+        const malformed = fakeStoreWithData({
+          entries: [{ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1, timestamp }],
+          reservations: []
+        });
+        expect(() => new CostEngine(() => new Date(), { store: malformed, path: "irrelevant.json" })).toThrow(
+          CorruptCostStateError
+        );
+      });
+
+      it("accepts the EXACT canonical form Date.prototype.toISOString() itself always produces (no false positives)", () => {
+        const canonical = new Date("2024-06-15T10:00:00.000Z").toISOString();
+        const valid = fakeStoreWithData({
+          entries: [{ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1, timestamp: canonical }],
+          reservations: []
+        });
+        const engine = new CostEngine(() => new Date(), { store: valid, path: "irrelevant.json" });
+        expect(engine.total()).toBe(1);
+      });
+
+      it("restart proof: a genuinely canonical persisted timestamp correctly survives restart and remains inside its real daily window", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-canonical-ts-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const fixedNow = new Date("2024-06-15T12:00:00.000Z");
+          const engine = new CostEngine(() => fixedNow, { store, path: statePath });
+          engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 3 });
+
+          const restarted = new CostEngine(() => new Date(), { store, path: statePath });
+          // The restored, canonical timestamp is genuinely inside its own UTC day window.
+          expect(restarted.totalInWindow({ taskId: "t1" }, "2024-06-15T00:00:00.000Z")).toBeCloseTo(3);
+          // ...and genuinely outside the NEXT day's window.
+          expect(restarted.totalInWindow({ taskId: "t1" }, "2024-06-16T00:00:00.000Z")).toBe(0);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
       });
     }
   );

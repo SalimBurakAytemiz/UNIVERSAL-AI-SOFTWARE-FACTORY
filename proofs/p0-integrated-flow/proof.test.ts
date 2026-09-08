@@ -29,7 +29,8 @@ import { createDefaultModelRegistry } from "../../runtime/models/registry.js";
 import { FileStateStore } from "../../runtime/state/file-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const requirementsDir = join(__dirname, "..", "..", "specification", "requirements");
+const repoRoot = join(__dirname, "..", "..");
+const requirementsDir = join(repoRoot, "specification", "requirements");
 
 describe("Proof: P0 integrated flow (Requirements -> Traceability -> Genome -> Organization -> Project OS -> Policy -> Routing -> State)", () => {
   let tempRoot: string;
@@ -42,7 +43,7 @@ describe("Proof: P0 integrated flow (Requirements -> Traceability -> Genome -> O
     tempRoot = mkdtempSync(join(tmpdir(), "uasf-p0-integrated-"));
 
     // Step 1-2: Requirements -> Traceability, against the REAL registry.
-    const traceabilityIssues = traceRequirements(requirementsDir);
+    const traceabilityIssues = traceRequirements(requirementsDir, repoRoot);
     expect(traceabilityIssues).toEqual([]); // this repo's own evidence must be clean before it bootstraps new work
 
     // Step 3-8: Genome -> Organization -> Project OS -> Policy -> Routing -> State.
@@ -86,7 +87,7 @@ describe("Proof: P0 integrated flow (Requirements -> Traceability -> Genome -> O
   it("the chain fails closed at the very first step if the real registry ever regresses", () => {
     // This does not mutate the registry — it only proves the gate exists and is wired
     // to real, live data, by re-running the exact same call the pipeline uses.
-    const issues = traceRequirements(requirementsDir);
+    const issues = traceRequirements(requirementsDir, repoRoot);
     expect(Array.isArray(issues)).toBe(true);
   });
 });

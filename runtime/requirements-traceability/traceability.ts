@@ -5,6 +5,9 @@
 // "kanıtsız iddiaları" (orphan status claims) tespit eder — bölüm 294'teki
 // "no unsupported upgrades" kuralının denetlenebilir hâlidir.
 
+import { existsSync } from "node:fs";
+import { assertWithinRoot } from "../sandbox/sandbox.js";
+
 export type RequirementStatus =
   | "DEFINED"
   | "PLANNED"
@@ -55,6 +58,58 @@ function progressRank(status: RequirementStatus): number {
 }
 
 /**
+ * P1 fix (29th independent review round, finding 5, "proof references must
+ * resolve to real evidence"): a ref containing whitespace is never a
+ * repository-relative path in this registry's own data (verified against
+ * every real ref currently in `specification/requirements/*.yml` — zero
+ * false positives) — it is a legacy, pre-dating-this-convention free-text
+ * audit note (e.g. UASF-REQ-0001's "Session audit: single 'Initial
+ * commit'..."). Such notes are still genuine evidence under "no claim
+ * without evidence" (bölüm 303), just not filesystem-checkable, so this
+ * function does not attempt to verify them and treats their mere presence
+ * as it always has. Every OTHER ref is treated as a path and MUST resolve
+ * to a real, in-repository file or directory — see `isVerifiedEvidenceRef()`
+ * below.
+ */
+function looksLikeFilePath(ref: string): boolean {
+  return !/\s/.test(ref);
+}
+
+/**
+ * P1 fix (29th independent review round, finding 5, "proof references must
+ * resolve to real evidence"): `detectTraceabilityIssues()` used to treat a
+ * MERELY NON-EMPTY `proofRefs`/`testRefs`/`implementationRefs` array as
+ * sufficient evidence — `proof_refs: ["does/not/exist"]` (a typo, a moved/
+ * deleted file, or a fabricated reference never backed by anything real)
+ * satisfied `hasProof` exactly the same as a genuine, real proof file
+ * would, completely defeating baseline section 303's "no claim without
+ * evidence" for the one thing this module exists to enforce. Fixed: a
+ * path-shaped ref (bkz. `looksLikeFilePath()`) now only counts as evidence
+ * if it ACTUALLY resolves, via `assertWithinRoot()` (the same path-
+ * confinement primitive `runtime/sandbox/sandbox.ts` already uses to stop
+ * a scaffold escaping its project root — reused here rather than
+ * reinventing traversal protection), to a real, EXISTING file or directory
+ * strictly inside `rootDir` — a `../`-style reference attempting to point
+ * outside the repository is rejected the same way a scaffold escape is
+ * (fails closed, counts as no evidence, never throws — an invalid
+ * reference is validation feedback, not a crash).
+ */
+function isVerifiedEvidenceRef(ref: string, rootDir: string): boolean {
+  if (!looksLikeFilePath(ref)) return true;
+  let resolved: string;
+  try {
+    resolved = assertWithinRoot(rootDir, ref);
+  } catch {
+    return false;
+  }
+  return existsSync(resolved);
+}
+
+function hasVerifiedEvidence(refs: readonly string[], rootDir: string): boolean {
+  return refs.some((ref) => isVerifiedEvidenceRef(ref, rootDir));
+}
+
+/**
  * Kayıt defterindeki her gereksinimi tarar ve durumu ile kanıtları
  * arasındaki tutarsızlıkları bulur. BLOCKED/DEPRECATED/SUPERSEDED
  * durumundaki kayıtlar denetlenmez (bölüm 294'te bu durumlar için ayrı bir
@@ -68,17 +123,25 @@ function progressRank(status: RequirementStatus): number {
  * kanıt testinin kendisinin hem uygulama hem doğrulama olduğu durumlar)
  * ayrı bir "implementation" dosyasına sahip olmayabilmesidir — önemli olan
  * HİÇBİR kanıt olmadan ilerleme iddia edilmemesidir.
+ *
+ * `rootDir` is the repository root every path-shaped ref is resolved
+ * against (bkz. `isVerifiedEvidenceRef()`'in fix notu) — required, not
+ * defaulted, so a caller must always state explicitly which tree these
+ * repository-relative refs are meant to resolve inside of.
  */
-export function detectTraceabilityIssues(requirements: readonly TraceableRequirement[]): TraceabilityIssue[] {
+export function detectTraceabilityIssues(
+  requirements: readonly TraceableRequirement[],
+  rootDir: string
+): TraceabilityIssue[] {
   const issues: TraceabilityIssue[] = [];
 
   for (const req of requirements) {
     const rank = progressRank(req.status);
     if (rank === -1) continue;
 
-    const hasProof = req.proofRefs.length > 0;
-    const hasTest = req.testRefs.length > 0;
-    const hasImplementation = req.implementationRefs.length > 0;
+    const hasProof = hasVerifiedEvidence(req.proofRefs, rootDir);
+    const hasTest = hasVerifiedEvidence(req.testRefs, rootDir);
+    const hasImplementation = hasVerifiedEvidence(req.implementationRefs, rootDir);
 
     if (rank >= progressRank("IMPLEMENTATION_IN_PROGRESS") && !hasImplementation && !hasTest && !hasProof) {
       issues.push({ requirementId: req.id, issue: "MISSING_IMPLEMENTATION_REFS", status: req.status });

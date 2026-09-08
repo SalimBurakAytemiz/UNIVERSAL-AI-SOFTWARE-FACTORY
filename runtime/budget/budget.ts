@@ -373,11 +373,26 @@ export class BudgetGuard {
       });
     }
 
+    // P1 fix (29th independent review round, finding 7, "per-run budget must
+    // be scoped to the actual run"): `this.#costEngine.total()` sums this
+    // engine's ENTIRE durable ledger — every entry ever recorded across
+    // every run that has shared this `CostEngine` instance/persisted state,
+    // not just the current run — so a SECOND run starting on the same
+    // durable ledger (the ordinary, intended way this repo's `CostEngine`
+    // persists across restarts) inherited whatever the FIRST run already
+    // spent, leaving it with zero fresh `perRunUsd` capacity of its own.
+    // Fixed exactly like `perTaskUsd` above: when the caller supplies a
+    // genuine `runId`, the ceiling is scoped to ONLY that run's entries/
+    // reservations via `totalFor`/`reservedTotal`; callers that never
+    // supply `runId` (every one of the 200+ existing call sites today) see
+    // `runScope` degrade to `{}`, which `matchesScope()` treats as "matches
+    // everything" — i.e. the exact prior global-sum behavior, unchanged.
     if (this.#limits.perRunUsd !== undefined) {
+      const runScope: CostScope = scope.runId !== undefined ? { runId: scope.runId } : {};
       checks.push({
         ceiling: "perRunUsd",
         limit: this.#limits.perRunUsd,
-        projected: this.#costEngine.total() + this.#costEngine.reservedTotal({}) + projectedAmountUsd
+        projected: this.#costEngine.totalFor(runScope) + this.#costEngine.reservedTotal(runScope) + projectedAmountUsd
       });
     }
 
@@ -497,12 +512,20 @@ export class BudgetGuard {
     taskId: string;
     agentId?: string;
     projectId?: string;
+    runId?: string;
     provider: string;
     modelId: string;
     amountUsd: number;
   }) {
     const snapshot = { ...entry };
-    this.assertWithinBudget({ taskId: snapshot.taskId, projectId: snapshot.projectId }, snapshot.amountUsd);
+    // P1 fix (29th independent review round, finding 7): `runId` must reach
+    // `assertWithinBudget()`'s scope, not just `taskId`/`projectId` — otherwise
+    // `buildCeilingChecks()`'s new `perRunUsd` scoping (bkz. yukarıdaki fix
+    // notu) is unreachable through this, the most common spend path.
+    this.assertWithinBudget(
+      { taskId: snapshot.taskId, projectId: snapshot.projectId, runId: snapshot.runId },
+      snapshot.amountUsd
+    );
     return this.#costEngine.record(snapshot);
   }
 

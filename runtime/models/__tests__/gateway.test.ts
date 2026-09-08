@@ -1220,7 +1220,7 @@ describe("ModelGateway + MockProvider", () => {
         expect(gateway.hasProvider("other")).toBe(true);
       });
 
-      it("replaceProvider() performs the swap explicitly and records an audited event", () => {
+      it("replaceProvider() performs the swap explicitly and records an audited event", async () => {
         const auditLog = new AuditLog();
         const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
         gateway.registerProvider(new MockProvider());
@@ -1229,16 +1229,155 @@ describe("ModelGateway + MockProvider", () => {
           id: "mock",
           invoke: async () => ({ modelId: "m", provider: "mock", costUsd: 0, output: "replacement" })
         };
-        expect(() => gateway.replaceProvider(replacement)).not.toThrow();
+        await expect(
+          gateway.replaceProvider(replacement, { policy: permissivePolicy(), risk: 0 })
+        ).resolves.not.toThrow();
 
         const events = auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED");
         expect(events).toHaveLength(1);
         expect(events[0]!.payload).toMatchObject({ providerId: "mock" });
       });
 
-      it("replaceProvider() rejects replacing an id that was never registered (it is not a disguised register())", () => {
+      it("replaceProvider() rejects replacing an id that was never registered (it is not a disguised register())", async () => {
+        const gateway = new ModelGateway(new ApprovalWorkflow(), new AuditLog());
+        await expect(
+          gateway.replaceProvider(new MockProvider(), { policy: permissivePolicy(), risk: 0 })
+        ).rejects.toThrow(UnknownProviderError);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (29th independent review round, finding 2, 'provider replacement must require policy + approval + audit')",
+    () => {
+      function replacement(output = "replacement"): ModelProvider {
+        return {
+          id: "mock",
+          invoke: async () => ({ modelId: "m", provider: "mock", costUsd: 0, output })
+        };
+      }
+
+      it("BLOCKER regression: a policy DENY blocks provider replacement entirely, and the ORIGINAL adapter keeps serving invocations", async () => {
+        const auditLog = new AuditLog();
+        const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        const denyPolicy = new PolicyEngine();
+        denyPolicy.addRule({ name: "deny-all", priority: 10, evaluate: () => "DENY" });
+
+        await expect(gateway.replaceProvider(replacement(), { policy: denyPolicy, risk: 0 })).rejects.toThrow(
+          CapabilityDeniedError
+        );
+
+        // No audit event was ever recorded for a blocked replacement.
+        expect(auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED")).toHaveLength(0);
+
+        // The ORIGINAL adapter still handles invocations — no silent redirection occurred.
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!;
+        const response = await gateway.invoke(model, { prompt: "hello" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toContain("hello");
+        expect(response.output).not.toContain("replacement");
+      });
+
+      it("a risk-5 replacement is unconditionally APPROVAL_REQUIRED, even under an otherwise fully-permissive policy", async () => {
+        const auditLog = new AuditLog();
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals, auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        await expect(
+          gateway.replaceProvider(replacement(), { policy: permissivePolicy(), risk: 5 })
+        ).rejects.toThrow(CapabilityApprovalRequiredError);
+        expect(auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED")).toHaveLength(0);
+      });
+
+      it("a risk-5 replacement succeeds once a genuine, matching approval is granted, and the audit event names both implementations", async () => {
+        const auditLog = new AuditLog();
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals, auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        const description = "Replace provider adapter 'mock'";
+        approvals.requestFor("appr-1", { actionType: "model.provider.replace", description, risk: 5 });
+        approvals.approve("appr-1", "founder@example.com");
+
+        await expect(
+          gateway.replaceProvider(replacement(), {
+            policy: permissivePolicy(),
+            risk: 5,
+            description,
+            approvalId: "appr-1"
+          })
+        ).resolves.not.toThrow();
+
+        const events = auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED");
+        expect(events).toHaveLength(1);
+        expect(events[0]!.payload).toMatchObject({
+          providerId: "mock",
+          previousImplementation: "MockProvider",
+          newImplementation: "Object"
+        });
+
+        // The replacement adapter is now genuinely the one invoked.
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!;
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("replacement");
+      });
+
+      it("an approval registered in a DIFFERENT ModelGateway's own approvals store cannot authorize this gateway's replacement", async () => {
+        const elsewhere = new ApprovalWorkflow();
+        elsewhere.requestFor("appr-elsewhere", { actionType: "model.provider.replace", description: "d", risk: 5 });
+        elsewhere.approve("appr-elsewhere", "founder@example.com");
+
+        const gateway = new ModelGateway(new ApprovalWorkflow(), new AuditLog());
+        gateway.registerProvider(new MockProvider());
+
+        await expect(
+          gateway.replaceProvider(replacement(), {
+            policy: permissivePolicy(),
+            risk: 5,
+            description: "d",
+            approvalId: "appr-elsewhere"
+          })
+        ).rejects.toThrow(ApprovalEvidenceMismatchError);
+      });
+
+      it("BLOCKER regression: replaceProvider() fails closed when the ModelGateway was constructed with no AuditLog, even for a fully-permitted risk-0 replacement", async () => {
+        const gateway = new ModelGateway(); // no AuditLog supplied
+        gateway.registerProvider(new MockProvider());
+
+        await expect(gateway.replaceProvider(replacement(), { policy: permissivePolicy(), risk: 0 })).rejects.toThrow(
+          "ModelGateway was constructed without an AuditLog"
+        );
+
+        // The original adapter must still be the one serving invocations.
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!;
+        const response = await gateway.invoke(model, { prompt: "hello" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toContain("hello");
+      });
+
+      it("registerProvider() is unaffected by the audit requirement — ordinary registration never needs an AuditLog", () => {
         const gateway = new ModelGateway();
-        expect(() => gateway.replaceProvider(new MockProvider())).toThrow(UnknownProviderError);
+        expect(() => gateway.registerProvider(new MockProvider())).not.toThrow();
+        expect(gateway.hasProvider("mock")).toBe(true);
       });
     }
   );

@@ -148,6 +148,48 @@ export class DuplicateProviderIdError extends Error {
   }
 }
 
+/**
+ * P1 fix (29th independent review round, finding 2, "provider replacement
+ * must require policy + approval + audit"): `replaceProvider()`'s only
+ * requirement used to be that the AuditLog happened to be present — an
+ * OPTIONAL constructor parameter — and even then, recording was purely
+ * best-effort (`this.#auditLog?.append(...)`, silently a no-op when
+ * omitted). Since replacing a trusted provider adapter is EXACTLY the kind
+ * of "no silent architectural deletion" action baseline section 147/303
+ * exists to gate, this operation is now REQUIRED to carry durable audit
+ * evidence — a `ModelGateway` constructed without an `AuditLog` cannot call
+ * `replaceProvider()` at all (it can still `registerProvider()`/`invoke()`
+ * normally; only the explicit-replacement path demands it).
+ */
+export class ProviderReplacementAuditRequiredError extends Error {
+  constructor(id: string) {
+    super(
+      `Cannot replace provider '${id}': this ModelGateway was constructed without an AuditLog. Provider ` +
+        `replacement must generate durable audit evidence (baseline section 147/303) — construct the ` +
+        `ModelGateway with an AuditLog to enable replaceProvider().`
+    );
+    this.name = "ProviderReplacementAuditRequiredError";
+  }
+}
+
+/**
+ * P1 fix (29th independent review round, finding 2): the authorization
+ * context `replaceProvider()` now REQUIRES — mirrors `ModelInvocationContext`
+ * (policy is mandatory, risk is caller-stated so the SAME risk-5-forces-
+ * approval floor `PolicyEngine.evaluate()` already enforces for every other
+ * risky action applies here too, and `approvalId` is a reference into this
+ * gateway's OWN `#approvals` store, never a workflow object — bkz.
+ * `ModelInvocationContext.approvalId`'in fix notu, the SAME anti-forgery
+ * reasoning applies here).
+ */
+export interface ProviderReplacementContext {
+  readonly policy: PolicyEngine;
+  readonly risk: RiskLevel;
+  readonly projectId?: string;
+  readonly description?: string;
+  readonly approvalId?: string;
+}
+
 export class ModelGateway {
   // Gerçek ECMAScript private alan (`#`), TypeScript'in `private`
   // anahtar kelimesinden BİLEREK farklı: `private` yalnızca DERLEME
@@ -212,18 +254,68 @@ export class ModelGateway {
    * `DuplicateProviderIdError`'ın fix notu. Bilinmeyen bir id'yi
    * değiştirmeye çalışmak da reddedilir (bu bir "replace" değil, gizlenmiş
    * bir "register" olurdu); `registerProvider()` kullanılmalıdır.
+   *
+   * P1 fix (29th independent review round, finding 2, "provider replacement
+   * must require policy + approval + audit"): this used to be an
+   * unconditional, unauthenticated public mutation — ANY caller holding a
+   * `ModelGateway` reference could silently redirect every future "trusted"
+   * call for a live provider id to a completely different implementation,
+   * with audit evidence recorded only best-effort (or not at all, if no
+   * `AuditLog` happened to be supplied at construction). Since the adapter
+   * bound to a provider id is the ONLY thing standing between an authorized,
+   * budget-reserved `invoke()` and an ACTUAL external side effect, swapping
+   * it is exactly the kind of action baseline section 147's default-deny
+   * policy gate exists for. Fixed: replacement now goes through the SAME
+   * `CapabilityGateway.authorize()` every risky Factory action passes
+   * through (bkz. `invoke()`'in kendi çağrısı) — a genuine `PolicyEngine`
+   * DENY blocks the swap entirely, a risk-5 replacement is unconditionally
+   * `APPROVAL_REQUIRED` (the SAME built-in floor every other risky action
+   * enforces) unless a genuine, pre-registered approval (`context.approvalId`,
+   * resolved against THIS gateway's own `#approvals` store — never a
+   * caller-supplied workflow object) is presented, and the swap is
+   * UNCONDITIONALLY required to generate durable audit evidence — a
+   * `ModelGateway` with no `AuditLog` cannot call this method at all (bkz.
+   * `ProviderReplacementAuditRequiredError`'ın fix notu). The recorded event
+   * captures BOTH the previous and replacement adapter's own implementation
+   * identity (its constructor name — the only distinguishing identity a
+   * `ModelProvider` exposes beyond the id, which is intentionally UNCHANGED
+   * by a replace), so a legitimate reviewer can see that a REAL swap
+   * happened, not merely a same-instance no-op.
    */
-  replaceProvider(provider: ModelProvider): void {
-    if (!this.#providers.has(provider.id)) {
+  async replaceProvider(provider: ModelProvider, context: ProviderReplacementContext): Promise<void> {
+    const existingProvider = this.#providers.get(provider.id);
+    if (!existingProvider) {
       throw new UnknownProviderError(provider.id);
     }
-    this.#providers.set(provider.id, provider);
-    this.#auditLog?.append({
-      type: "MODEL_PROVIDER_REPLACED",
-      actor: "ModelGateway",
-      payload: { providerId: provider.id },
-      timestamp: new Date().toISOString()
-    });
+    if (!this.#auditLog) {
+      throw new ProviderReplacementAuditRequiredError(provider.id);
+    }
+    const auditLog = this.#auditLog;
+    const capabilityGateway = new CapabilityGateway(context.policy, this.#approvals);
+    const approvalReference = context.approvalId !== undefined ? { approvalId: context.approvalId } : undefined;
+
+    await capabilityGateway.authorize(
+      {
+        actionType: "model.provider.replace",
+        risk: context.risk,
+        description: context.description ?? `Replace provider adapter '${provider.id}'`,
+        projectId: context.projectId
+      },
+      () => {
+        this.#providers.set(provider.id, provider);
+        auditLog.append({
+          type: "MODEL_PROVIDER_REPLACED",
+          actor: "ModelGateway",
+          payload: {
+            providerId: provider.id,
+            previousImplementation: existingProvider.constructor?.name ?? "unknown",
+            newImplementation: provider.constructor?.name ?? "unknown"
+          },
+          timestamp: new Date().toISOString()
+        });
+      },
+      approvalReference
+    );
   }
 
   hasProvider(id: string): boolean {

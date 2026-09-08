@@ -85,8 +85,43 @@ function isSensitiveKey(key: string): boolean {
 const SECRET_ASSIGNMENT_PATTERN =
   /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|secret|password|credential)(\s*[:=]\s*)(['"]?)([^\s'",;]+)\3/gi;
 const URL_USERINFO_PATTERN = /(:\/\/[^/\s:@]+):([^/\s:@]+)@/g;
-const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)(\S+(?:\s+\S+)?)/gi;
-const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)(\S+)/gi;
+/**
+ * P1 fix (29th independent review round, finding 4, "redact complete
+ * credential-bearing header values"): this used to be
+ * `/\b(authorization\s*:\s*)(\S+(?:\s+\S+)?)/gi` — bounded to AT MOST two
+ * whitespace-separated tokens after the header name (a deliberate 28th-
+ * round fix for a DIFFERENT problem: the ORIGINAL unbounded
+ * `(?:\s+\S+)*` swallowed trailing, unrelated log text sharing the same
+ * line, e.g. a URL after `curl -H 'Authorization: Bearer xyz' https://...`).
+ * That two-token cap broke multi-component auth schemes Codex reproduced:
+ * `Authorization: Digest username="alice", realm="example.com",
+ * nonce="xyz", response="..."` and `Authorization: AWS4-HMAC-SHA256
+ * Credential=AKIA.../20220830/us-east-1/s3/aws4_request,
+ * SignedHeaders=host;x-amz-date, Signature=abcd1234` both have their
+ * REAL credential material (the nonce/response/Signature fields) sitting
+ * past the second token — completely unredacted. Fixed: the captured
+ * value now runs to the first single-quote or newline (or end of string)
+ * instead of a fixed token count — `[^'\n]+` — which fully covers
+ * multi-token/comma-separated schemes (Digest, AWS, NTLM/Negotiate; none
+ * of these use a literal single quote inside the header value itself,
+ * only Digest's OWN double-quoted sub-fields, which this pattern does not
+ * treat as a stop character) while STILL stopping at the closing `'` in
+ * the exact `curl -H 'Authorization: ...' https://...` shell-quoting
+ * case the 28th round's regression test covers, so that fix's own
+ * BLOCKER regression continues to pass unchanged.
+ */
+const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)([^'\n]+)/gi;
+/**
+ * P1 fix (29th independent review round, finding 4): same fix as
+ * `AUTHORIZATION_HEADER_PATTERN` above, for the identical reason — the
+ * old `(\S+)` stopped at the FIRST whitespace, so `Cookie: a=abc;
+ * sessionid=SECRET` (a real cookie header's own "; "-separated pairs)
+ * only ever redacted `a=abc;`, leaving `sessionid=SECRET` — the actual
+ * secret — completely in the clear. `\bcookie\b` already matches
+ * `Set-Cookie:` too (the character before "Cookie" is a non-word `-`, a
+ * genuine word boundary), so this single pattern covers both.
+ */
+const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)([^'\n]+)/gi;
 const BARE_BEARER_TOKEN_PATTERN = /\bbearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
 
 function redactSecretsInString(text: string): string {

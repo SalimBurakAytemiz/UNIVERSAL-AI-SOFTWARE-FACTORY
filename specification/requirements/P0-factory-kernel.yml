@@ -4696,3 +4696,53 @@
     does NOT invoke Codex itself, and does NOT create a new branch — all work stayed on
     claude/ai-factory-baseline-v1-seawq7. P0 remains BLOCKED_PENDING_REVIEW awaiting the next independent review
     to return INDEPENDENT_REVIEW_RESULT: CLEAN.
+
+    Round 29 (fresh, independent Codex closure review, consolidated batch of SEVEN priority-P1 findings, plus a
+    narrow, explicitly-scoped root-class audit for the same seven classes): (1) `cost-engine.ts`'s
+    `commitReservation()` is now idempotent under persistence failure — every recorded `CostEntry` carries its
+    originating `reservationId`, and a retry recognizes an already-committed reservation by that durable id and
+    converges on the SAME entry instead of double-recording, with real restart proofs. (2) `models/gateway.ts`
+    gained an explicit, policy-gated, audited `replaceProvider()` (`ProviderReplacementContext` requiring a
+    `PolicyEngine` + risk, routed through the SAME `CapabilityGateway.authorize()` path `invoke()` uses, plus a
+    mandatory `AuditLog` — `ProviderReplacementAuditRequiredError` if none was supplied at construction) —
+    `registerProvider()` continues to reject a colliding id (round 28's fix, unchanged) but is no longer the only
+    path capable of redirecting trusted provider traffic. (3) `assumption-register.ts`'s internal `mustGet()`
+    converted to a genuine ECMAScript `#mustGet()` (same class of fix as `approval.ts` in round 28 and every
+    other id-keyed registry across rounds 25/27) — no plain-JS/any-cast access can reach the mutable authoritative
+    record. (4) `logger.ts`'s `AUTHORIZATION_HEADER_PATTERN`/`COOKIE_HEADER_PATTERN` widened from a fixed
+    1-2-token capture to running to the first single quote or newline (`[^'\n]+`), fully redacting multi-component
+    schemes (Digest, AWS SigV4, Proxy-Authorization, Set-Cookie, multi-pair Cookie headers) a round-28 fix's own
+    token cap had left partially exposed, while preserving that round's own curl-shell-quoting regression. (5)
+    `requirements-traceability/traceability.ts`'s `detectTraceabilityIssues()` now requires an explicit `rootDir`
+    and verifies every path-shaped `proof_refs`/`test_refs`/`implementation_refs` entry actually resolves (via
+    `sandbox.ts`'s `assertWithinRoot()`, rejecting traversal) to a real, existing file or directory before it
+    counts as evidence — a bare `proof_refs: ["does/not/exist"]` no longer satisfies any progress claim; free-text
+    legacy audit notes (whitespace-containing, pre-dating this convention) are still accepted unchanged. (6)
+    `cost-engine.ts`'s persisted-state validator now requires each entry's `timestamp` to be in EXACT canonical
+    `Date.prototype.toISOString()` form (round-trip checked), closing a path where a non-canonical-but-parseable
+    timestamp could sort incorrectly under `totalInWindow()`'s lexical string comparison and silently vanish from
+    daily/monthly totals. (7) `budget.ts`'s `perRunUsd` ceiling is now scoped to an optional, additive `runId`
+    ownership dimension (mirroring the existing `agentId`/`projectId` precedent) threaded through
+    `CostScope`/`CostEntry`/`ReservationOwnership` and `spend()`'s entry type — a caller supplying `runId` gets a
+    ceiling scoped to ONLY that run's own entries/reservations via `totalFor`/`reservedTotal`, while every existing
+    caller that never supplies one continues to see the exact prior global-sum behavior (backward-compatible,
+    since `matchesScope()`'s empty-scope-matches-everything semantics are unchanged). All seven fixes carry
+    deterministic regression tests (including exact BLOCKER reproductions) and were verified via a genuine
+    temporary in-place bypass reproducing the exact predicted failure, then fully reverted and reconfirmed clean.
+
+    The root-class audit (limited to these seven exact classes, not broadened into unrelated architecture) found
+    no further genuine instances: `decision-ledger.ts`/`assumption-register.ts` persist via explicit full-snapshot
+    `saveTo()`/`loadFrom()`, not cost-engine's append-and-catch-partial-failure shape, so they are not vulnerable
+    to the same double-accounting-on-retry defect; every other registry/provider mutation path already fails
+    closed or is already policy-gated from prior rounds; no other TypeScript-only-private authoritative lookup
+    remains; no other durable timestamp is used in a lexical-window comparison; `perTaskUsd` was already correctly
+    task-scoped and `dailyUsd`/`monthlyUsd` are intentionally period/global-scoped by design. Full required
+    sequence re-run and green: lint, typecheck, build, 1084/1084 tests (44 files, +43 net new),
+    validate:requirements (42 schema-valid records), history-and-current-tree-aware secret-scan (PASS), Factory
+    Doctor (READY), `npm run verify:production-install` (PASS), all 9 P0 proofs (13 assertions). No status raised
+    on any requirement beyond what real evidence supports — every touched requirement was already UNIT_TESTED or
+    PROOF_VERIFIED, and these are hardening fixes to already-tested requirements, not first implementations. P0
+    remains BLOCKED_PENDING_REVIEW, awaiting the next (30th) independent Codex review to return
+    INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this round does NOT merge, does NOT move to P1,
+    does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch — all work stayed
+    on claude/ai-factory-baseline-v1-seawq7.

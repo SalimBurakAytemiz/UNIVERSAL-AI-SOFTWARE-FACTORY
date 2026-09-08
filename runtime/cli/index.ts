@@ -87,7 +87,7 @@ function printRoutingExplain(): void {
 
 function printTraceRequirement(): void {
   const requirementsDir = join(repoRoot, "specification", "requirements");
-  const issues = traceRequirements(requirementsDir);
+  const issues = traceRequirements(requirementsDir, repoRoot);
   console.log("factory trace requirement");
   console.log("==========================");
   if (issues.length === 0) {

@@ -236,7 +236,7 @@ export class AssumptionRegister {
    * sekme, yeni satır, bunların kombinasyonu) reddedilir.
    */
   accept(id: string, confirmedBy?: string): Assumption {
-    const assumption = this.mustGet(id);
+    const assumption = this.#mustGet(id);
     if (assumption.impact === "HIGH" && !isNonBlankIdentity(confirmedBy)) {
       throw new FounderConfirmationRequiredError(id);
     }
@@ -247,13 +247,13 @@ export class AssumptionRegister {
   }
 
   reject(id: string): Assumption {
-    const assumption = this.mustGet(id);
+    const assumption = this.#mustGet(id);
     assumption.status = "REJECTED";
     return freezeRecord(assumption);
   }
 
   validate(id: string): Assumption {
-    const assumption = this.mustGet(id);
+    const assumption = this.#mustGet(id);
     assumption.status = "VALIDATED";
     assumption.confirmedAt = new Date().toISOString();
     return freezeRecord(assumption);
@@ -263,7 +263,28 @@ export class AssumptionRegister {
     return [...this.#assumptions.values()].filter((a) => a.status === status).map((a) => freezeRecord(a));
   }
 
-  private mustGet(id: string): MutableAssumption {
+  /**
+   * P1 fix (29th independent review round, finding 3, "assumption
+   * authoritative lookup must be runtime-private" — same root class as
+   * `policy-engine/approval.ts`'s `#mustGet()`, round 28 finding 1): this
+   * used to be declared with TypeScript's `private` keyword — compile-time
+   * only, so the compiled JS leaves it an ordinary, callable instance
+   * method reachable via `(register as any).mustGet(id)` or plain bracket
+   * access, with no type-system escape hatch needed at all. Since this
+   * method returns the ACTUAL mutable `MutableAssumption` object stored in
+   * `#assumptions` (never a frozen copy — `accept()`/`reject()`/`validate()`
+   * rely on that to make their own in-place status transitions), any caller
+   * able to reach it could flip a HIGH-impact assumption straight to
+   * `status: "ACCEPTED"` with no `confirmedBy` at all, completely bypassing
+   * `accept()`'s Founder-confirmation gate the SAME way `#assumptions`
+   * itself already had to be converted to a genuine private field for (bkz.
+   * bu sınıfın üstündeki 25th round fix notu) — a private Map is worthless
+   * if a private-in-name-only method still hands out direct mutable access
+   * to what it stores. Fixed the same way `approval.ts`'s `#mustGet()`
+   * already is: a genuine ECMAScript private method (`#`), enforced by the
+   * JS runtime itself.
+   */
+  #mustGet(id: string): MutableAssumption {
     const assumption = this.#assumptions.get(id);
     if (!assumption) throw new AssumptionNotFoundError(id);
     return assumption;
