@@ -277,4 +277,96 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       });
     }
   );
+
+  describe(
+    "P2 fix (31st independent review round, finding 5, 'return a concurrently refreshed cache entry'): " +
+      "get()'s locked re-check must reuse a value another process already refreshed while this process " +
+      "was waiting for the lock, not unconditionally report undefined",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: initial unlocked read sees an expired entry; ANOTHER " +
+          "process refreshes the same key to a fresh value while this process waits for the lock; the " +
+          "locked re-read correctly sees the fresh entry -> get() must return it, not force a recompute",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-concurrent-refresh-"));
+          const path = join(tempRoot, "cache.json");
+          const store = new FileStateStore();
+          const cache = new FileCache<string>(store, path);
+
+          vi.useFakeTimers();
+          vi.setSystemTime(1_000_000);
+          // A genuinely expired entry, durably persisted — this is what
+          // get()'s INITIAL (unlocked) read will see.
+          cache.set("k", "stale-value", 0);
+          vi.setSystemTime(1_000_001);
+
+          // Intercept the SECOND loadAll() call (the one made AFTER the
+          // lock is acquired, per get()'s own locked re-check) and, right
+          // before it actually reads, write a fresh, non-expired entry for
+          // the SAME key directly to the shared durable file — simulating
+          // another process's ALREADY-COMPLETED, already-lock-released
+          // refresh landing in the gap between this process's initial read
+          // and its own locked re-read.
+          let loadCount = 0;
+          const cacheInternals = cache as unknown as { loadAll(): Map<string, unknown> };
+          const originalLoadAll = cacheInternals.loadAll.bind(cache);
+          vi.spyOn(cacheInternals, "loadAll").mockImplementation(() => {
+            loadCount++;
+            if (loadCount === 2) {
+              store.write(path, [
+                ["k", { value: "fresh-value", computedAt: Date.now(), expiresAt: Date.now() + 100_000 }]
+              ]);
+            }
+            return originalLoadAll();
+          });
+
+          const result = cache.get("k");
+
+          expect(loadCount).toBe(2);
+          expect(result).toBe("fresh-value");
+          // The fresh entry must survive — it was never actually expired
+          // by the time the authoritative, locked re-check ran.
+          expect(cache.size()).toBe(1);
+        }
+      );
+
+      it("no regression: if the locked re-check finds the entry is STILL expired, it is deleted and get() still returns undefined", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-still-expired-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        cache.set("k", "v", 0);
+        vi.setSystemTime(1_000_001);
+
+        expect(cache.get("k")).toBeUndefined();
+        expect(cache.size()).toBe(0);
+      });
+
+      it("no regression: if the locked re-check finds the entry has meanwhile been removed entirely, get() returns undefined without throwing", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-removed-"));
+        const path = join(tempRoot, "cache.json");
+        const store = new FileStateStore();
+        const cache = new FileCache<string>(store, path);
+
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        cache.set("k", "v", 0);
+        vi.setSystemTime(1_000_001);
+
+        let loadCount = 0;
+        const cacheInternals = cache as unknown as { loadAll(): Map<string, unknown> };
+        const originalLoadAll = cacheInternals.loadAll.bind(cache);
+        vi.spyOn(cacheInternals, "loadAll").mockImplementation(() => {
+          loadCount++;
+          if (loadCount === 2) {
+            store.write(path, []);
+          }
+          return originalLoadAll();
+        });
+
+        expect(cache.get("k")).toBeUndefined();
+        expect(loadCount).toBe(2);
+      });
+    }
+  );
 });

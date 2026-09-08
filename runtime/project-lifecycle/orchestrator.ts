@@ -439,7 +439,38 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // İÇİNDE atanır — bu, hem ücretli model çağrısının HEM DE gerçek dosya
   // sistemi mutasyonunun, TEK bir yetkilendirme kararının ARDINDAN
   // gerçekleştiğini garanti eder (bkz. yukarıdaki fix notu).
+  //
+  // P1 fix (31st independent review round, finding 3, "keep all bootstrap
+  // writes inside the authorized execution"): the genome/organization/
+  // bootstrap-state `stateStore.write()` calls used to run AFTER this
+  // `gateway.authorize()` call returned — but `authorize()` (bkz.
+  // capability-gateway/gateway.ts'in round-27 finding 5 fix notu) already
+  // transitions a risk-5/APPROVAL_REQUIRED approval APPROVED -> EXECUTING
+  // -> EXECUTED the MOMENT its own `execute` callback (which used to
+  // contain ONLY the paid model invocation + `scaffoldProjectOs()`)
+  // resolves successfully. Since these three writes happened OUTSIDE that
+  // callback, a failure in ANY of them (a filesystem error, an
+  // `assertFilesystemConfinement()` rejection, a serialization failure)
+  // meant the approval record was ALREADY, PERMANENTLY marked EXECUTED —
+  // durably claiming a successful execution — even though
+  // `bootstrapProject()` itself still threw and the bootstrap never
+  // genuinely completed (no genome.json, or no organization.json, or no
+  // bootstrap.json, despite a real, billed model invocation and a real
+  // scaffold having already happened). A reviewer inspecting the approval
+  // record afterward would see EXECUTED with no way to tell the write
+  // actually failed. Fixed: every protected write this function performs
+  // now runs INSIDE the SAME `execute` callback, after `scaffoldProjectOs()`
+  // — so a failure in ANY of them is caught by `authorize()`'s own
+  // try/catch (bkz. gateway.ts), which calls `failExecution()` (an honest,
+  // terminal EXECUTION_FAILED record) and RE-THROWS the genuine error,
+  // never leaving the approval in a state that claims more success than
+  // genuinely occurred. `statePath`/`totalCostUsd` are captured via `let`s
+  // declared before the callback (mirroring `invocationResponse`'s
+  // existing pattern immediately below) since this function's return value
+  // still needs them afterward.
   let invocationResponse!: ModelInvocationResponse;
+  let statePath!: string;
+  let totalCostUsd!: number;
   const scaffold = await gateway.authorize(scaffoldAction, async () => {
     invocationResponse = await modelGateway.invoke(
       modelDecision.model,
@@ -456,51 +487,53 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
         description: `Bootstrap summary for project '${genome.project.id}'`
       }
     );
-    return scaffoldProjectOs(baseDir, genome.project.id);
+    const scaffoldResult = scaffoldProjectOs(baseDir, genome.project.id);
+
+    // P1 fix (5th independent review round, "final-destination / dangling
+    // symlink escape"): eskiden bu dosya yolları düz `join()` ile
+    // oluşturuluyordu — scaffoldProjectOs() klasörleri onaylasa bile, bu
+    // klasörlerin İÇİNDEKİ NİHAİ dosya adı (ör. "genome.json") daha önce
+    // (veya scaffold ile yazma arasında) saldırgan tarafından dışarıya
+    // işaret eden bir symlink (sarkan/dangling olsun olmasın) olarak
+    // yerleştirilmiş olabilirdi — `writeFileSync` böyle bir symlink'i takip
+    // eder ve dosyayı GERÇEKTEN symlink'in işaret ettiği (baseDir dışı)
+    // konumda oluşturur. Artık her nihai dosya yolu, gerçek yazmadan HEMEN
+    // önce assertFilesystemConfinement() ile ayrıca doğrulanır.
+    // `stateStore` artık YUKARIDA (costEngine'in kendi durable persistence
+    // ihtiyacı için, bkz. o satırın üstündeki fix notu) çözülmüştür — burada
+    // tekrar oluşturulmaz, aynı örnek kullanılmaya devam eder.
+    stateStore.write(
+      assertFilesystemConfinement(scaffoldResult.projectRoot, join("project-genome", "genome.json")),
+      genome
+    );
+    stateStore.write(
+      assertFilesystemConfinement(scaffoldResult.projectRoot, join("organization", "organization.json")),
+      organization
+    );
+
+    statePath = assertFilesystemConfinement(scaffoldResult.projectRoot, join("state", "bootstrap.json"));
+    totalCostUsd = costEngine.totalFor({ projectId: genome.project.id });
+    stateStore.write(statePath, {
+      bootstrappedAt: new Date().toISOString(),
+      projectId: genome.project.id,
+      organizationTeams: organization.teams,
+      // Bu noktaya ulaşıldıysa gateway.authorize() zaten ALLOW vermiştir —
+      // aksi halde yukarıda fırlatırdı (bkz. capability-gateway/gateway.ts).
+      policyDecision: "ALLOW",
+      selectedModel: {
+        modelId: modelDecision.model.modelId,
+        tier: modelDecision.model.tier,
+        // P1 fix (23rd independent review round): the ACTUAL cost the real,
+        // guarded invocation incurred (`invocationResponse.costUsd`) — never
+        // the model's merely nominal per-call price — since this field now
+        // documents a genuine invocation that really happened.
+        costUsd: invocationResponse.costUsd
+      },
+      totalCostUsd
+    });
+
+    return scaffoldResult;
   }, approvalReference);
-
-  // P1 fix (5th independent review round, "final-destination / dangling
-  // symlink escape"): eskiden bu dosya yolları düz `join()` ile
-  // oluşturuluyordu — scaffoldProjectOs() klasörleri onaylasa bile, bu
-  // klasörlerin İÇİNDEKİ NİHAİ dosya adı (ör. "genome.json") daha önce
-  // (veya scaffold ile yazma arasında) saldırgan tarafından dışarıya
-  // işaret eden bir symlink (sarkan/dangling olsun olmasın) olarak
-  // yerleştirilmiş olabilirdi — `writeFileSync` böyle bir symlink'i takip
-  // eder ve dosyayı GERÇEKTEN symlink'in işaret ettiği (baseDir dışı)
-  // konumda oluşturur. Artık her nihai dosya yolu, gerçek yazmadan HEMEN
-  // önce assertFilesystemConfinement() ile ayrıca doğrulanır.
-  // `stateStore` artık YUKARIDA (costEngine'in kendi durable persistence
-  // ihtiyacı için, bkz. o satırın üstündeki fix notu) çözülmüştür — burada
-  // tekrar oluşturulmaz, aynı örnek kullanılmaya devam eder.
-  stateStore.write(
-    assertFilesystemConfinement(scaffold.projectRoot, join("project-genome", "genome.json")),
-    genome
-  );
-  stateStore.write(
-    assertFilesystemConfinement(scaffold.projectRoot, join("organization", "organization.json")),
-    organization
-  );
-
-  const statePath = assertFilesystemConfinement(scaffold.projectRoot, join("state", "bootstrap.json"));
-  const totalCostUsd = costEngine.totalFor({ projectId: genome.project.id });
-  stateStore.write(statePath, {
-    bootstrappedAt: new Date().toISOString(),
-    projectId: genome.project.id,
-    organizationTeams: organization.teams,
-    // Bu noktaya ulaşıldıysa gateway.authorize() zaten ALLOW vermiştir —
-    // aksi halde yukarıda fırlatırdı (bkz. capability-gateway/gateway.ts).
-    policyDecision: "ALLOW",
-    selectedModel: {
-      modelId: modelDecision.model.modelId,
-      tier: modelDecision.model.tier,
-      // P1 fix (23rd independent review round): the ACTUAL cost the real,
-      // guarded invocation incurred (`invocationResponse.costUsd`) — never
-      // the model's merely nominal per-call price — since this field now
-      // documents a genuine invocation that really happened.
-      costUsd: invocationResponse.costUsd
-    },
-    totalCostUsd
-  });
 
   return { genome, organization, scaffold, modelDecision, statePath, totalCostUsd };
 }

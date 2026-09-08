@@ -147,6 +147,28 @@ export interface ModelInvocationContext {
   readonly risk: RiskLevel;
   readonly taskId: string;
   readonly projectId?: string;
+  /**
+   * P1 fix (31st independent review round, finding 2, "preserve run and
+   * agent ownership through model invocations"): `ModelInvocationContext`
+   * used to carry `taskId`/`projectId` but no `runId`/`agentId` at all —
+   * even though `runtime/cost/cost-engine.ts`'s `CostScope`/
+   * `ReservationOwnership` (round 14's `agentId`, round 29's `runId`) have
+   * long supported both, and `runtime/budget/budget.ts`'s `perRunUsd`
+   * ceiling (round 29) is specifically scoped BY `runId`. Since neither
+   * field could ever reach `invoke()` below, `budget.reserve()`/`.commit()`
+   * never received them for a REAL model invocation — the ONLY path that
+   * actually spends money — so `perRunUsd` silently degraded to its
+   * "no runId supplied" global-scope fallback for every single model call
+   * this Factory ever makes, and no committed `CostEntry` for a real
+   * invocation ever carried an `agentId`, making per-agent cost
+   * attribution (`costEngine.totalFor({ agentId })`) permanently empty in
+   * practice despite the ledger itself supporting it. Both are optional,
+   * additive fields (matching every prior ownership-dimension addition in
+   * this codebase) — a caller that never supplies them sees the exact
+   * prior behavior, unchanged.
+   */
+  readonly runId?: string;
+  readonly agentId?: string;
   readonly description?: string;
   readonly approvalId?: string;
 }
@@ -497,6 +519,13 @@ export class ModelGateway {
     const executionScope = freezeRecord({
       taskId: context.taskId,
       projectId: context.projectId,
+      // P1 fix (31st independent review round, finding 2, "preserve run
+      // and agent ownership through model invocations"): captured into
+      // the SAME frozen snapshot, at the SAME synchronous-prefix point,
+      // as every other authoritative ownership field — bkz.
+      // `ModelInvocationContext.runId`/`.agentId`'in üstündeki fix notu.
+      runId: context.runId,
+      agentId: context.agentId,
       risk: context.risk,
       description:
         context.description ??
@@ -561,10 +590,18 @@ export class ModelGateway {
         // these against what is ACTUALLY committed, so even if this call
         // site's own commit() call below were ever changed incorrectly,
         // the reservation layer itself still fails closed.
+        // P1 fix (31st independent review round, finding 2): `runId`/
+        // `agentId` now flow into the reservation's own authoritative
+        // scope, the SAME way `taskId`/`projectId`/`provider`/`modelId`
+        // already do — without this, `perRunUsd` could never actually be
+        // enforced for a real model invocation, and no committed entry
+        // could ever be attributed to an agent.
         const reservation = budget.reserve(
           {
             taskId: executionScope.taskId,
             projectId: executionScope.projectId,
+            runId: executionScope.runId,
+            agentId: executionScope.agentId,
             provider: authorizedModel.provider,
             modelId: authorizedModel.modelId
           },
@@ -597,9 +634,21 @@ export class ModelGateway {
         // no longer redefine WHOSE ledger a cost lands on, even though its
         // reported `costUsd` (a legitimate actual-amount value, not an
         // identity field) is still used for the dollar amount recorded.
+        // P1 fix (31st independent review round, finding 2): `runId`/
+        // `agentId` are read from `executionScope` (the pre-authorized
+        // snapshot), never from `context` again — the SAME "authorize one
+        // identity, account that SAME identity" invariant this method's
+        // own fix notes above already establish for `taskId`/`projectId`/
+        // `provider`/`modelId`, extended to the two new ownership
+        // dimensions. `budget.commit()`'s own ownership-mismatch check
+        // (cost-engine.ts's `ownershipMismatches()`) independently
+        // re-verifies `runId`/`agentId` against what was actually reserved
+        // — defense in depth, not reliance on this call site alone.
         budget.commit(reservation.id, {
           taskId: executionScope.taskId,
           projectId: executionScope.projectId,
+          runId: executionScope.runId,
+          agentId: executionScope.agentId,
           provider: authorizedModel.provider,
           modelId: authorizedModel.modelId,
           amountUsd: response.costUsd

@@ -26,6 +26,94 @@ function hashOf(record: Omit<AuditRecord, "hash">): string {
 }
 
 /**
+ * P1 fix (31st independent review round, finding 7, "reject or canonically
+ * serialize non-JSON audit payloads"): `append()` used to accept ANY
+ * `event.payload` value `structuredClone()` could clone — which includes
+ * `Map`/`Set`/`Date`/`RegExp` instances, none of which `JSON.stringify()`
+ * (used by `hashOf()` above, since `#records` is ultimately an in-memory
+ * structure with no separate canonical-serialization step) represents
+ * faithfully: `JSON.stringify(new Map([["k", "v"]]))` produces `"{}"` — an
+ * empty object — silently discarding every entry. The record actually
+ * STORED (via `structuredClone`, which DOES preserve a real `Map`
+ * instance) and the record the HASH actually authenticates (computed over
+ * `JSON.stringify()`'s `"{}"` view of that same field) would then disagree
+ * about what the payload even contains — two audit events differing only
+ * in what a `Map`/`Set` field holds could hash IDENTICALLY, defeating
+ * baseline section 242's tamper-evidence guarantee for exactly the data a
+ * reviewer would need to trust. Fixed with the simpler of the two
+ * documented options (a fail-closed JSON-only contract, rather than a
+ * bespoke canonical serializer covering every structured-clone-able type):
+ * `assertJsonCompatibleValue()` below walks the ENTIRE event (after
+ * `structuredClone()`, so a getter/Proxy-backed caller value cannot answer
+ * differently across the check and the eventual hash/store) and rejects
+ * anything that is not a plain, JSON-representable value — a plain object
+ * (or array/string/number/boolean/null), recursively — BEFORE `hashOf()`
+ * or `this.#records.push()` ever run, so a `Map`/`Set`/`Date`/function/
+ * symbol/BigInt payload is refused outright rather than silently
+ * mis-hashed or partially recorded. Numbers are accepted regardless of
+ * finiteness (bkz. `assertJsonCompatibleValue()`'ın kendi notu) — NaN/
+ * Infinity are a DIFFERENT, already-accepted lossy case (both collapse to
+ * `null` under `JSON.stringify()`, never to a fabricated-looking value),
+ * and several call sites deliberately log a rejected invalid amount as
+ * forensic evidence.
+ */
+export class UnsupportedAuditPayloadError extends Error {
+  constructor(path: string, reason: string) {
+    super(
+      `Refusing to append audit record: '${path}' is ${reason}, which is not a plain, JSON-representable ` +
+        `value. JSON.stringify() (used to compute this record's tamper-evident hash) silently mis-serializes ` +
+        `types like Map/Set (e.g. as "{}", discarding every entry) — accepting one here would let this ` +
+        `record's hash authenticate a DIFFERENT payload than what was actually stored, defeating baseline ` +
+        `section 242's tamper-evidence guarantee. Convert it to a plain object/array/string/number/boolean/ ` +
+        `null before calling append().`
+    );
+    this.name = "UnsupportedAuditPayloadError";
+  }
+}
+
+function assertJsonCompatibleValue(value: unknown, path: string): void {
+  if (value === null || value === undefined) return;
+  const type = typeof value;
+  // A `number` is accepted regardless of finiteness — NaN/Infinity are
+  // real, meaningful values several call sites (bkz. runtime/budget/
+  // budget.ts's BUDGET_INVALID_AMOUNT_REJECTED/BUDGET_RESERVATION_COMMIT_FAILED
+  // events) DELIBERATELY log as forensic evidence of exactly what invalid
+  // amount was rejected — `JSON.stringify(NaN)`/`JSON.stringify(Infinity)`
+  // both collapse to the single, unambiguous sentinel `null`, which is a
+  // well-understood, already-accepted lossy representation elsewhere in
+  // this codebase, not the "silently authenticates a DIFFERENT, fabricated-
+  // looking payload" defect class this fix targets (bkz. üstteki fix
+  // notu) — that defect is specific to non-plain-object types whose
+  // `JSON.stringify()` output looks like ordinary, unremarkable data
+  // (`{}`) while actually discarding real content.
+  if (type === "string" || type === "boolean" || type === "number") return;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertJsonCompatibleValue(item, `${path}[${index}]`));
+    return;
+  }
+  if (type === "object") {
+    // Only a genuine plain object (Object.prototype, or a null-prototype
+    // dictionary) is accepted — a Map/Set/Date/RegExp/class instance all
+    // have a DIFFERENT prototype, which is exactly how this check tells
+    // "ordinary JSON-shaped data" apart from a type JSON.stringify() would
+    // silently misrepresent.
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new UnsupportedAuditPayloadError(
+        path,
+        `an instance of '${Object.prototype.toString.call(value)}' rather than a plain object`
+      );
+    }
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      assertJsonCompatibleValue(nested, `${path}.${key}`);
+    }
+    return;
+  }
+  // function / symbol / bigint.
+  throw new UnsupportedAuditPayloadError(path, `of unsupported type '${type}'`);
+}
+
+/**
  * Append-only, hash-chained audit log. In-memory for the P0 kernel;
  * a durable backend (baseline section 275, State Store) is future work.
  * Genesis previousHash is a fixed constant so tampering with record #0
@@ -85,6 +173,12 @@ export class AuditLog {
    */
   append(event: AuditEvent): AuditRecord {
     const detachedEvent = structuredClone(event);
+    // P1 fix (31st independent review round, finding 7, "reject or
+    // canonically serialize non-JSON audit payloads"): bkz.
+    // `assertJsonCompatibleValue()`'ın üstündeki fix notu — runs on the
+    // ALREADY-detached clone (never the caller's original `event`), before
+    // any hash is computed or anything is pushed onto `#records`.
+    assertJsonCompatibleValue(detachedEvent, "event");
     const previousHash = this.#records.length > 0
       ? this.#records[this.#records.length - 1]!.hash
       : AuditLog.GENESIS_HASH;

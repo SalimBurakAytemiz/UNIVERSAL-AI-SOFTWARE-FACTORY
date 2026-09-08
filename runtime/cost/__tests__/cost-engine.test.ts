@@ -751,7 +751,17 @@ describe("CostEngine", () => {
         ["an entry has a Date.parse-able but non-canonical timezone-offset timestamp", { entries: [{ taskId: "t", provider: "p", modelId: "m", amountUsd: 1, timestamp: "2024-01-15T10:00:00+05:00" }], reservations: [] }],
         ["a reservation has an invalid status", { entries: [], reservations: [{ id: "res-1-abc", scope: {}, amountUsd: 1, status: "MADE_UP_STATUS" }] }],
         ["a reservation has an invalid amountUsd", { entries: [], reservations: [{ id: "res-1-abc", scope: {}, amountUsd: Infinity, status: "ACTIVE" }] }],
-        ["a reservation's scope is not an object", { entries: [], reservations: [{ id: "res-1-abc", scope: "not-an-object", amountUsd: 1, status: "ACTIVE" }] }]
+        ["a reservation's scope is not an object", { entries: [], reservations: [{ id: "res-1-abc", scope: "not-an-object", amountUsd: 1, status: "ACTIVE" }] }],
+        [
+          "two reservations share the same id (round 31, finding 4)",
+          {
+            entries: [],
+            reservations: [
+              { id: "res-1-dup", scope: { taskId: "a" }, amountUsd: 1, status: "ACTIVE" },
+              { id: "res-1-dup", scope: { taskId: "b" }, amountUsd: 2, status: "ACTIVE" }
+            ]
+          }
+        ]
       ])("rejects malformed persisted state: %s", (_label, malformed) => {
         const fakeStore: StateStore = {
           write: () => {},
@@ -762,6 +772,30 @@ describe("CostEngine", () => {
           CorruptCostStateError
         );
       });
+
+      it(
+        "BLOCKER regression, exact reproduction (31st independent review round, finding 4, 'reject duplicate " +
+          "reservation IDs during ledger restore'): a persisted ledger with two reservations sharing the same " +
+          "id fails restoration entirely — neither reservation is silently discarded via Map overwrite",
+        () => {
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              ({
+                entries: [],
+                reservations: [
+                  { id: "res-1-dup", scope: { taskId: "task-a" }, amountUsd: 0.5, status: "ACTIVE" },
+                  { id: "res-1-dup", scope: { taskId: "task-b" }, amountUsd: 0.7, status: "ACTIVE" }
+                ]
+              }) as never,
+            exists: () => true
+          };
+
+          expect(() => new CostEngine(() => new Date(), { store: fakeStore, path: "irrelevant.json" })).toThrow(
+            CorruptCostStateError
+          );
+        }
+      );
 
       it("a fresh, never-before-used persistence path (no file yet) starts with genuinely empty state, not an error", () => {
         tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-fresh-"));

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { AuditLog } from "../audit-log.js";
+import { AuditLog, UnsupportedAuditPayloadError } from "../audit-log.js";
+import { createHash } from "node:crypto";
 
 describe("AuditLog", () => {
   it("appends records with an incrementing sequence and hash chain", () => {
@@ -250,4 +251,87 @@ describe("AuditLog", () => {
       expect(log.verifyIntegrity()).toBe(true);
     });
   });
+
+  describe(
+    "P1 fix (31st independent review round, finding 7, 'reject or canonically serialize non-JSON audit " +
+      "payloads'): a payload value JSON.stringify() would silently mis-serialize must be rejected BEFORE " +
+      "the record's hash is computed or it is appended",
+    () => {
+      it("BLOCKER regression, exact reproduction: a Map payload value is rejected before append, never silently mis-hashed as '{}'", () => {
+        const log = new AuditLog();
+        const payload = { m: new Map([["k", "v"]]) } as unknown as Record<string, unknown>;
+
+        expect(() => log.append({ type: "BAD", actor: "x", payload, timestamp: new Date().toISOString() })).toThrow(
+          UnsupportedAuditPayloadError
+        );
+        expect(log.all()).toHaveLength(0); // nothing was partially recorded
+      });
+
+      it("a Set payload value is likewise rejected before append", () => {
+        const log = new AuditLog();
+        const payload = { s: new Set([1, 2, 3]) } as unknown as Record<string, unknown>;
+
+        expect(() => log.append({ type: "BAD", actor: "x", payload, timestamp: new Date().toISOString() })).toThrow(
+          UnsupportedAuditPayloadError
+        );
+        expect(log.all()).toHaveLength(0);
+      });
+
+      it("a Date payload value is rejected too (JSON.stringify() would silently convert it to a string, not preserve the instance the caller passed)", () => {
+        const log = new AuditLog();
+        const payload = { d: new Date("2026-01-01T00:00:00.000Z") } as unknown as Record<string, unknown>;
+
+        expect(() => log.append({ type: "BAD", actor: "x", payload, timestamp: new Date().toISOString() })).toThrow(
+          UnsupportedAuditPayloadError
+        );
+      });
+
+      it("a Map/Set nested arbitrarily deep inside an otherwise-plain payload is still caught", () => {
+        const log = new AuditLog();
+        const payload = { outer: { list: [{ inner: new Map() }] } } as unknown as Record<string, unknown>;
+
+        expect(() => log.append({ type: "BAD", actor: "x", payload, timestamp: new Date().toISOString() })).toThrow(
+          UnsupportedAuditPayloadError
+        );
+      });
+
+      it("no regression: NaN/Infinity amounts are still accepted (deliberately logged as forensic evidence of a rejected invalid amount elsewhere in this codebase)", () => {
+        const log = new AuditLog();
+        const record = log.append({
+          type: "BUDGET_INVALID_AMOUNT_REJECTED",
+          actor: "budget-guard",
+          payload: { projectedAmountUsd: NaN, other: Infinity },
+          timestamp: new Date().toISOString()
+        });
+        expect(log.all()).toHaveLength(1);
+        expect(record.hash).toBeTruthy();
+      });
+
+      it("no regression: an ordinary plain-object/array/string/number/boolean/null payload still hashes deterministically and matches a hand-computed SHA-256 of its own canonical JSON", () => {
+        const log = new AuditLog();
+        const timestamp = "2026-01-01T00:00:00.000Z";
+        const record = log.append({
+          type: "ORDINARY",
+          actor: "x",
+          payload: { a: 1, b: "two", c: [true, false, null], d: { nested: "value" } },
+          timestamp
+        });
+
+        const expectedHash = createHash("sha256")
+          .update(
+            JSON.stringify({
+              type: "ORDINARY",
+              actor: "x",
+              payload: { a: 1, b: "two", c: [true, false, null], d: { nested: "value" } },
+              timestamp,
+              sequence: 0,
+              previousHash: "0".repeat(64)
+            })
+          )
+          .digest("hex");
+        expect(record.hash).toBe(expectedHash);
+        expect(log.verifyIntegrity()).toBe(true);
+      });
+    }
+  );
 });

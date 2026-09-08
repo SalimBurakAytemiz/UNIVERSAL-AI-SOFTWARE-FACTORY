@@ -415,6 +415,20 @@ function assertValidPersistedCostState(data: unknown): asserts data is Persisted
       throw new CorruptCostStateError(`entries[${index}].amountUsd is invalid (${String(err)})`);
     }
   });
+  // P1 fix (31st independent review round, finding 4, "reject duplicate
+  // reservation IDs during ledger restore"): `#loadFromStore()` (bkz.
+  // aşağısı) inserts each validated reservation into `#reservations` via
+  // `Map.set(r.id, ...)` — a persisted/corrupt ledger file containing TWO
+  // reservation records that happen to share the same `id` (a hand edit,
+  // a merge conflict, or a corrupted write) would have the Map silently
+  // OVERWRITE the first with the second, with no error and no trace —
+  // the first reservation's protected capacity (and, if it had already
+  // gone RECONCILIATION_FAILED, its unresolved-cost protection) simply
+  // vanishes from authoritative state. Fixed the same way this function
+  // already refuses every other invalid persisted record: reject the
+  // WHOLE restore, before a single reservation ever reaches
+  // `#reservations`, the moment any two records share an id.
+  const seenReservationIds = new Set<string>();
   data.reservations.forEach((reservation: unknown, index: number) => {
     if (!isPlainObject(reservation)) {
       throw new CorruptCostStateError(`reservations[${index}] is not a plain object`);
@@ -422,6 +436,13 @@ function assertValidPersistedCostState(data: unknown): asserts data is Persisted
     if (typeof reservation.id !== "string" || reservation.id.length === 0) {
       throw new CorruptCostStateError(`reservations[${index}].id is not a non-empty string`);
     }
+    if (seenReservationIds.has(reservation.id)) {
+      throw new CorruptCostStateError(
+        `reservations[${index}].id '${reservation.id}' duplicates an earlier reservation's id — restoring both ` +
+          `would let Map insertion silently discard one of them`
+      );
+    }
+    seenReservationIds.add(reservation.id);
     assertValidPersistedScope(reservation.scope, `reservations[${index}]`);
     try {
       assertValidMonetaryAmount(reservation.amountUsd as number, `restored reservations[${index}]`);
@@ -670,6 +691,51 @@ export class CostEngine {
       this.#lockDepth--;
       release();
     }
+  }
+
+  /**
+   * P1 fix (31st independent review round, finding 1, "recheck ceilings
+   * inside the persistent-ledger lock"): `#withDurableMutation()` above
+   * already makes a MUTATION (record/createReservation/commitReservation/
+   * releaseReservation) safe against a sibling `CostEngine` instance's
+   * concurrent write — but `BudgetGuard.reserve()`/`spend()` (bkz.
+   * runtime/budget/budget.ts) each perform a SEPARATE step BEFORE ever
+   * calling into one of those mutating methods: reading this engine's
+   * CURRENT totals (`totalFor()`/`reservedTotal()`/`totalInWindow()`) to
+   * decide whether a ceiling would be exceeded. That read happened
+   * OUTSIDE any lock, against whatever this instance's in-memory
+   * `#entries`/`#reservations` happened to hold at that moment — which,
+   * for two `BudgetGuard`/`CostEngine` instances sharing one persisted
+   * ledger, can be arbitrarily stale relative to a sibling instance's own
+   * already-durably-committed writes. Codex reproduced: two guards, each
+   * over its OWN `CostEngine` instance pointed at the SAME persistence
+   * path, each check "$0 committed + $0 reserved + my $0.60" against a
+   * $1.00 ceiling, both pass (each reading its own stale, empty-looking
+   * ledger), and only THEN does each call `createReservation()` — which
+   * IS lock-protected and DOES reload the latest state first, but by then
+   * the ceiling decision has already been made against stale data; the
+   * reload happens too late to change a decision that was never rechecked
+   * against it. Fixed: this method exposes the SAME lock-acquire +
+   * reload-latest-state critical section `#withDurableMutation()` already
+   * uses, but PUBLICLY, so a caller (`BudgetGuard`) can run its OWN
+   * ceiling-check logic — which itself calls back into this engine's
+   * `totalFor()`/`reservedTotal()`/`totalInWindow()` read methods — as
+   * part of the SAME serialized transaction that then performs the
+   * reservation/spend mutation, rather than as a separate, unprotected
+   * step beforehand. Because `#lockDepth` is already reentrant (bkz.
+   * `#withDurableMutation()`'ın üstündeki not), a mutating call
+   * (`createReservation()`/`record()`) made from INSIDE `mutator` here
+   * sees `#lockDepth > 0` and runs directly against the state THIS call
+   * already reloaded, never re-acquiring or re-reloading — so the ceiling
+   * check and the mutation it gates are guaranteed to observe the exact
+   * same authoritative snapshot, with no gap in which a sibling instance
+   * could interleave. When no persistence is configured, this degrades to
+   * a plain synchronous call (identical to `#withDurableMutation()`'s own
+   * no-persistence branch) — a single in-memory ledger has no sibling to
+   * race against, so there is nothing to serialize.
+   */
+  withLedgerLock<R>(mutator: () => R): R {
+    return this.#withDurableMutation(mutator);
   }
 
   /**

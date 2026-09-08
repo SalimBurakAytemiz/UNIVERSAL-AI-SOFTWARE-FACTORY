@@ -4848,3 +4848,65 @@
     (31st) independent Codex review to return INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this
     round does NOT merge, does NOT move to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did
     NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
+    Round 31 (fresh, independent Codex closure review, consolidated batch of SEVEN priority-P1/P2 findings, plus
+    a narrow, explicitly-scoped root-class audit for the same seven classes): (1) `budget.ts`'s `reserve()`/
+    `spend()` used to perform their ceiling check OUTSIDE `cost-engine.ts`'s lock-protected critical section,
+    then mutate INSIDE it — two `BudgetGuard`/`CostEngine` instances sharing one persisted ledger could each
+    pass a ceiling check against their own stale, pre-lock totals and both proceed. Fixed: `CostEngine` gained a
+    public `withLedgerLock()` (the same lock-acquire + reload-latest-state critical section
+    `#withDurableMutation()` already used internally, now exposed) so `BudgetGuard`'s ceiling check and the
+    mutation it gates run as ONE serialized transaction — the check observes the exact same freshly-reloaded
+    state the mutation is about to be applied to. (2) `models/gateway.ts`'s `ModelInvocationContext` and
+    `models/router.ts`'s `RoutingRequest` carried `taskId`/`projectId` but no `runId`/`agentId` — meaning
+    `perRunUsd` (round 29) was structurally unreachable through the ONLY path that actually spends money
+    (`ModelGateway.invoke()`), and no committed `CostEntry` for a real invocation could ever carry an `agentId`.
+    Fixed: both fields added, snapshotted into `executionScope`/`routingScope` alongside every other ownership
+    field, and threaded into `budget.reserve()`/`.commit()`. (3) `project-lifecycle/orchestrator.ts`'s
+    genome.json/organization.json/bootstrap.json writes ran AFTER `gateway.authorize()` returned — but
+    `authorize()` already transitions a risk-5 approval APPROVED -> EXECUTING -> EXECUTED the moment its OWN
+    `execute` callback resolves; a failure in any of those three writes left the approval permanently claiming
+    EXECUTED despite the bootstrap never completing. Fixed: all three writes now run INSIDE the same `execute`
+    callback, after `scaffoldProjectOs()`, so a failure is caught by `authorize()`'s own `failExecution()` path
+    (an honest EXECUTION_FAILED record) instead of being silently missed. (4) `cost-engine.ts`'s
+    `#loadFromStore()` inserted persisted reservations into `#reservations` via `Map.set(r.id, ...)` with no
+    duplicate-id check — two reservation records sharing an id would have the second silently overwrite the
+    first. Fixed: `assertValidPersistedCostState()` now rejects the whole restore if any two reservations share
+    an id. (5) `cache/file-cache.ts`'s `get()` — after its locked re-check found a key no longer expired (another
+    process had already refreshed it while this process waited for the lock) — still unconditionally returned
+    `undefined`, forcing an unnecessary recompute of a value another process just computed. Fixed: the locked
+    re-check now returns the fresh value it actually found. (6) `assumptions/assumption-register.ts` declared
+    `AssumptionStatus` including `"SUPERSEDED"` from the start, but no method could ever legitimately produce it.
+    Fixed: an explicit `supersede(id, supersededBy)` mirroring `decision-ledger.ts`'s own `supersede()` — existence
+    of the replacement, self-supersession, cycles, and a dead-end (already-SUPERSEDED) replacement are all
+    rejected; `accept()`/`reject()`/`validate()` now refuse to operate on an already-SUPERSEDED assumption
+    (terminal state); persisted-restore validation extended with the same per-record and whole-graph checks
+    `decision-ledger.ts` already has. (7) `audit/audit-log.ts`'s `append()` accepted any `structuredClone()`-able
+    payload (including `Map`/`Set`/`Date`), but its hash is computed via `JSON.stringify()`, which silently
+    mis-serializes a `Map`/`Set` as `"{}"` — two audit events differing only in what such a field held could hash
+    identically, defeating tamper-evidence for exactly the data a reviewer would need to trust. Fixed with the
+    simpler of the two documented options: a fail-closed JSON-only contract (`assertJsonCompatibleValue()`)
+    rejecting any non-plain-object value before the hash is computed or the record is stored; non-finite numbers
+    (NaN/Infinity) remain accepted, since several call sites deliberately log a rejected invalid amount as
+    forensic evidence and `JSON.stringify()` already represents both as the unambiguous sentinel `null`, not a
+    fabricated-looking value. All seven fixes carry deterministic regression tests (including exact BLOCKER
+    reproductions using the literal scenarios from the review) and were verified via a genuine temporary in-place
+    bypass reproducing the exact predicted failure, then fully reverted and reconfirmed clean. The root-class
+    audit (limited to these seven exact classes, not broadened into unrelated architecture) found NO further
+    genuine instances beyond the seven reported: every other check-then-lock budget path, every other cost/
+    ownership propagation surface, every other `CapabilityGateway.authorize()` call site, every other persisted-
+    restore function, every other locked-cache pattern, every other status/lifecycle enum, and every other
+    tamper-evidence hashing site was individually examined and found already correct or genuinely inapplicable
+    (details in each fix's own commentary above and in the touched files' fix-note comments). Full
+    required sequence re-run and green: lint, typecheck, build, 1145/1145 tests (44 files, +45 net new — one
+    pre-existing, timing-sensitive `secret-scan.test.mjs` git-history-scan test occasionally exceeds its 5-second
+    hardcoded timeout under load and was confirmed to genuinely pass given more time, not a functional
+    regression), validate:requirements (42 schema-valid records), history-and-current-tree-aware secret-scan
+    (PASS), Factory Doctor (READY), `npm run verify:production-install` (PASS), all 9 P0 proofs (13 assertions).
+    No status raised on any requirement beyond what real evidence supports — every touched requirement was
+    already UNIT_TESTED or PROOF_VERIFIED, and this round's fixes are hardening/completion of a declared-but-
+    unimplemented transition (finding 6), not first implementations of new requirements. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next (32nd) independent Codex review to return
+    INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this round does NOT merge, does NOT move to P1,
+    does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch — all work stayed
+    on claude/ai-factory-baseline-v1-seawq7.

@@ -21,6 +21,17 @@ interface MutableAssumption {
   createdAt: string;
   confirmedAt?: string;
   confirmedBy?: string;
+  /**
+   * P2 fix (31st independent review round, finding 6, "implement the
+   * SUPERSEDED assumption transition"): set ONLY by `supersede()` (bkz.
+   * aşağısı) to the id of the assumption that replaces this one — the
+   * authoritative replacement relationship a SUPERSEDED record must
+   * durably carry, mirroring `decision-ledger.ts`'s own `supersededBy`
+   * field for the exact same reason (baseline section 255, Decision/
+   * Assumption Explainability: "why did this change?" must always be
+   * answerable, not just "that this changed").
+   */
+  supersededBy?: string;
 }
 
 /** Dışa döndürülen her varsayım bunun donmuş, ayrık bir kopyasıdır. */
@@ -40,6 +51,44 @@ export class FounderConfirmationRequiredError extends Error {
         `Founder confirmation (confirmedBy). See baseline section 47.`
     );
     this.name = "FounderConfirmationRequiredError";
+  }
+}
+
+/**
+ * P2 fix (31st independent review round, finding 6, "implement the
+ * SUPERSEDED assumption transition"): thrown by `supersede()` itself (a
+ * second attempt to supersede an already-SUPERSEDED assumption) and by
+ * `accept()`/`reject()`/`validate()` (bkz. aşağıdaki fix notu) — once an
+ * assumption has been superseded it is TERMINAL, exactly like
+ * `decision-ledger.ts`'s own `DecisionAlreadySupersededError` makes ACTIVE
+ * decisions terminal-once-superseded: evolve the CURRENT active
+ * replacement instead of re-deciding the fate of a retired assumption.
+ */
+export class AssumptionAlreadySupersededError extends Error {
+  constructor(id: string, supersededBy: string | undefined) {
+    super(
+      `Assumption '${id}' has already been SUPERSEDED` +
+        (supersededBy ? ` (by '${supersededBy}')` : "") +
+        `. A superseded assumption is terminal — it can no longer be accepted, rejected, validated, or ` +
+        `superseded again. Operate on its current active replacement instead.`
+    );
+    this.name = "AssumptionAlreadySupersededError";
+  }
+}
+
+/**
+ * P2 fix (31st independent review round, finding 6): thrown by
+ * `supersede()` for every invariant OTHER than "already superseded"
+ * (above) and "replacement does not exist" (which reuses the existing
+ * `AssumptionNotFoundError` — bkz. `supersede()`'in üstündeki fix notu) —
+ * self-supersession, superseding-with-a-dead-end (a replacement that is
+ * itself already SUPERSEDED), and cycles, none of which the live
+ * propose()/accept()/reject()/validate() API could ever otherwise produce.
+ */
+export class InvalidAssumptionSupersessionError extends Error {
+  constructor(id: string, supersededBy: string, reason: string) {
+    super(`Cannot supersede assumption '${id}' with '${supersededBy}': ${reason}.`);
+    this.name = "InvalidAssumptionSupersessionError";
   }
 }
 
@@ -125,6 +174,9 @@ function describeInvalidPersistedAssumption(value: unknown): string | undefined 
   if (candidate.confirmedBy !== undefined && typeof candidate.confirmedBy !== "string") {
     return "invalid 'confirmedBy' (must be a string when present)";
   }
+  if (candidate.supersededBy !== undefined && !isNonEmptyString(candidate.supersededBy)) {
+    return "invalid 'supersededBy' (must be a non-empty string when present)";
+  }
   // Domain invariant, identical to accept()'s own gate: a HIGH-impact
   // ACCEPTED record must carry a genuine (non-blank) Founder confirmation
   // identity — a persisted record can never claim a state the live API
@@ -136,6 +188,102 @@ function describeInvalidPersistedAssumption(value: unknown): string | undefined 
   ) {
     return "HIGH-impact ACCEPTED record is missing a valid Founder confirmation identity (confirmedBy)";
   }
+  // P2 fix (31st independent review round, finding 6, "implement the
+  // SUPERSEDED assumption transition"): mirrors decision-ledger.ts's
+  // reciprocal SUPERSEDED/supersededBy check — supersede() (bkz. aşağısı)
+  // never produces one of these fields without the other, so a persisted
+  // record claiming either combination alone could never have come from
+  // the live API.
+  if (candidate.status === "SUPERSEDED" && !isNonEmptyString(candidate.supersededBy)) {
+    return "SUPERSEDED record is missing 'supersededBy' — supersede() never produces one without the other";
+  }
+  if (candidate.status !== "SUPERSEDED" && candidate.supersededBy !== undefined) {
+    return "a non-SUPERSEDED record must not carry 'supersededBy' — supersede() only ever sets it together with status: SUPERSEDED";
+  }
+  return undefined;
+}
+
+/**
+ * P2 fix (31st independent review round, finding 6, "implement the
+ * SUPERSEDED assumption transition"): `describeInvalidPersistedAssumption()`
+ * above validates each record IN ISOLATION — it cannot see whether a
+ * `supersededBy` target actually exists among the OTHER persisted records,
+ * whether it forms a cycle, or whether the same successor is claimed by
+ * more than one predecessor. Mirrors `decision-ledger.ts`'s own
+ * `describeInvalidPersistedDecisionGraph()` (round 24/28) for the
+ * identical reason: a hand-edited/corrupted persisted file has no live
+ * API guard against these, so this is the ONLY place they can be caught
+ * before reaching authoritative state. Run AFTER every individual record
+ * passes `describeInvalidPersistedAssumption()` and BEFORE any record
+ * enters the register — fail-closed on the WHOLE batch, same philosophy
+ * as every other check in this file.
+ */
+function describeInvalidPersistedAssumptionGraph(
+  records: readonly MutableAssumption[]
+): { index: number; reason: string } | undefined {
+  const byId = new Map<string, MutableAssumption>();
+  records.forEach((r) => byId.set(r.id, r));
+
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    if (record.supersededBy === undefined) continue;
+    if (record.supersededBy === record.id) {
+      return { index: i, reason: `supersededBy cannot reference itself ('${record.id}')` };
+    }
+    if (!byId.has(record.supersededBy)) {
+      return { index: i, reason: `supersededBy '${record.supersededBy}' does not reference any persisted assumption` };
+    }
+  }
+
+  const incomingCount = new Map<string, number>();
+  for (const record of records) {
+    if (record.supersededBy === undefined) continue;
+    incomingCount.set(record.supersededBy, (incomingCount.get(record.supersededBy) ?? 0) + 1);
+  }
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    if (record.supersededBy === undefined) continue;
+    if ((incomingCount.get(record.supersededBy) ?? 0) > 1) {
+      return {
+        index: i,
+        reason:
+          `supersededBy '${record.supersededBy}' is claimed as the replacement by more than one predecessor — ` +
+          `merged supersession chains are not a valid lifecycle (supersede() never assigns the same successor twice)`
+      };
+    }
+  }
+
+  // Cycle detection over the supersededBy edges, identical three-color DFS
+  // to decision-ledger.ts's own graph validator.
+  const WHITE = 0;
+  const GRAY = 1;
+  const BLACK = 2;
+  const color = new Map<string, number>(records.map((r) => [r.id, WHITE]));
+
+  function visit(id: string, path: readonly string[]): { index: number; reason: string } | undefined {
+    color.set(id, GRAY);
+    const next = byId.get(id)!.supersededBy;
+    if (next !== undefined) {
+      if (color.get(next) === GRAY) {
+        const cycleIndex = records.findIndex((r) => r.id === id);
+        return { index: cycleIndex, reason: `supersession chain forms a cycle: ${[...path, id, next].join(" -> ")}` };
+      }
+      if (color.get(next) === WHITE) {
+        const result = visit(next, [...path, id]);
+        if (result) return result;
+      }
+    }
+    color.set(id, BLACK);
+    return undefined;
+  }
+
+  for (const record of records) {
+    if (color.get(record.id) === WHITE) {
+      const result = visit(record.id, []);
+      if (result) return result;
+    }
+  }
+
   return undefined;
 }
 
@@ -237,6 +385,15 @@ export class AssumptionRegister {
    */
   accept(id: string, confirmedBy?: string): Assumption {
     const assumption = this.#mustGet(id);
+    // P2 fix (31st independent review round, finding 6, "implement the
+    // SUPERSEDED assumption transition"): a SUPERSEDED assumption is
+    // terminal (bkz. `AssumptionAlreadySupersededError`'ın üstündeki fix
+    // notu) — without this guard, introducing `supersede()` below would
+    // let a caller supersede an assumption and then still accept() the
+    // very record that was just declared retired, silently reviving it.
+    if (assumption.status === "SUPERSEDED") {
+      throw new AssumptionAlreadySupersededError(id, assumption.supersededBy);
+    }
     if (assumption.impact === "HIGH" && !isNonBlankIdentity(confirmedBy)) {
       throw new FounderConfirmationRequiredError(id);
     }
@@ -248,15 +405,84 @@ export class AssumptionRegister {
 
   reject(id: string): Assumption {
     const assumption = this.#mustGet(id);
+    if (assumption.status === "SUPERSEDED") {
+      throw new AssumptionAlreadySupersededError(id, assumption.supersededBy);
+    }
     assumption.status = "REJECTED";
     return freezeRecord(assumption);
   }
 
   validate(id: string): Assumption {
     const assumption = this.#mustGet(id);
+    if (assumption.status === "SUPERSEDED") {
+      throw new AssumptionAlreadySupersededError(id, assumption.supersededBy);
+    }
     assumption.status = "VALIDATED";
     assumption.confirmedAt = new Date().toISOString();
     return freezeRecord(assumption);
+  }
+
+  /**
+   * P2 fix (31st independent review round, finding 6, "implement the
+   * SUPERSEDED assumption transition"): `AssumptionStatus` declared
+   * `"SUPERSEDED"` from the start, but no public method could ever
+   * legitimately produce it — the ONLY way to reach that state was for a
+   * caller to bypass this class's invariants entirely (which the
+   * genuine `#`-private `#assumptions` field, bkz. bu sınıfın üstündeki
+   * 25th round fix notu, already makes impossible from outside). This is
+   * the explicit, invariant-enforcing transition: `id` is marked
+   * SUPERSEDED and durably records WHICH assumption replaces it —
+   * mirroring `decision-ledger.ts`'s own `supersede()` for the identical
+   * "why did this change, and to what?" explainability requirement
+   * (baseline section 255/47), adapted to this register's own shape
+   * (assumptions have no separate `project`/scope field to preserve the
+   * way decisions do — this register is not partitioned that way, so
+   * there is no additional ownership dimension to carry over).
+   */
+  supersede(id: string, supersededBy: string): Assumption {
+    const assumption = this.#mustGet(id);
+    if (assumption.status === "SUPERSEDED") {
+      throw new AssumptionAlreadySupersededError(id, assumption.supersededBy);
+    }
+    if (id === supersededBy) {
+      throw new InvalidAssumptionSupersessionError(id, supersededBy, "an assumption cannot supersede itself");
+    }
+    // "Replacement assumption must exist" — reuses the same
+    // AssumptionNotFoundError() every other lookup in this class already
+    // throws, rather than inventing a second, redundant error type.
+    const replacement = this.#mustGet(supersededBy);
+    if (replacement.status === "SUPERSEDED") {
+      throw new InvalidAssumptionSupersessionError(
+        id,
+        supersededBy,
+        `'${supersededBy}' is itself SUPERSEDED and cannot serve as an active replacement`
+      );
+    }
+    if (this.#supersessionChainReaches(supersededBy, id)) {
+      throw new InvalidAssumptionSupersessionError(id, supersededBy, "this would create a supersession cycle");
+    }
+    assumption.status = "SUPERSEDED";
+    assumption.supersededBy = supersededBy;
+    return freezeRecord(assumption);
+  }
+
+  /**
+   * Follows `supersededBy` edges starting at `startId`; returns true if
+   * `targetId` is ever reached — used by `supersede()` to refuse creating
+   * a cycle. `visited` guards against looping forever on a chain that
+   * (impossibly, given this method is the only way to create an edge) is
+   * already corrupt.
+   */
+  #supersessionChainReaches(startId: string, targetId: string): boolean {
+    let current: string | undefined = startId;
+    const visited = new Set<string>();
+    while (current !== undefined) {
+      if (current === targetId) return true;
+      if (visited.has(current)) return false;
+      visited.add(current);
+      current = this.#assumptions.get(current)?.supersededBy;
+    }
+    return false;
   }
 
   allWithStatus(status: AssumptionStatus): readonly Assumption[] {
@@ -317,30 +543,38 @@ export class AssumptionRegister {
     const register = new AssumptionRegister();
     const records = store.read<unknown[]>(path) ?? [];
     const seenIds = new Set<string>();
+    // P1 fix (24th independent review round, "restored assumptions must
+    // be detached"): each validated candidate is copied (`{ ...record }`),
+    // never the exact object `store.read()` returned — a caller/store that
+    // later mutates the original object can no longer reach authoritative
+    // state.
+    const validated: MutableAssumption[] = [];
     records.forEach((record, index) => {
       const failure = describeInvalidPersistedAssumption(record);
       if (failure) {
         throw new CorruptPersistedAssumptionError(index, failure);
       }
-      const validated = record as MutableAssumption;
-      if (seenIds.has(validated.id)) {
-        throw new CorruptPersistedAssumptionError(index, `duplicate id '${validated.id}'`);
+      const candidate = record as MutableAssumption;
+      if (seenIds.has(candidate.id)) {
+        throw new CorruptPersistedAssumptionError(index, `duplicate id '${candidate.id}'`);
       }
-      seenIds.add(validated.id);
-      // P1 fix (24th independent review round, "restored assumptions must
-      // be detached"): this used to store `validated` — the EXACT object
-      // `store.read()` returned — directly into `this.assumptions`. Every
-      // field on `MutableAssumption` is a primitive (no nested objects/
-      // arrays), so a shallow copy is sufficient to fully detach it: if the
-      // caller/store still holds (or later returns again, e.g. a cache) a
-      // reference to that same object and mutates it — `original.status =
-      // "ACCEPTED"` — authoritative registry state changed with NO
-      // `accept()`/`reject()`/`validate()` call and NO invariant check at
-      // all, the exact same class of bypass `freezeRecord()`-on-read
-      // already protects against for objects LEAVING this class. Now the
-      // register owns its own independent copy from the moment of load.
-      register.#assumptions.set(validated.id, { ...validated });
+      seenIds.add(candidate.id);
+      validated.push({ ...candidate });
     });
+
+    // P2 fix (31st independent review round, finding 6, "implement the
+    // SUPERSEDED assumption transition"): run only AFTER every record has
+    // individually passed validation, and BEFORE any of them enters
+    // `register.#assumptions` — see `describeInvalidPersistedAssumptionGraph()`'s
+    // note above.
+    const graphFailure = describeInvalidPersistedAssumptionGraph(validated);
+    if (graphFailure) {
+      throw new CorruptPersistedAssumptionError(graphFailure.index, graphFailure.reason);
+    }
+
+    for (const record of validated) {
+      register.#assumptions.set(record.id, record);
+    }
     return register;
   }
 }

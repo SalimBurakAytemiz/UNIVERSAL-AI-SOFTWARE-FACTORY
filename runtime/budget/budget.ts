@@ -508,6 +508,23 @@ export class BudgetGuard {
    * `costEngine.record()` both operate on this SAME snapshot, never the
    * original `entry` parameter again.
    */
+  /**
+   * P1 fix (31st independent review round, finding 1, "recheck ceilings
+   * inside the persistent-ledger lock"): `assertWithinBudget()`'s ceiling
+   * check and `costEngine.record()`'s mutation used to run as two SEPARATE
+   * steps — the check reading whatever totals this engine's in-memory
+   * state happened to hold at that moment, unprotected by any lock. For a
+   * `CostEngine` backed by shared persistence (bkz. `CostEngine.
+   * withLedgerLock()`'ın üstündeki fix notu), a sibling instance's
+   * already-durably-recorded spend could be invisible to that read, so
+   * this call's own ceiling check could pass against stale data even
+   * though the sibling's write — reloaded only once `record()` itself
+   * acquired the lock — would have made it fail. Fixed: the check AND the
+   * record now both run inside ONE `withLedgerLock()` transaction, so the
+   * ceiling check observes the exact same freshly-reloaded state the
+   * mutation is about to be applied to, with no gap for a sibling
+   * instance to interleave.
+   */
   spend(entry: {
     taskId: string;
     agentId?: string;
@@ -518,15 +535,17 @@ export class BudgetGuard {
     amountUsd: number;
   }) {
     const snapshot = { ...entry };
-    // P1 fix (29th independent review round, finding 7): `runId` must reach
-    // `assertWithinBudget()`'s scope, not just `taskId`/`projectId` — otherwise
-    // `buildCeilingChecks()`'s new `perRunUsd` scoping (bkz. yukarıdaki fix
-    // notu) is unreachable through this, the most common spend path.
-    this.assertWithinBudget(
-      { taskId: snapshot.taskId, projectId: snapshot.projectId, runId: snapshot.runId },
-      snapshot.amountUsd
-    );
-    return this.#costEngine.record(snapshot);
+    return this.#costEngine.withLedgerLock(() => {
+      // P1 fix (29th independent review round, finding 7): `runId` must reach
+      // `assertWithinBudget()`'s scope, not just `taskId`/`projectId` — otherwise
+      // `buildCeilingChecks()`'s new `perRunUsd` scoping (bkz. yukarıdaki fix
+      // notu) is unreachable through this, the most common spend path.
+      this.assertWithinBudget(
+        { taskId: snapshot.taskId, projectId: snapshot.projectId, runId: snapshot.runId },
+        snapshot.amountUsd
+      );
+      return this.#costEngine.record(snapshot);
+    });
   }
 
   /**
@@ -574,30 +593,51 @@ export class BudgetGuard {
       throw err;
     }
 
-    const checks = this.buildCeilingChecks(snapshot, amountUsd);
-    for (const check of checks) {
-      if (exceedsMonetaryAmount(check.projected, check.limit)) {
-        this.#auditLog?.append({
-          type: "BUDGET_RESERVATION_BLOCKED",
-          actor: "budget-guard",
-          payload: { scope: snapshot, amountUsd, ...check },
-          timestamp: this.#now().toISOString()
-        });
-        throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
+    // P1 fix (31st independent review round, finding 1, "recheck ceilings
+    // inside the persistent-ledger lock"): the ceiling check (reading
+    // `this.#costEngine`'s current totals) and the reservation mutation
+    // (`createReservation()`) used to be two SEPARATE steps — the check
+    // running against whatever this engine's in-memory state happened to
+    // hold, unprotected by any lock, and the mutation only reloading the
+    // LATEST durable state once it acquired the lock itself, by which
+    // point the ceiling decision had already been made. Two `BudgetGuard`/
+    // `CostEngine` instances sharing one persisted ledger could each pass
+    // a ceiling check against their own stale, empty-looking totals and
+    // both proceed to reserve — exactly the double-reservation race
+    // `CostEngine.withLedgerLock()`'ın üstündeki fix notu describes.
+    // Fixed: the check and the mutation now both run inside ONE
+    // `withLedgerLock()` transaction, so the check observes the exact same
+    // freshly-reloaded state the reservation is about to be recorded
+    // against — a sibling instance's already-committed cost or open
+    // reservation can never be invisible to this check.
+    const created = this.#costEngine.withLedgerLock(() => {
+      const checks = this.buildCeilingChecks(snapshot, amountUsd);
+      for (const check of checks) {
+        if (exceedsMonetaryAmount(check.projected, check.limit)) {
+          this.#auditLog?.append({
+            type: "BUDGET_RESERVATION_BLOCKED",
+            actor: "budget-guard",
+            payload: { scope: snapshot, amountUsd, ...check },
+            timestamp: this.#now().toISOString()
+          });
+          throw new BudgetExceededError(check.ceiling, check.limit, check.projected);
+        }
       }
-    }
 
-    // Rezervasyon, bu ledger'a bağlı HER `BudgetGuard`'ın PAYLAŞTIĞI
-    // `this.#costEngine`'in KENDİSİNDE oluşturulur — artık bu sınıfın
-    // kendi özel bir Map'inde DEĞİL (bkz. bu sınıfın üstündeki 16th
-    // independent review round fix notu).
-    const created = this.#costEngine.createReservation(snapshot, amountUsd);
+      // Rezervasyon, bu ledger'a bağlı HER `BudgetGuard`'ın PAYLAŞTIĞI
+      // `this.#costEngine`'in KENDİSİNDE oluşturulur — artık bu sınıfın
+      // kendi özel bir Map'inde DEĞİL (bkz. bu sınıfın üstündeki 16th
+      // independent review round fix notu).
+      const reservation = this.#costEngine.createReservation(snapshot, amountUsd);
 
-    this.#auditLog?.append({
-      type: "BUDGET_RESERVATION_CREATED",
-      actor: "budget-guard",
-      payload: { reservationId: created.id, scope: snapshot, amountUsd, checks },
-      timestamp: this.#now().toISOString()
+      this.#auditLog?.append({
+        type: "BUDGET_RESERVATION_CREATED",
+        actor: "budget-guard",
+        payload: { reservationId: reservation.id, scope: snapshot, amountUsd, checks },
+        timestamp: this.#now().toISOString()
+      });
+
+      return reservation;
     });
 
     return freezeRecord({ id: created.id, scope: created.scope, amountUsd: created.amountUsd });

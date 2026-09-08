@@ -1522,4 +1522,117 @@ describe("ModelGateway + MockProvider", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (31st independent review round, finding 2, 'preserve run and agent ownership through model " +
+      "invocations'): runId/agentId now flow from ModelInvocationContext through reservation, commit, and " +
+      "cost attribution",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: the SAME task/project invoked under DIFFERENT runs and " +
+          "DIFFERENT agents keeps costs separated by run and attributable by agent",
+        async () => {
+          const costEngine = new CostEngine();
+          const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+          const gateway = new ModelGateway();
+          gateway.registerProvider(new MockProvider());
+          const model = mockModel({ costPerCall: 0.6 });
+
+          await gateway.invoke(
+            model,
+            { prompt: "p1" },
+            { policy: permissivePolicy(), budget, risk: 0, taskId: "t1", runId: "run-a", agentId: "agent-a" }
+          );
+          await gateway.invoke(
+            model,
+            { prompt: "p2" },
+            { policy: permissivePolicy(), budget, risk: 0, taskId: "t1", runId: "run-b", agentId: "agent-b" }
+          );
+
+          // Costs are genuinely separated by run — run-b's own $0.60 does
+          // not count against run-a's $1 perRunUsd ceiling, and vice versa.
+          expect(costEngine.totalFor({ runId: "run-a" })).toBe(0.6);
+          expect(costEngine.totalFor({ runId: "run-b" })).toBe(0.6);
+          // Costs are genuinely attributable by agent.
+          expect(costEngine.totalFor({ agentId: "agent-a" })).toBe(0.6);
+          expect(costEngine.totalFor({ agentId: "agent-b" })).toBe(0.6);
+        }
+      );
+
+      it("BLOCKER: perRunUsd is actually enforced for a real model invocation, not silently unreachable", async () => {
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const model = mockModel({ costPerCall: 0.6 });
+
+        await gateway.invoke(model, { prompt: "p1" }, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "t1",
+          runId: "run-a"
+        });
+
+        // A second $0.60 invocation in the SAME run must be blocked by the
+        // $1 perRunUsd ceiling — this is only reachable if runId genuinely
+        // flows all the way through reserve()/commit().
+        await expect(
+          gateway.invoke(model, { prompt: "p2" }, {
+            policy: permissivePolicy(),
+            budget,
+            risk: 0,
+            taskId: "t1",
+            runId: "run-a"
+          })
+        ).rejects.toThrow(BudgetExceededError);
+
+        // A DIFFERENT run gets its own fresh allowance.
+        const response = await gateway.invoke(model, { prompt: "p3" }, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "t1",
+          runId: "run-b"
+        });
+        expect(response.output).toContain("p3");
+      });
+
+      it("no regression: omitting runId/agentId entirely preserves the exact prior global-scope behavior", async () => {
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const model = mockModel({ costPerCall: 0.6 });
+
+        await gateway.invoke(model, { prompt: "p1" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" });
+        // No runId supplied by either call -> both share the SAME global
+        // perRunUsd scope, exactly as before this fix.
+        await expect(
+          gateway.invoke(model, { prompt: "p2" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t2" })
+        ).rejects.toThrow(BudgetExceededError);
+      });
+
+      it("a committed CostEntry for a real invocation carries the invocation's own runId/agentId (durable attribution, not just an in-flight reservation)", async () => {
+        const costEngine = new CostEngine();
+        const budget = new BudgetGuard(costEngine, {});
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const model = mockModel({ costPerCall: 0.3 });
+
+        await gateway.invoke(model, { prompt: "p" }, {
+          policy: permissivePolicy(),
+          budget,
+          risk: 0,
+          taskId: "t1",
+          runId: "run-x",
+          agentId: "agent-x"
+        });
+
+        const entry = costEngine.all().find((e) => e.taskId === "t1");
+        expect(entry?.runId).toBe("run-x");
+        expect(entry?.agentId).toBe("agent-x");
+      });
+    }
+  );
 });

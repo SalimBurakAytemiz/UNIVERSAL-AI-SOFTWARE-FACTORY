@@ -1133,3 +1133,82 @@ describe(
     });
   }
 );
+
+describe(
+  "P1 fix (31st independent review round, finding 2, 'preserve run and agent ownership through model " +
+    "invocations'): RoutingRequest.runId/agentId propagate into every invokeAuthorized() call",
+  () => {
+    it("BLOCKER regression, exact reproduction: a routed invocation's runId is enforced by perRunUsd, not silently dropped", async () => {
+      const registry = createDefaultModelRegistry();
+      const gateway = new ModelGateway();
+      gateway.registerProvider(new MockProvider());
+      const router = new CheapestCapableModelRouter(registry);
+      const policy = permissivePolicy();
+      const costEngine = new CostEngine();
+      const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+      const model = registry.all().find((m) => m.costPerCall > 0 && m.costPerCall <= 0.6)!;
+      const cost = model.costPerCall;
+
+      await router.routeAndExecute(
+        { taskId: "t1", risk: 0, requiredCapabilities: model.capabilities, runId: "run-a" },
+        gateway,
+        { prompt: "p1" },
+        () => true,
+        policy,
+        budget
+      );
+
+      // Same run: a second invocation whose cost would push run-a's total
+      // over the $1 ceiling must be blocked.
+      if (cost * 2 > 1) {
+        await expect(
+          router.routeAndExecute(
+            { taskId: "t1", risk: 0, requiredCapabilities: model.capabilities, runId: "run-a" },
+            gateway,
+            { prompt: "p2" },
+            () => true,
+            policy,
+            budget
+          )
+        ).rejects.toThrow(BudgetExceededError);
+      }
+
+      // A DIFFERENT run is unaffected — its own fresh $1 allowance.
+      const result = await router.routeAndExecute(
+        { taskId: "t1", risk: 0, requiredCapabilities: model.capabilities, runId: "run-b" },
+        gateway,
+        { prompt: "p3" },
+        () => true,
+        policy,
+        budget
+      );
+      expect(result.response.output).toContain("p3");
+      expect(costEngine.totalFor({ runId: "run-a" })).toBe(cost);
+      expect(costEngine.totalFor({ runId: "run-b" })).toBe(cost);
+    });
+
+    it("agentId propagates through routeAndExecute() into durable, attributable cost entries", async () => {
+      const registry = createDefaultModelRegistry();
+      const gateway = new ModelGateway();
+      gateway.registerProvider(new MockProvider());
+      const router = new CheapestCapableModelRouter(registry);
+      const policy = permissivePolicy();
+      const costEngine = new CostEngine();
+      const budget = permissiveBudget(costEngine);
+
+      const model = registry.all()[0]!;
+      await router.routeAndExecute(
+        { taskId: "t1", risk: 0, requiredCapabilities: model.capabilities, agentId: "agent-z" },
+        gateway,
+        { prompt: "p" },
+        () => true,
+        policy,
+        budget
+      );
+
+      const entry = costEngine.all().find((e) => e.taskId === "t1");
+      expect(entry?.agentId).toBe("agent-z");
+    });
+  }
+);

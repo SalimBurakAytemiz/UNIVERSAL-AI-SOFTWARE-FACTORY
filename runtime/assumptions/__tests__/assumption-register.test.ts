@@ -3,10 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  AssumptionAlreadySupersededError,
+  AssumptionNotFoundError,
   AssumptionRegister,
   CorruptPersistedAssumptionError,
   DuplicateAssumptionIdError,
-  FounderConfirmationRequiredError
+  FounderConfirmationRequiredError,
+  InvalidAssumptionSupersessionError
 } from "../assumption-register.js";
 import { FileStateStore, type StateStore } from "../../state/file-store.js";
 
@@ -506,6 +509,261 @@ describe("AssumptionRegister", () => {
         const accepted = register.accept("a3", "founder@example.com");
         expect(accepted.status).toBe("ACCEPTED");
         expect(accepted.confirmedBy).toBe("founder@example.com");
+      });
+    }
+  );
+
+  describe(
+    "P2 fix (31st independent review round, finding 6, 'implement the SUPERSEDED assumption transition'): " +
+      "an explicit, invariant-enforcing supersede() operation",
+    () => {
+      it("supersede() marks the old assumption SUPERSEDED and records which assumption replaces it", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "old", description: "d1", reason: "r1", impact: "LOW", source: "s" });
+        register.propose({ id: "new", description: "d2", reason: "r2", impact: "LOW", source: "s" });
+
+        const superseded = register.supersede("old", "new");
+        expect(superseded.status).toBe("SUPERSEDED");
+        expect(superseded.supersededBy).toBe("new");
+        expect(register.get("old")!.status).toBe("SUPERSEDED");
+        expect(register.get("new")!.status).toBe("PROPOSED"); // untouched
+      });
+
+      it("BLOCKER: replacement assumption must exist — superseding with an unknown id fails closed, and the original assumption is untouched", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "old", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+        expect(() => register.supersede("old", "does-not-exist")).toThrow(AssumptionNotFoundError);
+        expect(register.get("old")!.status).toBe("PROPOSED");
+      });
+
+      it("superseding an unknown assumption id fails closed", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "new", description: "d", reason: "r", impact: "LOW", source: "s" });
+        expect(() => register.supersede("does-not-exist", "new")).toThrow(AssumptionNotFoundError);
+      });
+
+      it("BLOCKER: prevents self-supersession", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+        expect(() => register.supersede("a", "a")).toThrow(InvalidAssumptionSupersessionError);
+        expect(register.get("a")!.status).toBe("PROPOSED");
+      });
+
+      it("BLOCKER: prevents a direct two-node supersession cycle (A -> B -> A)", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+        register.supersede("a", "b");
+        expect(() => register.supersede("b", "a")).toThrow(InvalidAssumptionSupersessionError);
+        // The first, legitimate supersession must remain intact.
+        expect(register.get("a")!.status).toBe("SUPERSEDED");
+        expect(register.get("b")!.status).toBe("PROPOSED");
+      });
+
+      it("BLOCKER: prevents a longer supersession cycle (A -> B -> C -> A)", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+        register.supersede("a", "b");
+        register.supersede("b", "c");
+        expect(() => register.supersede("c", "a")).toThrow(InvalidAssumptionSupersessionError);
+      });
+
+      it("BLOCKER: a replacement that is itself already SUPERSEDED cannot serve as an active replacement (invalid chain)", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+        register.supersede("a", "b"); // "a" is now SUPERSEDED (replaced by "b")
+        // Trying to supersede "c" WITH "a" as the replacement must fail — "a" is
+        // itself already SUPERSEDED, so it cannot serve as an active replacement.
+        expect(() => register.supersede("c", "a")).toThrow(InvalidAssumptionSupersessionError);
+      });
+
+      it("supersede() is rejected a second time on an already-SUPERSEDED assumption", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+        register.supersede("a", "b");
+        expect(() => register.supersede("a", "c")).toThrow(AssumptionAlreadySupersededError);
+      });
+
+      it("a SUPERSEDED assumption is terminal: accept()/reject()/validate() all refuse to operate on it", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+        register.supersede("a", "b");
+
+        expect(() => register.accept("a")).toThrow(AssumptionAlreadySupersededError);
+        expect(() => register.reject("a")).toThrow(AssumptionAlreadySupersededError);
+        expect(() => register.validate("a")).toThrow(AssumptionAlreadySupersededError);
+      });
+
+      it("no regression: superseding a HIGH-impact, already-Founder-accepted assumption still requires no additional confirmation, and the replacement can independently go through its own Founder confirmation", () => {
+        const register = new AssumptionRegister();
+        register.propose({ id: "old", description: "d", reason: "r", impact: "HIGH", source: "s" });
+        register.accept("old", "founder@example.com");
+        register.propose({ id: "new", description: "d", reason: "r", impact: "HIGH", source: "s" });
+        register.accept("new", "founder@example.com");
+
+        const superseded = register.supersede("old", "new");
+        expect(superseded.status).toBe("SUPERSEDED");
+        expect(register.get("new")!.status).toBe("ACCEPTED");
+      });
+
+      describe("restore regressions: a persisted SUPERSEDED graph must satisfy the same invariants live supersede() enforces", () => {
+        let tempRoot: string;
+
+        afterEach(() => {
+          if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+        });
+
+        it("saveTo()/loadFrom() round-trips a genuine supersede() chain, including supersededBy", () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-assumption-supersede-"));
+          const path = join(tempRoot, "assumptions.json");
+          const store = new FileStateStore();
+
+          const register = new AssumptionRegister();
+          register.propose({ id: "old", description: "d", reason: "r", impact: "LOW", source: "s" });
+          register.propose({ id: "new", description: "d", reason: "r", impact: "LOW", source: "s" });
+          register.supersede("old", "new");
+          register.saveTo(store, path);
+
+          const restored = AssumptionRegister.loadFrom(store, path);
+          expect(restored.get("old")!.status).toBe("SUPERSEDED");
+          expect(restored.get("old")!.supersededBy).toBe("new");
+        });
+
+        it("BLOCKER: a persisted record claiming SUPERSEDED without supersededBy is rejected", () => {
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              [
+                {
+                  id: "a",
+                  description: "d",
+                  reason: "r",
+                  impact: "LOW",
+                  source: "s",
+                  status: "SUPERSEDED",
+                  createdAt: new Date().toISOString()
+                }
+              ] as never,
+            exists: () => true
+          };
+          expect(() => AssumptionRegister.loadFrom(fakeStore, "irrelevant.json")).toThrow(
+            CorruptPersistedAssumptionError
+          );
+        });
+
+        it("BLOCKER: a persisted record claiming a non-SUPERSEDED status while carrying supersededBy is rejected", () => {
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              [
+                {
+                  id: "a",
+                  description: "d",
+                  reason: "r",
+                  impact: "LOW",
+                  source: "s",
+                  status: "PROPOSED",
+                  createdAt: new Date().toISOString(),
+                  supersededBy: "b"
+                }
+              ] as never,
+            exists: () => true
+          };
+          expect(() => AssumptionRegister.loadFrom(fakeStore, "irrelevant.json")).toThrow(
+            CorruptPersistedAssumptionError
+          );
+        });
+
+        it("BLOCKER: a persisted supersededBy referencing a non-existent assumption is rejected", () => {
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              [
+                {
+                  id: "a",
+                  description: "d",
+                  reason: "r",
+                  impact: "LOW",
+                  source: "s",
+                  status: "SUPERSEDED",
+                  createdAt: new Date().toISOString(),
+                  supersededBy: "ghost"
+                }
+              ] as never,
+            exists: () => true
+          };
+          expect(() => AssumptionRegister.loadFrom(fakeStore, "irrelevant.json")).toThrow(
+            CorruptPersistedAssumptionError
+          );
+        });
+
+        it("BLOCKER: a persisted supersession cycle (A -> B -> A) is rejected", () => {
+          const now = new Date().toISOString();
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              [
+                { id: "a", description: "d", reason: "r", impact: "LOW", source: "s", status: "SUPERSEDED", createdAt: now, supersededBy: "b" },
+                { id: "b", description: "d", reason: "r", impact: "LOW", source: "s", status: "SUPERSEDED", createdAt: now, supersededBy: "a" }
+              ] as never,
+            exists: () => true
+          };
+          expect(() => AssumptionRegister.loadFrom(fakeStore, "irrelevant.json")).toThrow(
+            CorruptPersistedAssumptionError
+          );
+        });
+
+        it("BLOCKER: a persisted merged supersession chain (two predecessors claiming the same successor) is rejected", () => {
+          const now = new Date().toISOString();
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              [
+                { id: "a", description: "d", reason: "r", impact: "LOW", source: "s", status: "SUPERSEDED", createdAt: now, supersededBy: "c" },
+                { id: "b", description: "d", reason: "r", impact: "LOW", source: "s", status: "SUPERSEDED", createdAt: now, supersededBy: "c" },
+                { id: "c", description: "d", reason: "r", impact: "LOW", source: "s", status: "PROPOSED", createdAt: now }
+              ] as never,
+            exists: () => true
+          };
+          expect(() => AssumptionRegister.loadFrom(fakeStore, "irrelevant.json")).toThrow(
+            CorruptPersistedAssumptionError
+          );
+        });
+
+        it("BLOCKER: a persisted self-superseding record (supersededBy === id) is rejected", () => {
+          const fakeStore: StateStore = {
+            write: () => {},
+            read: () =>
+              [
+                {
+                  id: "a",
+                  description: "d",
+                  reason: "r",
+                  impact: "LOW",
+                  source: "s",
+                  status: "SUPERSEDED",
+                  createdAt: new Date().toISOString(),
+                  supersededBy: "a"
+                }
+              ] as never,
+            exists: () => true
+          };
+          expect(() => AssumptionRegister.loadFrom(fakeStore, "irrelevant.json")).toThrow(
+            CorruptPersistedAssumptionError
+          );
+        });
       });
     }
   );

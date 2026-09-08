@@ -104,17 +104,41 @@ export class FileCache<T = unknown> {
       // haritayı geri yazmak, tam da bu ikinci finding'in tarif ettiği
       // gibi, o process'in az önce başarıyla yazdığı tazelenmiş girdiyi
       // (veya tamamen alakasız başka bir anahtarı) sessizce silebilirdi.
-      this.withLock(() => {
+      //
+      // P2 fix (31st independent review round, finding 5, "return a
+      // concurrently refreshed cache entry"): this used to unconditionally
+      // `return undefined;` after the locked re-check above, regardless of
+      // what that re-check actually found. Codex reproduced: this
+      // process's initial (unlocked) read sees an expired entry; while
+      // this process waits to acquire the lock, ANOTHER process calls
+      // `set()` for the SAME key with a freshly-computed, non-expired
+      // value; once this process finally acquires the lock and re-reads,
+      // `latestEntry` correctly reflects that fresh value (so the
+      // `if (... expired ...)` guard above correctly does NOT delete it)
+      // — but the caller still received `undefined` regardless, forcing an
+      // unnecessary recomputation of a value another process JUST
+      // computed. Fixed: the locked re-check now returns EXACTLY what the
+      // authoritative re-read found — `latestEntry`'s value if it exists
+      // and is genuinely not expired (a concurrent refresh this process
+      // should reuse, not discard), `undefined` if it is still expired
+      // (and gets deleted, as before) or has meanwhile been removed
+      // entirely by another process.
+      return this.withLock(() => {
         const latest = this.loadAll();
         const latestEntry = latest.get(key);
+        if (!latestEntry) return undefined;
         // Same >= boundary as the initial check above and cache.ts's
         // Cache.get() — bkz. bu dosyadaki fix notu.
-        if (latestEntry && latestEntry.expiresAt !== undefined && Date.now() >= latestEntry.expiresAt) {
+        if (latestEntry.expiresAt !== undefined && Date.now() >= latestEntry.expiresAt) {
           latest.delete(key);
           this.saveAll(latest);
+          return undefined;
         }
+        // Another process already refreshed this exact key to a fresh,
+        // non-expired value while this process was waiting for the lock —
+        // reuse it instead of telling the caller to recompute.
+        return latestEntry.value;
       });
-      return undefined;
     }
     return entry.value;
   }

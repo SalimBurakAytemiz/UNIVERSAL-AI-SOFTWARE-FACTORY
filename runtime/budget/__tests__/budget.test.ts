@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CostEngine, InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
 import {
   BudgetExceededError,
@@ -10,6 +13,7 @@ import {
   type BudgetLimits
 } from "../budget.js";
 import { AuditLog } from "../../audit/audit-log.js";
+import { FileStateStore } from "../../state/file-store.js";
 
 /**
  * Testlerin gerçek zamanı beklemeden gün/ay sınırlarını (rollover)
@@ -2105,6 +2109,97 @@ describe("BudgetGuard", () => {
 
         const blockedEvent = auditLog.all().find((r) => r.type === "BUDGET_RESERVATION_BLOCKED");
         expect((blockedEvent?.payload as { scope?: { projectId?: string } })?.scope?.projectId).toBe("p1");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (31st independent review round, finding 1, 'recheck ceilings inside the persistent-ledger " +
+      "lock'): two BudgetGuard/CostEngine instances sharing one persisted ledger must not each pass a " +
+      "ceiling check against their own stale, pre-lock totals",
+    () => {
+      let tempRoot: string;
+
+      afterEach(() => {
+        if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: two independent guards/processes sharing one ledger, each " +
+          "trying $0.60 against a $1 ceiling -> exactly one succeeds",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-budget-ledger-lock-"));
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+
+          // Two SEPARATE CostEngine instances (simulating two processes),
+          // each wrapped in its own BudgetGuard, sharing ONE durable ledger
+          // path — exactly the topology round 30's cost-engine.ts fix made
+          // safe for MUTATIONS, but which this finding shows was still
+          // unsafe for the CEILING CHECK that gates a mutation.
+          const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+          const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+          const guardA = new BudgetGuard(engineA, { perTaskUsd: 1 });
+          const guardB = new BudgetGuard(engineB, { perTaskUsd: 1 });
+
+          // Without the fix, both guards read "0 committed + 0 reserved"
+          // from their own stale in-memory state and BOTH pass their
+          // ceiling check before either reservation is actually created —
+          // $1.20 total reserved against a $1.00 ceiling.
+          let firstSucceeded = false;
+          let secondSucceeded = false;
+          let secondError: unknown;
+          try {
+            guardA.reserve({ taskId: "shared-task" }, 0.6);
+            firstSucceeded = true;
+          } catch {
+            // not expected on the first call, but don't mask the second call's assertion below
+          }
+          try {
+            guardB.reserve({ taskId: "shared-task" }, 0.6);
+            secondSucceeded = true;
+          } catch (err) {
+            secondError = err;
+          }
+
+          expect(firstSucceeded).toBe(true);
+          expect(secondSucceeded).toBe(false);
+          expect(secondError).toBeInstanceOf(BudgetExceededError);
+
+          // The ledger itself must genuinely reflect only ONE $0.60
+          // reservation, not two.
+          const engineC = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(engineC.reservedTotal({ taskId: "shared-task" })).toBe(0.6);
+        }
+      );
+
+      it("the same recheck-under-lock protection applies to the direct spend() path, not just reserve()", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-budget-ledger-lock-spend-"));
+        const store = new FileStateStore();
+        const statePath = join(tempRoot, "cost-state.json");
+
+        const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+        const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+        const guardA = new BudgetGuard(engineA, { perTaskUsd: 1 });
+        const guardB = new BudgetGuard(engineB, { perTaskUsd: 1 });
+
+        guardA.spend({ taskId: "shared-task", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(() =>
+          guardB.spend({ taskId: "shared-task", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(BudgetExceededError);
+
+        const engineC = new CostEngine(() => new Date(), { store, path: statePath });
+        expect(engineC.totalFor({ taskId: "shared-task" })).toBe(0.6);
+      });
+
+      it("a caller sharing ONE CostEngine instance across guards (the ordinary, already-safe topology) still behaves exactly as before", () => {
+        const engine = new CostEngine();
+        const guardA = new BudgetGuard(engine, { perTaskUsd: 1 });
+        const guardB = new BudgetGuard(engine, { perTaskUsd: 1 });
+
+        guardA.reserve({ taskId: "t" }, 0.6);
+        expect(() => guardB.reserve({ taskId: "t" }, 0.6)).toThrow(BudgetExceededError);
+        expect(engine.reservedTotal({ taskId: "t" })).toBe(0.6);
       });
     }
   );

@@ -36,6 +36,22 @@ export interface RoutingRequest {
    * already required it to for a DIRECT (non-routed) caller.
    */
   readonly projectId?: string;
+  /**
+   * P1 fix (31st independent review round, finding 2, "preserve run and
+   * agent ownership through model invocations"): mirrors `projectId`'s own
+   * fix note above — `RoutingRequest` carried no `runId`/`agentId` at all,
+   * so a routed invocation (the path every real Factory task actually
+   * uses, not a direct `gateway.invoke()` call) could never have its
+   * `perRunUsd` ceiling enforced or its committed cost attributed to an
+   * agent, regardless of what `ModelInvocationContext`/`CostScope`
+   * themselves supported. Captured into the SAME frozen `routingScope`
+   * snapshot as every other routing field (bkz. `routeAndExecute()`'s fix
+   * note) and propagated into `ModelInvocationContext.runId`/`.agentId` on
+   * EVERY candidate invocation — initial, every escalation step, and
+   * fallback.
+   */
+  readonly runId?: string;
+  readonly agentId?: string;
   /** 0 = trivial, 5 = critical. Mirrors PolicyAction.risk in the policy engine. */
   readonly risk: 0 | 1 | 2 | 3 | 4 | 5;
   readonly requiredCapabilities: readonly string[];
@@ -232,6 +248,10 @@ export class CheapestCapableModelRouter {
       // `ModelInvocationContext` has always supported it — see
       // `RoutingRequest.projectId`'s fix note above.
       projectId: request.projectId,
+      // P1 fix (31st independent review round, finding 2): bkz.
+      // `RoutingRequest.runId`/`.agentId`'in üstündeki fix notu.
+      runId: request.runId,
+      agentId: request.agentId,
       description: `Invoke model '${decision.model.modelId}' (${decision.model.tier}) for task ${request.taskId}`,
       // P1 fix (25th independent review round, "approval evidence must
       // flow through model invocation path"): bkz. `RoutingRequest.approvalId`'in

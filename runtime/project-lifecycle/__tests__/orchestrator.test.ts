@@ -1840,4 +1840,147 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (31st independent review round, finding 3, 'keep all bootstrap writes inside the authorized " +
+      "execution'): a protected write (genome/organization/bootstrap-state) failing must never leave a " +
+      "risk-5 approval falsely claiming a successful execution",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: approved risk-5 bootstrap, force one StateStore.write() " +
+          "failure -> operation fails -> approval does NOT remain successful -> failure evidence is " +
+          "recorded -> the scaffold was genuinely created (a real filesystem mutation DID happen) but the " +
+          "genome.json write never landed",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-write-failure-"));
+          const policy = new PolicyEngine();
+          policy.addRule({
+            name: "allow-model-invoke",
+            priority: 10,
+            evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+          });
+
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(new MockProvider());
+          const costEngine = new CostEngine();
+
+          const projectId = "proj-risk5-write-failure";
+          const approvals = new ApprovalWorkflow();
+          const approvalId = "approval-risk5-write-failure";
+          approvals.requestFor(approvalId, {
+            actionType: "project.scaffold",
+            risk: 5,
+            description: `Scaffold Project OS for '${projectId}'`,
+            projectId
+          });
+          approvals.approve(approvalId, "founder@example.com");
+
+          // Delegates to a REAL FileStateStore for every write except the
+          // genome.json one, which it deliberately fails — simulating a
+          // genuine durable-storage I/O error on ONE of the three protected
+          // writes this function performs after scaffolding.
+          const realStore = new FileStateStore();
+          const genomeWritePath = join("project-genome", "genome.json");
+          const failingStore: StateStore = {
+            write: (path, data) => {
+              if (path.endsWith(genomeWritePath)) {
+                throw new Error("simulated durable-storage write failure");
+              }
+              realStore.write(path, data);
+            },
+            read: (path) => realStore.read(path),
+            exists: (path) => realStore.exists(path)
+          };
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome(projectId),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: createDefaultModelRegistry(),
+              modelGateway,
+              costEngine,
+              stateStore: failingStore,
+              risk: 5,
+              approvals,
+              approvalId
+            })
+          ).rejects.toThrow("simulated durable-storage write failure");
+
+          // The approval must be an honest EXECUTION_FAILED record, never
+          // EXECUTED — this is the crux of the finding.
+          expect(approvals.get(approvalId)?.status).toBe("EXECUTION_FAILED");
+          expect(approvals.get(approvalId)?.status).not.toBe("EXECUTED");
+
+          // The scaffold's directories (a real filesystem mutation made
+          // INSIDE the same execute() callback, before the failing write)
+          // did genuinely happen — this finding does not ask for full
+          // transactional rollback of the scaffold itself, only that the
+          // APPROVAL's own state stay honest about what succeeded.
+          expect(existsSync(join(tempRoot, projectId))).toBe(true);
+          // But the genome.json write that failed never landed.
+          expect(existsSync(join(tempRoot, projectId, "project-genome", "genome.json"))).toBe(false);
+
+          // A retry with a genuinely working store must be rejected too —
+          // EXECUTION_FAILED is terminal, exactly like EXECUTED/REJECTED —
+          // proving this isn't a silently-retryable half-state.
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome(projectId),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: createDefaultModelRegistry(),
+              modelGateway,
+              costEngine,
+              risk: 5,
+              approvals,
+              approvalId
+            })
+          ).rejects.toThrow();
+        }
+      );
+
+      it("no regression: when every write succeeds, the approval genuinely reaches EXECUTED and all three protected writes land", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-write-success-"));
+        const policy = new PolicyEngine();
+        policy.addRule({
+          name: "allow-model-invoke",
+          priority: 10,
+          evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+        });
+
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+        const costEngine = new CostEngine();
+
+        const projectId = "proj-risk5-write-success";
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-risk5-write-success";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId
+        });
+        approvals.approve(approvalId, "founder@example.com");
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome(projectId),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway,
+          costEngine,
+          risk: 5,
+          approvals,
+          approvalId
+        });
+
+        expect(approvals.get(approvalId)?.status).toBe("EXECUTED");
+        expect(existsSync(join(tempRoot, projectId, "project-genome", "genome.json"))).toBe(true);
+        expect(existsSync(join(tempRoot, projectId, "organization", "organization.json"))).toBe(true);
+        expect(existsSync(result.statePath)).toBe(true);
+      });
+    }
+  );
 });
