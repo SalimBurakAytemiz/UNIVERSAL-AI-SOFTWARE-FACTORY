@@ -178,13 +178,28 @@ export class TechnologyRegistry {
     }
 
     const updated = freezeRecord({ ...current, lifecycle: to });
-    this.#technologies.set(id, updated);
+    // P1 fix (30th independent review round targeted audit, same root
+    // class as finding 6, "provider replacement must rollback if audit
+    // fails"): this used to call `this.#technologies.set(id, updated)`
+    // FIRST and append to the audit log only afterward — if an audit log
+    // WAS configured and its `append()` threw (a broken/misconfigured
+    // sink), the lifecycle transition had already taken effect with no
+    // corresponding audit trail, and the thrown error gave the caller no
+    // indication the mutation nonetheless succeeded. Fixed: when an audit
+    // log is configured, the append happens FIRST — if it throws, this
+    // method never reaches `this.#technologies.set()`, so the map is
+    // never observably updated and a caller who catches the audit error
+    // sees the state genuinely unchanged. (No audit log configured is a
+    // different, deliberately-accepted case — see the constructor's own
+    // fix note — and the transition still applies normally, since no
+    // audit trail was ever promised in that mode.)
     this.#auditLog?.append({
       type: "TECHNOLOGY_LIFECYCLE_TRANSITIONED",
       actor: "technology-registry",
       payload: { id, from: current.lifecycle, to, reason },
       timestamp: new Date().toISOString()
     });
+    this.#technologies.set(id, updated);
     return updated;
   }
 

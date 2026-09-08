@@ -50,6 +50,45 @@ export interface ModelProvider {
 }
 
 /**
+ * P1 fix (30th independent review round, finding 5, "store immutable
+ * provider bindings"): `registerProvider()`/`replaceProvider()` used to
+ * store the caller's OWN `ModelProvider` OBJECT directly in `#providers` —
+ * a live reference to whatever the caller passed in, not a copy. Since a
+ * plain `ModelProvider` object is an ordinary, caller-owned, mutable JS
+ * object, nothing stopped that SAME caller from later reassigning
+ * `provider.invoke = maliciousFunction` — every FUTURE, already-authorized
+ * `#rawInvoke()` call for that provider id would then silently execute the
+ * attacker-controlled function instead, with zero re-registration, zero
+ * new audit event, and zero opportunity for the policy/approval gate this
+ * file's `replaceProvider()` exists to enforce. Fixed by capturing a
+ * DETACHED, frozen binding at the moment of registration/replacement — the
+ * provider id, the `invoke` method BOUND to the provider instance at that
+ * exact moment (`Function.prototype.bind`, so the captured function keeps
+ * working correctly even if it reads its own `this` state, but is
+ * otherwise a completely independent reference the caller's own object can
+ * never redirect), and the implementation's constructor name (captured
+ * once, for `replaceProvider()`'s own audit trail — bkz. aşağıdaki
+ * `implementationName`). `#providers` now stores ONLY this immutable
+ * binding — never the caller's live object — so mutating (or even
+ * reassigning properties on) the original `provider` object after
+ * registration has no effect whatsoever on what a future `invoke()` call
+ * actually executes.
+ */
+interface ProviderBinding {
+  readonly id: string;
+  readonly invoke: ModelProvider["invoke"];
+  readonly implementationName: string;
+}
+
+function captureProviderBinding(provider: ModelProvider): ProviderBinding {
+  return Object.freeze({
+    id: provider.id,
+    invoke: provider.invoke.bind(provider),
+    implementationName: provider.constructor?.name ?? "unknown"
+  });
+}
+
+/**
  * `ModelGateway.invoke()`'in atlanamaz şekilde ZORUNLU kıldığı yetkilendirme
  * bağlamı. `policy`/`budget` isteğe bağlı DEĞİLDİR — bölüm 147'nin gereği
  * budur: gerçek bir provider çağrısına giden HİÇBİR yol, bu ikisi olmadan
@@ -201,7 +240,7 @@ export class ModelGateway {
   // Reflect, hiçbiri bunu atlatamaz (bir `SyntaxError`/`TypeError`
   // üretir). Bölüm 147'nin "yapısal olarak engellenmeli, geliştirici
   // sözleşmesiyle değil" gereksinimini KARŞILAYAN budur.
-  readonly #providers = new Map<string, ModelProvider>();
+  readonly #providers = new Map<string, ProviderBinding>();
 
   /**
    * P1 fix (25th independent review round, "approval evidence must flow
@@ -245,7 +284,7 @@ export class ModelGateway {
     if (this.#providers.has(provider.id)) {
       throw new DuplicateProviderIdError(provider.id);
     }
-    this.#providers.set(provider.id, provider);
+    this.#providers.set(provider.id, captureProviderBinding(provider));
   }
 
   /**
@@ -302,17 +341,36 @@ export class ModelGateway {
         projectId: context.projectId
       },
       () => {
-        this.#providers.set(provider.id, provider);
+        // P1 fix (30th independent review round, finding 6, "provider
+        // replacement must rollback if audit fails"): this used to swap
+        // `this.#providers` FIRST, then call `auditLog.append(...)` — if
+        // the append call itself threw (a corrupted/durable-storage-backed
+        // `AuditLog` implementation failing to write, for instance), the
+        // provider binding was ALREADY replaced in memory, yet the promise
+        // this method returns rejects, giving every caller the impression
+        // the replacement never happened — a real, live architectural
+        // mutation with NO corresponding audit evidence, exactly what
+        // `ProviderReplacementAuditRequiredError` exists to make
+        // structurally impossible. Fixed by reordering: the durable audit
+        // event is appended FIRST; the actual swap (`this.#providers.set`)
+        // only runs immediately afterward, in the SAME synchronous tick (no
+        // `await` between them, so nothing else can observe an
+        // intermediate state). If `auditLog.append()` throws, this
+        // callback never reaches the swap at all — the original provider
+        // binding remains fully authoritative, and the thrown error
+        // propagates out of `replaceProvider()` exactly as before, now
+        // truthfully reflecting that nothing changed.
         auditLog.append({
           type: "MODEL_PROVIDER_REPLACED",
           actor: "ModelGateway",
           payload: {
             providerId: provider.id,
-            previousImplementation: existingProvider.constructor?.name ?? "unknown",
+            previousImplementation: existingProvider.implementationName,
             newImplementation: provider.constructor?.name ?? "unknown"
           },
           timestamp: new Date().toISOString()
         });
+        this.#providers.set(provider.id, captureProviderBinding(provider));
       },
       approvalReference
     );

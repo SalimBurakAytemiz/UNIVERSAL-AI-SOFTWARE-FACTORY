@@ -10,54 +10,79 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
 const requirementsDir = join(repoRoot, "specification", "requirements");
 
-describe("detectTraceabilityIssues (pure logic, refs are non-path free-text notes so no real fs verification is exercised)", () => {
-  it("flags a requirement claiming IMPLEMENTATION_IN_PROGRESS with no implementation_refs", () => {
-    const issues = detectTraceabilityIssues(
-      [{ id: "R1", status: "IMPLEMENTATION_IN_PROGRESS", implementationRefs: [], testRefs: [], proofRefs: [] }],
-      repoRoot
-    );
-    expect(issues).toEqual([{ requirementId: "R1", issue: "MISSING_IMPLEMENTATION_REFS", status: "IMPLEMENTATION_IN_PROGRESS" }]);
-  });
+describe(
+  "detectTraceabilityIssues (pure logic, refs are REAL resolvable repo paths — bkz. 30th independent review " +
+    "round finding 7, free-text prose no longer counts as evidence at all)",
+  () => {
+    it("flags a requirement claiming IMPLEMENTATION_IN_PROGRESS with no implementation_refs", () => {
+      const issues = detectTraceabilityIssues(
+        [{ id: "R1", status: "IMPLEMENTATION_IN_PROGRESS", implementationRefs: [], testRefs: [], proofRefs: [] }],
+        repoRoot
+      );
+      expect(issues).toEqual([{ requirementId: "R1", issue: "MISSING_IMPLEMENTATION_REFS", status: "IMPLEMENTATION_IN_PROGRESS" }]);
+    });
 
-  it("flags a requirement claiming UNIT_TESTED with no test_refs, even if implementation_refs exist", () => {
-    const issues = detectTraceabilityIssues(
-      [{ id: "R2", status: "UNIT_TESTED", implementationRefs: ["real evidence note for R2"], testRefs: [], proofRefs: [] }],
-      repoRoot
-    );
-    expect(issues.map((i) => i.issue)).toEqual(["MISSING_TEST_REFS"]);
-  });
+    it("flags a requirement claiming UNIT_TESTED with no test_refs, even if implementation_refs exist", () => {
+      const issues = detectTraceabilityIssues(
+        [{ id: "R2", status: "UNIT_TESTED", implementationRefs: ["package.json"], testRefs: [], proofRefs: [] }],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue)).toEqual(["MISSING_TEST_REFS"]);
+    });
 
-  it("flags a requirement claiming PROOF_VERIFIED with no proof_refs", () => {
-    const issues = detectTraceabilityIssues(
-      [
-        {
-          id: "R3",
-          status: "PROOF_VERIFIED",
-          implementationRefs: ["real evidence note for R3"],
-          testRefs: ["real test note for R3"],
-          proofRefs: []
-        }
-      ],
-      repoRoot
-    );
-    expect(issues.map((i) => i.issue)).toEqual(["MISSING_PROOF_REFS"]);
-  });
+    it("flags a requirement claiming PROOF_VERIFIED with no proof_refs", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R3",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: ["package.json"],
+            proofRefs: []
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue)).toEqual(["MISSING_PROOF_REFS"]);
+    });
 
-  it("does not flag a fully-evidenced requirement (free-text notes, no whitespace-free path claimed)", () => {
-    const issues = detectTraceabilityIssues(
-      [
-        {
-          id: "R4",
-          status: "PROOF_VERIFIED",
-          implementationRefs: ["implementation note for R4"],
-          testRefs: ["test note for R4"],
-          proofRefs: ["proof note for R4"]
-        }
-      ],
-      repoRoot
+    it("does not flag a fully-evidenced requirement (every ref a real, resolvable repository path)", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R4",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: ["package.json"],
+            proofRefs: ["package.json"]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues).toHaveLength(0);
+    });
+
+    it(
+      "BLOCKER regression, exact reproduction (30th independent review round, finding 7): a free-text " +
+        "'manually verified'-style claim NEVER counts as evidence, even alone with nothing else",
+      () => {
+        const issues = detectTraceabilityIssues(
+          [
+            {
+              id: "R9",
+              status: "PROOF_VERIFIED",
+              implementationRefs: ["manually verified"],
+              testRefs: ["manually verified"],
+              proofRefs: ["manually verified"]
+            }
+          ],
+          repoRoot
+        );
+        expect(issues.map((i) => i.issue).sort()).toEqual(
+          ["MISSING_IMPLEMENTATION_REFS", "MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort()
+        );
+      }
     );
-    expect(issues).toHaveLength(0);
-  });
 
   it("does not evaluate BLOCKED, DEPRECATED, or SUPERSEDED requirements", () => {
     const issues = detectTraceabilityIssues(
@@ -181,22 +206,29 @@ describe(
       expect(issues.map((i) => i.issue)).toEqual(["MISSING_IMPLEMENTATION_REFS"]);
     });
 
-    it("a free-text audit note (contains whitespace) is still accepted as non-path evidence, preserving legacy pre-convention records", () => {
-      const root = makeRoot(); // deliberately empty — nothing on disk matches any path
-      const issues = detectTraceabilityIssues(
-        [
-          {
-            id: "R14",
-            status: "PROOF_VERIFIED",
-            implementationRefs: ["Session audit: manually verified by the Founder"],
-            testRefs: ["Session audit: manually verified by the Founder"],
-            proofRefs: ["Session audit: manually verified by the Founder"]
-          }
-        ],
-        root
-      );
-      expect(issues).toHaveLength(0);
-    });
+    it(
+      "P1 fix (30th independent review round, finding 7, 'reject unverifiable free-text evidence " +
+        "references'): a free-text audit note (contains whitespace) is NO LONGER accepted as evidence — " +
+        "'no claim without evidence' applies to prose exactly as it does to a fabricated path",
+      () => {
+        const root = makeRoot(); // deliberately empty — nothing on disk matches any path
+        const issues = detectTraceabilityIssues(
+          [
+            {
+              id: "R14",
+              status: "PROOF_VERIFIED",
+              implementationRefs: ["Session audit: manually verified by the Founder"],
+              testRefs: ["Session audit: manually verified by the Founder"],
+              proofRefs: ["Session audit: manually verified by the Founder"]
+            }
+          ],
+          root
+        );
+        expect(issues.map((i) => i.issue).sort()).toEqual(
+          ["MISSING_IMPLEMENTATION_REFS", "MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort()
+        );
+      }
+    );
 
     it("only ONE genuinely-verified ref among several is sufficient (mirrors the pre-existing 'any ref counts' semantics)", () => {
       const root = makeRoot();

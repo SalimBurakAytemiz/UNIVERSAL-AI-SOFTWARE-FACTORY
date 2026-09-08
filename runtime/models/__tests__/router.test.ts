@@ -8,7 +8,7 @@ import {
   NoCapableModelError,
   PremiumFallbackBlockedError
 } from "../router.js";
-import type { ModelInvocationResponse } from "../gateway.js";
+import type { ModelInvocationResponse, ModelProvider } from "../gateway.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
 import { CapabilityDeniedError, CapabilityApprovalRequiredError } from "../../capability-gateway/gateway.js";
 import { CostEngine } from "../../cost/cost-engine.js";
@@ -240,7 +240,14 @@ describe("CheapestCapableModelRouter escalation (capability-driven initial promo
  * model. Fixed: every candidate response, at every tier, is validated;
  * fallback output is never trusted by default.
  */
-function setupThreeTierEscalationScenario() {
+// P1 fix (30th independent review round, finding 5, "store immutable provider bindings"): `ModelGateway`
+// now captures a provider's `invoke` binding AT registration time, so a `vi.spyOn(provider, "invoke")`
+// installed AFTER `registerProvider()` no longer has any effect on what the gateway actually calls (bkz.
+// models/gateway.ts's `captureProviderBinding()`) — exactly the "caller can't redirect an already-
+// registered provider" property that fix establishes. A test that needs to observe invocations must spy
+// BEFORE the provider is registered; this factory now accepts an optional pre-built (and pre-spied)
+// provider instead of always constructing its own fresh, un-spy-able one.
+function setupThreeTierEscalationScenario(provider: ModelProvider = new MockProvider()) {
   const registry = new ModelRegistry();
   registry.register({
     provider: "mock",
@@ -268,7 +275,6 @@ function setupThreeTierEscalationScenario() {
   });
 
   const gateway = new ModelGateway();
-  const provider = new MockProvider();
   gateway.registerProvider(provider);
   const router = new CheapestCapableModelRouter(registry);
   const policy = permissivePolicy();
@@ -384,7 +390,12 @@ describe("CheapestCapableModelRouter fallback output validation", () => {
 
 describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent review round: 'fallback execution bypasses policy and budget enforcement')", () => {
   it("a fallback candidate that policy DENYs is never invoked — the provider is never called for it", async () => {
-    const { router, gateway, provider } = setupThreeTierEscalationScenario();
+    // Spy BEFORE registration (bkz. this file's fix note above the factory
+    // function) — the gateway captures whatever `invoke` is bound to the
+    // provider AT registration time.
+    const rawProvider = new MockProvider();
+    const providerInvokeSpy = vi.spyOn(rawProvider, "invoke");
+    const { router, gateway } = setupThreeTierEscalationScenario(rawProvider);
     const policy = new PolicyEngine();
     policy.addRule(lowRiskAllowRule(5)); // would otherwise allow everything
     policy.addRule({
@@ -397,7 +408,6 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
     // guarded boundary itself and is legitimately called for every
     // candidate attempt) — this is the thing that must never be reached
     // for a denied candidate.
-    const providerInvokeSpy = vi.spyOn(provider, "invoke");
     const validate = vi.fn(() => false); // primary fails -> triggers an escalation attempt
 
     await expect(
@@ -417,7 +427,9 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
   });
 
   it("a fallback candidate requiring approval is not invoked without a valid approval", async () => {
-    const { router, gateway, provider } = setupThreeTierEscalationScenario();
+    const rawProvider = new MockProvider();
+    const providerInvokeSpy = vi.spyOn(rawProvider, "invoke");
+    const { router, gateway } = setupThreeTierEscalationScenario(rawProvider);
     const policy = new PolicyEngine();
     policy.addRule(lowRiskAllowRule(5));
     // Higher priority than the catch-all ALLOW above: both are non-DENY, so
@@ -430,7 +442,6 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
       evaluate: (action) => (action.description.includes("tier-premium") ? "APPROVAL_REQUIRED" : null)
     });
     const budget = permissiveBudget();
-    const providerInvokeSpy = vi.spyOn(provider, "invoke");
     const validate = vi.fn(() => false);
 
     await expect(
@@ -449,11 +460,12 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
   });
 
   it("insufficient budget blocks a fallback candidate BEFORE any provider call occurs", async () => {
-    const { router, gateway, provider, policy } = setupThreeTierEscalationScenario();
+    const rawProvider = new MockProvider();
+    const providerInvokeSpy = vi.spyOn(rawProvider, "invoke");
+    const { router, gateway, policy } = setupThreeTierEscalationScenario(rawProvider);
     const costEngine = new CostEngine();
     // Enough for the free initial (tier-mock, $0) but not the $0.5 premium fallback.
     const budget = new BudgetGuard(costEngine, { perRunUsd: 0.1 });
-    const providerInvokeSpy = vi.spyOn(provider, "invoke");
     const validate = vi.fn(() => false);
 
     await expect(
@@ -592,8 +604,9 @@ describe(
     );
 
     it("mutating options.allowPremiumFallback (false -> true) WHILE the initial candidate is pending has no effect — fallback stays blocked", async () => {
-      const { router, gateway, policy, budget, provider } = setupThreeTierEscalationScenario();
-      const providerInvokeSpy = vi.spyOn(provider, "invoke");
+      const rawProvider = new MockProvider();
+      const providerInvokeSpy = vi.spyOn(rawProvider, "invoke");
+      const { router, gateway, policy, budget } = setupThreeTierEscalationScenario(rawProvider);
       const validate = vi.fn(() => false); // primary always fails
 
       const options: { allowPremiumFallback?: boolean } = { allowPremiumFallback: false };

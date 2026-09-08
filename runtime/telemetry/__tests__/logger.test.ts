@@ -605,4 +605,69 @@ describe("Logger", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (30th independent review round, finding 9, 'redact complete header values containing apostrophes'): " +
+      "an apostrophe INSIDE the header value itself (a name like O'Connor) must not be treated as a shell/string " +
+      "quote boundary that truncates redaction before the real credential material",
+    () => {
+      it("BLOCKER regression, exact reproduction: 'Authorization: Digest username=\"O'Connor\", nonce=\"...\", response=\"SECRET\"' fully redacts through the trailing response value", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description:
+            'Authorization: Digest username="O\'Connor", realm="example.com", nonce="fake-nonce-value", response="fake-digest-response-should-not-appear"' // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-digest-response-should-not-appear");
+        expect(line).not.toContain("fake-nonce-value");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("BLOCKER regression, exact reproduction: 'Cookie: note=O'Connor; sessionid=SECRET' fully redacts the trailing session id, not just up to the apostrophe", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "Cookie: note=O'Connor; sessionid=fake-session-id-should-not-appear" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-session-id-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("no regression: the 28th round's shell-quoted 'curl -H ...' embedded-header case (whose closing apostrophe is followed by a space) still preserves trailing, unrelated log text", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "curl -H 'Authorization: Bearer fake-embedded-token-should-not-appear' https://api.example.com" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-token-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("curl");
+        expect(line).toContain("https://api.example.com");
+      });
+
+      it("no regression: 'Authorization: Digest ...' without any apostrophe still redacts every comma-separated sub-field, including the trailing response value", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description:
+            'Authorization: Digest username="alice", realm="example.com", nonce="xyz", response="fake-digest-response-should-not-appear"' // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-digest-response-should-not-appear");
+        expect(line).not.toContain("xyz");
+        expect(line).toContain("[REDACTED]");
+      });
+    }
+  );
 });

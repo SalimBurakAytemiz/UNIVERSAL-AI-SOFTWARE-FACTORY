@@ -644,7 +644,31 @@ export class BudgetGuard {
    */
   commit(
     reservationId: string,
-    entry: { taskId: string; agentId?: string; projectId?: string; provider: string; modelId: string; amountUsd: number }
+    entry: {
+      taskId: string;
+      agentId?: string;
+      projectId?: string;
+      // P1 fix (30th independent review round, finding 1, "preserve run
+      // identity through reservation commits"): this type used to omit
+      // `runId` entirely, so even a reservation created with one (via
+      // `reserve()`'s `ReservationOwnership`) had it silently DROPPED the
+      // moment it was committed — `commitReservation()`'s `record()` call
+      // only ever recorded the fields THIS type declared, and `runId`
+      // wasn't one of them. The committed `CostEntry` then carried no
+      // `runId` at all, so `perRunUsd`'s `totalFor({ runId })` scoping
+      // (round 29, finding 7) silently stopped counting it — a run's own
+      // ALREADY-COMMITTED spend vanished from its own ceiling the instant
+      // it was committed, letting a same-run follow-up reservation succeed
+      // as if that spend never happened. Adding `runId` here — and to
+      // `ownershipMismatches()` (bkz. cost-engine.ts) — closes both ends:
+      // the recorded entry now keeps the reservation's own `runId`, and a
+      // caller committing under a mismatched `runId` fails closed exactly
+      // like a mismatched `taskId`/`projectId`/`agentId` always has.
+      runId?: string;
+      provider: string;
+      modelId: string;
+      amountUsd: number;
+    }
   ) {
     // P1 fix (27th independent review round, finding 7, "snapshot spend
     // entries before checking them" — same root class, applied here too):
@@ -702,6 +726,7 @@ export class BudgetGuard {
             suppliedTaskId: snapshot.taskId,
             suppliedProjectId: snapshot.projectId,
             suppliedAgentId: snapshot.agentId,
+            suppliedRunId: snapshot.runId,
             suppliedProvider: snapshot.provider,
             suppliedModelId: snapshot.modelId
           },
@@ -722,6 +747,7 @@ export class BudgetGuard {
             taskId: snapshot.taskId,
             projectId: snapshot.projectId,
             agentId: snapshot.agentId,
+            runId: snapshot.runId,
             provider: snapshot.provider,
             modelId: snapshot.modelId
           },
@@ -734,9 +760,10 @@ export class BudgetGuard {
       throw err;
     }
 
-    const overages = this.buildCeilingChecks({ taskId: snapshot.taskId, projectId: snapshot.projectId }, 0).filter((check) =>
-      exceedsMonetaryAmount(check.projected, check.limit)
-    );
+    const overages = this.buildCeilingChecks(
+      { taskId: snapshot.taskId, projectId: snapshot.projectId, runId: snapshot.runId },
+      0
+    ).filter((check) => exceedsMonetaryAmount(check.projected, check.limit));
 
     this.#auditLog?.append({
       type: "BUDGET_RESERVATION_COMMITTED",

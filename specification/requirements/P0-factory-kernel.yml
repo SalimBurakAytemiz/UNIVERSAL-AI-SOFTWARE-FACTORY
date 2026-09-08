@@ -11,13 +11,24 @@
   source_baseline: "BASELINE-V1 section 318, 319"
   category: P0
   priority: CRITICAL
-  status: PROOF_VERIFIED
+  status: DEFINED
   implementation_refs: []
   test_refs: []
-  proof_refs:
-    - "Session audit: single 'Initial commit' with one-line README, working tree clean, no other branches/history."
+  proof_refs: []
   security_refs: []
-  notes: "Performed manually at session start via git status/log; repository was effectively empty."
+  notes: >
+    Performed manually at session start via git status/log; repository was
+    effectively empty (single "Initial commit", one-line README, clean
+    working tree, no other branches/history). That observation is true and
+    remains recorded above, but it was never a re-checkable artifact — no
+    file, no test, no CI job backs it, only a one-time manual look. P1 fix
+    (30th independent review round, finding 7, "reject unverifiable
+    free-text evidence references"): this requirement's status was
+    downgraded from PROOF_VERIFIED to DEFINED, since a prose claim like
+    "Session audit: ..." no longer counts as proof — no unsupported
+    upgrade is retained once the evidence bar it was never able to meet is
+    honestly enforced (baseline section 294, "no unsupported upgrades",
+    applies to keeping an upgrade, not only to making a new one).
 
 - id: UASF-REQ-0002
   title: Public secret / hygiene audit
@@ -33,7 +44,14 @@
   test_refs:
     - "tests/secret-scan.test.mjs"
   proof_refs:
-    - "CI job 'secret-scan' in .github/workflows/ci.yml"
+    # P1 fix (30th independent review round, finding 7, "reject unverifiable
+    # free-text evidence references"): this used to be the free-text
+    # sentence "CI job 'secret-scan' in .github/workflows/ci.yml" — prose
+    # describing where the proof lives, not itself a resolvable path, so it
+    # no longer counts as evidence under the tightened rule (bkz.
+    # runtime/requirements-traceability/traceability.ts). Corrected to the
+    # real path itself — the SAME true fact, now machine-verifiable.
+    - ".github/workflows/ci.yml"
   security_refs:
     - "SECURITY.md"
   notes: >
@@ -4746,3 +4764,87 @@
     INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this round does NOT merge, does NOT move to P1,
     does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch — all work stayed
     on claude/ai-factory-baseline-v1-seawq7.
+
+    Round 30 (fresh, independent Codex closure review, consolidated batch of NINE priority-P1 findings, plus a
+    narrow, explicitly-scoped root-class audit for the same nine classes): (1) `cost-engine.ts`'s
+    `ownershipMismatches()` now also compares `runId`, and `budget.ts`'s `commit()` threads the reservation's
+    `runId` through to the confirmed-scope/audit payload and the post-commit ceiling check — a second reservation
+    in the same run can no longer bypass a per-run ceiling the first reservation's commit already counted toward.
+    (2) `cost-engine.ts`'s `commitReservation()` now unconditionally deletes and re-persists an already-committed
+    reservation on every call (not only when one is still present in the in-memory map), so a retry whose EARLIER
+    attempt committed the cost but failed to persist the reservation's removal repairs durable state instead of
+    leaving a stale reservation to resurrect after restart. (3) `cost-engine.ts` gained a real cross-process file
+    lock (reusing `cache/file-lock.ts`, the same primitive `file-cache.ts` was hardened with in round 16) around
+    every durable mutation, with a reentrant `#lockDepth` guard so `commitReservation()`'s internal call into
+    `record()` — both wrapped — never deadlocks against itself; the lock is acquired, the LATEST durable state is
+    reloaded from disk, the mutation is applied, then persisted and released — so two `CostEngine` instances
+    sharing one persistence path can no longer silently overwrite each other's newer committed costs or
+    reservations. (4) `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` now constructs its default
+    `CostEngine` with durable persistence (`cost-ledger.json` under `baseDir`, via the same `FileStateStore` the
+    rest of bootstrap already shares) whenever the routed model's `costPerCall > 0`, instead of always defaulting
+    to a fresh in-memory ledger — a paid default bootstrap's spend now survives a restart and accumulates across
+    repeated bootstrap calls; the exact `costPerCall > 0` heuristic (rather than "a caller supplied a
+    `modelGateway`") was chosen specifically so the round-23 zero-filesystem-mutation regression for an unknown
+    provider with a genuinely free model keeps passing unchanged. (5) `models/gateway.ts` now captures a caller's
+    `ModelProvider` into a detached, frozen `ProviderBinding` (`{ id, invoke: provider.invoke.bind(provider),
+    implementationName }`) at both `registerProvider()` and `replaceProvider()` time, so a caller who later
+    reassigns a property on their OWN original provider object (e.g. redirecting `.invoke` to a malicious
+    function) can no longer alter which function the gateway actually calls. (6) `models/gateway.ts`'s
+    `replaceProvider()` now appends its mandatory audit event BEFORE swapping in the new provider binding (not
+    after), so a broken/throwing audit sink leaves the ORIGINAL provider authoritative and the replacement never
+    observably takes effect, mirroring the same reorder-for-atomicity fix applied to
+    `technology-registry/registry.ts`'s `transitionLifecycle()` in this round's own root-class audit (same class:
+    a governed mutation must never land before its mandatory audit durably succeeds). (7)
+    `requirements-traceability/traceability.ts`'s `isVerifiedEvidenceRef()` no longer treats a non-path-shaped
+    (whitespace-containing) ref as automatically-valid evidence — round 29's own deliberate "legacy free-text note"
+    carve-out is reversed, since it let `proof_refs: ["manually verified"]` (or any other prose sentence) satisfy
+    an evidence-backed status with nothing real behind it; only a path-shaped ref that actually resolves on disk
+    ever counts as evidence now. This genuinely broke 2 real registry entries that had relied on the old carve-out
+    — `UASF-REQ-0002`'s `proof_refs` was retargeted to the real, verified-existing `.github/workflows/ci.yml` path
+    (same underlying fact, now machine-checkable), and `UASF-REQ-0001` was honestly downgraded from
+    `PROOF_VERIFIED` to `DEFINED` (its `notes` field explains why) since no re-checkable artifact exists for it —
+    both corrections are visible in this file's own history, not merely asserted here. (8)
+    `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` no longer accepts a caller-supplied
+    `preflightTraceabilityIssues: TraceabilityIssue[]` claim (an ordinary caller who omitted the field, or passed
+    `[]`, previously sailed through with NO traceability check ever having actually run); it now always calls
+    `traceRequirements()` itself against a real, on-disk registry — defaulting to this Factory's own installation
+    (auto-located via a `findRepoRoot()` helper mirroring `cli/index.ts`'s own), or a caller-specified
+    `{requirementsDir, rootDir}` LOCATION (never a caller-fabricable RESULT) for tests exercising the refusal path
+    against a genuine, deliberately-broken fixture registry. (9) `telemetry/logger.ts`'s
+    `AUTHORIZATION_HEADER_PATTERN`/`COOKIE_HEADER_PATTERN` no longer treat every apostrophe as a hard value
+    boundary — round 29's `[^'\n]+` stopped redacting at an apostrophe legitimately embedded IN the credential
+    value itself (`Digest username="O'Connor", ..., response="SECRET"`; `Cookie: note=O'Connor;
+    sessionid=SECRET`), leaving the real secret exposed right after it; the captured value now only stops at an
+    apostrophe NOT immediately followed by a letter/digit (a real closing quote, as in the round-28
+    `curl -H '...'` shell-quoting regression, which continues to pass), while consuming a contraction/possessive
+    apostrophe as ordinary value content. All nine fixes carry deterministic regression tests (including exact
+    BLOCKER reproductions using the literal examples from the review) and were verified via a genuine temporary
+    in-place bypass reproducing the exact predicted failure, then fully reverted and reconfirmed clean.
+
+    The root-class audit (limited to these nine exact classes, not broadened into unrelated architecture) found
+    one further genuine instance: `technology-registry/registry.ts`'s `transitionLifecycle()` had the SAME
+    mutate-before-audit ordering as finding 6 (`models/gateway.ts`'s `replaceProvider()` before its round-30 fix)
+    — fixed the same way (audit append moved before the `#technologies.set()` mutation) with its own BLOCKER
+    regression test (a throwing `AuditLog` subclass proves the lifecycle transition never took effect). No other
+    genuine instances found: `decision-ledger.ts`/`assumption-register.ts` persist via explicit full-snapshot
+    `saveTo()`/`loadFrom()`, never called automatically per-mutation the way `cost-engine.ts`'s persistence is, so
+    they are not exposed to the same multi-instance lost-update or idempotent-retry classes as currently wired in
+    P0; `workers/registry.ts`'s stored records are plain data snapshots with no invocable methods, so finding 5's
+    mutable-binding class does not apply; `capability-gateway/gateway.ts`'s `authorize()` executes its caller
+    callback synchronously, within the same call, with no retained cross-call binding for a caller to later
+    redirect; no other evidence-verification logic exists outside `traceability.ts`; no other caller-suppliable
+    "clean result" (as opposed to a caller-suppliable location) trust boundary was found; `scripts/secret-scan.mjs`
+    performs no redaction, only detection, so finding 9's class does not apply there. Full required sequence
+    re-run and green: lint, typecheck, build, 1106/1106 tests (44 files, +22 net new), validate:requirements (42
+    schema-valid records), history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY),
+    `npm run verify:production-install` (PASS — compiled CLI and ajv-backed genome validator both work under a
+    real `npm ci --omit=dev` install with zero devDependencies present, confirmed by explicit absence checks for
+    `typescript`/`vitest`/`eslint`; the install's `node_modules/` also contains several EMPTY npm scope-namespace
+    directories such as `@eslint`/`@vitest`/`@typescript-eslint`/`@esbuild`/`@rolldown`/`@oxc-project` — confirmed
+    empty and unreachable via `require()`, a benign `npm ci --omit=dev` artifact of resolving the lockfile tree,
+    not an actual devDependency leak), all 9 P0 proofs (13 assertions). No status raised on any requirement beyond
+    what real evidence supports; UASF-REQ-0001's downgrade (see above) is the only status CHANGE this round, and
+    it is a correction toward less evidence, not an upgrade. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next
+    (31st) independent Codex review to return INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this
+    round does NOT merge, does NOT move to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did
+    NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.

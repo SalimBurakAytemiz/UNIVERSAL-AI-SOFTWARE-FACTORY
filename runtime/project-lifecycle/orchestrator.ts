@@ -21,7 +21,9 @@
 //   6. Tüm sonuç (Genome, Organizasyon, model kararı, maliyet) kalıcı
 //      duruma yazılır; süreç yeniden başlasa bile kaybolmaz (bölüm 277).
 
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseProjectGenome, type ProjectGenome } from "../project-genome/genome.js";
 import { composeOrganizationFromGenome, type OrganizationComposition } from "../organization-composer/composer.js";
 import { scaffoldProjectOs, type ScaffoldResult } from "../project-os/scaffold.js";
@@ -36,8 +38,31 @@ import { MockProvider } from "../models/providers/mock-provider.js";
 import { CostEngine } from "../cost/cost-engine.js";
 import { assertValidBudgetLimits, BudgetGuard, type BudgetLimits } from "../budget/budget.js";
 import { FileStateStore, type StateStore } from "../state/file-store.js";
+import { traceRequirements } from "../cli/commands/trace-requirement.js";
 import type { TraceabilityIssue } from "../requirements-traceability/traceability.js";
 import { freezeRecord } from "../util/immutable.js";
+
+/**
+ * P1 fix (30th independent review round, finding 8, "preflight
+ * traceability must come from a trusted source"): mirrors
+ * `runtime/cli/index.ts`'s own `findRepoRoot()` — walks up from this
+ * module's own location looking for `package.json`, so `bootstrapProject()`
+ * can locate the Factory's OWN requirement registry without any caller
+ * having to tell it where it is (and, more importantly, without trusting
+ * anything a caller claims about what that registry contains).
+ */
+function findRepoRoot(startDir: string): string {
+  let dir = startDir;
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, "package.json"))) return dir;
+    dir = dirname(dir);
+  }
+  throw new Error(`Could not locate repository root from ${startDir}`);
+}
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_REPO_ROOT = findRepoRoot(__dirname);
+const DEFAULT_REQUIREMENTS_DIR = join(DEFAULT_REPO_ROOT, "specification", "requirements");
 
 /**
  * The default `ModelGateway` used when a caller doesn't inject their own
@@ -86,8 +111,27 @@ export interface BootstrapProjectInput {
   readonly modelGateway?: ModelGateway;
   /** Both the Organization Composer's team-activation threshold and the Capability Gateway action's risk level. Defaults to 1 (low). */
   readonly risk?: RiskLevel;
-  /** Factory'nin kendi gereksinim kayıt defterindeki izlenebilirlik sorunları (varsa) — boş olmayan bir liste bootstrap'i durdurur. */
-  readonly preflightTraceabilityIssues?: readonly TraceabilityIssue[];
+  /**
+   * P1 fix (30th independent review round, finding 8, "preflight
+   * traceability must come from a trusted source"): this field used to be
+   * `preflightTraceabilityIssues?: readonly TraceabilityIssue[]` — a
+   * caller-supplied CLAIM about what the traceability check already
+   * found, trusted verbatim. `bootstrapProject()`'s own gate was `if
+   * (input.preflightTraceabilityIssues && ...length > 0) throw ...` — an
+   * ordinary caller who simply OMITTED the field, or passed `[]`, sailed
+   * straight through with NO traceability check ever actually having run,
+   * regardless of the Factory's REAL registry's real state. A result a
+   * caller can fabricate is not evidence. Fixed: `bootstrapProject()` now
+   * computes the check itself, unconditionally, every call, via
+   * `traceRequirements()` against a real, on-disk registry — `requirementsRegistry`
+   * only ever says WHERE to look (defaulting to this Factory's own
+   * installation, auto-discovered — bkz. `DEFAULT_REQUIREMENTS_DIR`), never
+   * WHAT was found there. A caller can point the check at a different
+   * registry location (useful for tests exercising the refusal path with a
+   * genuine, deliberately-broken fixture registry) but can never skip the
+   * check itself or fabricate its result.
+   */
+  readonly requirementsRegistry?: { readonly requirementsDir: string; readonly rootDir: string };
   /**
    * P1 fix (27th independent review round, finding 10, "provide a real
    * approval path for risk-5 bootstrap"): the `CapabilityGateway` this
@@ -178,8 +222,22 @@ export interface BootstrapProjectResult {
  * `budgetLimits` reference) is what `BudgetGuard` is constructed from.
  */
 export async function bootstrapProject(input: BootstrapProjectInput): Promise<BootstrapProjectResult> {
-  if (input.preflightTraceabilityIssues && input.preflightTraceabilityIssues.length > 0) {
-    throw new PreflightTraceabilityFailedError(input.preflightTraceabilityIssues);
+  // P1 fix (30th independent review round, finding 8, "preflight
+  // traceability must come from a trusted source"): this check now
+  // ALWAYS genuinely runs `traceRequirements()` against a real, on-disk
+  // registry — either the location `input.requirementsRegistry` names, or
+  // (by default, for every ordinary caller) this Factory's own
+  // installation, located ONCE at module load via `findRepoRoot()`. There
+  // is no code path left by which omitting a field, or passing an empty
+  // array, could mean "the registry is clean" without the registry
+  // actually having been read and evaluated.
+  const { requirementsDir, rootDir } = input.requirementsRegistry ?? {
+    requirementsDir: DEFAULT_REQUIREMENTS_DIR,
+    rootDir: DEFAULT_REPO_ROOT
+  };
+  const traceabilityIssues = traceRequirements(requirementsDir, rootDir);
+  if (traceabilityIssues.length > 0) {
+    throw new PreflightTraceabilityFailedError(traceabilityIssues);
   }
 
   // Herhangi bir `await`den ÖNCE: bu çağrının kullanacağı HER alan yerel
@@ -334,7 +392,46 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     risk: 0,
     requiredCapabilities: ["summarization"]
   });
-  const costEngine = callerCostEngine ?? new CostEngine();
+  // P1 fix (30th independent review round, finding 4, "do not use an
+  // ephemeral ledger for paid default bootstraps"): `costEngine` used to
+  // default to a bare `new CostEngine()` — genuinely, unconditionally
+  // in-memory-only — regardless of whether the model THIS bootstrap is
+  // about to invoke (`modelDecision.model`, already selected above) can
+  // cost real money. Since this function's own per-call `costEngine` (when
+  // the caller doesn't supply one) is NEVER exposed back to the caller —
+  // bkz. `BootstrapProjectResult`, it has no `costEngine` field — the ONLY
+  // spend it will EVER see is this one, single, already-selected
+  // invocation, so `modelDecision.model.costPerCall > 0` is a precise,
+  // sufficient signal for "this call is about to spend real money," not
+  // merely "the caller happened to supply their own `ModelGateway`" (a
+  // caller can supply a custom gateway purely to register an ADDITIONAL
+  // free/mock adapter, with no real cost at all — exactly the existing
+  // 23rd-round regression fixture below, whose registry entry is
+  // `costPerCall: 0`, demonstrates). Defaulting to durable persistence
+  // ONLY when the selected model can genuinely cost something means: a
+  // caller who wires in a real, priced model but forgets (or never thinks
+  // to) wire in a MATCHING durable `costEngine` no longer has that real
+  // spend silently vanish in memory the moment the process exits — never
+  // durable, never enforced against `dailyUsd`/`monthlyUsd` on a
+  // subsequent run, exactly the "no silent spending" violation baseline
+  // section 147 forbids — while every $0 mock/test path (the default
+  // registry, or any caller-supplied registry whose selected model is
+  // still free) keeps the EXACT prior in-memory-only behavior, per this
+  // finding's own explicit allowance ("mock/free test paths may explicitly
+  // use in-memory accounting when appropriate"). Persisted via
+  // `stateStore` (the SAME store — caller-supplied or the default
+  // `FileStateStore` — this function already uses for its other durable
+  // state) at a stable path anchored under `baseDir`, so repeated
+  // `bootstrapProject()` calls against the same `baseDir` share ONE
+  // authoritative, restart-surviving ledger — exactly what
+  // `dailyUsd`/`monthlyUsd`/`perRunUsd` ceilings need to mean anything
+  // across more than a single process lifetime.
+  const stateStore = callerStateStore ?? new FileStateStore();
+  const costEngine =
+    callerCostEngine ??
+    (modelDecision.model.costPerCall > 0
+      ? new CostEngine(() => new Date(), { store: stateStore, path: join(baseDir, "cost-ledger.json") })
+      : new CostEngine());
   const budget = new BudgetGuard(costEngine, budgetGuardLimits);
   const modelGateway = callerModelGateway ?? defaultBootstrapModelGateway();
 
@@ -372,7 +469,9 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // eder ve dosyayı GERÇEKTEN symlink'in işaret ettiği (baseDir dışı)
   // konumda oluşturur. Artık her nihai dosya yolu, gerçek yazmadan HEMEN
   // önce assertFilesystemConfinement() ile ayrıca doğrulanır.
-  const stateStore = callerStateStore ?? new FileStateStore();
+  // `stateStore` artık YUKARIDA (costEngine'in kendi durable persistence
+  // ihtiyacı için, bkz. o satırın üstündeki fix notu) çözülmüştür — burada
+  // tekrar oluşturulmaz, aynı örnek kullanılmaya devam eder.
   stateStore.write(
     assertFilesystemConfinement(scaffold.projectRoot, join("project-genome", "genome.json")),
     genome

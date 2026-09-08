@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1004,6 +1004,158 @@ describe("CostEngine", () => {
         });
         expect(recorded.amountUsd).toBe(1);
         expect(engine.all()).toHaveLength(1);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (30th independent review round, finding 2, 'persist reservation deletion on idempotent retry'): " +
+      "a retry must repair durable state even when the reservation is already absent from the in-memory map",
+    () => {
+      function storeThatFailsOnceOnCall(failOnCall: number): StateStore {
+        let calls = 0;
+        const data = new Map<string, unknown>();
+        return {
+          write: (path, value) => {
+            calls += 1;
+            if (calls === failOnCall) {
+              throw new Error("simulated transient durable-storage I/O failure");
+            }
+            data.set(path, value);
+          },
+          read: <T>(path: string) => data.get(path) as T | undefined,
+          exists: (path) => data.has(path)
+        };
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: commit succeeds in memory -> persistence of reservation " +
+          "removal fails -> retry -> restart -> committed cost exists exactly once, reservation does NOT reappear",
+        () => {
+          // 1st write: createReservation (succeeds). 2nd write: record()'s own
+          // persist (succeeds — the cost is durably recorded). 3rd write:
+          // commitReservation()'s post-record() reservation-deletion persist
+          // (fails) — in-memory the reservation Map entry is ALREADY deleted
+          // by this point (bkz. commitReservation()'s own code), but the
+          // durable file was never updated to reflect that.
+          const store = storeThatFailsOnceOnCall(3);
+          const engine = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+          const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+          expect(() =>
+            engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+          ).toThrow();
+
+          // Retry on the same reservation id, exactly as documented.
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 });
+
+          // Without the fix, the retry's idempotency check finds the entry
+          // already recorded but sees `#reservations` already lacks the id
+          // in memory, so it never re-persists — the durable file is left
+          // forever stale, still showing the reservation as present.
+          // Simulate a real process restart: a brand new CostEngine instance
+          // pointed at the SAME durable store/path must NOT resurrect it.
+          const restarted = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+          expect(restarted.all().filter((e) => e.taskId === "t1")).toHaveLength(1);
+          expect(restarted.total()).toBe(1);
+          expect(restarted.reservedTotal({ taskId: "t1" })).toBe(0);
+          expect(restarted.getReservation(reservation.id)).toBeUndefined();
+        }
+      );
+
+      it("a SECOND retry (durable state already correct) is a safe no-op, not a fresh write attempt", () => {
+        const store = storeThatFailsOnceOnCall(3);
+        const engine = new CostEngine(() => new Date(), { store, path: "cost-state.json" });
+        const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+        expect(() =>
+          engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).toThrow();
+        engine.commitReservation(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 });
+
+        // A further retry after durable state is already repaired must stay idempotent.
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 1
+        });
+        expect(recorded.amountUsd).toBe(1);
+        expect(engine.all().filter((e) => e.taskId === "t1")).toHaveLength(1);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (30th independent review round, finding 3, 'serialize persistent cost-ledger updates'): two " +
+      "CostEngine instances sharing the same persisted path must not overwrite each other's newer durable state",
+    () => {
+      let tempRoot: string;
+
+      afterEach(() => {
+        if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: A records cost/reservation, B (constructed from an older " +
+          "snapshot) also writes -> A's data MUST remain, B's data MUST also remain",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-concurrent-"));
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+
+          // Both instances are constructed from the SAME (empty) starting
+          // snapshot — exactly the scenario where a naive "overwrite the
+          // whole file with my own in-memory copy" implementation loses
+          // whichever instance writes SECOND.
+          const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+          const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+
+          engineA.record({ taskId: "a", provider: "mock", modelId: "m1", amountUsd: 1 });
+          // Without the fix, this second write (from B, which never saw A's
+          // write) would silently ERASE A's already-durably-recorded entry.
+          engineB.record({ taskId: "b", provider: "mock", modelId: "m1", amountUsd: 2 });
+
+          // A genuinely fresh THIRD instance, reading the final durable
+          // state, must see BOTH entries — neither was lost.
+          const engineC = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(engineC.all().map((e) => e.taskId).sort()).toEqual(["a", "b"]);
+          expect(engineC.total()).toBe(3);
+        }
+      );
+
+      it("reservations from two instances sharing the same durable path also both survive", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-concurrent-reservations-"));
+        const store = new FileStateStore();
+        const statePath = join(tempRoot, "cost-state.json");
+
+        const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+        const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+
+        const reservationA = engineA.createReservation({ taskId: "a" }, 0.5);
+        const reservationB = engineB.createReservation({ taskId: "b" }, 0.5);
+
+        const engineC = new CostEngine(() => new Date(), { store, path: statePath });
+        expect(engineC.getReservation(reservationA.id)).toBeDefined();
+        expect(engineC.getReservation(reservationB.id)).toBeDefined();
+        expect(engineC.reservedTotal({})).toBe(1);
+      });
+
+      it("a commit on one instance does not lose a plain record() already durably written by a sibling instance", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-concurrent-commit-"));
+        const store = new FileStateStore();
+        const statePath = join(tempRoot, "cost-state.json");
+
+        const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+        const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+
+        engineA.record({ taskId: "a", provider: "mock", modelId: "m1", amountUsd: 1 });
+        const reservationB = engineB.createReservation({ taskId: "b" }, 1);
+        engineB.commitReservation(reservationB.id, { taskId: "b", provider: "mock", modelId: "m1", amountUsd: 1 });
+
+        const engineC = new CostEngine(() => new Date(), { store, path: statePath });
+        expect(engineC.total()).toBe(2);
+        expect(engineC.all().map((e) => e.taskId).sort()).toEqual(["a", "b"]);
       });
     }
   );

@@ -99,18 +99,37 @@ const URL_USERINFO_PATTERN = /(:\/\/[^/\s:@]+):([^/\s:@]+)@/g;
  * Credential=AKIA.../20220830/us-east-1/s3/aws4_request,
  * SignedHeaders=host;x-amz-date, Signature=abcd1234` both have their
  * REAL credential material (the nonce/response/Signature fields) sitting
- * past the second token — completely unredacted. Fixed: the captured
- * value now runs to the first single-quote or newline (or end of string)
- * instead of a fixed token count — `[^'\n]+` — which fully covers
- * multi-token/comma-separated schemes (Digest, AWS, NTLM/Negotiate; none
- * of these use a literal single quote inside the header value itself,
- * only Digest's OWN double-quoted sub-fields, which this pattern does not
- * treat as a stop character) while STILL stopping at the closing `'` in
- * the exact `curl -H 'Authorization: ...' https://...` shell-quoting
- * case the 28th round's regression test covers, so that fix's own
- * BLOCKER regression continues to pass unchanged.
+ * past the second token — completely unredacted. Fixed (29th round): the
+ * captured value ran to the first single-quote or newline (or end of
+ * string) instead of a fixed token count — `[^'\n]+`.
+ *
+ * P1 fix (30th independent review round, finding 9, "redact complete
+ * header values containing apostrophes"): the 29th round's `[^'\n]+`
+ * treated EVERY apostrophe as a hard boundary, on the theory that none of
+ * Digest/AWS/NTLM's OWN syntax uses a literal `'` and the only place one
+ * could appear was the closing quote of a `curl -H '...'`-style shell
+ * invocation. Codex correctly showed this is false whenever the
+ * CREDENTIAL VALUE ITSELF legitimately contains an apostrophe — a
+ * `Digest username="O'Connor", ..., response="SECRET"` header, or a
+ * `Cookie: note=O'Connor; sessionid=SECRET` header, both stopped
+ * redacting at the apostrophe INSIDE "O'Connor", leaving the real secret
+ * (`response="SECRET"` / `sessionid=SECRET`) sitting in the clear right
+ * after it. An apostrophe inside a value is never followed immediately
+ * by whitespace/end-of-string/another-quote the way a shell's CLOSING
+ * quote always is — in "O'Connor" the `'` sits directly between two
+ * letters, whereas the 28th round's `curl -H '...'` case has the closing
+ * `'` immediately followed by a space (then unrelated trailing log text).
+ * Fixed: the captured value now consumes an apostrophe as ordinary value
+ * content whenever it is immediately followed by a letter or digit (the
+ * contraction/possessive shape — "O'Connor", "it's", "don't" — never a
+ * quote boundary), and still stops at any apostrophe that is NOT
+ * followed by a letter/digit (a real closing quote: followed by
+ * whitespace, punctuation, or end of string) or at a newline — so both
+ * the new apostrophe-in-value case and the 28th/29th rounds' own
+ * BLOCKER regressions (shell-quoted curl invocation; multi-component
+ * Digest/AWS/Cookie values) continue to pass unchanged.
  */
-const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)([^'\n]+)/gi;
+const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)((?:[^'\n]|'(?=[A-Za-z0-9]))+)/gi;
 /**
  * P1 fix (29th independent review round, finding 4): same fix as
  * `AUTHORIZATION_HEADER_PATTERN` above, for the identical reason — the
@@ -120,8 +139,12 @@ const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)([^'\n]+)/gi;
  * secret — completely in the clear. `\bcookie\b` already matches
  * `Set-Cookie:` too (the character before "Cookie" is a non-word `-`, a
  * genuine word boundary), so this single pattern covers both.
+ *
+ * P1 fix (30th independent review round, finding 9): same apostrophe-
+ * aware boundary fix as `AUTHORIZATION_HEADER_PATTERN` above, for the
+ * identical reason (`Cookie: note=O'Connor; sessionid=SECRET`).
  */
-const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)([^'\n]+)/gi;
+const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)((?:[^'\n]|'(?=[A-Za-z0-9]))+)/gi;
 const BARE_BEARER_TOKEN_PATTERN = /\bbearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
 
 function redactSecretsInString(text: string): string {

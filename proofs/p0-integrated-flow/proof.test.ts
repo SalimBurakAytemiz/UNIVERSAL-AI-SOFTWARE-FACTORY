@@ -57,8 +57,12 @@ describe("Proof: P0 integrated flow (Requirements -> Traceability -> Genome -> O
       },
       baseDir: tempRoot,
       policy,
-      modelRegistry: createDefaultModelRegistry(),
-      preflightTraceabilityIssues: traceabilityIssues
+      modelRegistry: createDefaultModelRegistry()
+      // No `requirementsRegistry` override: bootstrapProject() now computes
+      // this check itself, internally, against the Factory's own real
+      // registry (bkz. 30th independent review round, finding 8) — the
+      // `traceabilityIssues` computed above is this proof's OWN
+      // demonstration/assertion, not something bootstrapProject() trusts.
     });
 
     // Organization Composer genuinely derived from the Genome's declared capabilities.

@@ -13,7 +13,6 @@ import { FileStateStore, type StateStore } from "../../state/file-store.js";
 import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetExceededError, InvalidBudgetLimitError, type BudgetLimits } from "../../budget/budget.js";
-import type { TraceabilityIssue } from "../../requirements-traceability/traceability.js";
 import {
   ModelGateway,
   UnknownProviderError,
@@ -55,24 +54,39 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
     expect(existsSync(join(tempRoot, "proj-deny"))).toBe(false);
   });
 
-  it("refuses to bootstrap when the Factory's own requirement registry has traceability issues", async () => {
-    tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-"));
-    const policy = new PolicyEngine();
-    policy.addRule(lowRiskAllowRule(2));
-    const issues: TraceabilityIssue[] = [{ requirementId: "UASF-REQ-9999", issue: "MISSING_TEST_REFS", status: "UNIT_TESTED" }];
+  it(
+    "refuses to bootstrap when the requirement registry it actually reads (a real, on-disk, deliberately " +
+      "non-compliant fixture registry) has traceability issues — P1 fix (30th independent review round, " +
+      "finding 8, 'preflight traceability must come from a trusted source'): a caller can no longer skip " +
+      "this check by simply omitting/emptying a claimed-issues array, since bootstrapProject() now always " +
+      "genuinely reads and evaluates a real registry on disk",
+    async () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-"));
+      const registryRoot = join(tempRoot, "fake-registry");
+      const requirementsDir = join(registryRoot, "specification", "requirements");
+      mkdirSync(requirementsDir, { recursive: true });
+      // A genuine, on-disk requirement record claiming UNIT_TESTED with zero
+      // evidence of any kind — a real traceability violation, not a
+      // caller-fabricated claim.
+      writeFileSync(
+        join(requirementsDir, "broken.yml"),
+        "- id: FAKE-REQ-0001\n  status: UNIT_TESTED\n  implementation_refs: []\n  test_refs: []\n  proof_refs: []\n"
+      );
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(2));
 
-    await expect(
-      bootstrapProject({
-        genomeCandidate: validGenome("proj-blocked"),
-        baseDir: tempRoot,
-        policy,
-        modelRegistry: createDefaultModelRegistry(),
-        preflightTraceabilityIssues: issues
-      })
-    ).rejects.toThrow(PreflightTraceabilityFailedError);
+      await expect(
+        bootstrapProject({
+          genomeCandidate: validGenome("proj-blocked"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          requirementsRegistry: { requirementsDir, rootDir: registryRoot }
+        })
+      ).rejects.toThrow(PreflightTraceabilityFailedError);
 
-    // The genome was never even validated, let alone scaffolded.
-    expect(existsSync(join(tempRoot, "proj-blocked"))).toBe(false);
+      // The genome was never even validated, let alone scaffolded.
+      expect(existsSync(join(tempRoot, "proj-blocked"))).toBe(false);
   });
 
   it("rejects an invalid Project Genome before touching policy, filesystem, or models", async () => {
@@ -1167,6 +1181,100 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
 
         expect(readdirSync(tempRoot)).toHaveLength(0);
         expect(costEngine.total()).toBe(0);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (30th independent review round, finding 4, 'do not use an ephemeral ledger for paid default " +
+      "bootstraps'): a real, priced model invoked with no caller-supplied costEngine must be durably accounted",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a paid bootstrap's spend survives a fresh CostEngine instance " +
+          "pointed at the SAME baseDir (real restart proof, no costEngine ever supplied by the caller)",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-durable-default-ledger-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const paidRegistry = new ModelRegistry();
+          paidRegistry.register({
+            provider: "mock",
+            modelId: "paid-default-ledger",
+            tier: "MOCK",
+            costPerCall: 0.05,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome("proj-durable-default-ledger"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: paidRegistry
+            // Deliberately no `costEngine` — this is exactly the caller
+            // mistake finding 4 describes: a real, priced model with no
+            // durable ledger explicitly wired in.
+          });
+          expect(result.totalCostUsd).toBe(0.05);
+
+          // A genuinely FRESH CostEngine, sharing nothing with the one
+          // bootstrapProject() constructed internally, reading the SAME
+          // baseDir-anchored ledger path — simulates a process restart.
+          const restarted = new CostEngine(() => new Date(), {
+            store: new FileStateStore(),
+            path: join(tempRoot, "cost-ledger.json")
+          });
+          expect(restarted.totalFor({ projectId: "proj-durable-default-ledger" })).toBe(0.05);
+        }
+      );
+
+      it("repeated bootstrap calls against the SAME baseDir share one durable ledger (spend accumulates, not resets)", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-durable-default-ledger-accumulate-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const paidRegistry = new ModelRegistry();
+        paidRegistry.register({
+          provider: "mock",
+          modelId: "paid-default-ledger",
+          tier: "MOCK",
+          costPerCall: 0.05,
+          capabilities: ["summarization"],
+          status: "ACTIVE"
+        });
+
+        await bootstrapProject({
+          genomeCandidate: validGenome("proj-durable-a"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: paidRegistry
+        });
+        await bootstrapProject({
+          genomeCandidate: validGenome("proj-durable-b"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: paidRegistry
+        });
+
+        const ledger = new CostEngine(() => new Date(), {
+          store: new FileStateStore(),
+          path: join(tempRoot, "cost-ledger.json")
+        });
+        expect(ledger.total()).toBeCloseTo(0.1);
+      });
+
+      it("a $0 (mock/free) model keeps the exact prior in-memory-only default — no cost-ledger.json is created", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-free-model-no-ledger-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        await bootstrapProject({
+          genomeCandidate: validGenome("proj-free-no-ledger"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry()
+        });
+
+        expect(existsSync(join(tempRoot, "cost-ledger.json"))).toBe(false);
       });
     }
   );

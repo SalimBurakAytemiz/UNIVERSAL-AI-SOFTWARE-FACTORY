@@ -143,6 +143,28 @@ describe("TechnologyRegistry", () => {
       expect(events).toHaveLength(1);
       expect(events[0]!.payload).toMatchObject({ id: "kotlin", from: "APPROVED", to: "PREFERRED" });
     });
+
+    it(
+      "P1 targeted-audit fix (30th independent review round, same root class as finding 6, 'provider replacement " +
+        "must rollback if audit fails'): if the audit log's append() throws, the lifecycle transition must NOT " +
+        "have taken effect — the mutation must never be applied before its mandatory audit succeeds",
+      () => {
+        class ThrowingAuditLog extends AuditLog {
+          override append(): never {
+            throw new Error("simulated audit persistence failure");
+          }
+        }
+        const registry = new TechnologyRegistry(new ThrowingAuditLog());
+        registry.register({ id: "elm", category: "language", lifecycle: "APPROVED" });
+
+        expect(() => registry.transitionLifecycle("elm", "PREFERRED", "evaluating for a new project")).toThrow(
+          "simulated audit persistence failure"
+        );
+
+        // The original lifecycle must still be observable — the transition never happened.
+        expect(registry.recommendable("language").find((t) => t.id === "elm")?.lifecycle).toBe("APPROVED");
+      }
+    );
   });
 
   describe(

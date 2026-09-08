@@ -1381,4 +1381,145 @@ describe("ModelGateway + MockProvider", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (30th independent review round, finding 5, 'store immutable provider bindings'): mutating a " +
+      "caller-owned provider object after registration must never redirect already-authorized calls",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: register provider A, mutate the ORIGINAL object's invoke " +
+          "implementation to a malicious/different function -> the gateway continues using the registered binding",
+        async () => {
+          const provider = new MockProvider();
+          const gateway = new ModelGateway();
+          gateway.registerProvider(provider);
+
+          // The caller retains a reference to the SAME object it registered and, AFTER
+          // registration, reassigns its invoke method to something entirely different.
+          let maliciousCalled = false;
+          (provider as { invoke: unknown }).invoke = async () => {
+            maliciousCalled = true;
+            return { modelId: "hijacked", provider: "mock", costUsd: 0, output: "PWNED" };
+          };
+
+          const registry = createDefaultModelRegistry();
+          const model = registry.all()[0]!;
+          const response = await gateway.invoke(model, { prompt: "hello" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+
+          expect(maliciousCalled).toBe(false);
+          expect(response.output).toContain("hello");
+          expect(response.output).not.toContain("PWNED");
+        }
+      );
+
+      it("mutating the provider object's id after registration does not change which binding invoke() dispatches to", async () => {
+        const provider = new MockProvider();
+        const gateway = new ModelGateway();
+        gateway.registerProvider(provider);
+
+        (provider as { id: string }).id = "renamed";
+
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!; // still references provider "mock"
+        const response = await gateway.invoke(model, { prompt: "still routed" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toContain("still routed");
+      });
+
+      it("replaceProvider()'s captured binding is also immune to post-replacement mutation of the caller's new provider object", async () => {
+        const gateway = new ModelGateway(undefined, new AuditLog());
+        gateway.registerProvider(new MockProvider());
+
+        const replacementProvider = new MockProvider({ fixedOutput: "legit-replacement" });
+        await gateway.replaceProvider(replacementProvider, { policy: permissivePolicy(), risk: 0 });
+
+        let maliciousCalled = false;
+        (replacementProvider as { invoke: unknown }).invoke = async () => {
+          maliciousCalled = true;
+          return { modelId: "hijacked", provider: "mock", costUsd: 0, output: "PWNED" };
+        };
+
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!;
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+
+        expect(maliciousCalled).toBe(false);
+        expect(response.output).toBe("legit-replacement");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (30th independent review round, finding 6, 'provider replacement must rollback if audit fails'): " +
+      "governed mutations must not apply before mandatory audit succeeds",
+    () => {
+      class ThrowingAuditLog extends AuditLog {
+        override append(): never {
+          throw new Error("simulated audit persistence failure");
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: approved replacement -> force audit failure -> operation FAILS " +
+          "-> original provider remains active -> replacement is NOT observable",
+        async () => {
+          const auditLog = new ThrowingAuditLog();
+          const gateway = new ModelGateway(undefined, auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          const replacementProvider = new MockProvider({ fixedOutput: "should-never-be-observable" });
+          await expect(
+            gateway.replaceProvider(replacementProvider, { policy: permissivePolicy(), risk: 0 })
+          ).rejects.toThrow("simulated audit persistence failure");
+
+          // The original adapter must still be the one serving invocations —
+          // the swap must never have taken effect despite the approved policy decision.
+          const registry = createDefaultModelRegistry();
+          const model = registry.all()[0]!;
+          const response = await gateway.invoke(model, { prompt: "hello" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toContain("hello");
+          expect(response.output).not.toContain("should-never-be-observable");
+        }
+      );
+
+      it("a genuinely working AuditLog still allows the replacement to succeed and take effect (no regression)", async () => {
+        const auditLog = new AuditLog();
+        const gateway = new ModelGateway(undefined, auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        const replacementProvider = new MockProvider({ fixedOutput: "genuinely-replaced" });
+        await gateway.replaceProvider(replacementProvider, { policy: permissivePolicy(), risk: 0 });
+
+        const registry = createDefaultModelRegistry();
+        const model = registry.all()[0]!;
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("genuinely-replaced");
+        expect(auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED")).toHaveLength(1);
+      });
+    }
+  );
 });

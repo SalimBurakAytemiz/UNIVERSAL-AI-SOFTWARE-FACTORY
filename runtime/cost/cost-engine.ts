@@ -5,6 +5,7 @@
 import { randomBytes } from "node:crypto";
 import { freezeRecord } from "../util/immutable.js";
 import type { StateStore } from "../state/file-store.js";
+import { acquireFileLock, type FileLockOptions } from "../cache/file-lock.js";
 
 export class InvalidMonetaryAmountError extends Error {
   constructor(context: string, amount: number) {
@@ -464,6 +465,18 @@ function isCanonicalIsoTimestamp(value: string): boolean {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
+/**
+ * P1 fix (30th independent review round, finding 1, "preserve run identity
+ * through reservation commits"): `runId` (round 29's addition to
+ * `CostScope`/`ReservationOwnership`, for `perRunUsd` scoping) was never
+ * compared here — a caller committing under a DIFFERENT (or omitted)
+ * `runId` than the one the reservation was actually created under passed
+ * this check regardless, exactly like `taskId`/`projectId`/`agentId`
+ * always have been compared. Added the same way those three are: an
+ * unconditional equality check (both sides default to `undefined` when a
+ * caller never supplies one, so this is a no-op for every pre-existing
+ * caller that doesn't use `runId` at all).
+ */
 function ownershipMismatches(reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership): boolean {
   const reservedProvider = reservationScope.provider;
   const reservedModelId = reservationScope.modelId;
@@ -471,6 +484,7 @@ function ownershipMismatches(reservationScope: Readonly<ReservationOwnership>, s
     suppliedScope.taskId !== reservationScope.taskId ||
     suppliedScope.projectId !== reservationScope.projectId ||
     suppliedScope.agentId !== reservationScope.agentId ||
+    suppliedScope.runId !== reservationScope.runId ||
     (reservedProvider !== undefined && suppliedScope.provider !== reservedProvider) ||
     (reservedModelId !== undefined && suppliedScope.modelId !== reservedModelId)
   );
@@ -550,24 +564,111 @@ export class CostEngine {
    */
   readonly #persistenceStore?: StateStore;
   readonly #persistencePath?: string;
+  readonly #lockOptions?: FileLockOptions;
 
-  constructor(now: () => Date = () => new Date(), persistence?: { readonly store: StateStore; readonly path: string }) {
+  constructor(
+    now: () => Date = () => new Date(),
+    persistence?: { readonly store: StateStore; readonly path: string; readonly lockOptions?: FileLockOptions }
+  ) {
     this.#now = now;
     if (persistence) {
       this.#persistenceStore = persistence.store;
       this.#persistencePath = persistence.path;
-      const restored: unknown = persistence.store.read(persistence.path);
-      if (restored !== undefined) {
-        assertValidPersistedCostState(restored);
-        this.#entries = restored.entries.map((e) => freezeRecord({ ...e }));
-        let maxSeq = 0;
-        for (const r of restored.reservations) {
-          this.#reservations.set(r.id, { scope: freezeRecord({ ...r.scope }), amountUsd: r.amountUsd, status: r.status });
-          const match = /^res-(\d+)-/.exec(r.id);
-          if (match) maxSeq = Math.max(maxSeq, Number(match[1]));
-        }
-        this.#reservationSeq = maxSeq;
-      }
+      this.#lockOptions = persistence.lockOptions;
+      this.#loadFromStore();
+    }
+  }
+
+  /**
+   * `this.#entries`/`#reservations`/`#reservationSeq`'i, `#persistenceStore`'un
+   * O ANKİ (mümkün olan en güncel) içeriğiyle DEĞİŞTİRİR — yapıcı ve
+   * `#withDurableMutation()`'ın kilit altındaki kritik bölümü tarafından
+   * paylaşılan tek kaynak (bkz. `#withDurableMutation()`'ın fix notu, 30th
+   * independent review round finding 3).
+   */
+  #loadFromStore(): void {
+    if (!this.#persistenceStore || this.#persistencePath === undefined) return;
+    const restored: unknown = this.#persistenceStore.read(this.#persistencePath);
+    if (restored === undefined) return;
+    assertValidPersistedCostState(restored);
+    this.#entries = restored.entries.map((e) => freezeRecord({ ...e }));
+    this.#reservations = new Map();
+    let maxSeq = 0;
+    for (const r of restored.reservations) {
+      this.#reservations.set(r.id, { scope: freezeRecord({ ...r.scope }), amountUsd: r.amountUsd, status: r.status });
+      const match = /^res-(\d+)-/.exec(r.id);
+      if (match) maxSeq = Math.max(maxSeq, Number(match[1]));
+    }
+    this.#reservationSeq = maxSeq;
+  }
+
+  /**
+   * P1 fix (30th independent review round, finding 3, "serialize persistent
+   * cost-ledger updates"): every one of this class's mutating public
+   * methods (`record()`/`createReservation()`/`commitReservation()`/
+   * `releaseReservation()`/`markReservationReconciliationFailed()`) used to
+   * mutate `this.#entries`/`#reservations` — populated ONCE, at
+   * CONSTRUCTION time — and then unconditionally OVERWRITE the entire
+   * durable file with that in-memory state via `#persist()`. Codex
+   * reproduced the classic cross-instance "lost update" this causes: two
+   * `CostEngine` instances sharing the same `persistence.path` (the
+   * ordinary way two processes — or even two objects in one process —
+   * cooperate on one durable ledger) each read the file ONCE at
+   * construction; if instance A commits a real cost AFTER instance B was
+   * constructed, B's own next mutation still overwrites the ENTIRE file
+   * from its own (now stale) in-memory copy — silently ERASING A's
+   * already-durably-recorded spend the moment B persists, with no error,
+   * no conflict, and no trace (baseline section 147's "no silent
+   * spending" forbids exactly this: a real, previously recorded cost
+   * disappearing). Fixed the SAME way `runtime/cache/file-cache.ts`'s
+   * `set()` already fixed the identical class of bug (16th independent
+   * review round): every mutating method now runs its ENTIRE body inside
+   * `#withDurableMutation()`, which (only when persistence is configured —
+   * an in-memory-only engine has no shared file to race over, so it runs
+   * `mutator` directly) acquires a REAL cross-process `acquireFileLock()`
+   * (bkz. runtime/cache/file-lock.ts — the SAME hardened primitive
+   * `FileCache` already relies on, not a new locking mechanism), then
+   * calls `#loadFromStore()` to replace `this.#entries`/`#reservations`
+   * with the LATEST durable content — never a snapshot taken before the
+   * lock was acquired — before `mutator` performs its own single
+   * domain-level change and persists. Since every mutating method already
+   * calls `#persist()` (writing the COMPLETE current in-memory state)
+   * before returning on every code path (including failure paths, per
+   * this file's own established "no silent spending" persistence
+   * philosophy), the durable file is always an accurate reflection of
+   * `#entries`/`#reservations` by the time the lock is released — so
+   * re-loading it at the START of the NEXT locked mutation (whether on
+   * THIS instance or a sibling one) can never lose a committed cost or
+   * reservation another instance already durably recorded.
+   */
+  /**
+   * `commitReservation()` calls the PUBLIC `record()` internally (bkz.
+   * aşağısı) — both are wrapped in `#withDurableMutation()`, so a naive
+   * implementation would try to acquire the SAME cross-process file lock
+   * TWICE, from the SAME synchronous call stack, deadlocking against
+   * itself (a real OS-level file lock is not reentrant). `#lockDepth`
+   * tracks whether THIS instance's own call stack already holds the lock:
+   * when it does, the nested call runs `mutator` directly — no re-lock, no
+   * re-sync needed, since nothing else could have interleaved while this
+   * synchronous call stack has held the lock continuously.
+   */
+  #lockDepth = 0;
+
+  #withDurableMutation<R>(mutator: () => R): R {
+    if (!this.#persistenceStore || this.#persistencePath === undefined) {
+      return mutator();
+    }
+    if (this.#lockDepth > 0) {
+      return mutator();
+    }
+    const release = acquireFileLock(`${this.#persistencePath}.lock`, this.#lockOptions);
+    this.#lockDepth++;
+    try {
+      this.#loadFromStore();
+      return mutator();
+    } finally {
+      this.#lockDepth--;
+      release();
     }
   }
 
@@ -609,16 +710,24 @@ export class CostEngine {
     // Doğrudan record() çağrıları da (BudgetGuard'ı atlayan çağrılar dahil)
     // korunur — bozuk bir tutarın toplamlara sızmasına asla izin verilmez.
     assertValidMonetaryAmount(snapshot.amountUsd, `CostEngine.record(taskId=${snapshot.taskId})`);
-    const full: CostEntry = { ...snapshot, timestamp: this.#now().toISOString() };
-    // İç diziye eklenen nesne İLE dışarı döndürülen nesne KASITLI OLARAK
-    // aynı referans DEĞİLDİR: çağıran döndürülen kaydı (ör. amountUsd'yi
-    // NaN'a) mutasyona uğratsa bile, iç toplamlar (total/totalFor/
-    // totalInWindow) her zaman motorun kendi, asla dışarı sızmamış
-    // kopyasını okur. Object.freeze, bu ayrımın atlanamamasını (örn.
-    // "as any" ile alan ataması) TypeError'a çevirerek garanti eder.
-    this.#entries.push(full);
-    this.#persist();
-    return freezeRecord(full);
+    // P1 fix (30th independent review round, finding 3, "serialize
+    // persistent cost-ledger updates"): the actual mutation (push + persist)
+    // now runs inside `#withDurableMutation()` — bkz. bu sınıfın üstündeki
+    // fix notu — so a sibling `CostEngine` instance's already-durably-
+    // recorded entries are always re-synced into memory FIRST, never
+    // clobbered by this call's own (otherwise potentially stale) write.
+    return this.#withDurableMutation(() => {
+      const full: CostEntry = { ...snapshot, timestamp: this.#now().toISOString() };
+      // İç diziye eklenen nesne İLE dışarı döndürülen nesne KASITLI OLARAK
+      // aynı referans DEĞİLDİR: çağıran döndürülen kaydı (ör. amountUsd'yi
+      // NaN'a) mutasyona uğratsa bile, iç toplamlar (total/totalFor/
+      // totalInWindow) her zaman motorun kendi, asla dışarı sızmamış
+      // kopyasını okur. Object.freeze, bu ayrımın atlanamamasını (örn.
+      // "as any" ile alan ataması) TypeError'a çevirerek garanti eder.
+      this.#entries.push(full);
+      this.#persist();
+      return freezeRecord(full);
+    });
   }
 
   all(): readonly CostEntry[] {
@@ -690,11 +799,19 @@ export class CostEngine {
    */
   createReservation(scope: ReservationOwnership, amountUsd: number): LedgerReservation {
     assertValidMonetaryAmount(amountUsd, "CostEngine.createReservation");
-    const id = `res-${++this.#reservationSeq}-${randomBytes(16).toString("hex")}`;
-    const frozenScope = freezeRecord({ ...scope });
-    this.#reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
-    this.#persist();
-    return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
+    // P1 fix (30th independent review round, finding 3, "serialize
+    // persistent cost-ledger updates"): bkz. `record()`'un üstündeki fix
+    // notu — `#withDurableMutation()`'ın kilit altındaki resenkronizasyonu
+    // sayesinde `++this.#reservationSeq` de her zaman en güncel sıraya göre
+    // ilerler, bir kardeş instance'ın zaten ilerlettiği sırayı asla
+    // görmezden gelmez.
+    return this.#withDurableMutation(() => {
+      const id = `res-${++this.#reservationSeq}-${randomBytes(16).toString("hex")}`;
+      const frozenScope = freezeRecord({ ...scope });
+      this.#reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
+      this.#persist();
+      return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
+    });
   }
 
   /**
@@ -737,11 +854,18 @@ export class CostEngine {
    * durum geçişidir, kendi başına bir "bulundu mu?" sözleşmesi değildir).
    */
   markReservationReconciliationFailed(id: string): void {
-    const r = this.#reservations.get(id);
-    if (r) {
-      r.status = "RECONCILIATION_FAILED";
-      this.#persist();
-    }
+    // P1 fix (30th independent review round, finding 3, "serialize
+    // persistent cost-ledger updates"): bkz. `record()`'un üstündeki fix
+    // notu — resenkronize edilmeden mutasyona uğratılırsa, bir kardeş
+    // instance'ın bu ARADA oluşturduğu BAŞKA bir rezervasyon burada
+    // sessizce KAYBOLABİLİRDİ.
+    this.#withDurableMutation(() => {
+      const r = this.#reservations.get(id);
+      if (r) {
+        r.status = "RECONCILIATION_FAILED";
+        this.#persist();
+      }
+    });
   }
 
   /**
@@ -829,13 +953,50 @@ export class CostEngine {
    * never actually succeeded yet" case, where this idempotency check finds
    * nothing and the normal commit path runs exactly as before.
    */
-  commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
+  /**
+   * P1 fix (30th independent review round, finding 3, "serialize
+   * persistent cost-ledger updates"): the public `commitReservation()`
+   * below now only wraps this method's ENTIRE body in
+   * `#withDurableMutation()` — a genuinely private helper so that this
+   * method's own internal `this.record(...)` call (bkz. aşağısı) can
+   * reach the PUBLIC `record()` API (which is ITSELF `#withDurableMutation`-
+   * wrapped) without a caller ever observing an intermediate, not-yet-
+   * locked state. `#withDurableMutation()`'s `#lockDepth` tracking makes
+   * that inner `record()` call a no-op re-lock/re-sync — see its own fix
+   * note above.
+   */
+  #commitReservationInner(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
     const alreadyCommitted = this.#entries.find((e) => e.reservationId === id);
     if (alreadyCommitted) {
-      if (this.#reservations.has(id)) {
-        this.#reservations.delete(id);
-        this.#persist();
-      }
+      // P1 fix (30th independent review round, finding 2, "persist
+      // reservation deletion on idempotent retry"): this used to call
+      // `#persist()` ONLY `if (this.#reservations.has(id))` — but that
+      // in-memory check answers the WRONG question. Consider: the FIRST
+      // `commitReservation()` attempt's `record()` call succeeds (entry
+      // durably persisted), then `this.#reservations.delete(id)` succeeds
+      // IN MEMORY, but the immediately-following `#persist()` call itself
+      // throws (a transient durable-storage I/O failure) — the exception
+      // propagates to the caller, but `#reservations` has ALREADY had the
+      // id removed from the in-memory Map. A caller that (correctly, per
+      // this method's own documented retry contract) calls
+      // `commitReservation(id, ...)` again lands HERE: `alreadyCommitted`
+      // is found, but `this.#reservations.has(id)` is now FALSE (it was
+      // already deleted in memory before the failed persist), so the old
+      // code did NOTHING — leaving the DURABLE file forever showing this
+      // reservation as still present, even though it was genuinely
+      // committed and removed. A process restart then RESTORES that stale
+      // reservation from disk, resurrecting already-consumed budget
+      // capacity out of nowhere. Fixed: this branch now unconditionally
+      // removes `id` from the in-memory map (a no-op if already absent)
+      // and unconditionally calls `#persist()` — `#persist()` always
+      // serializes the CURRENT, correct in-memory state in full (bkz. bu
+      // dosyanın üstündeki `#persist()`'in notu), so repeating it costs
+      // nothing when nothing was actually stale, and REPAIRS the durable
+      // file the moment it does not yet agree with memory. Every retry is
+      // now a genuine "reconcile durable state to match memory" step, not
+      // merely "retry whatever step didn't run last time."
+      this.#reservations.delete(id);
+      this.#persist();
       return freezeRecord(alreadyCommitted);
     }
 
@@ -895,6 +1056,10 @@ export class CostEngine {
     return recorded;
   }
 
+  commitReservation(id: string, entry: Omit<CostEntry, "timestamp">): CostEntry {
+    return this.#withDurableMutation(() => this.#commitReservationInner(id, entry));
+  }
+
   /**
    * Bir rezervasyonu, HİÇBİR gerçek maliyet oluşmadığı varsayımıyla
    * (provider çağrısı hiç yapılmadı veya başarısız oldu) serbest bırakır.
@@ -922,19 +1087,24 @@ export class CostEngine {
    * rejected.
    */
   releaseReservation(id: string, callerScope: ReservationOwnership): LedgerReservation {
-    const reservation = this.#reservations.get(id);
-    if (!reservation) {
-      throw new UnknownReservationError(id);
-    }
-    if (reservation.status === "RECONCILIATION_FAILED") {
-      throw new UnresolvedReconciliationError(id);
-    }
-    if (ownershipMismatches(reservation.scope, callerScope)) {
-      throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
-    }
-    this.#reservations.delete(id);
-    this.#persist();
-    return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
+    // P1 fix (30th independent review round, finding 3, "serialize
+    // persistent cost-ledger updates"): bkz. `record()`'un üstündeki fix
+    // notu.
+    return this.#withDurableMutation(() => {
+      const reservation = this.#reservations.get(id);
+      if (!reservation) {
+        throw new UnknownReservationError(id);
+      }
+      if (reservation.status === "RECONCILIATION_FAILED") {
+        throw new UnresolvedReconciliationError(id);
+      }
+      if (ownershipMismatches(reservation.scope, callerScope)) {
+        throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
+      }
+      this.#reservations.delete(id);
+      this.#persist();
+      return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
+    });
   }
 
   /**

@@ -1034,6 +1034,54 @@ factory:
     BLOCKED_PENDING_REVIEW, awaiting the next (30th) independent Codex review to return
     INDEPENDENT_REVIEW_RESULT: CLEAN.
 
+    Round 30 (fresh, independent Codex closure review, consolidated batch of NINE priority-P1 findings, plus a
+    narrow, explicitly-scoped root-class audit for the same nine classes): (1) run identity (runId) is now part of
+    authoritative reservation ownership in cost-engine.ts/budget.ts, so a committed reservation's spend stays
+    associated with its originating run and a later reservation in the SAME run can no longer bypass a per-run
+    ceiling; (2) cost-engine.ts's commitReservation() now unconditionally repairs durable reservation-deletion
+    state on every call (not only when the reservation is still present in memory), closing a path where a retry
+    after a persistence failure could leave a stale reservation to resurrect after restart; (3) cost-engine.ts
+    gained a real cross-process file lock (reusing cache/file-lock.ts) with a reentrant lock-depth guard around
+    every durable mutation, always reloading the LATEST durable state after acquiring the lock, so two CostEngine
+    instances sharing one persistence path can no longer silently overwrite each other's newer committed costs or
+    reservations; (4) project-lifecycle/orchestrator.ts's bootstrapProject() now constructs its default CostEngine
+    with durable persistence whenever the routed model has a non-zero cost per call, instead of always defaulting
+    to a fresh in-memory ledger that forgot spend on every bootstrap/restart; (5) models/gateway.ts now captures a
+    registered/replaced provider into a detached, frozen binding (id + bound invoke function + implementation
+    name), so a caller can no longer redirect an already-registered provider's behavior by mutating their own
+    original provider object after the fact; (6) models/gateway.ts's replaceProvider() now appends its mandatory
+    audit event BEFORE swapping in the new provider binding, so a broken/throwing audit sink leaves the original
+    provider authoritative and the replacement never observably takes effect; (7)
+    requirements-traceability/traceability.ts no longer treats free-text/whitespace-containing evidence
+    references as automatically-valid — only a path-shaped reference that actually resolves on disk counts as
+    evidence now (round 29 had deliberately carved out an exemption for such refs; round 30 reverses it as the
+    same "no claim without evidence" defect one layer up), which required two real, honest registry corrections
+    (UASF-REQ-0002's proof_refs retargeted to a real path; UASF-REQ-0001 downgraded from PROOF_VERIFIED to
+    DEFINED since no re-checkable artifact exists for it — see that requirement's own notes for the full
+    rationale); (8) project-lifecycle/orchestrator.ts's bootstrapProject() no longer accepts a caller-supplied
+    "preflight traceability issues" CLAIM (fabricable by simply omitting the field or passing an empty array) —
+    it now always genuinely computes this check itself against a real, on-disk requirement registry, defaulting
+    to this Factory's own installation and accepting only a caller-specified registry LOCATION (never a
+    caller-fabricated RESULT) for tests; (9) telemetry/logger.ts's Authorization/Cookie header redaction no
+    longer treats every apostrophe as a value boundary — an apostrophe legitimately embedded in a credential
+    value itself (e.g. a name like O'Connor inside a Digest username or Cookie note field) no longer truncates
+    redaction before the real secret, while the round-28 shell-quoting regression (a closing apostrophe followed
+    by whitespace) continues to be respected as a genuine boundary. All nine fixes carry deterministic regression
+    tests (including exact BLOCKER reproductions using the literal examples from the review) and were verified
+    via a genuine temporary in-place bypass reproducing the exact predicted failure, then fully reverted and
+    reconfirmed clean. The root-class audit (limited to these nine exact classes) found one further genuine
+    instance directly in P0: technology-registry/registry.ts's transitionLifecycle() had the same
+    mutate-before-audit ordering as finding 6, fixed the same way with its own BLOCKER regression test. No other
+    genuine instances of any of the nine classes were found elsewhere in P0 (see UASF-REQ-0042's notes for the
+    full per-class audit reasoning). Full required sequence re-run and green: lint, typecheck, build, 1106/1106
+    tests (44 files, +22 net new), validate:requirements (42 schema-valid records), history-and-current-tree-aware
+    secret-scan (PASS), Factory Doctor (READY), verify:production-install (PASS), all 9 P0 proofs (13 assertions).
+    No status raised on any requirement beyond what real evidence supports; UASF-REQ-0001's downgrade is a
+    correction toward less evidence, not an upgrade. Per explicit instruction, this round does NOT merge, does NOT
+    move to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch. P0
+    remains BLOCKED_PENDING_REVIEW, awaiting the next (31st) independent Codex review to return
+    INDEPENDENT_REVIEW_RESULT: CLEAN.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -3793,6 +3841,34 @@ completed_milestones:
     new), validate:requirements (42 schema-valid records), history-and-current-tree-aware secret-scan (PASS),
     Factory Doctor (READY), `npm run verify:production-install` (PASS), all 9 P0 proofs (13 assertions) — all
     clean, no orphaned processes, no leftover TEMP-BYPASS markers anywhere in the tree.
+  - >-
+    THIS SESSION (round 30) — fixed 9 blocking findings from a fresh independent Codex review, plus one further
+    genuine instance found during the round's own root-class audit (`technology-registry/registry.ts`'s
+    `transitionLifecycle()`, same mutate-before-audit class as finding 6). Summary: run identity now flows through
+    reservation commits so a per-run budget ceiling cannot be bypassed by a second reservation in the same run
+    (`cost-engine.ts`/`budget.ts`); `commitReservation()`'s reservation-deletion is now unconditionally repaired on
+    every idempotent retry, closing a stale-reservation-resurrects-after-restart path; `cost-engine.ts` gained a
+    real cross-process file lock around every durable mutation (reusing `cache/file-lock.ts`), always reloading
+    the latest durable state after acquiring it, so two instances sharing one persistence path can no longer lose
+    each other's writes; `project-lifecycle/orchestrator.ts`'s default bootstrap `CostEngine` is now durable
+    whenever the routed model has non-zero cost, instead of silently forgetting spend on every restart;
+    `models/gateway.ts` now captures registered/replaced providers into a detached, frozen binding so a caller
+    cannot redirect an already-registered provider by mutating their own original object afterward, and its
+    `replaceProvider()` now appends its mandatory audit event BEFORE swapping in the new binding (rollback-safe
+    if the audit sink throws); `requirements-traceability/traceability.ts` no longer treats free-text/whitespace
+    evidence references as automatically valid (only a real, resolving path counts), which required two honest
+    registry corrections (`UASF-REQ-0002` retargeted to a real path; `UASF-REQ-0001` downgraded from
+    PROOF_VERIFIED to DEFINED); `project-lifecycle/orchestrator.ts`'s preflight traceability check can no longer
+    be bypassed by a caller-supplied empty/omitted issues claim — it now always genuinely reads a real, on-disk
+    registry; `telemetry/logger.ts`'s Authorization/Cookie header redaction no longer stops at an apostrophe
+    legitimately embedded inside the credential value itself (e.g. a name like O'Connor), while still respecting
+    the round-28 shell-quoting boundary case. All nine fixes plus the one audit-found instance carry deterministic
+    regression tests (including exact BLOCKER reproductions using the literal examples from the review), verified
+    via genuine temporary in-place bypass reproducing the exact predicted failure, then fully reverted and
+    reconfirmed clean. Re-ran the full required sequence: lint, typecheck, build, 1106/1106 tests (44 files, +22
+    net new), validate:requirements (42 schema-valid records), history-and-current-tree-aware secret-scan (PASS),
+    Factory Doctor (READY), `npm run verify:production-install` (PASS), all 9 P0 proofs (13 assertions) — all
+    clean, no orphaned processes, no leftover TEMP-BYPASS markers anywhere in the tree.
 
 known_limitations:
   - >-
@@ -4402,6 +4478,35 @@ blockers:
     remains BLOCKED_PENDING_REVIEW, awaiting the next independent Codex review to return CLEAN. Per explicit
     instruction, this round does not merge, does not move to P1, does not declare P0 complete, does not invoke
     Codex itself, and did not create a new branch.
+  - >-
+    ROUND 30 (fresh, independent Codex closure review, consolidated batch of NINE priority-P1 findings): (1)
+    scope identity lost between reservation and commit — `runId` is now part of authoritative reservation
+    ownership. (2) durable reservation-deletion not repaired by an idempotent retry — `commitReservation()` now
+    unconditionally repairs it on every call. (3) multi-instance durable ledger lost-update races — `cost-engine.ts`
+    gained a real cross-process file lock with always-reload-latest-state-under-lock semantics. (4) paid execution
+    falling back to ephemeral accounting — bootstrap's default `CostEngine` is now durable whenever the routed
+    model has non-zero cost. (5) caller-owned provider bindings remaining mutable — `models/gateway.ts` now
+    captures a detached, frozen binding at registration/replacement time. (6) governed mutations applied before
+    mandatory audit succeeds — `replaceProvider()`'s audit append now happens before the provider swap. (7)
+    unverifiable free-text treated as evidence — `traceability.ts` no longer accepts non-path-shaped refs as
+    evidence at all, requiring two honest registry corrections (`UASF-REQ-0002` retargeted; `UASF-REQ-0001`
+    downgraded PROOF_VERIFIED -> DEFINED). (8) caller-controlled 'clean' preflight results — bootstrap's
+    traceability check can no longer be bypassed by a caller-supplied empty/omitted claim; it always genuinely
+    reads a real, on-disk registry. (9) credential redaction broken by apostrophes — `logger.ts`'s header
+    redaction no longer stops at an apostrophe embedded inside the credential value itself. A narrow,
+    explicitly-scoped root-class audit for these same nine classes found one further genuine instance:
+    `technology-registry/registry.ts`'s `transitionLifecycle()` had the same mutate-before-audit ordering as
+    finding 6, fixed the same way with its own regression test. All ten fixes (9 reported + 1 swept) carry
+    deterministic regression tests (including exact BLOCKER reproductions using the literal examples from the
+    review) and were verified via genuine temporary in-place bypass reproducing the exact predicted failure, then
+    fully reverted and reconfirmed clean. Full root causes, fixes, and regression evidence are detailed in
+    `completed_milestones`'s round-30 entry, the touched files' own fix-note comments, and the round-30 closure
+    summary in `specification/requirements/P0-factory-kernel.yml` (UASF-REQ-0042). Tested (1106/1106 tests, +22
+    net new) and verified per the full required sequence: lint, typecheck, build, test, validate:requirements,
+    history-and-current-tree-aware secret-scan, Factory Doctor, `npm run verify:production-install`, all 9 P0
+    proofs. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next (31st) independent Codex review to return CLEAN.
+    Per explicit instruction, this round does not merge, does not move to P1, does not declare P0 complete, does
+    not invoke Codex itself, and did not create a new branch.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -4419,6 +4524,103 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 30). A fresh,
+  independent Codex review of the complete branch (forwarded by the
+  Founder) found NINE actionable findings (all priority-P1) and required
+  them fixed as ONE consolidated closure batch, plus a narrow,
+  explicitly-scoped root-class audit for the same nine classes. All nine
+  findings were fixed: (1) `runId` is now part of authoritative
+  reservation ownership in `cost-engine.ts`/`budget.ts`, so a committed
+  reservation's spend stays associated with its originating run and a
+  later reservation in the SAME run can no longer bypass a per-run
+  ceiling; (2) `cost-engine.ts`'s `commitReservation()` now unconditionally
+  repairs durable reservation-deletion state on every call, closing a path
+  where a retry after a persistence failure could leave a stale
+  reservation to resurrect after restart; (3) `cost-engine.ts` gained a
+  real cross-process file lock (reusing `cache/file-lock.ts`) with a
+  reentrant lock-depth guard around every durable mutation, always
+  reloading the LATEST durable state after acquiring the lock, so two
+  `CostEngine` instances sharing one persistence path can no longer
+  silently overwrite each other's newer committed costs or reservations;
+  (4) `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` now
+  constructs its default `CostEngine` with durable persistence whenever
+  the routed model has a non-zero cost per call, instead of always
+  defaulting to a fresh in-memory ledger that forgot spend on every
+  bootstrap/restart; (5) `models/gateway.ts` now captures a
+  registered/replaced provider into a detached, frozen binding (id + bound
+  invoke function + implementation name), so a caller can no longer
+  redirect an already-registered provider's behavior by mutating their own
+  original provider object after the fact; (6) `models/gateway.ts`'s
+  `replaceProvider()` now appends its mandatory audit event BEFORE
+  swapping in the new provider binding, so a broken/throwing audit sink
+  leaves the original provider authoritative and the replacement never
+  observably takes effect; (7)
+  `requirements-traceability/traceability.ts` no longer treats free-text/
+  whitespace-containing evidence references as automatically-valid — only
+  a path-shaped reference that actually resolves on disk counts as
+  evidence now, which required two honest registry corrections
+  (`UASF-REQ-0002`'s `proof_refs` retargeted to a real path;
+  `UASF-REQ-0001` downgraded from `PROOF_VERIFIED` to `DEFINED` since no
+  re-checkable artifact exists for it); (8)
+  `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` no longer
+  accepts a caller-supplied "preflight traceability issues" CLAIM
+  (fabricable by simply omitting the field or passing an empty array) — it
+  now always genuinely computes this check itself against a real, on-disk
+  requirement registry, defaulting to this Factory's own installation and
+  accepting only a caller-specified registry LOCATION (never a
+  caller-fabricated RESULT) for tests; (9) `telemetry/logger.ts`'s
+  Authorization/Cookie header redaction no longer treats every apostrophe
+  as a value boundary — an apostrophe legitimately embedded in a
+  credential value itself (e.g. a name like O'Connor) no longer truncates
+  redaction before the real secret, while the round-28 shell-quoting
+  regression (a closing apostrophe followed by whitespace) continues to be
+  respected as a genuine boundary. All nine fixes carry deterministic
+  regression tests (including exact BLOCKER reproductions using the
+  literal examples from the review) and were verified via a genuine
+  temporary in-place bypass reproducing the exact predicted failure, then
+  fully reverted and reconfirmed clean. The root-class audit (limited to
+  these nine exact classes, not broadened into unrelated architecture)
+  found one further genuine instance directly in P0:
+  `technology-registry/registry.ts`'s `transitionLifecycle()` had the same
+  mutate-before-audit ordering as finding 6, fixed the same way (audit
+  append moved before the mutation) with its own BLOCKER regression test.
+  No other genuine instances of any of the nine classes were found
+  elsewhere in P0: `decision-ledger.ts`/`assumption-register.ts` persist
+  via explicit full-snapshot `saveTo()`/`loadFrom()`, never called
+  automatically per-mutation the way `cost-engine.ts`'s persistence is, so
+  they are not exposed to the same multi-instance lost-update or
+  idempotent-retry classes as currently wired in P0; `workers/registry.ts`'s
+  stored records are plain data snapshots with no invocable methods;
+  `capability-gateway/gateway.ts`'s `authorize()` executes its caller
+  callback synchronously with no retained cross-call binding; no other
+  evidence-verification logic exists outside `traceability.ts`; no other
+  caller-suppliable "clean result" trust boundary was found;
+  `scripts/secret-scan.mjs` performs no redaction, only detection. Full
+  required sequence re-run and green: lint, typecheck, build, 1106/1106
+  tests (44 files, +22 net new), validate:requirements (42 schema-valid
+  records), history-and-current-tree-aware secret-scan (PASS), Factory
+  Doctor (READY), `npm run verify:production-install` (PASS — compiled CLI
+  and ajv-backed genome validator both work under a real `npm ci
+  --omit=dev` install with zero devDependencies present; the install's
+  `node_modules/` also contains several EMPTY npm scope-namespace
+  directories such as `@eslint`/`@vitest`/`@typescript-eslint` — confirmed
+  empty and unreachable via `require()`, a benign npm artifact, not an
+  actual devDependency leak), all 9 P0 proofs (13 assertions). Requirement
+  registry updated (UASF-REQ-0042's notes gained the round 30 closure
+  summary; `UASF-REQ-0001`/`UASF-REQ-0002` genuinely corrected) from this
+  real evidence only — no status raised beyond what is genuinely
+  supported, since every touched requirement (other than the honest
+  UASF-REQ-0001 downgrade) was already UNIT_TESTED or PROOF_VERIFIED and
+  this round's fixes are hardening, not first implementations. Do not
+  proceed to further P0 feature work, merge, move to P1, or declare P0
+  complete until an independent (Codex) re-review of this diff confirms no
+  blocking P0 finding remains — per explicit Founder instruction, this
+  session does not invoke Codex itself, and did not create a new branch
+  (all work stayed on claude/ai-factory-baseline-v1-seawq7). If/when that
+  comes back clean, resume from the prior exact_next_action below.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 29). A fresh,
   independent Codex review of the complete branch (forwarded by the
   Founder) found SEVEN actionable findings (all priority-P1) and required

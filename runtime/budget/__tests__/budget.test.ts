@@ -123,6 +123,56 @@ describe("BudgetGuard", () => {
     }
   );
 
+  describe(
+    "P1 fix (30th independent review round, finding 1, 'preserve run identity through reservation commits'): " +
+      "runId must survive reserve() -> commit(), not just spend()",
+    () => {
+      it("BLOCKER regression, exact reproduction: Run A reserve+commit 0.60 under $1 perRunUsd, then a second 0.60 reservation in Run A MUST FAIL", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservationA1 = guard.reserve({ taskId: "a1", runId: "run-a", provider: "mock", modelId: "m1" }, 0.6);
+        guard.commit(reservationA1.id, { taskId: "a1", runId: "run-a", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        // Without the fix, commit() silently drops runId from the recorded entry, so this
+        // second reservation in the SAME run sees only its own 0.6 (not the already-committed
+        // 0.6) against the $1 ceiling, and wrongly succeeds.
+        expect(() => guard.reserve({ taskId: "a2", runId: "run-a", provider: "mock", modelId: "m1" }, 0.6)).toThrow(
+          BudgetExceededError
+        );
+
+        // The committed entry genuinely carries runId now.
+        expect(costEngine.totalFor({ runId: "run-a" })).toBe(0.6);
+
+        // Run B still gets its own fresh allowance.
+        const reservationB = guard.reserve({ taskId: "b1", runId: "run-b", provider: "mock", modelId: "m1" }, 1);
+        expect(() =>
+          guard.commit(reservationB.id, { taskId: "b1", runId: "run-b", provider: "mock", modelId: "m1", amountUsd: 1 })
+        ).not.toThrow();
+      });
+
+      it("committing under a runId that does not match the reservation's own runId fails closed (ownership mismatch)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservation = guard.reserve({ taskId: "a1", runId: "run-a", provider: "mock", modelId: "m1" }, 0.5);
+        expect(() =>
+          guard.commit(reservation.id, { taskId: "a1", runId: "run-b", provider: "mock", modelId: "m1", amountUsd: 0.5 })
+        ).toThrow(ReservationOwnershipMismatchError);
+      });
+
+      it("a reservation created with no runId still commits normally (backward compatible)", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        const reservation = guard.reserve({ taskId: "a1", provider: "mock", modelId: "m1" }, 0.6);
+        const recorded = guard.commit(reservation.id, { taskId: "a1", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(recorded.runId).toBeUndefined();
+        expect(costEngine.total()).toBe(0.6);
+      });
+    }
+  );
+
   describe("dailyUsd ceiling (real enforcement, not just a defined field)", () => {
     it("blocks spending that would exceed the daily ceiling within the same UTC day", () => {
       const clock = makeClock("2026-03-10T08:00:00.000Z");
