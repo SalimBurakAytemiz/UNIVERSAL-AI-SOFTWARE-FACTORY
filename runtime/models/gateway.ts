@@ -55,6 +55,19 @@ function identityDigestOf(parts: readonly (string | number | undefined)[]): stri
  * `invoke()` itself will bind into `PolicyAction.identityDigest` below —
  * a single, shared source of truth rather than a hand-duplicated formula
  * that could silently drift from what `invoke()` actually checks.
+ *
+ * P1 fix (35th independent review round, finding 4, "include taskType in
+ * invocation approval identity"): `taskType` (`ModelInvocationRequest`'s
+ * OTHER field, alongside `prompt`) used to be entirely absent from this
+ * digest — even though it materially influences model behavior/routing
+ * (bkz. `ModelInvocationRequest.taskType`'ın kendi tanımı) exactly the same
+ * way `prompt` already does. Two invocations sharing the same task/run/
+ * agent/provider/model/prompt but requesting a DIFFERENT `taskType` (e.g.
+ * "summarize" vs. "generate-code" against an identical prompt string) used
+ * to produce the IDENTICAL digest, so an approval genuinely requested for
+ * one `taskType` could silently authorize a materially different one. Now
+ * an explicit, required parameter — bkz. aşağıdaki `invoke()`'in çağrısı,
+ * `authorizedRequest.taskType`'ı geçirir.
  */
 export function computeModelInvocationIdentityDigest(params: {
   readonly taskId: string;
@@ -63,8 +76,59 @@ export function computeModelInvocationIdentityDigest(params: {
   readonly provider: string;
   readonly modelId: string;
   readonly prompt: string;
+  readonly taskType?: string;
 }): string {
-  return identityDigestOf([params.taskId, params.runId, params.agentId, params.provider, params.modelId, params.prompt]);
+  return identityDigestOf([
+    params.taskId,
+    params.runId,
+    params.agentId,
+    params.provider,
+    params.modelId,
+    params.prompt,
+    params.taskType
+  ]);
+}
+
+/**
+ * P1 fix (35th independent review round, finding 3, "bind provider
+ * approvals to complete candidate configuration"): `provider.invoke.toString()`
+ * only captures the METHOD'S SOURCE TEXT — which is shared by every
+ * instance of the same class (a class method lives once, on the shared
+ * prototype; `toString()` returns the identical text regardless of which
+ * instance calls it). Two DIFFERENT, independently-configured instances of
+ * the same adapter class (e.g. one instance pointed at a legitimate
+ * endpoint/account, another pointed at an attacker-controlled one, or two
+ * genuinely distinct customer accounts) therefore produced the EXACT SAME
+ * digest — an approval genuinely requested for candidate A's exact
+ * configuration could then authorize installing candidate B, so long as B
+ * happened to be built from the same class. Fixed: every OWN, string-keyed,
+ * enumerable property the candidate `provider` object actually carries
+ * (its config surface — the same fields `detachFromCallerMutation()` below
+ * locks at registration time) is folded into the digest too, keyed by
+ * property name for a canonical, order-independent fingerprint. Each
+ * value is hashed INDIVIDUALLY (`sha256`, one-way) rather than embedded in
+ * cleartext, so a config field that happens to hold a plaintext secret
+ * (an API key/endpoint credential stored directly on the adapter) never
+ * appears in the digest's input in a recoverable form — only a
+ * non-reversible fingerprint of it does, which is exactly this finding's
+ * own "no plaintext secrets" requirement while still making two
+ * differently-configured instances produce provably different digests.
+ */
+function canonicalProviderConfigFingerprint(provider: ModelProvider): string {
+  const entries = Reflect.ownKeys(provider)
+    .filter((key): key is string => typeof key === "string")
+    .sort()
+    .map((key) => {
+      const value = (provider as unknown as Record<string, unknown>)[key];
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(value) ?? String(value);
+      } catch {
+        serialized = String(value);
+      }
+      return `${key}:${createHash("sha256").update(serialized).digest("hex")}`;
+    });
+  return entries.join("|");
 }
 
 /**
@@ -72,10 +136,18 @@ export function computeModelInvocationIdentityDigest(params: {
  * `model.provider.replace` action `replaceProvider()` gates — takes the
  * CANDIDATE provider object itself (never a hand-typed implementation
  * name/source string) so a caller cannot accidentally compute a digest for
- * an implementation other than the one it actually holds.
+ * an implementation other than the one it actually holds. Now also folds in
+ * `canonicalProviderConfigFingerprint()` (bkz. üstteki fix notu) so two
+ * instances of the same class with materially different configuration are
+ * never mistaken for the same approved candidate.
  */
 export function computeProviderReplacementIdentityDigest(provider: ModelProvider, id: string): string {
-  return identityDigestOf([id, provider.constructor?.name ?? "unknown", provider.invoke.toString()]);
+  return identityDigestOf([
+    id,
+    provider.constructor?.name ?? "unknown",
+    provider.invoke.toString(),
+    canonicalProviderConfigFingerprint(provider)
+  ]);
 }
 
 export interface ModelInvocationRequest {
@@ -239,17 +311,61 @@ interface ProviderBinding {
  * only the caller-visible, caller-mutable public surface the finding
  * actually describes.
  */
-function detachFromCallerMutation(provider: ModelProvider): void {
+/**
+ * P1 fix (35th independent review round, finding 5, "freeze
+ * non-configurable writable provider fields"): the guard used to be
+ * `descriptor.configurable` — skipping the lock ENTIRELY for a legal (if
+ * unusual) descriptor shape, `{ writable: true, configurable: false }`
+ * (e.g. a provider constructed via `Object.defineProperty(this, "endpoint",
+ * { value: ..., writable: true, configurable: false })` instead of a plain
+ * assignment). Such a field remained fully caller-mutable forever — exactly
+ * the caller-owned-state leak this whole function exists to close — even
+ * though the ECMAScript spec explicitly PERMITS toggling `writable` from
+ * `true` to `false` on a non-configurable data property (the one narrowing
+ * change a non-configurable property still allows; verified empirically:
+ * `Object.defineProperty` with `configurable` left at its EXISTING `false`
+ * value and only `writable` reduced to `false` succeeds, it does not
+ * throw). Fixed: the guard is now `descriptor.writable || descriptor.configurable`
+ * — i.e. "there is still SOMETHING about this data property this function
+ * can tighten" — covering all three non-fully-locked shapes
+ * (`writable:true,configurable:true`; `writable:true,configurable:false`;
+ * `writable:false,configurable:true`, the last one closing a second, more
+ * minor gap where an already-non-writable-but-still-configurable field
+ * could still be redefined back to writable, or deleted, by anyone holding
+ * the object). Only `writable:false,configurable:false` (already fully
+ * locked) is skipped, since nothing further can or needs to change. If
+ * locking a property nonetheless throws (an edge case this function cannot
+ * anticipate for every possible provider shape), the provider binding is
+ * refused fail-closed — `UnsafeProviderConfigurationError` — rather than
+ * silently registering a provider with unprotected caller-mutable state.
+ */
+export class UnsafeProviderConfigurationError extends Error {
+  constructor(id: string, key: PropertyKey, cause: unknown) {
+    super(
+      `Provider '${id}' exposes a configuration property (${String(key)}) that could not be safely ` +
+        `detached from caller mutation: ${cause instanceof Error ? cause.message : String(cause)}. Registration ` +
+        `is refused fail-closed (baseline section 147) rather than leaving that property caller-mutable.`
+    );
+    this.name = "UnsafeProviderConfigurationError";
+  }
+}
+
+function detachFromCallerMutation(provider: ModelProvider, id: string): void {
   for (const key of Reflect.ownKeys(provider)) {
     const descriptor = Object.getOwnPropertyDescriptor(provider, key);
-    if (descriptor && "value" in descriptor && descriptor.configurable) {
+    if (!descriptor || !("value" in descriptor) || !(descriptor.writable || descriptor.configurable)) {
+      continue;
+    }
+    try {
       Object.defineProperty(provider, key, { ...descriptor, writable: false, configurable: false });
+    } catch (err) {
+      throw new UnsafeProviderConfigurationError(id, key, err);
     }
   }
 }
 
 function captureProviderBinding(provider: ModelProvider, id: string): ProviderBinding {
-  detachFromCallerMutation(provider);
+  detachFromCallerMutation(provider, id);
   return Object.freeze({
     id,
     invoke: provider.invoke.bind(provider),
@@ -592,15 +708,37 @@ export class ModelGateway {
         // the replacement never happened — a real, live architectural
         // mutation with NO corresponding audit evidence, exactly what
         // `ProviderReplacementAuditRequiredError` exists to make
-        // structurally impossible. Fixed by reordering: the durable audit
-        // event is appended FIRST; the actual swap (`this.#providers.set`)
-        // only runs immediately afterward, in the SAME synchronous tick (no
-        // `await` between them, so nothing else can observe an
-        // intermediate state). If `auditLog.append()` throws, this
-        // callback never reaches the swap at all — the original provider
-        // binding remains fully authoritative, and the thrown error
-        // propagates out of `replaceProvider()` exactly as before, now
-        // truthfully reflecting that nothing changed.
+        // structurally impossible.
+        //
+        // P1 fix (35th independent review round, finding 11, "prepare
+        // provider binding before recording replacement"): the round-30
+        // fix above still left ONE gap of the exact same shape, one step
+        // earlier: `captureProviderBinding(provider, id)` was called
+        // INLINE, as part of the `this.#providers.set(...)` expression,
+        // AFTER `auditLog.append(...)` had already durably recorded
+        // "MODEL_PROVIDER_REPLACED". Since the 35th round's own finding 5
+        // fix made `captureProviderBinding()` (via `detachFromCallerMutation()`)
+        // capable of THROWING — `UnsafeProviderConfigurationError`, for a
+        // candidate whose configuration cannot be safely locked — a
+        // candidate that fails to bind would leave the audit log
+        // truthfully-looking but factually WRONG: a durable
+        // "MODEL_PROVIDER_REPLACED" record for a swap that never actually
+        // happened, with the ORIGINAL provider still authoritative in
+        // `this.#providers`. Fixed by building the binding FIRST: the
+        // candidate is validated and locked into an authoritative
+        // `ProviderBinding` value BEFORE anything is recorded or applied.
+        // Only once that succeeds does the durable audit event get
+        // appended, and only then does the actual swap
+        // (`this.#providers.set`) run — all three steps in the SAME
+        // synchronous tick (no `await` between any of them), so nothing
+        // else can observe an intermediate state. If `captureProviderBinding()`
+        // throws, NEITHER the audit record NOR the swap ever happens — the
+        // original provider binding remains fully authoritative, and the
+        // thrown error propagates out of `replaceProvider()` truthfully
+        // reflecting that nothing changed. If `auditLog.append()` itself
+        // then throws, the swap still never runs, preserving the round-30
+        // fix's own guarantee unchanged.
+        const binding = captureProviderBinding(provider, id);
         auditLog.append({
           type: "MODEL_PROVIDER_REPLACED",
           actor: "ModelGateway",
@@ -611,7 +749,7 @@ export class ModelGateway {
           },
           timestamp: new Date().toISOString()
         });
-        this.#providers.set(id, captureProviderBinding(provider, id));
+        this.#providers.set(id, binding);
       },
       approvalReference
     );
@@ -820,7 +958,13 @@ export class ModelGateway {
           agentId: executionScope.agentId,
           provider: authorizedModel.provider,
           modelId: authorizedModel.modelId,
-          prompt: authorizedRequest.prompt
+          prompt: authorizedRequest.prompt,
+          // P1 fix (35th independent review round, finding 4): bkz.
+          // `computeModelInvocationIdentityDigest()`'in fix notu —
+          // `authorizedRequest` (the pre-authorized snapshot, never the
+          // original, still-caller-mutable `request` parameter) supplies
+          // `taskType` the same way it already supplies `prompt`.
+          taskType: authorizedRequest.taskType
         })
       },
       async () => {

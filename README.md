@@ -63,6 +63,17 @@ completion.
   data survives a process restart, not just in-memory.
 - **A public-repository secret scanner** with no external dependency,
   wired into CI (`scripts/secret-scan.mjs`).
+- **Governance mechanisms** (`runtime/invariants/`, `runtime/governance/`):
+  a Central Invariant Guard that new governance actions must pass before
+  taking effect; a Scope Lock + Backlog Router giving each phase a
+  machine-readable OPEN / LOCKED_FOR_CLOSURE / CLOSED state instead of
+  free-text status prose, with every transition recorded in the Founder
+  Decision Ledger; a Phase Closure Manifest that structurally rejects
+  "tests passed" as sufficient grounds for closure, requiring real
+  evidence, a clean invariant report, zero unresolved BLOCKED
+  requirements, and an independent review result of exactly `CLEAN`; and
+  an Implementation Reality Matrix distinguishing a requirement's claimed
+  status from what its evidence actually supports.
 
 All of the above is backed by automated tests — see [Verifying it
 yourself](#verifying-it-yourself). None of the P1/P2/P3 phases (general
@@ -74,7 +85,7 @@ yet.
 Run `npm run build && node dist/runtime/cli/index.js baseline status` for a
 live, computed answer. As of this writing:
 
-- 42 P0-scope requirements are tracked, all with real evidence (no bare
+- 46 P0-scope requirements are tracked, all with real evidence (no bare
   `DEFINED`-only items remain); see
   `specification/requirements/P0-factory-kernel.yml` for exact IDs and
   evidence (`implementation_refs` / `test_refs` / `proof_refs`).

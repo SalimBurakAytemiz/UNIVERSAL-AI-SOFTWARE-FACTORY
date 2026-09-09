@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseProjectGenome, type ProjectGenome } from "../project-genome/genome.js";
 import { composeOrganizationFromGenome, type OrganizationComposition } from "../organization-composer/composer.js";
-import { scaffoldProjectOs, type ScaffoldResult } from "../project-os/scaffold.js";
+import { scaffoldProjectOs, PROJECT_OS_SUBDIRECTORIES, type ScaffoldResult } from "../project-os/scaffold.js";
 import { CapabilityGateway, type ApprovalReference } from "../capability-gateway/gateway.js";
 import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
@@ -131,6 +131,35 @@ export interface BootstrapProjectInput {
    * genuine, deliberately-broken fixture registry) but can never skip the
    * check itself or fabricate its result.
    */
+  /**
+   * P1 fix (35th independent review round, finding 6, "always preflight
+   * the Factory authoritative requirement registry"): this field used to
+   * be the ONLY location `bootstrapProject()` ever actually checked — `const
+   * { requirementsDir, rootDir } = input.requirementsRegistry ?? {
+   * DEFAULT_REQUIREMENTS_DIR, DEFAULT_REPO_ROOT }`. A caller (or a
+   * production bootstrap path constructed/misconfigured to always pass
+   * this field) could supply an arbitrary, entirely CLEAN registry
+   * location and `bootstrapProject()` would evaluate ONLY that one —
+   * never the Factory's own real, on-disk registry — even if the real
+   * registry had genuine, unresolved traceability blockers. That is
+   * exactly the "a result a caller can fabricate is not evidence"
+   * defect the 30th round's own fix note above already named, just one
+   * level up: the LOCATION being checked, not the RESULT, was the
+   * caller-substitutable input. Fixed: the Factory's own authoritative
+   * registry (`DEFAULT_REQUIREMENTS_DIR`/`DEFAULT_REPO_ROOT`, located
+   * ONCE at module load via `findRepoRoot()` — never influenced by
+   * anything in `input`) is now ALWAYS checked, unconditionally, on every
+   * call, regardless of whether this field is supplied. This field, where
+   * supplied, now names an ADDITIONAL location whose traceability issues
+   * ALSO block the bootstrap — never a REPLACEMENT for the authoritative
+   * check. This preserves its original, legitimate test-only purpose
+   * (exercising the refusal path against a deliberately-broken FIXTURE
+   * registry, without needing to corrupt the Factory's own real
+   * specification directory to do so) while closing the bypass: a normal
+   * caller supplying a clean override can no longer mask a genuinely
+   * broken authoritative registry, since the authoritative registry is
+   * evaluated independently and unconditionally either way.
+   */
   readonly requirementsRegistry?: { readonly requirementsDir: string; readonly rootDir: string };
   /**
    * P1 fix (27th independent review round, finding 10, "provide a real
@@ -225,19 +254,30 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // P1 fix (30th independent review round, finding 8, "preflight
   // traceability must come from a trusted source"): this check now
   // ALWAYS genuinely runs `traceRequirements()` against a real, on-disk
-  // registry — either the location `input.requirementsRegistry` names, or
-  // (by default, for every ordinary caller) this Factory's own
-  // installation, located ONCE at module load via `findRepoRoot()`. There
-  // is no code path left by which omitting a field, or passing an empty
-  // array, could mean "the registry is clean" without the registry
-  // actually having been read and evaluated.
-  const { requirementsDir, rootDir } = input.requirementsRegistry ?? {
-    requirementsDir: DEFAULT_REQUIREMENTS_DIR,
-    rootDir: DEFAULT_REPO_ROOT
-  };
-  const traceabilityIssues = traceRequirements(requirementsDir, rootDir);
-  if (traceabilityIssues.length > 0) {
-    throw new PreflightTraceabilityFailedError(traceabilityIssues);
+  // registry — this Factory's own installation, located ONCE at module
+  // load via `findRepoRoot()`. There is no code path left by which
+  // omitting a field, or passing an empty array, could mean "the registry
+  // is clean" without the registry actually having been read and
+  // evaluated.
+  //
+  // P1 fix (35th independent review round, finding 6, "always preflight
+  // the Factory authoritative requirement registry"): this authoritative
+  // check now ALWAYS runs against `DEFAULT_REQUIREMENTS_DIR`/
+  // `DEFAULT_REPO_ROOT` UNCONDITIONALLY — never against
+  // `input.requirementsRegistry` instead of it. Bkz.
+  // `BootstrapProjectInput.requirementsRegistry`'in fix notu: that field,
+  // where supplied, is now an ADDITIONAL check below, never a substitute
+  // for this one.
+  const authoritativeIssues = traceRequirements(DEFAULT_REQUIREMENTS_DIR, DEFAULT_REPO_ROOT);
+  if (authoritativeIssues.length > 0) {
+    throw new PreflightTraceabilityFailedError(authoritativeIssues);
+  }
+  if (input.requirementsRegistry) {
+    const { requirementsDir, rootDir } = input.requirementsRegistry;
+    const additionalIssues = traceRequirements(requirementsDir, rootDir);
+    if (additionalIssues.length > 0) {
+      throw new PreflightTraceabilityFailedError(additionalIssues);
+    }
   }
 
   // Herhangi bir `await`den ÖNCE: bu çağrının kullanacağı HER alan yerel
@@ -291,7 +331,43 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // `baseDir` dışına işaret eden bir symlink de aynı şekilde reddedilmelidir
   // (4th independent review round fix).
   const genome = parseProjectGenome(genomeCandidate);
-  assertFilesystemConfinement(baseDir, genome.project.id);
+  const projectRoot = assertFilesystemConfinement(baseDir, genome.project.id);
+  // P1 fix (35th independent review round, finding 8, "validate all
+  // scaffold destinations before paid model invocation"): only
+  // `projectRoot` itself used to be validated here — `scaffoldProjectOs()`'s
+  // own per-subdirectory `assertFilesystemConfinement()` calls (bkz.
+  // project-os/scaffold.ts) and the individual final-file confinement
+  // checks for genome.json/organization.json/bootstrap.json all ran ONLY
+  // later, INSIDE `gateway.authorize()`'s `execute` callback, AFTER
+  // `modelGateway.invoke()` (the paid provider call) already ran and
+  // committed real cost. A symlink planted at any one of those 24
+  // subdirectory names, or at either intermediate directory the three
+  // final files land in, pointing outside `projectRoot` would therefore
+  // still incur a genuine, billed model invocation before the bootstrap
+  // ultimately failed — a real, unrecoverable spend for a request that was
+  // never going to be allowed to scaffold anyway, exactly the "no silent
+  // spending" violation baseline section 147 forbids. Fixed: EVERY
+  // destination `scaffoldProjectOs()`/the write calls below will ever
+  // touch is derived and validated HERE, in this function's own
+  // synchronous prefix, before `gateway.authorize()` is even called (let
+  // alone before its `execute` callback's paid model invocation runs) —
+  // `assertFilesystemConfinement()` is the same real-filesystem-aware
+  // (symlink-following, canonicalizing) check used everywhere else in this
+  // codebase, so a traversal attempt, a symlink escape, or any other
+  // unsafe/invalid target is rejected before any paid work — or any
+  // filesystem mutation at all — occurs. `scaffoldProjectOs()`'s own
+  // per-subdirectory validation immediately before each `mkdirSync()` (and
+  // the write-site validations below, immediately before each
+  // `stateStore.write()`) remain in place unchanged — this preflight adds
+  // an EARLIER, additional check; it does not replace the defense-in-depth
+  // re-validation each mutation site already performs immediately before
+  // its own mutation.
+  for (const sub of PROJECT_OS_SUBDIRECTORIES) {
+    assertFilesystemConfinement(projectRoot, sub);
+  }
+  assertFilesystemConfinement(projectRoot, join("project-genome", "genome.json"));
+  assertFilesystemConfinement(projectRoot, join("organization", "organization.json"));
+  assertFilesystemConfinement(projectRoot, join("state", "bootstrap.json"));
   const organization = composeOrganizationFromGenome(genome, risk);
 
   // P2 fix (13th independent review round targeted audit, same class as

@@ -308,4 +308,71 @@ describe("FileStateStore", () => {
       });
     }
   );
+
+  describe(
+    "P2 fix (35th independent review round, finding 9, 'reject lossy state serialization'): a value that " +
+      "JSON.stringify() would SUCCEED on but silently misrepresent (a non-finite number, an undefined array " +
+      "element, or a non-plain-object instance nested anywhere in the graph) is rejected before any " +
+      "filesystem mutation, rather than being silently written as something DIFFERENT from what was passed",
+    () => {
+      it("BLOCKER regression, exact reproduction: a nested NaN amount is rejected rather than silently written as null", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-lossy-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        store.write(path, { amountUsd: 1 });
+
+        expect(() => store.write(path, { amountUsd: NaN })).toThrow(UnserializableStateError);
+        // Previously valid state remains untouched.
+        expect(store.read<{ amountUsd: number }>(path)?.amountUsd).toBe(1);
+      });
+
+      it("BLOCKER regression: a nested Infinity/-Infinity value is rejected rather than silently written as null", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-lossy-"));
+        const store = new FileStateStore();
+        expect(() => store.write(join(tempRoot, "a.json"), { ceiling: Infinity })).toThrow(UnserializableStateError);
+        expect(() => store.write(join(tempRoot, "b.json"), { ceiling: -Infinity })).toThrow(UnserializableStateError);
+      });
+
+      it("BLOCKER regression: an undefined ARRAY element is rejected rather than silently written as null", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-lossy-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        expect(() => store.write(path, { items: ["a", undefined, "c"] })).toThrow(UnserializableStateError);
+        expect(store.exists(path)).toBe(false);
+      });
+
+      it("BLOCKER regression: a nested Date/Map/Set instance is rejected rather than silently reproduced as a different structure", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-lossy-"));
+        const store = new FileStateStore();
+        expect(() => store.write(join(tempRoot, "date.json"), { at: new Date() })).toThrow(UnserializableStateError);
+        expect(() => store.write(join(tempRoot, "map.json"), { m: new Map([["k", "v"]]) })).toThrow(
+          UnserializableStateError
+        );
+        expect(() => store.write(join(tempRoot, "set.json"), { s: new Set([1, 2]) })).toThrow(UnserializableStateError);
+      });
+
+      it("no regression: an undefined OBJECT PROPERTY value is still accepted — the key is omitted, matching its own observable absence on read-back", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-lossy-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        store.write(path, { taskId: "t1", agentId: undefined, projectId: "p1" });
+        const readBack = store.read<{ taskId: string; agentId?: string; projectId?: string }>(path);
+        expect(readBack?.taskId).toBe("t1");
+        expect(readBack?.agentId).toBeUndefined();
+        expect(readBack?.projectId).toBe("p1");
+      });
+
+      it("no regression: ordinary finite numbers, strings, booleans, null, nested objects and arrays still write and read back correctly", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-lossy-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+        const value = { a: 1, b: "x", c: true, d: null, e: [1, 2, { f: "g" }], h: { i: [3, 4] } };
+
+        store.write(path, value);
+        expect(store.read(path)).toEqual(value);
+      });
+    }
+  );
 });

@@ -33,17 +33,122 @@ export interface StateStore {
  * destroy previously valid durable state" (bölüm 277).
  */
 export class UnserializableStateError extends Error {
-  constructor(path: string, cause?: unknown) {
+  constructor(path: string, cause?: unknown, detail?: string) {
     super(
-      `Refusing to write state to '${path}': the provided value does not serialize to valid JSON ` +
-        `(this happens for 'undefined' itself, a function, a symbol, an object whose toJSON() returns ` +
-        `undefined, a circular reference, or a value JSON cannot represent such as a BigInt). The ` +
-        `previous durable state at this path, if any, was left completely untouched — nothing was ever ` +
+      `Refusing to write state to '${path}': the provided value does not serialize to valid JSON` +
+        (detail
+          ? ` (${detail})`
+          : ` (this happens for 'undefined' itself, a function, a symbol, an object whose toJSON() returns ` +
+            `undefined, a circular reference, or a value JSON cannot represent such as a BigInt)`) +
+        `. The previous durable state at this path, if any, was left completely untouched — nothing was ever ` +
         `written or renamed.`,
       { cause }
     );
     this.name = "UnserializableStateError";
   }
+}
+
+/**
+ * P2 fix (35th independent review round, finding 9, "reject lossy state
+ * serialization"): the checks above only ever caught the cases where
+ * `JSON.stringify()` either THROWS (circular reference, BigInt) or
+ * silently returns the non-string value `undefined` for the value being
+ * serialized AS A WHOLE (the top-level value is `undefined`/a function/a
+ * `toJSON()` returning `undefined`). Codex reproduced a materially
+ * different, quieter class of the same underlying defect: `JSON.stringify`
+ * neither throws NOR returns `undefined` for a value NESTED somewhere
+ * inside an otherwise-normal object/array that contains `NaN`/`Infinity`/
+ * `-Infinity` (silently coerced to the JSON literal `null`) or an
+ * `undefined` ARRAY ELEMENT (also silently coerced to `null`) — both
+ * writes SUCCEED, but the durable state that lands on disk is NOT the
+ * same value the caller thought it was persisting: a reservation amount
+ * of `NaN` (a genuine, already-rejected-elsewhere invalid value, bkz.
+ * `cost/cost-engine.ts`'in kendi doğrulamaları) or a legitimate `Infinity`
+ * ceiling could silently become `null` on disk, and a subsequent
+ * `read()`/restart would observe a DIFFERENT value than was ever
+ * genuinely written — `deserialize(serialize(value))` no longer equals
+ * `value`, the exact "no claim without evidence"/durable-state-integrity
+ * violation baseline section 277/303 forbids, just for state read BACK
+ * rather than state overwritten. Fixed: after confirming the value
+ * serializes AT ALL (the existing checks above, unchanged — a genuinely
+ * circular reference is caught there FIRST, so this walk below never
+ * needs its own cycle detection: `JSON.stringify` succeeding already
+ * proves `data`'s object graph is acyclic), `assertNoLossySerialization()`
+ * recursively re-walks the SAME original `data` and rejects any node
+ * whose `JSON.stringify` representation would NOT be semantically
+ * equivalent to the original: a non-finite number anywhere, an `undefined`
+ * ARRAY element (no safe "omit" equivalent — unlike an object property,
+ * every array index must hold SOME value, and `null` is already a
+ * legitimate, DIFFERENT value an array can genuinely contain), a function/
+ * symbol/bigint anywhere, or an instance of anything other than a plain
+ * object (`Map`/`Set`/`Date`/`RegExp`/a class instance — none of which
+ * `JSON.stringify()` represents faithfully; the SAME "only a genuine plain
+ * object, recursively" contract `runtime/audit/audit-log.ts`'s own
+ * `canonicalizeAuditValue()` already established for exactly this reason,
+ * reused here rather than inventing a second, differently-scoped rule).
+ * An `undefined` OBJECT PROPERTY value is deliberately the ONE exception,
+ * left un-rejected: `JSON.stringify({a: undefined})` produces `"{}"` (the
+ * key is OMITTED, not coerced to `null`), and `JSON.parse("{}").a` is ALSO
+ * `undefined` (via ordinary property absence) — the round trip is
+ * genuinely lossless from the caller's observable point of view
+ * (`value.a === undefined` both before and after), unlike the array/
+ * top-level cases above. This exception matters in practice: several
+ * existing, legitimate P0 durable-state shapes (e.g.
+ * `runtime/cost/cost-engine.ts`'s persisted `CostEntry`/reservation scope
+ * objects, whose optional `agentId`/`projectId`/`runId` fields are
+ * assigned directly from a caller-supplied value that is often genuinely
+ * `undefined`) already rely on exactly this "an unset optional field is an
+ * `undefined`-valued own property" convention — rejecting it outright
+ * would fail closed for a case that is not actually lossy, breaking
+ * ordinary, already-correct persistence for no integrity benefit (the same
+ * reasoning `audit-log.ts`'s own 33rd-round fix note documents for its
+ * identical design choice).
+ */
+function assertNoLossySerialization(value: unknown, jsonPath: string, statePath: string, canOmit: boolean): void {
+  if (value === null) return;
+  if (value === undefined) {
+    if (canOmit) return;
+    throw new UnserializableStateError(
+      statePath,
+      undefined,
+      `'${jsonPath}' is undefined in a position with no safe 'omit' equivalent (an array element, or the ` +
+        `top-level value itself) — JSON.stringify() would silently turn this into null, a DIFFERENT value ` +
+        `from what was actually written`
+    );
+  }
+  const type = typeof value;
+  if (type === "number") {
+    if (!Number.isFinite(value as number)) {
+      throw new UnserializableStateError(
+        statePath,
+        undefined,
+        `'${jsonPath}' is a non-finite number (${String(value)}) — JSON.stringify() would silently coerce it ` +
+          `to null, a DIFFERENT value from what was actually written`
+      );
+    }
+    return;
+  }
+  if (type === "string" || type === "boolean") return;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoLossySerialization(item, `${jsonPath}[${index}]`, statePath, false));
+    return;
+  }
+  if (type === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new UnserializableStateError(
+        statePath,
+        undefined,
+        `'${jsonPath}' is an instance of '${Object.prototype.toString.call(value)}' rather than a plain ` +
+          `object — JSON.stringify() does not represent it faithfully`
+      );
+    }
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      assertNoLossySerialization(nested, `${jsonPath}.${key}`, statePath, true);
+    }
+    return;
+  }
+  throw new UnserializableStateError(statePath, undefined, `'${jsonPath}' is of unsupported type '${type}'`);
 }
 
 /**
@@ -104,6 +209,16 @@ export class FileStateStore implements StateStore {
     } catch (err) {
       throw new UnserializableStateError(path, err);
     }
+
+    // P2 fix (35th independent review round, finding 9, "reject lossy
+    // state serialization"): bkz. `assertNoLossySerialization()`'ın
+    // üstündeki fix notu. Runs over the ORIGINAL `data` (never the
+    // already-produced `serialized` text, which by definition cannot
+    // distinguish "a genuine null" from "a NaN silently coerced to
+    // null") — safe from infinite recursion on a circular reference
+    // because `JSON.stringify()` above already succeeded, which is only
+    // possible for an acyclic object graph.
+    assertNoLossySerialization(data, "$", path, true);
 
     const dir = dirname(path);
     mkdirSync(dir, { recursive: true });

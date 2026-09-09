@@ -46,22 +46,11 @@ export interface FileLockOptions {
    */
   readonly staleMs?: number;
   readonly pollIntervalMs?: number;
-  /**
-   * P1 fix (33rd independent review round, finding 6 / root class E,
-   * "lock ownership must not rely on PID alone"): see `isLockStale()`'s own
-   * fix note below for the full rationale — this bounds how long a
-   * CONFIRMED-ALIVE owner (per `isProcessAlive()`) may be trusted before
-   * PID reuse becomes a MORE plausible explanation than a genuinely
-   * long-lived holder. Defaults to a value far larger than any legitimate
-   * critical section this codebase performs.
-   */
-  readonly maxOwnerAgeMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_STALE_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 15;
-const DEFAULT_MAX_OWNER_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * P1 fix (28th independent review round, finding 11, "validate file-lock
@@ -95,7 +84,7 @@ const DEFAULT_MAX_OWNER_AGE_MS = 24 * 60 * 60 * 1000;
  * silently disabling timeout/staleness/backoff behavior.
  */
 export class InvalidFileLockOptionsError extends Error {
-  constructor(option: "timeoutMs" | "staleMs" | "pollIntervalMs" | "maxOwnerAgeMs", value: unknown, requirement: string) {
+  constructor(option: "timeoutMs" | "staleMs" | "pollIntervalMs", value: unknown, requirement: string) {
     super(
       `Invalid FileLockOptions.${option}: ${typeof value === "number" ? value : JSON.stringify(value)} ` +
         `(typeof ${typeof value}). ${requirement} A file lock's timing configuration is rejected BEFORE any ` +
@@ -106,12 +95,7 @@ export class InvalidFileLockOptionsError extends Error {
   }
 }
 
-function assertValidLockTimingOptions(
-  timeoutMs: number,
-  staleMs: number,
-  pollIntervalMs: number,
-  maxOwnerAgeMs: number
-): void {
+function assertValidLockTimingOptions(timeoutMs: number, staleMs: number, pollIntervalMs: number): void {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new InvalidFileLockOptionsError(
       "timeoutMs",
@@ -128,17 +112,6 @@ function assertValidLockTimingOptions(
       pollIntervalMs,
       "pollIntervalMs must be a finite number > 0 (a zero/negative interval turns the retry loop into an " +
         "uncontrolled busy-loop)."
-    );
-  }
-  // P1 fix (33rd independent review round, finding 6 / root class E): see
-  // `isLockStale()`'s own fix note for why this bound exists.
-  if (!Number.isFinite(maxOwnerAgeMs) || maxOwnerAgeMs <= 0) {
-    throw new InvalidFileLockOptionsError(
-      "maxOwnerAgeMs",
-      maxOwnerAgeMs,
-      "maxOwnerAgeMs must be a finite number > 0 (a non-positive/non-finite value would either make every " +
-        "confirmed-live owner instantly reclaimable or restore the unbounded-trust PID-reuse hole this option " +
-        "exists to close)."
     );
   }
 }
@@ -295,51 +268,53 @@ function readLockMeta(metaPath: string): LockMeta | undefined {
  */
 /**
  * P1 fix (33rd independent review round, finding 6 / root class E, "lock
- * ownership must not rely on PID alone"): this file's own header comment on
- * `acquireFileLock()` had always documented, as a KNOWN, deliberate P0
- * limitation, that `isProcessAlive(meta.pid)` cannot actually distinguish
- * "the SAME process that acquired this lock is still running under this
- * PID" from "the ORIGINAL owner died, and the OS has since reassigned this
- * EXACT PID to a completely unrelated later process" (PID reuse) — a
- * narrow but real window on any long-running host. Combined with the
- * CONFIRMED-ALIVE branch's own "never stale regardless of age" rule (17th
- * independent review round), this meant a PID-reused zombie lock was not
- * merely theoretically mis-classified but PERMANENTLY unreclaimable: no
- * amount of elapsed time would ever route it into the bounded
- * UNKNOWN-owner recovery path, since `isProcessAlive()` would keep
- * reporting "alive" (correctly, about the NEW, unrelated process) forever.
- * A portable, dependency-free way to read a PID's actual process-start
- * timestamp does not exist in Node.js without either a native addition or
- * a platform-specific (e.g. Linux-only /proc) code path — both of which
- * this codebase's own stated principles reject. Fixed instead with the
- * round's explicitly offered alternative: an authoritative bound on how
- * long ANY confirmed-live reading may be trusted. The CONFIRMED-ALIVE
- * branch is no longer an unconditional, permanent grant — it is now ALSO
- * checked against `meta.acquiredAt` (the lock's OWN recorded acquisition
- * time, never the directory's mtime, which a legitimate owner's later
- * writes could otherwise reset) via `maxOwnerAgeMs`, a ceiling several
- * orders of magnitude larger than any legitimate critical section this
- * codebase performs (default 24 hours vs. `staleMs`'s default 30 seconds).
- * A genuinely long-lived, still-running owner remains fully protected for
- * any realistic duration — nothing changes for it. Only once a lock's
- * recorded age becomes implausible for a real held critical section does
- * it fall through to the SAME governed, authenticated, single-winner
- * reclaim path (`tryReclaimStaleLock`/`acquireReclaimGate`) every other
- * stale/dead/unknown-owner lock already goes through — never an instant,
- * unauthenticated steal. This satisfies the round's requirements: a
- * confirmed CURRENT owner remains protected (for any realistic duration);
- * a dead/PID-reused REPLACED owner eventually becomes reclaimable; the
- * check fails conservatively when identity cannot be proven (still routes
- * through the existing, cautious, re-verified reclaim gate, never an
- * immediate delete); and it is deterministically testable (bkz.
- * `file-lock.test.ts`'in root class E bölümü) without needing to actually
- * reproduce a real OS PID-reuse event.
+ * ownership must not rely on PID alone") — SUPERSEDED, see the 35th round
+ * fix note directly below: this round had bounded a CONFIRMED-ALIVE
+ * reading by an `acquiredAt`-derived `maxOwnerAgeMs` ceiling, so that a
+ * PID-reused zombie lock (the ORIGINAL owner died; the OS reassigns the
+ * exact same PID to a later, unrelated process) would eventually become
+ * reclaimable rather than permanently blocking `acquireFileLock()`. That
+ * design traded away a DIFFERENT, more severe guarantee to get there: age
+ * alone, applied uniformly to every confirmed-alive reading, cannot tell a
+ * PID-reused zombie apart from a genuinely alive owner in the middle of an
+ * unusually long — but entirely legitimate — held critical section. A
+ * caller configuring (or defaulting into) a `maxOwnerAgeMs` shorter than
+ * some real workload's actual hold time would have TWO processes believing
+ * they both own the SAME critical section at once — exactly the mutual-
+ * exclusion violation this entire module exists to prevent, the opposite
+ * failure mode from the one round 33 was fixing.
+ *
+ * P1 fix (35th independent review round, finding 7, "do not reclaim a lock
+ * from a confirmed-live owner"): reverses round 33's approach for exactly
+ * this reason — `maxOwnerAgeMs` is removed entirely, and the CONFIRMED-
+ * ALIVE branch is restored to the 17th independent review round's original,
+ * unconditional invariant: a lock whose owner PID is confirmed alive is
+ * NEVER stale, regardless of how long it has been held. Age is not, and
+ * cannot be, authoritative proof of a DIFFERENT process now holding the
+ * same PID — only genuine identity proof (a portable process-start-time
+ * reading, which Node.js cannot provide without a native addition or a
+ * platform-specific `/proc` path this codebase's own stated principles
+ * already reject) could safely distinguish the two, and no such proof is
+ * available here. The residual PID-reuse exposure round 33 set out to
+ * close is therefore knowingly re-accepted — narrower in practice than it
+ * sounds, since a PID reused by an unrelated process needs to ALSO
+ * coincide with THIS specific lock still being held from before that PID's
+ * original process died, and is the SAME conservative "when identity
+ * cannot be proven, wait rather than risk stealing a live owner's lock"
+ * trade-off `isProcessAlive()`'s own EPERM/unexpected-error handling has
+ * always made a few lines above. Three states remain, now exactly as the
+ * 17th round originally established: (1) CONFIRMED ALIVE (meta readable
+ * AND `isProcessAlive` true) → NEVER stale, age irrelevant; (2) CONFIRMED
+ * DEAD (meta readable AND `isProcessAlive` false, i.e. ESRCH) → ALWAYS
+ * stale, immediately; (3) UNKNOWN (metadata unreadable — race, corruption,
+ * disk error) → falls back to the directory's own `mtime` against
+ * `staleMs`, the same bounded, non-identity-based recovery signal as
+ * before.
  */
-function isLockStale(lockDirPath: string, metaPath: string, staleMs: number, maxOwnerAgeMs: number): boolean {
+function isLockStale(lockDirPath: string, metaPath: string, staleMs: number): boolean {
   const meta = readLockMeta(metaPath);
   if (meta) {
-    if (!isProcessAlive(meta.pid)) return true;
-    return Date.now() - meta.acquiredAt > maxOwnerAgeMs;
+    return !isProcessAlive(meta.pid);
   }
   try {
     const stat = statSync(lockDirPath);
@@ -407,13 +382,13 @@ function isLockStale(lockDirPath: string, metaPath: string, staleMs: number, max
  * `acquireFileLock`) HER ZAMAN normal zaman aşımı kontrolüne VE
  * uyku/backoff'a uğrayan tek, koşulsuz bir yola yönlendirir.
  */
-function tryReclaimStaleLock(lockDirPath: string, metaPath: string, staleMs: number, maxOwnerAgeMs: number): boolean {
+function tryReclaimStaleLock(lockDirPath: string, metaPath: string, staleMs: number): boolean {
   const claimPath = `${lockDirPath}.reclaim`;
-  if (!acquireReclaimGate(claimPath, staleMs, maxOwnerAgeMs)) {
+  if (!acquireReclaimGate(claimPath, staleMs)) {
     return false;
   }
   try {
-    if (!isLockStale(lockDirPath, metaPath, staleMs, maxOwnerAgeMs)) {
+    if (!isLockStale(lockDirPath, metaPath, staleMs)) {
       // Sahip, bizim ilk gözlemimizle şimdi arasında meşru şekilde
       // yenilendi (ör. canlı bir sahip release() edip yeniden kilitledi,
       // ya da hiç stale değilmiş) — ASLA dokunma.
@@ -557,7 +532,7 @@ export function sanitizeReclaimToken(token: string | undefined): string {
   return "unknown-generation";
 }
 
-function acquireReclaimGate(claimPath: string, staleMs: number, maxOwnerAgeMs: number): boolean {
+function acquireReclaimGate(claimPath: string, staleMs: number): boolean {
   const claimMetaPath = join(claimPath, "owner.json");
   try {
     mkdirSync(claimPath);
@@ -565,7 +540,7 @@ function acquireReclaimGate(claimPath: string, staleMs: number, maxOwnerAgeMs: n
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    if (!isLockStale(claimPath, claimMetaPath, staleMs, maxOwnerAgeMs)) {
+    if (!isLockStale(claimPath, claimMetaPath, staleMs)) {
       // Kapı hâlâ meşru şekilde tutuluyor (canlı bir sahip VEYA henüz
       // yaşlanmamış) — ASLA dokunma.
       return false;
@@ -579,7 +554,7 @@ function acquireReclaimGate(claimPath: string, staleMs: number, maxOwnerAgeMs: n
       // Recovery kapısını ALDIKTAN SONRA yeniden doğrula — aynı anda
       // başka HİÇBİR kurtarıcı bu AYNI nesli hedefleyemez, bu yüzden bu
       // kontrol ile gerçek `rmSync` arasında TOCTOU penceresi KALMAZ.
-      if (!isLockStale(claimPath, claimMetaPath, staleMs, maxOwnerAgeMs)) {
+      if (!isLockStale(claimPath, claimMetaPath, staleMs)) {
         return false;
       }
       try {
@@ -675,33 +650,34 @@ function acquireRecoveryGate(recoveryGatePath: string, staleMs: number): boolean
  * hatası, kapı kaybı, sahip hâlâ canlı, `isLockStale` false) döngü HER
  * ZAMAN `pollIntervalMs` kadar uyur, ASLA sıkı döngüye girmez.
  *
- * P1 fix (33rd independent review round, finding 6 / root class E): the
- * paragraph that used to stand here documented "sahiplik kimliği yalnızca
- * PID + rastgele bir token ile belirlenir; PID reuse teorik olarak
- * kalıcı-yanlış-CANLI bir sonuca yol açabilir" as an ACCEPTED, permanent
- * P0 limitation. It no longer is one: `isLockStale()` now also bounds a
- * CONFIRMED-ALIVE reading by `maxOwnerAgeMs` (bkz. `isLockStale()`'in
- * kendi fix notu) — a PID-reused zombie lock eventually ages past that
- * ceiling and is recovered through the SAME authenticated, single-winner
- * reclaim path every other stale lock already uses, rather than remaining
- * unreclaimable forever. The remaining, intentionally accepted residual
- * scope is narrower than before: within `maxOwnerAgeMs` (a value several
- * orders of magnitude larger than any legitimate critical section this
- * codebase performs), a PID-reused zombie is still indistinguishable from
- * a genuine long-lived owner — this is the same conservative trade-off
- * `isProcessAlive()`'s own EPERM/unexpected-error handling has always made
- * (bkz. o fonksiyonun kendi fix notu): when identity truly cannot be
- * proven, wait rather than risk stealing a live owner's lock.
+ * P1 fix (33rd independent review round, finding 6 / root class E) —
+ * SUPERSEDED by the 35th round, finding 7 (bkz. `isLockStale()`'in kendi,
+ * en güncel fix notu): this paragraph used to document that a
+ * CONFIRMED-ALIVE reading was bounded by `maxOwnerAgeMs`, so a PID-reused
+ * zombie lock would eventually age past that ceiling and become
+ * reclaimable rather than blocking forever. That mechanism has been
+ * REMOVED: age applied uniformly to every confirmed-alive owner cannot
+ * tell a PID-reused zombie apart from a genuinely alive owner mid-way
+ * through an unusually long but legitimate critical section — reclaiming
+ * the latter puts two processes in the same critical section at once,
+ * a strictly worse failure than the PID-reuse window it was closing. The
+ * ORIGINAL 17th independent review round invariant is restored: sahiplik
+ * kimliği yalnızca PID + rastgele bir token ile belirlenir; bir kilit,
+ * sahibi CANLI olduğu sürece yaşı ne olursa olsun ASLA reclaim edilmez.
+ * PID reuse remains an accepted, permanent, narrow P0 limitation — the
+ * same conservative trade-off `isProcessAlive()`'s own EPERM/unexpected-
+ * error handling has always made (bkz. o fonksiyonun kendi fix notu): when
+ * identity truly cannot be proven, wait rather than risk stealing a live
+ * owner's lock.
  */
 export function acquireFileLock(lockDirPath: string, options: FileLockOptions = {}): () => void {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const maxOwnerAgeMs = options.maxOwnerAgeMs ?? DEFAULT_MAX_OWNER_AGE_MS;
   // P1 fix (28th independent review round, finding 11, "validate file-lock
   // timing options"): validated BEFORE any acquisition/retry logic runs —
   // bkz. `assertValidLockTimingOptions()`'ın üstündeki fix notu.
-  assertValidLockTimingOptions(timeoutMs, staleMs, pollIntervalMs, maxOwnerAgeMs);
+  assertValidLockTimingOptions(timeoutMs, staleMs, pollIntervalMs);
   const metaPath = join(lockDirPath, "owner.json");
   const token = randomBytes(8).toString("hex");
   const deadline = Date.now() + timeoutMs;
@@ -737,9 +713,7 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
     // canlı) — bu satırdan SONRA, döngünün başına dönmeden ÖNCE, TEK VE
     // KOŞULSUZ bir zaman aşımı kontrolünden geçilir; hiçbir dal bunu
     // atlayamaz (bkz. yukarıdaki fonksiyon-seviyesi fix notu).
-    const reclaimed = isLockStale(lockDirPath, metaPath, staleMs, maxOwnerAgeMs)
-      ? tryReclaimStaleLock(lockDirPath, metaPath, staleMs, maxOwnerAgeMs)
-      : false;
+    const reclaimed = isLockStale(lockDirPath, metaPath, staleMs) ? tryReclaimStaleLock(lockDirPath, metaPath, staleMs) : false;
 
     if (Date.now() >= deadline) {
       throw new FileLockTimeoutError(lockDirPath, timeoutMs);

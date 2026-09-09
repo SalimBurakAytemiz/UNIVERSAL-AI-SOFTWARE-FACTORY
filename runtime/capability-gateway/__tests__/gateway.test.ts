@@ -742,4 +742,72 @@ describe("CapabilityGateway", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (35th independent review round, finding 1, 'snapshot policy result before invoking observers')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: policy returns DENY -> observer attempts to mutate the " +
+          "result it was handed to ALLOW -> operation remains DENIED",
+        async () => {
+          const policy = new PolicyEngine();
+          policy.addRule({ name: "deny-all", priority: 10, evaluate: () => "DENY" });
+          const gateway = new CapabilityGateway(policy);
+
+          let mutationThrew = false;
+          await expect(
+            gateway.authorize({ actionType: "x", risk: 1, description: "x" }, () => "never", undefined, (r) => {
+              try {
+                (r as { decision: string }).decision = "ALLOW";
+              } catch {
+                mutationThrew = true;
+              }
+            })
+          ).rejects.toThrow(CapabilityDeniedError);
+          expect(mutationThrew).toBe(true);
+        }
+      );
+
+      it(
+        "BLOCKER regression: an observer replacing the action field entirely cannot smuggle a different " +
+          "action into approval matching",
+        async () => {
+          const policy = new PolicyEngine();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new CapabilityGateway(policy, approvals);
+          const action = { actionType: "risky.action", risk: 5 as const, description: "y" };
+          approvals.requestFor("appr-1", action);
+          approvals.approve("appr-1", "founder@example.com");
+
+          await expect(
+            gateway.authorize(action, () => "never", { approvalId: "appr-1" }, (r) => {
+              try {
+                (r as { action: unknown }).action = { actionType: "other", risk: 5, description: "other" };
+              } catch {
+                // expected: frozen snapshot rejects the replacement attempt.
+              }
+            })
+          ).resolves.toBe("never");
+        }
+      );
+
+      it("no regression: a well-behaved observer that only reads the result sees the correct decision", async () => {
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const gateway = new CapabilityGateway(policy);
+
+        let observed: string | undefined;
+        const result = await gateway.authorize(
+          { actionType: "x", risk: 1, description: "x" },
+          () => "ok",
+          undefined,
+          (r) => {
+            observed = r.decision;
+          }
+        );
+        expect(observed).toBe("ALLOW");
+        expect(result).toBe("ok");
+      });
+    }
+  );
 });

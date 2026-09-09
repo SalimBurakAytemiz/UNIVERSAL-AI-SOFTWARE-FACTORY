@@ -217,6 +217,53 @@ describe(
   }
 );
 
+describe(
+  "secret-scan: P1 fix (35th independent review round, finding 12, 'detect base64 padding in quoted " +
+    "secret assignments') — a quoted secret value ending in base64 '=' padding must still be detected",
+  () => {
+    // Synthetic, deliberately fake Base64-shaped fixture values (not derived
+    // from any real credential) — used only to prove the scanner's pattern
+    // matching, per this repo's secret-scan:allow convention.
+    const doublePadded = "YWJjZGVmZ2hpamtsbW5vcA=="; // secret-scan:allow (fake fixture value, tests detection itself)
+    const singlePadded = "YWJjZGVmZ2hpamtsbW5vcQ="; // secret-scan:allow (fake fixture value, tests detection itself)
+
+    it("BLOCKER: detects a double-quoted apiKey value with double '==' base64 padding", () => {
+      const findings = findSecretsInText(`apiKey="${doublePadded}"`, "config.ts"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("BLOCKER: detects a single-quoted secret value with single '=' base64 padding", () => {
+      const findings = findSecretsInText(`secret='${singlePadded}'`, "config.ts"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("BLOCKER: detects a double-quoted JSON password field with base64 padding", () => {
+      const findings = findSecretsInText(`{"password": "${doublePadded}"}`, "config.json"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("no-regression: still detects a quoted value with no base64 padding at all", () => {
+      const findings = findSecretsInText('access_token: "abcdefghijklmnopqrstuvwxyz"', "config.yaml"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+
+    it("no-regression: does not flag an unquoted value that happens to end in '=' (outside this finding's scope)", () => {
+      const findings = findSecretsInText("password=abcdefghijklmnopqrstuvwxyz=", "config.env"); // secret-scan:allow (fake fixture value, tests detection itself)
+      expect(findings.some((f) => f.pattern === "Generic API key/secret assignment with a real-looking value")).toBe(
+        true
+      );
+    });
+  }
+);
+
 describe("secret-scan: no whole-file allowlist (regression for the P2 finding)", () => {
   let tempRoot;
 

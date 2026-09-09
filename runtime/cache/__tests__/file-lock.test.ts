@@ -470,18 +470,6 @@ describe(
       });
     });
 
-    describe("maxOwnerAgeMs", () => {
-      it.each([NaN, Infinity, -Infinity, 0, -1])("rejects %s", (bad) => {
-        expect(() => acquireFileLock(freshLockDir(), { maxOwnerAgeMs: bad })).toThrow(InvalidFileLockOptionsError);
-      });
-
-      it("accepts a genuine positive value", () => {
-        const lockDirPath = freshLockDir();
-        const release = acquireFileLock(lockDirPath, { maxOwnerAgeMs: 1000 });
-        release();
-      });
-    });
-
     it("validation happens BEFORE any filesystem mutation — no lock directory is created for an invalid option", () => {
       const lockDirPath = freshLockDir();
       expect(() => acquireFileLock(lockDirPath, { timeoutMs: NaN })).toThrow(InvalidFileLockOptionsError);
@@ -497,16 +485,17 @@ describe(
 );
 
 describe(
-  "P1 fix (33rd independent review round, finding 6 / root class E, 'lock ownership must not rely on PID " +
-    "alone'): a CONFIRMED-ALIVE PID reading must not grant unconditional, permanent trust — real OS PID reuse " +
-    "(the original owner dies; the OS reassigns the exact same PID to a later, unrelated process) is " +
-    "reproduced deterministically here by using THIS TEST PROCESS' OWN pid (guaranteed alive) paired with an " +
-    "implausibly old recorded acquisition time — from isLockStale()'s perspective this is EXACTLY what a " +
-    "PID-reused zombie lock looks like: a genuinely alive PID that is NOT the process that actually acquired it",
+  "P1 fix (35th independent review round, finding 7, 'do not reclaim a lock from a confirmed-live owner') " +
+    "— reverses the 33rd independent review round's finding 6/root class E approach: age (however large, " +
+    "however configured) must NEVER, on its own, make a CONFIRMED-ALIVE owner's lock reclaimable. A real OS " +
+    "PID-reuse scenario (the original owner dies; the OS reassigns the exact same PID to a later, unrelated " +
+    "process) is reproduced deterministically here by using THIS TEST PROCESS' OWN pid (guaranteed alive) " +
+    "paired with an implausibly old recorded acquisition time — from isLockStale()'s perspective this is " +
+    "EXACTLY what a PID-reused zombie lock looks like, and it must remain unreclaimable regardless",
   () => {
     it(
       "BLOCKER regression, exact reproduction: a lock whose confirmed-alive owner's recorded acquiredAt is " +
-        "far older than maxOwnerAgeMs is eventually reclaimed, rather than blocking forever",
+        "implausibly old is NEVER reclaimed — a contender blocks for the full timeout rather than stealing it",
       () => {
         const lockDirPath = makeLockDir();
         writeRawOwnerFile(
@@ -518,37 +507,33 @@ describe(
           })
         );
 
-        const start = Date.now();
-        const release = acquireFileLock(lockDirPath, {
-          timeoutMs: 5_000,
-          staleMs: 60_000, // irrelevant here — the confirmed-alive branch never consults staleMs
-          pollIntervalMs: 10,
-          maxOwnerAgeMs: 100 // far smaller than the fabricated owner's actual age
-        });
-        const elapsed = Date.now() - start;
-
-        expect(elapsed).toBeLessThan(2_000);
-        release();
+        expect(() =>
+          acquireFileLock(lockDirPath, {
+            timeoutMs: 150,
+            staleMs: 1, // irrelevant here — the confirmed-alive branch never consults staleMs
+            pollIntervalMs: 10
+          })
+        ).toThrow(FileLockTimeoutError);
       }
     );
 
-    it("root-cause proof: the SAME confirmed-alive owner is protected under the default maxOwnerAgeMs but reclaimable once an explicit, smaller ceiling is exceeded — the ceiling itself, not the fixture, is what changes the outcome", () => {
-      const lockDirPath = makeLockDir();
-      // One hour old: comfortably within the default 24h ceiling, so with
-      // NO explicit maxOwnerAgeMs override this confirmed-alive owner
-      // remains fully protected — proving the fixture alone does not
-      // "cheat" the test.
-      writeRawOwnerFile(
-        lockDirPath,
-        JSON.stringify({ pid: process.pid, token: "zombie-owner", acquiredAt: Date.now() - 60 * 60 * 1000 })
-      );
+    it(
+      "BLOCKER regression: a confirmed-alive owner held for a genuinely implausible duration " +
+        "(far beyond the OLD maxOwnerAgeMs default this round removed) still cannot be acquired by a contender",
+      () => {
+        const lockDirPath = makeLockDir();
+        writeRawOwnerFile(
+          lockDirPath,
+          JSON.stringify({ pid: process.pid, token: "live-owner", acquiredAt: Date.now() - 30 * 24 * 60 * 60 * 1000 })
+        );
 
-      expect(() =>
-        acquireFileLock(lockDirPath, { timeoutMs: 150, staleMs: 1, pollIntervalMs: 10 })
-      ).toThrow(FileLockTimeoutError);
-    });
+        expect(() =>
+          acquireFileLock(lockDirPath, { timeoutMs: 150, staleMs: 1, pollIntervalMs: 10 })
+        ).toThrow(FileLockTimeoutError);
+      }
+    );
 
-    it("no regression: a confirmed-alive owner well within maxOwnerAgeMs (a normal, realistic lock age) remains fully protected", () => {
+    it("no regression: a confirmed-alive owner with a normal, realistic lock age remains fully protected", () => {
       const lockDirPath = makeLockDir();
       writeRawOwnerFile(
         lockDirPath,
@@ -556,24 +541,23 @@ describe(
       );
 
       expect(() =>
-        acquireFileLock(lockDirPath, { timeoutMs: 150, staleMs: 1, pollIntervalMs: 10, maxOwnerAgeMs: 60_000 })
+        acquireFileLock(lockDirPath, { timeoutMs: 150, staleMs: 1, pollIntervalMs: 10 })
       ).toThrow(FileLockTimeoutError);
     });
 
-    it("no regression: a genuinely DEAD owner is still reclaimed near-instantly regardless of maxOwnerAgeMs (the dead branch is checked first and never consults acquiredAt)", () => {
+    it("no regression: a genuinely DEAD owner is still reclaimed near-instantly, regardless of its recorded age (the dead branch is checked first and never consults acquiredAt)", () => {
       const lockDirPath = makeLockDir();
       const deadPid = spawnDeadPid();
       writeRawOwnerFile(
         lockDirPath,
-        JSON.stringify({ pid: deadPid, token: "dead-owner", acquiredAt: Date.now() })
+        JSON.stringify({ pid: deadPid, token: "dead-owner", acquiredAt: Date.now() - 999_999_999 })
       );
 
       const start = Date.now();
       const release = acquireFileLock(lockDirPath, {
         timeoutMs: 5_000,
         staleMs: 60_000,
-        pollIntervalMs: 10,
-        maxOwnerAgeMs: 24 * 60 * 60 * 1000
+        pollIntervalMs: 10
       });
       const elapsed = Date.now() - start;
 

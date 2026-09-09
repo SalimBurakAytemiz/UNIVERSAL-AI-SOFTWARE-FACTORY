@@ -159,6 +159,23 @@ sistem" talebini karşılayan kısımdır.
   Project OS (Capability Gateway üzerinden) -> Maliyet/Model Yönlendirme
   -> Kalıcı Durum. Ayrı ayrı test edilmiş parçaların GERÇEKTEN birlikte
   çalıştığının kanıtı `proofs/p0-integrated-flow/` altındadır.
+- **`runtime/invariants/`** — Merkezi Değişmez Kural Bekçisi (Central
+  Invariant Guard, `invariant-guard.ts`). Yeni bir yönetişim eylemi (bir
+  fazı kilitlemek/kapatmak gibi) gerçekleşmeden ÖNCE kontrol edilmesi
+  gereken kuralları (ör. "gereksinim kaydı temiz yükleniyor mu?",
+  "politika motoru varsayılan olarak reddediyor mu?") TEK bir yerde
+  toplar. Kendi kanıt kaynağını icat etmez — mevcut gereksinim
+  yükleyicisini ve izlenebilirlik modülünü kullanır.
+- **`runtime/governance/`** — 35. bağımsız inceleme turunda eklenen üç
+  yönetişim mekanizması: **Scope Lock + Backlog Router**
+  (`scope-lock.ts`, bir fazın OPEN / LOCKED_FOR_CLOSURE / CLOSED
+  durumunu makine-okunur şekilde izler ve her geçişi mevcut Karar
+  Defteri'ne kaydeder), **Phase Closure Manifest** (`phase-closure.ts`,
+  "testler geçti" tek başına asla yeterli değildir — gerçek kanıt,
+  temiz bir Değişmez Kural raporu, bloke gereksinim olmaması VE bağımsız
+  bir incelemenin "CLEAN" sonucu vermesi gerekir), ve **Uygulama
+  Gerçeklik Matrisi** (`reality-matrix.ts`, bir gereksinimin İDDİA
+  ettiği durum ile kanıtın GERÇEKTEN desteklediği durumu ayırt eder).
 
 **Yanlış değiştirilirse ne etkilenebilir?** `policy-engine` veya `budget`
 içindeki bir hata, gerçek bir dağıtımda maliyet kontrolünün veya insan
@@ -221,6 +238,16 @@ baştan başlamak yerine kaldığı yerden devam edebilir.
 **Yanlış değiştirilirse ne etkilenebilir?** Yanlış/eski bir durum, bir
 sonraki oturumun tamamlanmış işi tekrar yapmasına veya eksik bir adımı
 atlamasına yol açabilir.
+
+**`project-state/governance/`** — `ScopeLock`/`FounderDecisionLedger`
+sınıflarının GERÇEKTEN çalıştırılmasıyla üretilen, kalıcı yönetişim
+durumu (bir fazın OPEN/LOCKED_FOR_CLOSURE/CLOSED durumu ve bu duruma
+nasıl gelindiğinin karar kaydı). Elle düzenlenmez — bkz. o klasörün kendi
+README.md dosyası.
+
+**`project-state/phase-closures/`** — Her faz-kapatma DENEMESİNİN (başarılı
+olsun olmasın) kalıcı kaydı; "neden kapanmadı?" sorusunun cevabı her zaman
+diskte durur — bkz. o klasörün kendi README.md dosyası.
 
 ---
 

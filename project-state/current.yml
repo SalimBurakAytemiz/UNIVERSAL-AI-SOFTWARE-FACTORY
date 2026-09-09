@@ -1242,6 +1242,30 @@ factory:
     to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch — all work
     stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    Round 35 (the 35th independent Codex review found 12 actionable findings — 9 P1, 3 P2 — fixed as one
+    consolidated closure batch, PLUS four new Factory governance mechanisms in the same batch): see
+    specification/requirements/P0-factory-kernel.yml's UASF-REQ-0042 notes (Round 35 paragraph) for the full,
+    detailed account of all twelve fixes, the four governance mechanisms (Central Invariant Guard, Scope Lock +
+    Backlog Router, Phase Closure Manifest, Implementation Reality Matrix, in `runtime/invariants/` and
+    `runtime/governance/`), and the two real defects a same-round self-audit found and fixed in this round's OWN
+    new governance code (pre-audit transition exposure in ScopeLock/BacklogRouter; replaceable production
+    authority in PhaseClosureManifest's Reality Matrix check) before the batch was considered complete. Full
+    required sequence re-run and green: lint, typecheck, build, 1360/1360 tests (50 files), validate:requirements
+    (46 schema-valid records — 4 new for the governance mechanisms), history-and-current-tree-aware secret-scan
+    (PASS), Factory Doctor (READY). No status raised on any requirement beyond what real evidence supports.
+
+    P0 STATUS CHANGE: per this round's explicit instruction, P0 is set to READY_FOR_INDEPENDENT_REVIEW rather than
+    remaining BLOCKED_PENDING_REVIEW, because every local mandatory gate above passed. This is now backed by
+    executable state, not merely prose: the new Scope Lock mechanism was genuinely run against this repository's
+    own real requirement registry (Central Invariant Guard reported zero BLOCKING violations) and P0 was
+    transitioned OPEN -> LOCKED_FOR_CLOSURE, persisted at project-state/governance/scope-lock.json and recorded
+    in project-state/governance/decision-ledger.json (decisionId: round35-p0-lock-for-closure). P0 remains
+    LOCKED_FOR_CLOSURE (i.e. NOT closed) — the new Phase Closure Manifest mechanism structurally REJECTS an
+    actual CLOSED outcome unless a LATER independent review supplies `independentReviewResult: "CLEAN"`, which
+    this session cannot manufacture on its own. Per explicit instruction, this round does NOT merge, does NOT
+    move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all
+    work stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4915,7 +4939,34 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
-  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 34). A fresh,
+  P0 IS NOW READY_FOR_INDEPENDENT_REVIEW (this session, round 35) — not CLOSED. A fresh, independent Codex
+  review of the complete branch found TWELVE actionable findings (9 P1, 3 P2) and required them fixed as ONE
+  consolidated closure batch, PLUS four new Factory governance mechanisms (Central Invariant Guard, Scope Lock
+  + Backlog Router, Phase Closure Manifest, Implementation Reality Matrix) implemented in the same batch,
+  reusing existing architecture (the Founder Decision Ledger, the requirement-traceability evidence path) rather
+  than introducing a parallel one. All twelve findings fixed with deterministic BLOCKER-reproduction and
+  no-regression tests, each individually bypass-verified. A narrow, same-round self-audit of the four NEW
+  governance mechanisms (scoped to the same 11 named root-cause classes the twelve findings belong to) found and
+  fixed two real defects before the batch was considered complete: (a) ScopeLock/BacklogRouter were committing
+  authoritative state mutations BEFORE recording to the Decision Ledger (same "pre-audit transition exposure"
+  class as finding 2); (b) PhaseClosureManifest was trusting a caller-supplied `blockedRequirementIds` instead of
+  computing the Implementation Reality Matrix internally (same "replaceable production authority" class as
+  finding 6). See specification/requirements/P0-factory-kernel.yml's UASF-REQ-0042 notes (Round 35 paragraph) and
+  UASF-REQ-0043 through UASF-REQ-0046 (the four new governance-mechanism requirement records) for full detail.
+  Full required sequence green: lint, typecheck, build, 1360/1360 tests, validate:requirements (46 records),
+  history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY). Per this round's explicit
+  instruction, P0's status was changed from BLOCKED_PENDING_REVIEW to READY_FOR_INDEPENDENT_REVIEW using the new
+  Scope Lock mechanism for real (not merely a prose claim) — see project-state/governance/ for the persisted,
+  genuinely-computed ScopeLock/DecisionLedger state. P0 is explicitly NOT closed: the Phase Closure Manifest
+  mechanism structurally requires a LATER independent review to supply `independentReviewResult: "CLEAN"` before
+  an actual CLOSED transition can occur, which this session cannot supply itself. Do not move to P1, do not
+  declare P0 CLOSED, and do not invoke Codex, until that independent review comes back clean. When it does,
+  resume from the prior exact_next_action below: wire the remaining foundation modules (Discovery, Decisions,
+  Assumptions, Technology/Business-Capability registries) into the same integrated pipeline, consider a
+  SQLite-backed StateStore, get a Founder decision on P0-sufficiency and licensing (section 206), and consider
+  whether the four new governance mechanisms should gate future rounds' own closure claims going forward.
+
+  P0 WAS STILL BLOCKED_PENDING_REVIEW (round 34, prior session). A fresh,
   independent Codex review of the complete branch found TWELVE actionable
   findings (6 P1, 6 P2) and required them fixed as ONE consolidated closure
   batch, plus a narrow, explicitly-scoped root-class audit for 8 named

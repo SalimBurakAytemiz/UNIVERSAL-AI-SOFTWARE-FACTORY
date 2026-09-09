@@ -4,6 +4,7 @@ import {
   UnknownProviderError,
   DuplicateProviderIdError,
   ProviderInvocationError,
+  UnsafeProviderConfigurationError,
   computeModelInvocationIdentityDigest,
   computeProviderReplacementIdentityDigest,
   type ModelInvocationResponse
@@ -1802,6 +1803,55 @@ describe("ModelGateway + MockProvider", () => {
         expect(response.output).toContain("hello");
       });
 
+      it(
+        "P1 fix (35th independent review round, finding 11, 'prepare provider binding before recording " +
+          "replacement'), BLOCKER regression, exact reproduction: a candidate whose binding construction " +
+          "FAILS (its configuration cannot be safely locked) leaves NO 'MODEL_PROVIDER_REPLACED' audit " +
+          "record, and the ORIGINAL provider remains authoritative",
+        async () => {
+          const auditLog = new AuditLog();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals, auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          class LockRejectingProvider implements ModelProvider {
+            readonly id = "mock";
+            endpoint = "https://x.example.com";
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "should-never-be-used" };
+            }
+          }
+          // A Proxy whose defineProperty trap rejects every attempt to lock
+          // an own property descriptor — exactly the shape
+          // `detachFromCallerMutation()` (bkz. finding 5's fix) needs to
+          // genuinely fail on, deterministically, without relying on any
+          // platform-specific object exotica.
+          const candidate = new Proxy(new LockRejectingProvider(), {
+            defineProperty: () => false
+          });
+
+          await expect(
+            gateway.replaceProvider(candidate, { policy: permissivePolicy(), risk: 0 })
+          ).rejects.toThrow(UnsafeProviderConfigurationError);
+
+          // No audit event was ever recorded for a replacement that never
+          // actually completed.
+          expect(auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED")).toHaveLength(0);
+
+          // The ORIGINAL adapter still handles invocations — no silent
+          // partial-swap occurred.
+          const registry = createDefaultModelRegistry();
+          const model = registry.all()[0]!;
+          const response = await gateway.invoke(model, { prompt: "hello" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toContain("hello");
+        }
+      );
+
       it("registerProvider() is unaffected by the audit requirement — ordinary registration never needs an AuditLog", () => {
         const gateway = new ModelGateway();
         expect(() => gateway.registerProvider(new MockProvider())).not.toThrow();
@@ -2148,6 +2198,225 @@ describe("ModelGateway + MockProvider", () => {
         expect(() => {
           Object.defineProperty(provider, "invoke", { value: async () => {}, configurable: true, writable: true });
         }).not.toThrow();
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (35th independent review round, finding 3, 'bind provider approvals to complete candidate " +
+      "configuration'): two instances of the SAME provider class with materially different configuration " +
+      "must never share an approval identity",
+    () => {
+      class EndpointProvider implements ModelProvider {
+        readonly id = "mock";
+        constructor(readonly endpoint: string) {}
+        async invoke(): Promise<ModelInvocationResponse> {
+          return { modelId: "m", provider: "mock", costUsd: 0, output: `endpoint:${this.endpoint}` };
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: two same-class candidates with different endpoints " +
+          "produce DIFFERENT identity digests",
+        () => {
+          const good = new EndpointProvider("https://good.example.com");
+          const evil = new EndpointProvider("https://evil.example.com");
+          expect(computeProviderReplacementIdentityDigest(good, "mock")).not.toBe(
+            computeProviderReplacementIdentityDigest(evil, "mock")
+          );
+        }
+      );
+
+      it(
+        "BLOCKER regression: an approval requested for one endpoint configuration cannot authorize " +
+          "installing a DIFFERENT endpoint configuration under the same provider id",
+        async () => {
+          const auditLog = new AuditLog();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals, auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          const description = "Replace provider adapter 'mock'";
+          const goodCandidate = new EndpointProvider("https://good.example.com");
+          approvals.requestFor("appr-good", {
+            actionType: "model.provider.replace",
+            description,
+            risk: 5,
+            identityDigest: computeProviderReplacementIdentityDigest(goodCandidate, "mock")
+          });
+          approvals.approve("appr-good", "founder@example.com");
+
+          const evilCandidate = new EndpointProvider("https://evil.example.com");
+          await expect(
+            gateway.replaceProvider(evilCandidate, {
+              policy: permissivePolicy(),
+              risk: 5,
+              description,
+              approvalId: "appr-good"
+            })
+          ).rejects.toThrow(ApprovalEvidenceMismatchError);
+          expect(auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED")).toHaveLength(0);
+        }
+      );
+
+      it("no regression: an approval matching the EXACT candidate configuration still succeeds", async () => {
+        const auditLog = new AuditLog();
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals, auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        const description = "Replace provider adapter 'mock'";
+        const candidate = new EndpointProvider("https://good.example.com");
+        approvals.requestFor("appr-1", {
+          actionType: "model.provider.replace",
+          description,
+          risk: 5,
+          identityDigest: computeProviderReplacementIdentityDigest(candidate, "mock")
+        });
+        approvals.approve("appr-1", "founder@example.com");
+
+        await expect(
+          gateway.replaceProvider(candidate, { policy: permissivePolicy(), risk: 5, description, approvalId: "appr-1" })
+        ).resolves.not.toThrow();
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (35th independent review round, finding 4, 'include taskType in invocation approval identity')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: same task/model/prompt but a DIFFERENT taskType produces " +
+          "a different approval identity, so the old approval cannot authorize the new action",
+        async () => {
+          const registry = createDefaultModelRegistry();
+          const model = registry.all().find((m) => m.tier === "PREMIUM")!;
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals);
+
+          approvals.requestFor("appr-1", {
+            actionType: "model.invoke",
+            description: `Invoke model '${model.modelId}' (${model.tier}) for task t1`,
+            risk: 5,
+            costUsd: model.costPerCall,
+            identityDigest: computeModelInvocationIdentityDigest({
+              taskId: "t1",
+              provider: model.provider,
+              modelId: model.modelId,
+              prompt: "hello",
+              taskType: "summarize"
+            })
+          });
+          approvals.approve("appr-1", "founder@example.com");
+
+          await expect(
+            gateway.invoke(
+              model,
+              { prompt: "hello", taskType: "generate-code" },
+              { policy: permissivePolicy(), budget: permissiveBudget(), risk: 5, taskId: "t1", approvalId: "appr-1" }
+            )
+          ).rejects.toThrow(ApprovalEvidenceMismatchError);
+        }
+      );
+
+      it("no regression: an approval matching the EXACT taskType still authorizes the invocation", async () => {
+        const registry = createDefaultModelRegistry();
+        const model = registry.all().find((m) => m.tier === "PREMIUM")!;
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        gateway.registerProvider(new MockProvider());
+
+        approvals.requestFor("appr-1", {
+          actionType: "model.invoke",
+          description: `Invoke model '${model.modelId}' (${model.tier}) for task t1`,
+          risk: 5,
+          costUsd: model.costPerCall,
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            provider: model.provider,
+            modelId: model.modelId,
+            prompt: "hello",
+            taskType: "summarize"
+          })
+        });
+        approvals.approve("appr-1", "founder@example.com");
+
+        await expect(
+          gateway.invoke(
+            model,
+            { prompt: "hello", taskType: "summarize" },
+            { policy: permissivePolicy(), budget: permissiveBudget(), risk: 5, taskId: "t1", approvalId: "appr-1" }
+          )
+        ).resolves.not.toThrow();
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (35th independent review round, finding 5, 'freeze non-configurable writable provider fields')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a config field declared with a legal " +
+          "{writable:true, configurable:false} descriptor (previously skipped entirely) is now locked at " +
+          "registration time",
+        async () => {
+          class OddDescriptorProvider implements ModelProvider {
+            readonly id = "odd";
+            constructor() {
+              Object.defineProperty(this, "endpoint", {
+                value: "https://good.example.com",
+                writable: true,
+                configurable: false,
+                enumerable: true
+              });
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return {
+                modelId: "m",
+                provider: "odd",
+                costUsd: 0,
+                output: `endpoint:${(this as unknown as { endpoint: string }).endpoint}`
+              };
+            }
+          }
+
+          const gateway = new ModelGateway();
+          const provider = new OddDescriptorProvider();
+          gateway.registerProvider(provider);
+
+          expect(() => {
+            (provider as unknown as { endpoint: string }).endpoint = "https://evil.example.com";
+          }).toThrow(TypeError);
+
+          const model = mockModel({ provider: "odd" });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toBe("endpoint:https://good.example.com");
+        }
+      );
+
+      it("no regression: an ordinary provider with plain assignable fields still registers and invokes normally", async () => {
+        class PlainProvider implements ModelProvider {
+          readonly id = "plain";
+          note = "unchanged";
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "plain", costUsd: 0, output: this.note };
+          }
+        }
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new PlainProvider());
+        const model = mockModel({ provider: "plain" });
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("unchanged");
       });
     }
   );

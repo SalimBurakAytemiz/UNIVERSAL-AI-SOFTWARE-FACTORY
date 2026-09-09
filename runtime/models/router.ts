@@ -371,7 +371,35 @@ export class CheapestCapableModelRouter {
     // fix notu. `requiredCapabilities` bir dizi alanıdır; `freezeRecord`
     // onun da bir KOPYASINI dondurur. Bundan sonra `request`/`options`
     // parametrelerinin KENDİLERİ bir daha ASLA okunmaz.
-    const routingScope: RoutingRequest = freezeRecord({ ...request });
+    //
+    // P2 fix (35th independent review round, finding 10, "snapshot
+    // fallback approval mappings before awaiting"): `freezeRecord()` only
+    // freezes `routingScope` ITSELF (a shallow freeze — bkz. its own fix
+    // note in runtime/util/immutable.ts) plus, as a SPECIAL CASE, any
+    // ARRAY-typed field it copies. `fallbackApprovalIds` is a nested plain
+    // OBJECT (`Partial<Record<ModelTier, string>>`), not an array — the
+    // generic `{ ...request }` spread above copies it by REFERENCE, and
+    // `freezeRecord` never touches that nested object's own properties.
+    // A caller still holding `request.fallbackApprovalIds` could therefore
+    // mutate ITS properties (e.g. `fallbackApprovalIds.PREMIUM = "different-id"`)
+    // from a microtask scheduled WHILE the initial `invokeAuthorized()`
+    // call below is pending — the escalation loop's later read of
+    // `routingScope.fallbackApprovalIds?.[decision.model.tier]` (after
+    // that first `await`) would then see the MUTATED mapping, letting a
+    // caller redirect which approval id authorizes a fallback step after
+    // routing has already started, exactly the SAME "caller-owned mutable
+    // state read again after an await" class this method's own 12th/13th
+    // round fixes already closed for every OTHER field. Fixed: the nested
+    // object is cloned into an independent, frozen copy in this SAME
+    // synchronous prefix — `Object.freeze({ ...request.fallbackApprovalIds })`
+    // — and substituted into `routingScope` in place of the original,
+    // still-mutable reference; the escalation loop below (unchanged)
+    // reads it from `routingScope`, which now genuinely owns an immutable
+    // copy no caller can reach.
+    const routingScope: RoutingRequest = freezeRecord({
+      ...request,
+      fallbackApprovalIds: request.fallbackApprovalIds ? Object.freeze({ ...request.fallbackApprovalIds }) : undefined
+    });
     const allowPremiumFallback = options.allowPremiumFallback ?? false;
     // `invocationRequest`'in KENDİSİ de aynı şekilde, aynı senkron ön ekte
     // donmuş bir anlık görüntüye alınır — bkz. yukarıdaki fix notu.

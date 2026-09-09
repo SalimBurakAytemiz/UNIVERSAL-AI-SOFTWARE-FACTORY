@@ -177,6 +177,28 @@ export class ApprovalWorkflow {
     this.#auditLog = auditLog;
   }
 
+  /**
+   * P1 fix (35th independent review round, finding 2, "rollback approval
+   * state when audit recording fails" — same root class also fixed below
+   * for approve()/reject()/requestChanges()/beginExecution()/
+   * completeExecution()/failExecution()): this used to call
+   * `this.#requests.set(id, req)` BEFORE `this.audit(...)`. `audit()`
+   * (ultimately `AuditLog.append()`, bkz. audit-log.ts) validates its
+   * payload and CAN throw (`UnsupportedAuditPayloadError`) for a
+   * malformed value reaching it at runtime despite this method's own
+   * `string`-typed parameters (e.g. a caller bypassing TypeScript via `as
+   * any`) — if it did, `req` was ALREADY inserted into `#requests`,
+   * permanently occupying `id` in `PENDING` status with NO corresponding
+   * audit evidence, and a caller who saw `request()` throw (reasonably
+   * assuming nothing happened) could never retry with the SAME id
+   * (`DuplicateApprovalIdError` on the next attempt) even though, from
+   * their perspective, no request was ever successfully created. Fixed:
+   * `audit()` is called FIRST, against the not-yet-stored candidate
+   * record; only once it returns successfully is the record inserted into
+   * `#requests`. If `audit()` throws, `#requests` is never touched at all
+   * — the id remains free for a genuine retry, and the failure is
+   * explicit (the same thrown error the caller already sees).
+   */
   request(id: string, actionDescription: string, risk: number): ApprovalRequest {
     if (this.#requests.has(id)) {
       throw new DuplicateApprovalIdError(id);
@@ -188,8 +210,8 @@ export class ApprovalWorkflow {
       status: "PENDING",
       requestedAt: new Date().toISOString()
     };
-    this.#requests.set(id, req);
     this.audit("APPROVAL_REQUESTED", req);
+    this.#requests.set(id, req);
     return freezeRecord(req);
   }
 
@@ -209,6 +231,12 @@ export class ApprovalWorkflow {
    * of these fields to match before treating an approval as covering a
    * given action.
    */
+  /**
+   * P1 fix (35th independent review round, finding 2): same reordering as
+   * `request()` above — bkz. o metodun fix notu — `audit()` before
+   * `#requests.set()`, so a rejected audit payload never leaves a phantom
+   * PENDING record occupying `id`.
+   */
   requestFor(id: string, action: PolicyAction, options?: { readonly actorId?: string }): ApprovalRequest {
     if (this.#requests.has(id)) {
       throw new DuplicateApprovalIdError(id);
@@ -225,8 +253,8 @@ export class ApprovalWorkflow {
       status: "PENDING",
       requestedAt: new Date().toISOString()
     };
-    this.#requests.set(id, req);
     this.audit("APPROVAL_REQUESTED", req);
+    this.#requests.set(id, req);
     return freezeRecord(req);
   }
 
@@ -237,18 +265,54 @@ export class ApprovalWorkflow {
    * edilmez: bu, "kim onayladı?" sorusunun her zaman cevaplanabilir
    * kalmasını sağlayan minimum kanıt gereğidir.
    */
+  /**
+   * P1 fix (35th independent review round, finding 2, "rollback approval
+   * state when audit recording fails"): `approve()`/`reject()`/
+   * `requestChanges()`/`beginExecution()`/`completeExecution()`/
+   * `failExecution()` all used to mutate the authoritative `req` object
+   * (the ACTUAL object stored in `#requests`, per `#mustGet()`'s own fix
+   * note) IN PLACE FIRST, then call `this.audit(...)` — if `audit()`
+   * threw (bkz. `request()`'s fix note above for exactly how/why it can),
+   * the mutation had ALREADY landed: the request was left permanently in
+   * its NEW status (e.g. `APPROVED`) with NO corresponding audit record,
+   * directly violating "no claim without evidence" (bölüm 303) for the
+   * single most security-relevant state transition this codebase tracks
+   * — baseline section 120's own invariant ("a risk-5 action can never
+   * reach EXECUTED without a genuine, evidenced Founder approval") is
+   * meaningless if the approval itself can silently exist with no audit
+   * trail. Fixed: every caller below builds its intended NEXT state as an
+   * independent, not-yet-applied `next` object (a full candidate
+   * snapshot, `{ ...req, <changed fields> }`) and passes it to `#commit()`,
+   * which calls `audit()` against that candidate FIRST and copies its
+   * fields onto the real `req` (via `Object.assign`, preserving object
+   * identity for every other method that already holds a reference to
+   * it) ONLY once `audit()` returns successfully. If `audit()` throws,
+   * `req` is never touched — the request stays in its PRIOR status
+   * (`PENDING`, `APPROVED`, ...) exactly as it was before the call, and
+   * the exception propagates to the caller as an explicit, visible
+   * failure. No approval can be left claiming a status the audit trail
+   * does not also, successfully, record.
+   */
+  #commit(req: MutableApprovalRequest, next: MutableApprovalRequest, auditType: string): ApprovalRequest {
+    this.audit(auditType, next);
+    Object.assign(req, next);
+    return freezeRecord(req);
+  }
+
   approve(id: string, decidedBy: string, evidenceRef?: string): ApprovalRequest {
     assertValidApprover(decidedBy);
     const req = this.#mustGet(id);
     if (req.status !== "PENDING") {
       throw new Error(`Cannot approve request ${id}: status is ${req.status}, not PENDING`);
     }
-    req.status = "APPROVED";
-    req.decidedAt = new Date().toISOString();
-    req.decidedBy = decidedBy;
-    req.evidenceRef = evidenceRef;
-    this.audit("APPROVAL_APPROVED", req);
-    return freezeRecord(req);
+    const next: MutableApprovalRequest = {
+      ...req,
+      status: "APPROVED",
+      decidedAt: new Date().toISOString(),
+      decidedBy,
+      evidenceRef
+    };
+    return this.#commit(req, next, "APPROVAL_APPROVED");
   }
 
   reject(id: string, decidedBy: string, evidenceRef?: string): ApprovalRequest {
@@ -257,12 +321,14 @@ export class ApprovalWorkflow {
     if (req.status !== "PENDING") {
       throw new Error(`Cannot reject request ${id}: status is ${req.status}, not PENDING`);
     }
-    req.status = "REJECTED";
-    req.decidedAt = new Date().toISOString();
-    req.decidedBy = decidedBy;
-    req.evidenceRef = evidenceRef;
-    this.audit("APPROVAL_REJECTED", req);
-    return freezeRecord(req);
+    const next: MutableApprovalRequest = {
+      ...req,
+      status: "REJECTED",
+      decidedAt: new Date().toISOString(),
+      decidedBy,
+      evidenceRef
+    };
+    return this.#commit(req, next, "APPROVAL_REJECTED");
   }
 
   /**
@@ -300,13 +366,15 @@ export class ApprovalWorkflow {
     if (req.status !== "PENDING") {
       throw new Error(`Cannot request changes on request ${id}: status is ${req.status}, not PENDING`);
     }
-    req.status = "REQUEST_CHANGES";
-    req.decidedAt = new Date().toISOString();
-    req.decidedBy = decidedBy;
-    req.changeRequestReason = reason;
-    req.evidenceRef = evidenceRef;
-    this.audit("APPROVAL_CHANGES_REQUESTED", req);
-    return freezeRecord(req);
+    const next: MutableApprovalRequest = {
+      ...req,
+      status: "REQUEST_CHANGES",
+      decidedAt: new Date().toISOString(),
+      decidedBy,
+      changeRequestReason: reason,
+      evidenceRef
+    };
+    return this.#commit(req, next, "APPROVAL_CHANGES_REQUESTED");
   }
 
   /**
@@ -359,9 +427,8 @@ export class ApprovalWorkflow {
         `Action ${id} cannot begin execution: status is ${req.status}, requires APPROVED`
       );
     }
-    req.status = "EXECUTING";
-    this.audit("APPROVAL_EXECUTION_STARTED", req);
-    return freezeRecord(req);
+    const next: MutableApprovalRequest = { ...req, status: "EXECUTING" };
+    return this.#commit(req, next, "APPROVAL_EXECUTION_STARTED");
   }
 
   /** EXECUTING -> EXECUTED. Call ONLY after the real work this approval authorized has genuinely succeeded. */
@@ -372,9 +439,8 @@ export class ApprovalWorkflow {
         `Action ${id} cannot complete execution: status is ${req.status}, requires EXECUTING`
       );
     }
-    req.status = "EXECUTED";
-    this.audit("APPROVAL_EXECUTED", req);
-    return freezeRecord(req);
+    const next: MutableApprovalRequest = { ...req, status: "EXECUTED" };
+    return this.#commit(req, next, "APPROVAL_EXECUTED");
   }
 
   /** EXECUTING -> EXECUTION_FAILED (terminal for this id — bkz. üstteki fix notu, "valid retry semantics"). */
@@ -385,10 +451,8 @@ export class ApprovalWorkflow {
         `Action ${id} cannot fail execution: status is ${req.status}, requires EXECUTING`
       );
     }
-    req.status = "EXECUTION_FAILED";
-    req.failureReason = reason;
-    this.audit("APPROVAL_EXECUTION_FAILED", req);
-    return freezeRecord(req);
+    const next: MutableApprovalRequest = { ...req, status: "EXECUTION_FAILED", failureReason: reason };
+    return this.#commit(req, next, "APPROVAL_EXECUTION_FAILED");
   }
 
   /**

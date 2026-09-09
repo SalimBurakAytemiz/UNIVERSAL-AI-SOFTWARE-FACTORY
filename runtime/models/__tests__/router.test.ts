@@ -712,6 +712,59 @@ describe(
         ).rejects.toThrow(ApprovalEvidenceMismatchError);
       }
     );
+
+    it(
+      "P2 fix (35th independent review round, finding 10, 'snapshot fallback approval mappings before " +
+        "awaiting'), BLOCKER regression, exact reproduction: mutating the fallbackApprovalIds mapping's " +
+        "PREMIUM entry WHILE the initial candidate is pending has no effect — the escalation step still uses " +
+        "the ORIGINALLY captured approval id",
+      async () => {
+        const { router, gateway, approvals, policy, budget } = setupApprovalGatedEscalationScenario();
+
+        approvals.requestFor("appr-good", {
+          actionType: "model.invoke",
+          description: "Invoke model 'tier-premium' (PREMIUM) for task t1",
+          risk: 0,
+          costUsd: 0.5,
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            provider: "mock",
+            modelId: "tier-premium",
+            prompt: "x"
+          })
+        });
+        approvals.approve("appr-good", "founder@example.com");
+
+        const fallbackApprovalIds: { PREMIUM?: string } = { PREMIUM: "appr-good" };
+        // Scheduled BEFORE calling routeAndExecute(), landing in the
+        // earliest possible microtask slot relative to the function's own
+        // internal await-driven resumption — the same technique this
+        // file's other pre/post-await mutation regressions already use.
+        Promise.resolve().then(() => {
+          fallbackApprovalIds.PREMIUM = "appr-nonexistent";
+        });
+
+        const validate = vi.fn((response: ModelInvocationResponse) => response.modelId === "tier-premium");
+
+        const result = await router.routeAndExecute(
+          {
+            taskId: "t1",
+            risk: 0,
+            requiredCapabilities: ["escalation-capability"],
+            fallbackApprovalIds
+          },
+          gateway,
+          { prompt: "x" },
+          validate,
+          policy,
+          budget,
+          { allowPremiumFallback: true }
+        );
+
+        expect(result.decision.model.modelId).toBe("tier-premium");
+        expect(approvals.get("appr-good")!.status).toBe("EXECUTED");
+      }
+    );
   }
 );
 

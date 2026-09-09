@@ -6,6 +6,7 @@
 
 import type { PolicyAction, PolicyEngine, PolicyEvaluationResult } from "../policy-engine/policy-engine.js";
 import { ApprovalWorkflow, type ApprovalRequest } from "../policy-engine/approval.js";
+import { freezeRecord } from "../util/immutable.js";
 
 export class CapabilityDeniedError extends Error {
   constructor(action: PolicyAction) {
@@ -201,13 +202,47 @@ export class CapabilityGateway {
    * existing call sites — e.g. `runId`/`agentId`'s own additions
    * elsewhere).
    */
+  /**
+   * P1 fix (35th independent review round, finding 1, "snapshot policy
+   * result before invoking observers"): `onDecision` used to receive the
+   * exact `PolicyEvaluationResult` OBJECT `this.#policy.evaluate()` just
+   * returned — a PLAIN, unfrozen object (`{ decision, matchedRule, action
+   * }`, built by a bare object literal in `PolicyEngine.evaluate()`; only
+   * the NESTED `action` field was frozen). Every reference the
+   * DENY/APPROVAL_REQUIRED branching below made — `result.decision`,
+   * `result.action` — re-read that SAME mutable object AFTER the observer
+   * callback had already run against it. A caller-supplied `onDecision`
+   * (malicious, or merely a careless "audit sink" that normalizes fields
+   * in place) could do `result.decision = "ALLOW"` or replace
+   * `result.action` entirely, and the enforcement branching immediately
+   * below would observe the TAMPERED value — turning a genuine DENY into
+   * an executed ALLOW with no trace of the substitution. Fixed: an
+   * independent, frozen `authoritativeResult` snapshot (`freezeRecord`,
+   * the same detach-and-freeze primitive `PolicyEngine.evaluate()` and
+   * every registry `get()`/`all()` in this codebase already use) is built
+   * BEFORE `onDecision` is invoked; `onDecision` receives this SAME frozen
+   * object (a genuine deep-frozen detached view — mutating `decision`/
+   * `matchedRule`/`action` on it throws `TypeError` in this module's
+   * strict-mode ESM instead of silently succeeding), and every enforcement
+   * read below (`authoritativeResult.decision`, `authoritativeAction =
+   * authoritativeResult.action`) uses ONLY this frozen snapshot, never the
+   * original `result` the policy engine returned. An observer attempting
+   * to mutate the decision it was handed can no longer affect
+   * authorization at all — the mutation itself fails closed instead of
+   * silently taking effect.
+   */
   async authorize<T>(
     action: PolicyAction,
     execute: () => Promise<T> | T,
     approval?: ApprovalReference,
     onDecision?: (result: PolicyEvaluationResult) => void
   ): Promise<T> {
-    const result = this.#policy.evaluate(action);
+    const rawResult = this.#policy.evaluate(action);
+    const result: PolicyEvaluationResult = freezeRecord({
+      decision: rawResult.decision,
+      matchedRule: rawResult.matchedRule,
+      action: rawResult.action
+    });
     onDecision?.(result);
     // P1 fix (27th independent review round, finding 4, "bind approval to
     // the policy-evaluated action"): every reference below uses

@@ -1,7 +1,20 @@
 import { describe, expect, it, afterEach } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** Mirrors orchestrator.ts's own `findRepoRoot()` — locates the REAL repo root from this test file's own location. */
+function findRepoRootForTest(startDir: string): string {
+  let dir = startDir;
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, "package.json"))) return dir;
+    dir = dirname(dir);
+  }
+  throw new Error(`Could not locate repository root from ${startDir}`);
+}
+const REAL_REPO_ROOT = findRepoRootForTest(dirname(fileURLToPath(import.meta.url)));
+const REAL_REQUIREMENTS_DIR = join(REAL_REPO_ROOT, "specification", "requirements");
 import { bootstrapProject, PreflightTraceabilityFailedError, type BootstrapProjectInput } from "../orchestrator.js";
 import { scaffoldProjectOs } from "../../project-os/scaffold.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
@@ -105,6 +118,121 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       // The genome was never even validated, let alone scaffolded.
       expect(existsSync(join(tempRoot, "proj-blocked"))).toBe(false);
   });
+
+  describe(
+    "P1 fix (35th independent review round, finding 6, 'always preflight the Factory authoritative " +
+      "requirement registry'): a caller-supplied requirementsRegistry can never REPLACE the check against " +
+      "the Factory's OWN real registry — it can only add an ADDITIONAL one",
+    () => {
+      const fixtureFileName = "__round35-temporary-preflight-bypass-test-fixture.yml";
+      const fixturePath = join(REAL_REQUIREMENTS_DIR, fixtureFileName);
+
+      afterEach(() => {
+        if (existsSync(fixturePath)) unlinkSync(fixturePath);
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: the REAL authoritative registry has a genuine, unresolved " +
+          "traceability blocker -> caller supplies a CLEAN, entirely separate override registry -> " +
+          "bootstrap still FAILS, because the authoritative registry is checked unconditionally",
+        async () => {
+          // A genuine, on-disk, schema-valid record claiming UNIT_TESTED
+          // with zero evidence, written directly into the Factory's OWN
+          // real requirements directory (never a substitute location) —
+          // this is exactly what the pre-fix code could be bypassed
+          // around by supplying a clean `requirementsRegistry` override.
+          writeFileSync(
+            fixturePath,
+            [
+              "- id: UASF-REQ-99991",
+              "  title: Round 35 temporary preflight-bypass regression fixture",
+              "  description: Deliberately claims UNIT_TESTED with zero backing evidence; deleted in afterEach.",
+              "  source_baseline: 'BASELINE-V1 section 0 (test fixture)'",
+              "  category: P0",
+              "  priority: LOW",
+              "  status: UNIT_TESTED",
+              "  implementation_refs: []",
+              "  test_refs: []",
+              "  proof_refs: []",
+              ""
+            ].join("\n")
+          );
+
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-"));
+          const cleanRegistryRoot = join(tempRoot, "clean-registry");
+          const cleanRequirementsDir = join(cleanRegistryRoot, "specification", "requirements");
+          mkdirSync(cleanRequirementsDir, { recursive: true });
+          // A genuinely CLEAN override — zero traceability issues of its own.
+          writeFileSync(
+            join(cleanRequirementsDir, "clean.yml"),
+            [
+              "- id: UASF-REQ-99981",
+              "  title: Round 35 clean override fixture",
+              "  description: A genuinely clean, fully-specified requirement with no evidence claim to violate.",
+              "  source_baseline: 'BASELINE-V1 section 0 (test fixture)'",
+              "  category: P0",
+              "  priority: LOW",
+              "  status: DEFINED",
+              "  implementation_refs: []",
+              "  test_refs: []",
+              "  proof_refs: []",
+              ""
+            ].join("\n")
+          );
+
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-authoritative-blocked"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: createDefaultModelRegistry(),
+              requirementsRegistry: { requirementsDir: cleanRequirementsDir, rootDir: cleanRegistryRoot }
+            })
+          ).rejects.toThrow(PreflightTraceabilityFailedError);
+
+          expect(existsSync(join(tempRoot, "proj-authoritative-blocked"))).toBe(false);
+        }
+      );
+
+      it("no regression: when both the authoritative registry and a supplied override are clean, bootstrap proceeds", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-"));
+        const cleanRegistryRoot = join(tempRoot, "clean-registry-2");
+        const cleanRequirementsDir = join(cleanRegistryRoot, "specification", "requirements");
+        mkdirSync(cleanRequirementsDir, { recursive: true });
+        writeFileSync(
+          join(cleanRequirementsDir, "clean.yml"),
+          [
+            "- id: UASF-REQ-99971",
+            "  title: Round 35 clean override fixture 2",
+            "  description: A genuinely clean, fully-specified requirement with no evidence claim to violate.",
+            "  source_baseline: 'BASELINE-V1 section 0 (test fixture)'",
+            "  category: P0",
+            "  priority: LOW",
+            "  status: DEFINED",
+            "  implementation_refs: []",
+            "  test_refs: []",
+            "  proof_refs: []",
+            ""
+          ].join("\n")
+        );
+
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome("proj-both-clean"),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          requirementsRegistry: { requirementsDir: cleanRequirementsDir, rootDir: cleanRegistryRoot }
+        });
+        expect(result.genome.project.id).toBe("proj-both-clean");
+      });
+    }
+  );
 
   it("rejects an invalid Project Genome before touching policy, filesystem, or models", async () => {
     tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-"));
@@ -318,6 +446,61 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       expect(() => scaffoldProjectOs(tempRoot, "../outside")).toThrow(InvalidProjectIdError);
       expect(existsSync(escapedPath)).toBe(false);
     });
+
+    it(
+      "P1 fix (35th independent review round, finding 8, 'validate all scaffold destinations before paid " +
+        "model invocation'), BLOCKER regression, exact reproduction: one scaffold SUBdirectory ('security') " +
+        "is a symlink escaping the project root -> bootstrap FAILS -> the paid provider is NEVER invoked " +
+        "-> cost remains zero",
+      async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));
+        const outside = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-outside-"));
+        const projectId = "proj-subdir-escape";
+        const projectRoot = join(tempRoot, projectId);
+        mkdirSync(projectRoot, { recursive: true });
+
+        let symlinkSupported = true;
+        try {
+          symlinkSync(outside, join(projectRoot, "security"));
+        } catch {
+          symlinkSupported = false;
+        }
+        if (!symlinkSupported) {
+          rmSync(outside, { recursive: true, force: true });
+          return;
+        }
+
+        let invocationCount = 0;
+        class CountingProvider implements ModelProvider {
+          readonly id = "mock";
+          async invoke(model: ModelRecord, _request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+            invocationCount += 1;
+            return { modelId: model.modelId, provider: model.provider, costUsd: model.costPerCall, output: "x" };
+          }
+        }
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new CountingProvider());
+
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway
+          })
+        ).rejects.toThrow(PathEscapeError);
+
+        // The paid model call never happened — cost stayed at exactly zero.
+        expect(invocationCount).toBe(0);
+        // Nothing was scaffolded into the real (symlinked-to) outside target.
+        expect(readdirSync(outside)).toHaveLength(0);
+        rmSync(outside, { recursive: true, force: true });
+      }
+    );
 
     it("the full bootstrap pipeline refuses a symlink-based escape (project id passes format validation, the destination itself is a symlink)", async () => {
       tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-escape-"));

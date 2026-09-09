@@ -156,7 +156,20 @@ function looksLikeFilePath(ref: string): boolean {
  * verify exactly as before; only a path whose REAL location differs from
  * its apparent one is newly rejected.
  */
-function isVerifiedEvidenceRef(ref: string, rootDir: string): boolean {
+/**
+ * Exported (35th independent review round, Phase Closure Manifest
+ * governance mechanism, Part G — "consume the EXISTING authoritative
+ * evidence/traceability path, do NOT create a duplicate evidence
+ * subsystem"): this was previously module-private. The new Phase Closure
+ * Manifest (`runtime/governance/phase-closure.ts`) must verify that a
+ * phase-closure attempt's OWN evidence references resolve to real,
+ * on-disk artifacts before it will accept "tests passed" as sufficient for
+ * closure — reusing this EXACT function (rather than re-implementing path
+ * confinement + existence checking a second time) is what keeps that a
+ * single authoritative evidence path instead of a second one drifting
+ * alongside it.
+ */
+export function isVerifiedEvidenceRef(ref: string, rootDir: string): boolean {
   if (!looksLikeFilePath(ref)) return false;
   let resolved: string;
   try {

@@ -5310,3 +5310,192 @@
     return INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this round does NOT merge, does NOT move
     to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch — all work
     stayed on claude/ai-factory-baseline-v1-seawq7.
+
+    Round 35 (independent Codex review found 12 actionable findings — 9 P1, 3 P2 — fixed as one consolidated
+    closure batch, PLUS four new Factory governance mechanisms implemented in the same batch): (1) snapshot the
+    policy evaluation result before invoking observer callbacks (capability-gateway/gateway.ts); (2) roll back
+    approval state when audit recording fails, reordering audit-before-mutate (policy-engine/approval.ts); (3)
+    bind provider-replacement approvals to a complete candidate-configuration fingerprint, not just the provider
+    id (models/gateway.ts); (4) include taskType in the model-invocation approval identity digest
+    (models/gateway.ts); (5) freeze non-configurable writable provider fields, failing closed
+    (`UnsafeProviderConfigurationError`) if a lock attempt itself throws (models/gateway.ts); (6) always preflight
+    the Factory's OWN authoritative requirement registry — a caller-supplied override can only ADD an additional
+    check, never REPLACE the authoritative one (project-lifecycle/orchestrator.ts); (7) reversed round 33's own
+    age-based lock-reclamation approach after this round's independent review identified it as itself flawed —
+    `isLockStale()` no longer reclaims from a metadata owner confirmed alive via `isProcessAlive()`, regardless of
+    age (cache/file-lock.ts); (8) validate every scaffold destination via `assertFilesystemConfinement()` before
+    any paid model invocation, not after (project-lifecycle/orchestrator.ts); (9) reject lossy state serialization
+    (NaN/Infinity/non-plain-object values, `undefined` array elements) before writing durable state, reusing
+    audit-log.ts's established canonicalization precedent (state/file-store.ts); (10) snapshot fallback-approval
+    id mappings into a separately frozen nested object before an async boundary, closing the same shallow-freeze
+    gap as finding 1 (models/router.ts); (11) prepare the provider binding before recording the
+    MODEL_PROVIDER_REPLACED audit event, so a binding-construction failure can never be audited as a completed
+    replacement (models/gateway.ts); (12) detect base64 `=`/`==` padding inside quoted secret assignments —
+    `apiKey="...=="` previously evaded the generic secret-scan pattern entirely (scripts/secret-scan.mjs). All
+    twelve fixes carry deterministic BLOCKER-reproduction and no-regression tests, and were verified via a genuine
+    temporary in-place bypass reproducing the exact predicted failure(s), then fully reverted and reconfirmed
+    clean — including bypass verification of file-lock.ts's reversal (confirming a confirmed-alive owner's lock
+    is genuinely never reclaimed regardless of age) and of secret-scan.mjs's fix (confirming quoted, padded
+    Base64 secrets are genuinely detected).
+
+    In the same batch, four narrowly-scoped Factory governance mechanisms were implemented, reusing existing
+    architecture rather than introducing a parallel one: (a) a Central Invariant Guard
+    (`runtime/invariants/invariant-guard.ts`) — a registry of machine-checkable invariants that new governance
+    actions must pass before taking effect, itself consuming the EXISTING authoritative requirement loader
+    (`runtime/cli/commands/baseline-status.ts`) and traceability module
+    (`runtime/requirements-traceability/traceability.ts`) as its evidence source, plus one dynamic check against
+    the real, exported `PolicyEngine` class's own default-deny behavior; (b) a Scope Lock + Backlog Router
+    (`runtime/governance/scope-lock.ts`) — a machine-readable phase state (OPEN / LOCKED_FOR_CLOSURE / CLOSED)
+    replacing free-text status prose, gated by the Invariant Guard, with every transition recorded into the
+    EXISTING Founder Decision Ledger (`runtime/decisions/decision-ledger.ts`); a Backlog Router routes new items
+    proposed against a locked phase to a backlog instead of silently expanding scope, also recorded in the SAME
+    ledger; (c) a Phase Closure Manifest (`runtime/governance/phase-closure.ts`, persisted under
+    `project-state/phase-closures/`) — structurally enforces that "tests passed" alone is never sufficient for
+    phase closure: closure is REJECTED unless real, on-disk verification evidence is supplied (reusing
+    traceability.ts's own `isVerifiedEvidenceRef()`, newly exported for this purpose), the Invariant Guard reports
+    zero BLOCKING violations, the authoritative Implementation Reality Matrix (computed internally, never trusted
+    from a caller-supplied value) reports zero unresolved BLOCKED requirements, AND an independent review result
+    of exactly "CLEAN" is supplied — a bare locally-run verification pass can never itself satisfy this last gate;
+    (d) an Implementation Reality Matrix (`runtime/governance/reality-matrix.ts`) — a per-requirement view,
+    computed from the SAME `detectTraceabilityIssues()` evidence path, distinguishing each requirement's CLAIMED
+    status from its EFFECTIVE status (`UNSUPPORTED_CLAIM` when the claim has no resolvable evidence), with a
+    Turkish beginner-friendly rendering function. A dedicated end-to-end integration test proves all four
+    mechanisms genuinely interoperate through the same Decision Ledger and evidence path (no duplicate
+    decision-log or evidence subsystem was created). A narrow root-cause audit of this round's OWN new governance
+    code (scoped to the same 11 named classes the 12 findings above belong to, never broadened into unrelated
+    architecture) found and fixed two real defects before they could ship: `ScopeLock`/`BacklogRouter` were
+    mutating authoritative state BEFORE recording to the Decision Ledger (the same "pre-audit transition exposure"
+    class finding 2 closed one layer down — a `decisionId` collision could have left a phase transitioned, or an
+    item routed to backlog, with no audit trail); and `PhaseClosureManifest` was trusting a caller-supplied
+    `blockedRequirementIds` value instead of computing the Implementation Reality Matrix internally (the same
+    "replaceable production authority" class finding 6 closed one layer up). Both were fixed, given deterministic
+    regression tests, and bypass-verified the same way as every fix above.
+
+    Full required sequence re-run and green after every fix above, including the two audit-found governance-code
+    defects: lint, typecheck, build, 1360/1360 tests (50 files, +67 net new for this round's 12 fixes plus 4
+    governance mechanisms and their integration test), validate:requirements (42 schema-valid records),
+    history-and-current-tree-aware secret-scan (PASS — two new illustrative-example false positives from this
+    round's own fix-note prose and test fixture were marked with the established `secret-scan:allow` per-line
+    convention, not a broad exclusion), Factory Doctor (READY). No status raised on any requirement beyond what
+    real evidence supports.
+
+    PER EXPLICIT INSTRUCTION, P0 STATUS IS SET TO READY_FOR_INDEPENDENT_REVIEW, NOT CLOSED: every local mandatory
+    gate above passed, so this session used the new Scope Lock mechanism's own OPEN -> LOCKED_FOR_CLOSURE
+    transition as the executable form of "ready for independent review" — but P0 may only become CLOSED after a
+    LATER independent Codex review explicitly returns INDEPENDENT_REVIEW_RESULT: CLEAN (enforced structurally by
+    the new Phase Closure Manifest's own independentReviewResult gate, not merely by convention). This round does
+    NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, and does NOT invoke Codex itself — all work stayed
+    on claude/ai-factory-baseline-v1-seawq7.
+- id: UASF-REQ-0043
+  title: Central Invariant Guard
+  description: >
+    A single, central registry of machine-checkable invariants (baseline
+    section 147 default-deny, 294 no-unsupported-upgrades, 303 no-claim-
+    without-evidence) that governance actions (phase lock/close, backlog
+    routing) must pass before taking effect. Reuses the existing
+    authoritative requirement loader and traceability module as its
+    evidence source, plus one dynamic check against the real, exported
+    PolicyEngine class's own default-deny behavior — never a duplicate
+    evidence subsystem.
+  source_baseline: "BASELINE-V1 section 147, 294, 303, 317"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/invariants/invariant-guard.ts"
+  test_refs:
+    - "runtime/invariants/__tests__/invariant-guard.test.ts"
+    - "runtime/governance/__tests__/governance-integration.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: >
+    Introduced 35th independent review round, Part B. Three registered
+    invariants: requirement-registry-loads-cleanly, no-unsupported-
+    evidence-claims, policy-engine-default-deny. Genuinely exercised
+    against this repository's own real requirement registry as part of
+    this round's own closure (see project-state/governance/), not merely
+    unit-tested in isolation.
+- id: UASF-REQ-0044
+  title: Scope Lock + Backlog Router
+  description: >
+    A machine-readable phase state (OPEN / LOCKED_FOR_CLOSURE / CLOSED)
+    replacing free-text status prose, gated by the Central Invariant
+    Guard, with every transition recorded into the existing Founder
+    Decision Ledger. A Backlog Router routes new items proposed against a
+    locked phase to a backlog instead of silently expanding scope, also
+    recorded in the same ledger.
+  source_baseline: "BASELINE-V1 section 46, 255, 304"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/governance/scope-lock.ts"
+  test_refs:
+    - "runtime/governance/__tests__/scope-lock.test.ts"
+    - "runtime/governance/__tests__/governance-integration.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: >
+    Introduced 35th independent review round, Part C. A targeted, same-
+    round self-audit (see UASF-REQ-0042's notes, Round 35 paragraph) found
+    and fixed a "pre-audit transition exposure" defect in lock()/close()/
+    reopen()/route() before this round's closure batch was considered
+    complete — the ledger record is now committed BEFORE the authoritative
+    state mutation, not after, so a decisionId collision can never leave a
+    phase transitioned (or an item backlogged) with no audit trail.
+- id: UASF-REQ-0045
+  title: Phase Closure Manifest
+  description: >
+    Persisted under project-state/phase-closures/. Structurally enforces
+    that "tests passed" alone is never sufficient for phase closure:
+    closure is REJECTED unless real, on-disk verification evidence is
+    supplied, the Central Invariant Guard reports zero BLOCKING
+    violations, the authoritative Implementation Reality Matrix (computed
+    internally, never trusted from a caller-supplied value) reports zero
+    unresolved BLOCKED requirements, AND an independent review result of
+    exactly "CLEAN" is supplied.
+  source_baseline: "BASELINE-V1 section 147, 255, 296, 303"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/governance/phase-closure.ts"
+  test_refs:
+    - "runtime/governance/__tests__/phase-closure.test.ts"
+    - "runtime/governance/__tests__/governance-integration.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: >
+    Introduced 35th independent review round, Part D/G. A targeted, same-
+    round self-audit found and fixed a "replaceable production authority"
+    defect: `blockedRequirementIds` was originally a caller-supplied field
+    on `PhaseClosureAttempt`, letting a caller substitute a different
+    answer than the authoritative Implementation Reality Matrix actually
+    supports. Fixed by computing the matrix internally from
+    `deps.requirementsDir`, never accepting it from the caller. Exports
+    `isVerifiedEvidenceRef()` from requirements-traceability/traceability.ts
+    (previously module-private) so this module reuses the SAME evidence-
+    verification primitive rather than reimplementing it.
+- id: UASF-REQ-0046
+  title: Implementation Reality Matrix
+  description: >
+    A per-requirement view, computed from the existing
+    detectTraceabilityIssues() evidence path, distinguishing each
+    requirement's CLAIMED status from its EFFECTIVE status
+    (UNSUPPORTED_CLAIM when the claim has no resolvable evidence), with a
+    Turkish beginner-friendly rendering function.
+  source_baseline: "BASELINE-V1 section 281, 296, 303"
+  category: P0
+  priority: MEDIUM
+  status: UNIT_TESTED
+  implementation_refs:
+    - "runtime/governance/reality-matrix.ts"
+  test_refs:
+    - "runtime/governance/__tests__/reality-matrix.test.ts"
+    - "runtime/governance/__tests__/governance-integration.test.ts"
+  proof_refs: []
+  security_refs: []
+  notes: >
+    Introduced 35th independent review round, Part E. Verified against
+    this repository's own real, authoritative requirement registry
+    (zero unsupported claims as of this round's closure).

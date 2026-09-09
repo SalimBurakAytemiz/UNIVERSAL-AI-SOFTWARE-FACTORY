@@ -74,10 +74,30 @@ const PATTERNS = [
   // `.env.example` placeholder handling (a separate, dedicated code path
   // — unaffected), and the existing provider-specific patterns (AWS/
   // GitHub/Slack/Anthropic/OpenAI), none of which were touched.
+  // P1 fix (35th independent review round, finding 12, "detect base64
+  // padding in quoted secret assignments"): the two QUOTED alternatives
+  // below required their value character class to run uninterrupted all
+  // the way to the closing quote (`'[...]{12,}'` / `"[...]{12,}"`).
+  // Base64-encoded secret values routinely end in `=` or `==` padding
+  // (e.g. apiKey="YWJjZGVmZ2hpamtsbW5vcA=="), and `=` was not in that // secret-scan:allow (illustrative example text in a comment, not a real secret)
+  // character class, so the regex matched the base64 body, then found
+  // `=` instead of the expected closing quote; backtracking the
+  // quantifier never helps, since every shorter match is still followed
+  // by `=`, not the quote. The unquoted (bare) alternative cannot rescue
+  // this either: it starts matching at the same position as the opening
+  // quote character, which isn't itself in the bare class, so it never
+  // gets going. A real, quoted, padded Base64 secret assignment evaded
+  // detection entirely. Fixed by allowing 0-2 trailing `=` characters
+  // (the only valid Base64 padding lengths) immediately before each
+  // quoted alternative's closing quote. Additive and quote-scoped only:
+  // the bare/unquoted alternative is untouched (a trailing unquoted `=`
+  // is ambiguous with a following key=value pair and outside this
+  // finding's scope), and a quoted value with no padding still matches
+  // exactly as before (`={0,2}` accepts zero `=` too).
   {
     name: "Generic API key/secret assignment with a real-looking value",
     regex:
-      /(api[_-]?key|secret|password|access[_-]?token)['"]?\s*[:=]\s*(?:'[A-Za-z0-9_\-/.+]{12,}'|"[A-Za-z0-9_\-/.+]{12,}"|[A-Za-z0-9_\-/.+]{12,})/gi
+      /(api[_-]?key|secret|password|access[_-]?token)['"]?\s*[:=]\s*(?:'[A-Za-z0-9_\-/.+]{12,}={0,2}'|"[A-Za-z0-9_\-/.+]{12,}={0,2}"|[A-Za-z0-9_\-/.+]{12,})/gi
   },
   { name: "Anthropic API key", regex: /sk-ant-[A-Za-z0-9\-_]{20,}/g },
   // P2 fix (18th independent review round, same finding): the old pattern
