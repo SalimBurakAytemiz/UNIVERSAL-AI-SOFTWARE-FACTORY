@@ -1480,6 +1480,91 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
   );
 
   describe(
+    "P1 fix (37th independent review round, finding 5, 'durably persist real spend even when the STATIC " +
+      "per-call cost estimate was zero'): the ephemeral/durable CostEngine choice must be driven by whether " +
+      "the model is a KNOWN-free MOCK fixture, never by the registry's merely nominal `costPerCall` estimate " +
+      "alone — a non-MOCK model advertising `costPerCall: 0` can still report a genuinely positive ACTUAL cost",
+    () => {
+      class PositiveActualCostProvider implements ModelProvider {
+        readonly id = "custom-real";
+        async invoke(model: ModelRecord, _request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+          // The registry's own estimate for this model is exactly zero (see
+          // registration below) — but the REAL invocation reports a
+          // genuinely positive cost, exactly the divergence finding 5
+          // describes ("the actual provider invocation can report a
+          // positive real cost that would then be silently lost").
+          return { modelId: model.modelId, provider: model.provider, costUsd: 0.12, output: "real-output" };
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: a non-MOCK model registered with a $0 estimate, whose provider " +
+          "reports a positive ACTUAL cost, is durably recorded and survives a simulated restart",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-zero-estimate-real-cost-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+
+          const zeroEstimateRegistry = new ModelRegistry();
+          zeroEstimateRegistry.register({
+            provider: "custom-real",
+            modelId: "zero-estimate-real-cost",
+            // Deliberately NOT "MOCK" — a real, non-test-only tier — with a
+            // STATIC estimate of exactly zero. The old `costPerCall > 0`
+            // predicate would have (wrongly) treated this as free and used
+            // an in-memory-only CostEngine, silently losing the real spend.
+            tier: "STANDARD",
+            costPerCall: 0,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(new PositiveActualCostProvider());
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome("proj-zero-estimate-real-cost"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: zeroEstimateRegistry,
+            modelGateway
+            // Deliberately no `costEngine` — the durable-vs-ephemeral choice
+            // must be made internally, exactly as finding 5 describes.
+          });
+          expect(result.totalCostUsd).toBe(0.12);
+
+          // A genuinely FRESH CostEngine, sharing nothing with the one
+          // bootstrapProject() constructed internally, reading the SAME
+          // baseDir-anchored ledger path — simulates a process restart.
+          const restarted = new CostEngine(() => new Date(), {
+            store: new FileStateStore(),
+            path: join(tempRoot, "cost-ledger.json")
+          });
+          expect(restarted.totalFor({ projectId: "proj-zero-estimate-real-cost" })).toBe(0.12);
+        }
+      );
+
+      it(
+        "no-regression: a genuinely free MOCK-tier fixture (tier 'MOCK' AND costPerCall 0) keeps the exact " +
+          "prior in-memory-only ephemeral default — no cost-ledger.json is created",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-known-free-mock-still-ephemeral-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+
+          await bootstrapProject({
+            genomeCandidate: validGenome("proj-known-free-mock"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry()
+          });
+
+          expect(existsSync(join(tempRoot, "cost-ledger.json"))).toBe(false);
+        }
+      );
+    }
+  );
+
+  describe(
     "P1 fix (23rd independent review round, finding 5, 'reserve bootstrap budget before filesystem mutation'): " +
       "budget authorization must be a real, atomic RESERVATION completed before any filesystem mutation, not a " +
       "read-only precheck a concurrent caller can also pass",

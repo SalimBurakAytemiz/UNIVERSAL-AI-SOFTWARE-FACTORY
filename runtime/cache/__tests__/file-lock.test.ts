@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
@@ -256,6 +256,134 @@ describe(
 
         expect(elapsed).toBeLessThan(2_000);
         release();
+      }
+    );
+  }
+);
+
+describe(
+  "acquireFileLock deadline enforcement (P2 fix, 37th independent review round, finding 10, " +
+    "'timeout deadline checked only on the failure path') — a retry that only succeeds AFTER this waiter's " +
+    "own deadline has already elapsed must never be honored as a genuine acquisition, and the sleep between " +
+    "retries must never itself overshoot the remaining budget",
+  () => {
+    it(
+      "BLOCKER regression, exact reproduction: a retry's mkdirSync() succeeds (the owner released the lock " +
+        "during the immediately-preceding sleep) but the deadline had ALREADY elapsed by then — the waiter must " +
+        "fail closed with FileLockTimeoutError, not silently return a lock, and must clean up what it just created",
+      () => {
+        const lockDirPath = makeLockDir();
+        // A CONFIRMED-ALIVE owner (this same process) — isLockStale() then
+        // returns `false` WITHOUT calling Date.now() itself (bkz.
+        // isLockStale()'in kendi mantığı: canlı sahip her zaman false),
+        // keeping this test's own Date.now() call sequence deterministic.
+        writeFileSync(
+          join(lockDirPath, "owner.json"),
+          JSON.stringify({ pid: process.pid, token: "owner-token", acquiredAt: Date.now() }),
+          "utf8"
+        );
+
+        const realNow = Date.now;
+        let callCount = 0;
+        const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+          callCount += 1;
+          if (callCount === 1) {
+            // `const deadline = Date.now() + timeoutMs;`
+            return realNow();
+          }
+          if (callCount === 2) {
+            // `const remainingMs = deadline - Date.now();` — simulate the
+            // owner releasing the lock at some point during the sleep
+            // that is about to follow (exactly the race finding 10
+            // describes: this waiter cannot control WHEN the owner lets go).
+            rmSync(lockDirPath, { recursive: true, force: true });
+            return realNow();
+          }
+          // The retry's OWN deadline recheck (inside the fix, right after
+          // its mkdirSync() call succeeds): report that real time has
+          // already carried this waiter well past its own deadline — from
+          // the waiter's perspective, its sleep already exhausted its
+          // timeout budget before the owner happened to let go.
+          return realNow() + 60_000;
+        });
+
+        try {
+          expect(() =>
+            acquireFileLock(lockDirPath, { timeoutMs: 50, staleMs: 60_000, pollIntervalMs: 5 })
+          ).toThrow(FileLockTimeoutError);
+          // The directory this waiter's own retry legitimately (atomically)
+          // created must be cleaned back up — a rejected acquisition must
+          // never leave an orphaned lock behind for the NEXT waiter to see.
+          expect(existsSync(lockDirPath)).toBe(false);
+        } finally {
+          nowSpy.mockRestore();
+        }
+      }
+    );
+
+    it(
+      "no-regression: a retry that succeeds BEFORE the deadline is still honored as a genuine acquisition " +
+        "(the fix only rejects a retry succeeding AFTER the deadline, never a timely one)",
+      () => {
+        const lockDirPath = makeLockDir();
+        writeFileSync(
+          join(lockDirPath, "owner.json"),
+          JSON.stringify({ pid: process.pid, token: "owner-token", acquiredAt: Date.now() }),
+          "utf8"
+        );
+
+        const realNow = Date.now;
+        let callCount = 0;
+        const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+          callCount += 1;
+          if (callCount === 2) {
+            // Same simulated mid-sleep release as the BLOCKER test above...
+            rmSync(lockDirPath, { recursive: true, force: true });
+          }
+          // ...but every Date.now() call, including the retry's own
+          // deadline recheck, reports genuine real time — well within the
+          // configured budget.
+          return realNow();
+        });
+
+        try {
+          const release = acquireFileLock(lockDirPath, { timeoutMs: 5_000, staleMs: 60_000, pollIntervalMs: 5 });
+          release();
+        } finally {
+          nowSpy.mockRestore();
+        }
+      }
+    );
+
+    it("no-regression: 'timeoutMs: 0' (try once, never wait) is unaffected — the first attempt is never subject to this deadline recheck", () => {
+      const root = mkdtempSync(join(tmpdir(), "uasf-file-lock-deadline-"));
+      tempDirs.push(root);
+      const lockDirPath = join(root, "cache.lock"); // deliberately NOT pre-created — the lock is free
+      const release = acquireFileLock(lockDirPath, { timeoutMs: 0 });
+      release();
+    });
+
+    it(
+      "the sleep between retries never exceeds the REMAINING timeout budget, even when pollIntervalMs is " +
+        "configured far larger than timeoutMs itself",
+      () => {
+        const lockDirPath = makeLockDir();
+        writeFileSync(
+          join(lockDirPath, "owner.json"),
+          JSON.stringify({ pid: process.pid, token: "owner-token", acquiredAt: Date.now() }),
+          "utf8"
+        );
+        // The owner never releases in this test — genuine timeout is
+        // expected. `pollIntervalMs` is deliberately ~100x `timeoutMs`.
+        const start = Date.now();
+        expect(() =>
+          acquireFileLock(lockDirPath, { timeoutMs: 30, staleMs: 60_000, pollIntervalMs: 5_000 })
+        ).toThrow(FileLockTimeoutError);
+        const elapsed = Date.now() - start;
+
+        // If the sleep were NOT capped to the remaining budget, this would
+        // take ~5000ms (a full, uncapped pollIntervalMs) instead of ~30ms.
+        expect(elapsed).toBeLessThan(1_000);
       }
     );
   }

@@ -177,6 +177,38 @@ const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)((?:[^'\n]|'(?=[A-
  */
 const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)((?:[^'\n]|'(?=[A-Za-z0-9]))+)/gi;
 const BARE_BEARER_TOKEN_PATTERN = /\bbearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
+/**
+ * P1 fix (37th independent review round, finding 7, "redact bare,
+ * unlabeled provider credential signatures"): every pattern above this
+ * point only redacts a credential that is LABELED — preceded by
+ * `Authorization:`/`Cookie:`/`Bearer `/`api_key=`/etc., or sitting in a
+ * URL's userinfo section. A caller who logs a bare, unlabeled provider
+ * credential embedded in otherwise-ordinary prose — an error message
+ * ("provider call failed for key sk-proj-abc123..."), a raw result field,
+ * a copy-pasted URL/command-output fragment, or a stack trace that
+ * happens to include the offending value — has NO label for any existing
+ * pattern to anchor on, so the credential sailed straight through
+ * completely unredacted despite being immediately, unambiguously
+ * recognizable as a real provider secret BY ITS OWN SHAPE alone (an
+ * OpenAI/Anthropic `sk-...` key, a GitHub `ghp_.../github_pat_...` token,
+ * a Slack `xoxb-...` token, an AWS `AKIA.../ASIA...` access key id). This
+ * is the exact same recognizable-format class this repository's OWN
+ * `scripts/secret-scan.mjs` already trusts to flag a committed file as a
+ * real secret — see its "AWS Access Key ID"/"GitHub token"/"Slack
+ * token"/"OpenAI API key"/"Anthropic API key" patterns, mirrored here
+ * (assignment- and JSON-shaped variants of these are already covered by
+ * `SECRET_ASSIGNMENT_PATTERN` above and by `isSensitiveKey()`'s key-based
+ * check — this pattern exists specifically for the BARE, no-label case
+ * those two cannot see). `(?<![A-Za-z0-9])` anchors each alternative so
+ * it can never match as the tail of a longer, unrelated alphanumeric
+ * token (mirrors secret-scan.mjs's own "sk-" boundary fix, which avoids
+ * false-triggering on ordinary prose like "...ri`sk-5`-never-weakens...").
+ * Runs as an independent extra pass alongside (not instead of) every
+ * existing pattern — additive only, nothing previously redacted stops
+ * being redacted.
+ */
+const BARE_PROVIDER_CREDENTIAL_PATTERN =
+  /(?<![A-Za-z0-9])(?:sk-ant-[A-Za-z0-9_-]{20,}|sk-(?!ant-)[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16})/g;
 
 function redactSecretsInString(text: string): string {
   return text
@@ -205,7 +237,11 @@ function redactSecretsInString(text: string): string {
     // (`https://user:hunter2@host/...`) — the username is left visible
     // (often not secret, e.g. a service account name), only the password
     // portion is redacted.
-    .replace(URL_USERINFO_PATTERN, "$1:[REDACTED]@");
+    .replace(URL_USERINFO_PATTERN, "$1:[REDACTED]@")
+    // Bare, unlabeled provider credentials recognizable by their own
+    // format alone (sk-proj-.../sk-ant-.../ghp_.../github_pat_.../xoxb-.../
+    // AKIA.../ASIA...) — see BARE_PROVIDER_CREDENTIAL_PATTERN's fix note.
+    .replace(BARE_PROVIDER_CREDENTIAL_PATTERN, "[REDACTED]");
 }
 
 /**

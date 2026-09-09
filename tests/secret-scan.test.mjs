@@ -76,6 +76,47 @@ describe("secret-scan: findSecretsInText", () => {
 });
 
 describe(
+  "secret-scan: P1 fix (37th independent review round, finding 6, 'detect the canonical AWS JSON credential " +
+    "format') — a quoted `\"SecretAccessKey\": \"...\"` JSON property, the format AWS's own tooling actually " +
+    "emits, must be detected even though it does not match the existing snake_case assignment pattern",
+  () => {
+    it("BLOCKER regression, exact reproduction: flags a synthetic AWS credential JSON blob's SecretAccessKey field", () => {
+      const findings = findSecretsInText(
+        '{"AccessKeyId":"AKIAABCDEFGHIJKLMNOP","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}', // secret-scan:allow (fake fixture value, tests detection itself)
+        "aws-credentials.json"
+      );
+      expect(findings.some((f) => f.pattern === "AWS Secret Access Key (JSON credential format)")).toBe(true);
+    });
+
+    it("root-cause proof: the same value does NOT match via the pre-existing snake_case assignment pattern or the generic secret pattern", () => {
+      // Isolates the NEW pattern specifically: a minimal line containing
+      // ONLY the JSON-format key, with no snake_case/generic-keyword
+      // wording nearby that could make an unrelated, pre-existing pattern
+      // coincidentally also fire.
+      const findings = findSecretsInText(
+        '"SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"', // secret-scan:allow (fake fixture value, tests detection itself)
+        "isolated.json"
+      );
+      expect(findings.some((f) => f.pattern === "AWS Secret Access Key (JSON credential format)")).toBe(true);
+      expect(findings.some((f) => f.pattern === "AWS Secret Access Key (assignment)")).toBe(false);
+    });
+
+    it("no-regression: the pre-existing snake_case assignment format is still detected unchanged", () => {
+      const findings = findSecretsInText(
+        'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"', // secret-scan:allow (fake fixture value, tests detection itself)
+        "config.env"
+      );
+      expect(findings.some((f) => f.pattern === "AWS Secret Access Key (assignment)")).toBe(true);
+    });
+
+    it("does not flag an unrelated JSON property that merely happens to be named similarly", () => {
+      const findings = findSecretsInText('{"secretAccessKeyRotationEnabled": true}', "settings.json");
+      expect(findings.some((f) => f.pattern === "AWS Secret Access Key (JSON credential format)")).toBe(false);
+    });
+  }
+);
+
+describe(
   "secret-scan: P2 fix (18th independent review round, 'secret scanner misses project-scoped OpenAI keys " +
     "in JSON') — a project-scoped OpenAI key (sk-proj-...) must be detected regardless of surrounding syntax",
   () => {
@@ -502,6 +543,51 @@ describe("secret-scan: git-history-aware scanning", () => {
     }
   );
 
+  it(
+    "P1 fix (37th independent review round, finding 6): a synthetic AWS credential JSON blob's " +
+      "SecretAccessKey field, committed and later deleted, remains detected via history scanning",
+    () => {
+      tempRepo = initTempRepo();
+      writeFileSync(
+        join(tempRepo, "aws-credentials.json"),
+        '{"AccessKeyId":"AKIAABCDEFGHIJKLMNOP","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}\n' // secret-scan:allow (fake fixture value written into a temp repo)
+      );
+      git(["add", "aws-credentials.json"]);
+      git(["commit", "-m", "oops: add AWS credentials JSON"]);
+
+      execFileSync("git", ["rm", "aws-credentials.json"], { cwd: tempRepo });
+      git(["commit", "-m", "remove credentials"]);
+
+      const trackedNow = execFileSync("git", ["ls-files"], { cwd: tempRepo, encoding: "utf8" });
+      expect(trackedNow).not.toContain("aws-credentials.json");
+
+      const { findings, unreadableBlobs } = scanGitHistory(tempRepo);
+      expect(unreadableBlobs).toHaveLength(0);
+      expect(
+        findings.some(
+          (f) => f.pattern === "AWS Secret Access Key (JSON credential format)" && f.file.includes("aws-credentials.json")
+        )
+      ).toBe(true);
+    }
+  );
+
+  it(
+    "P1 fix (37th independent review round, finding 6): a currently-tracked AWS credential JSON blob's " +
+      "SecretAccessKey field is found by the current-tree scan (not only history)",
+    () => {
+      tempRepo = initTempRepo();
+      writeFileSync(
+        join(tempRepo, "aws-credentials.json"),
+        '{"AccessKeyId":"AKIAABCDEFGHIJKLMNOP","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}\n' // secret-scan:allow (fake fixture value written into a temp repo)
+      );
+      git(["add", "aws-credentials.json"]);
+      git(["commit", "-m", "add current AWS credentials JSON"]);
+
+      const findings = scanFile("aws-credentials.json", tempRepo);
+      expect(findings.some((f) => f.pattern === "AWS Secret Access Key (JSON credential format)")).toBe(true);
+    }
+  );
+
   describe("P2 fix (24th independent review round, 'secret history scan must fail closed on unreadable blobs')", () => {
     afterEach(() => {
       delete globalThis.__SECRET_SCAN_TEST_UNREADABLE_SHA__;
@@ -550,14 +636,33 @@ describe("secret-scan: git-history-aware scanning", () => {
 });
 
 describe("secret-scan: this repository's own known-historical baseline", () => {
-  it("the pre-existing historical fixture blob (commit 981f0a4, before secret-scan:allow existed) is baselined precisely, not hidden by a broad exclusion", () => {
-    // Scans the REAL repository (default cwd), proving the baseline
-    // actually resolves the genuine finding without rewriting git history.
-    const { findings, unreadableBlobs } = scanGitHistory();
-    expect(unreadableBlobs).toHaveLength(0);
-    const historicalFixtureFindings = findings.filter((f) => f.file.startsWith("history:tests/secret-scan.test.mjs@"));
-    expect(historicalFixtureFindings).toHaveLength(0);
-  });
+  // P2 fix (37th independent review round, "secret-scan history test
+  // exceeding the 5s default test timeout"): this test scans the FULL,
+  // REAL git history of this repository (`scanGitHistory()` with no
+  // override — bkz. yukarıdaki not) — as this repo has genuinely grown
+  // (37 rounds' worth of commits by the time of this fix), that real scan
+  // now legitimately takes longer than Vitest's 5000ms default test
+  // timeout, which is unrelated to whether the scanner itself is correct.
+  // Per this round's own explicit instruction: do not skip this test, do
+  // not weaken the scanner, do not raise the GLOBAL test timeout (which
+  // would silently mask a genuine hang in an unrelated, actually-fast
+  // test) — apply a narrow, justified timeout to ONLY this one
+  // genuinely-long-running history-integration test. 30s comfortably
+  // covers this repository's current history size with headroom for
+  // continued (linear) growth, while still failing loudly if this test
+  // itself ever genuinely hangs.
+  it(
+    "the pre-existing historical fixture blob (commit 981f0a4, before secret-scan:allow existed) is baselined precisely, not hidden by a broad exclusion",
+    () => {
+      // Scans the REAL repository (default cwd), proving the baseline
+      // actually resolves the genuine finding without rewriting git history.
+      const { findings, unreadableBlobs } = scanGitHistory();
+      expect(unreadableBlobs).toHaveLength(0);
+      const historicalFixtureFindings = findings.filter((f) => f.file.startsWith("history:tests/secret-scan.test.mjs@"));
+      expect(historicalFixtureFindings).toHaveLength(0);
+    },
+    30000
+  );
 });
 
 describe("secret-scan: .env.example placeholder checks", () => {

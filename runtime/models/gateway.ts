@@ -114,21 +114,102 @@ export function computeModelInvocationIdentityDigest(params: {
  * own "no plaintext secrets" requirement while still making two
  * differently-configured instances produce provably different digests.
  */
-function canonicalProviderConfigFingerprint(provider: ModelProvider): string {
+/**
+ * P1 fix (37th independent review round, finding 2, "reject lossy provider
+ * configuration fingerprints"): a value whose canonicalization
+ * (`JSON.stringify`) THROWS — a circular-referencing configuration object,
+ * a `BigInt` field — used to fall back to `String(value)`. For a plain
+ * object that fallback ALWAYS produces the literal string `"[object
+ * Object]"`, REGARDLESS of the object's actual shape — two materially
+ * DIFFERENT cyclic configurations (different endpoints, different nested
+ * structure, anything) collapse to the exact SAME hashed fingerprint
+ * component, exactly the "two different configurations must never silently
+ * share a digest" property this whole function exists to guarantee. Fixed
+ * with the safer of the two documented options: fail closed. A
+ * configuration value that cannot be canonicalized is refused outright
+ * (`UnsupportedProviderConfigurationError`) rather than silently
+ * fingerprinted as a lossy placeholder — an approval can never be computed
+ * for, nor a provider installed with, configuration this function cannot
+ * faithfully represent.
+ */
+export class UnsupportedProviderConfigurationError extends Error {
+  constructor(id: string, key: PropertyKey, cause: unknown) {
+    super(
+      `Provider '${id}' exposes a configuration property (${String(key)}) that could not be canonically ` +
+        `fingerprinted: ${cause instanceof Error ? cause.message : String(cause)}. Refusing fail-closed ` +
+        `(baseline section 147) rather than falling back to a lossy representation (e.g. "[object Object]") ` +
+        `under which materially different configurations could collide onto the same approval digest.`
+    );
+    this.name = "UnsupportedProviderConfigurationError";
+  }
+}
+
+/**
+ * P1 fix (37th independent review round, finding 1, "bind provider approval
+ * to the genuinely installed snapshot"): bkz. `replaceProvider()`'ın kendi
+ * fix notu for the full call-site rationale — `resolvedAccessors` is a
+ * SINGLE, already-taken reading of every accessor (getter) property this
+ * provider instance currently exposes (bkz. `resolveProviderAccessors()`),
+ * computed exactly ONCE per `replaceProvider()` call and threaded into both
+ * this function AND the later `detachFromCallerMutation()`/
+ * `captureProviderBinding()` call. Previously this function read every
+ * accessor DIRECTLY off the live `provider` object — a SEPARATE,
+ * independent invocation of each getter from whatever `detachFromCallerMutation()`
+ * would invoke again later when actually installing the binding. A
+ * stateful or Proxy-backed getter (returning a different value on each
+ * call) could therefore have its FIRST read folded into the approval
+ * digest, while its SECOND, independent read (moments later, inside the
+ * approved callback) is what actually gets locked into the installed
+ * `ProviderBinding` — an approval genuinely granted for configuration A
+ * silently installing configuration B. Data properties carry no such risk
+ * (a data property's value is fixed at the moment of the descriptor read,
+ * never re-evaluated), so only accessor properties need this
+ * once-only-shared-reading treatment.
+ */
+function canonicalProviderConfigFingerprint(
+  provider: ModelProvider,
+  id: string,
+  resolvedAccessors: ReadonlyMap<PropertyKey, unknown>
+): string {
   const entries = Reflect.ownKeys(provider)
     .filter((key): key is string => typeof key === "string")
     .sort()
     .map((key) => {
-      const value = (provider as unknown as Record<string, unknown>)[key];
+      const descriptor = Object.getOwnPropertyDescriptor(provider, key);
+      const value = descriptor && "value" in descriptor ? descriptor.value : resolvedAccessors.get(key);
       let serialized: string;
       try {
         serialized = JSON.stringify(value) ?? String(value);
-      } catch {
-        serialized = String(value);
+      } catch (err) {
+        throw new UnsupportedProviderConfigurationError(id, key, err);
       }
       return `${key}:${createHash("sha256").update(serialized).digest("hex")}`;
     });
   return entries.join("|");
+}
+
+/**
+ * Reads every OWN accessor (getter) property `provider` currently exposes
+ * exactly ONCE, returning a stable snapshot keyed by property name — bkz.
+ * `canonicalProviderConfigFingerprint()`'in üstündeki fix notu for why this
+ * single reading must be shared between digest computation and the later
+ * installed binding, rather than each independently re-invoking the same
+ * getter. A getter that throws refuses the ENTIRE operation fail-closed
+ * (`UnsafeProviderConfigurationError`), exactly as `detachFromCallerMutation()`
+ * already did for this same failure mode.
+ */
+function resolveProviderAccessors(provider: ModelProvider, id: string): ReadonlyMap<PropertyKey, unknown> {
+  const resolved = new Map<PropertyKey, unknown>();
+  for (const key of Reflect.ownKeys(provider)) {
+    const descriptor = Object.getOwnPropertyDescriptor(provider, key);
+    if (!descriptor || "value" in descriptor || !descriptor.get) continue;
+    try {
+      resolved.set(key, descriptor.get.call(provider));
+    } catch (err) {
+      throw new UnsafeProviderConfigurationError(id, key, err);
+    }
+  }
+  return resolved;
 }
 
 /**
@@ -141,12 +222,16 @@ function canonicalProviderConfigFingerprint(provider: ModelProvider): string {
  * instances of the same class with materially different configuration are
  * never mistaken for the same approved candidate.
  */
-export function computeProviderReplacementIdentityDigest(provider: ModelProvider, id: string): string {
+export function computeProviderReplacementIdentityDigest(
+  provider: ModelProvider,
+  id: string,
+  resolvedAccessors: ReadonlyMap<PropertyKey, unknown> = resolveProviderAccessors(provider, id)
+): string {
   return identityDigestOf([
     id,
     provider.constructor?.name ?? "unknown",
     provider.invoke.toString(),
-    canonicalProviderConfigFingerprint(provider)
+    canonicalProviderConfigFingerprint(provider, id, resolvedAccessors)
   ]);
 }
 
@@ -437,20 +522,31 @@ function isPlainConfigValue(value: unknown): value is Record<PropertyKey, unknow
  * snapshot and is left as-is — it cannot itself EXPOSE mutable state to a
  * reader, only accept writes, so it carries no read-time risk this fix
  * needs to close.
+ *
+ * P1 fix (37th independent review round, finding 1, "bind provider approval
+ * to the genuinely installed snapshot"): this used to call
+ * `descriptor.get.call(provider)` itself, right here — a SECOND, independent
+ * invocation of the SAME getter `canonicalProviderConfigFingerprint()` (via
+ * `replaceProvider()`'s own approval-digest computation) had ALREADY
+ * invoked moments earlier. `resolvedAccessors` (bkz. `resolveProviderAccessors()`'ın
+ * üstündeki fix notu) is that SAME, already-taken reading, threaded through
+ * so the value actually locked into the installed binding is GUARANTEED
+ * identical to whatever the approval digest was computed from — never a
+ * fresh, potentially-different second read of a stateful/Proxy-backed
+ * getter.
  */
-function detachFromCallerMutation(provider: ModelProvider, id: string): void {
+function detachFromCallerMutation(
+  provider: ModelProvider,
+  id: string,
+  resolvedAccessors: ReadonlyMap<PropertyKey, unknown>
+): void {
   for (const key of Reflect.ownKeys(provider)) {
     const descriptor = Object.getOwnPropertyDescriptor(provider, key);
     if (!descriptor) continue;
 
     if (!("value" in descriptor)) {
       if (!descriptor.get) continue;
-      let snapshot: unknown;
-      try {
-        snapshot = descriptor.get.call(provider);
-      } catch (err) {
-        throw new UnsafeProviderConfigurationError(id, key, err);
-      }
+      const snapshot = resolvedAccessors.get(key);
       if (isPlainConfigValue(snapshot)) {
         deepFreeze(snapshot);
       }
@@ -475,14 +571,32 @@ function detachFromCallerMutation(provider: ModelProvider, id: string): void {
       }
     }
 
-    if (isPlainConfigValue(descriptor.value) && !Object.isFrozen(descriptor.value)) {
+    // P1 fix (37th independent review round, finding 3, "deep-freeze
+    // nested provider state under a frozen root"): this used to also
+    // guard on `!Object.isFrozen(descriptor.value)`, skipping `deepFreeze()`
+    // ENTIRELY whenever the caller had already done a SHALLOW
+    // `Object.freeze()` on this config value themselves. `Object.freeze()`
+    // is shallow — a frozen top-level `config` object can still have a
+    // fully mutable `.nested` object one level down — so this guard treated
+    // "the top level happens to already be frozen" as proof "everything
+    // reachable from it is already frozen," letting a nested field remain
+    // silently mutable forever. `deepFreeze()` itself (bkz. `runtime/util/immutable.ts`'in
+    // fix notu) is now cycle-safe via its OWN internal `WeakSet`-based
+    // visited tracking, so calling it unconditionally here — even on an
+    // already (shallow-)frozen value — is always safe and correctly
+    // recurses into any still-mutable descendants.
+    if (isPlainConfigValue(descriptor.value)) {
       deepFreeze(descriptor.value);
     }
   }
 }
 
-function captureProviderBinding(provider: ModelProvider, id: string): ProviderBinding {
-  detachFromCallerMutation(provider, id);
+function captureProviderBinding(
+  provider: ModelProvider,
+  id: string,
+  resolvedAccessors: ReadonlyMap<PropertyKey, unknown> = resolveProviderAccessors(provider, id)
+): ProviderBinding {
+  detachFromCallerMutation(provider, id, resolvedAccessors);
   return Object.freeze({
     id,
     invoke: provider.invoke.bind(provider),
@@ -804,7 +918,19 @@ export class ModelGateway {
     // versa) still produce different digests — an approval genuinely
     // requested for one candidate's exact digest cannot authorize
     // installing a materially different implementation under the same id.
-    const candidateDigest = computeProviderReplacementIdentityDigest(provider, id);
+    //
+    // P1 fix (37th independent review round, finding 1, "bind provider
+    // approval to the genuinely installed snapshot"): `resolvedAccessors` is
+    // read HERE, exactly once, and threaded into BOTH this digest
+    // computation AND the later `captureProviderBinding()` call inside the
+    // approved callback below — bkz. `resolveProviderAccessors()`'ın
+    // üstündeki fix notu. Previously each call independently re-invoked
+    // every accessor property off the live `provider` object, so a
+    // stateful/Proxy-backed getter could answer differently at digest time
+    // than it did at install time, letting an approval genuinely granted
+    // for configuration A silently install configuration B.
+    const resolvedAccessors = resolveProviderAccessors(provider, id);
+    const candidateDigest = computeProviderReplacementIdentityDigest(provider, id, resolvedAccessors);
 
     await capabilityGateway.authorize(
       {
@@ -855,7 +981,14 @@ export class ModelGateway {
         // reflecting that nothing changed. If `auditLog.append()` itself
         // then throws, the swap still never runs, preserving the round-30
         // fix's own guarantee unchanged.
-        const binding = captureProviderBinding(provider, id);
+        //
+        // P1 fix (37th independent review round, finding 1): `resolvedAccessors`
+        // (the SAME single reading computed above, before `authorize()` ever
+        // ran) is passed through here too — never a fresh re-invocation of
+        // the candidate's own getters — so the installed binding is
+        // guaranteed to reflect EXACTLY the configuration the approval
+        // digest above was computed from.
+        const binding = captureProviderBinding(provider, id, resolvedAccessors);
         auditLog.append({
           type: "MODEL_PROVIDER_REPLACED",
           actor: "ModelGateway",

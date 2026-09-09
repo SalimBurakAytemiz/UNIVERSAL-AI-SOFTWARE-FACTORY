@@ -35,6 +35,32 @@ const PATTERNS = [
   // issued AWS access key ID format that the old pattern silently missed.
   { name: "AWS Access Key ID", regex: /(AKIA|ASIA)[0-9A-Z]{16}/g },
   { name: "AWS Secret Access Key (assignment)", regex: /aws_secret_access_key\s*=\s*['"]?[A-Za-z0-9/+=]{40}['"]?/gi },
+  // P1 fix (37th independent review round, finding 6, "known provider
+  // secret syntax gaps"): the pattern above only matches the snake_case,
+  // `key = value` shell/.env/TOML assignment style
+  // (`aws_secret_access_key = "..."`). The CANONICAL format AWS's own
+  // tooling actually emits — `aws configure --output json`, `aws sts
+  // get-session-token`/`assume-role`, the credential JSON many SDKs read
+  // directly, `~/.aws/credentials` exported as JSON — is instead a quoted
+  // JSON property named exactly `SecretAccessKey` (PascalCase, no
+  // underscores): `"SecretAccessKey": "<40-char value>"`. That key name
+  // does not match `aws_secret_access_key` at all (different casing,
+  // different word-separation), so a real credential pasted in this exact,
+  // extremely common shape sailed through undetected. It ALSO evades the
+  // existing generic "api key/secret/password/token" pattern below: that
+  // pattern requires the bare substring "secret" to sit immediately before
+  // the closing quote/`:`/`=`, but here "Secret" is the first half of the
+  // compound word "SecretAccessKey" — "AccessKey" sits between "Secret"
+  // and the colon, so the generic pattern's anchoring never lines up.
+  // Fixed with a dedicated pattern matching the exact, real key name AWS
+  // itself uses, mirroring the AWS access-key-id value's own character
+  // class (`[A-Za-z0-9/+]` — the secret is standard base64 without
+  // padding at this fixed 40-character length). Additive only — does not
+  // touch the pre-existing snake_case assignment pattern, so nothing
+  // previously detected stops being detected. Applies identically to both
+  // current-tree (`scanFile`) and git-history (`scanGitHistory`) scanning,
+  // since both funnel through the same shared `findSecretsInText`.
+  { name: "AWS Secret Access Key (JSON credential format)", regex: /"SecretAccessKey"\s*:\s*"[A-Za-z0-9/+]{40}"/g },
   { name: "Private key block", regex: /-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g },
   // P2 fix (18th independent review round targeted audit, same root
   // class): `gh[pousr]_` covers the classic PAT/OAuth/app-token prefixes

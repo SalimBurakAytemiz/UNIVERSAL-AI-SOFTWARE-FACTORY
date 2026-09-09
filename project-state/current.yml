@@ -1292,6 +1292,71 @@ factory:
     does NOT invoke Codex itself, and did NOT create a new branch — all work stayed on
     claude/ai-factory-baseline-v1-seawq7.
 
+    Round 37 ("P0 FINAL CLOSURE REMEDIATION ROUND"): explicitly scope-locked to closing review findings that
+    violate the EXISTING P0 contract, plus a narrow same-root-cause audit — no new P1 work, no new branch, no
+    merge, no Codex invocation, no CLOSED declaration. A 37th independent Codex review found TWELVE actionable
+    findings (8 P1, 4 P2), fixed as one consolidated batch, each reproduced deterministically, fixed, covered by a
+    new regression test, and bypass-verified (the fix was temporarily reverted and the exact predicted test(s) —
+    no more, no fewer — were confirmed to fail, then the fix was restored and full-suite green reconfirmed): (1)
+    gateway.ts's provider-replacement approval now binds to a ONE-TIME-RESOLVED accessor snapshot
+    (`resolveProviderAccessors()`) shared between the approval-digest computation and the actual installed
+    binding, closing the window where a stateful getter could answer differently between the two reads; (2)
+    gateway.ts's config fingerprint (`canonicalProviderConfigFingerprint()`) now throws
+    `UnsupportedProviderConfigurationError` instead of silently falling back to a lossy `String(value)` for a
+    circular/unserializable config field, so materially different configurations can never collide onto the same
+    approval digest; (3) `runtime/util/immutable.ts`'s shared `deepFreeze()` now tracks VISITED nodes via a
+    `WeakSet` instead of treating `Object.isFrozen()` as "already handled," so a caller-pre-frozen root's nested
+    children are still genuinely deep-frozen — this fix is in the one shared primitive, so every caller benefits;
+    (4) `phase-closure.ts`'s `attemptPhaseClosure()` gained a new `ScopeLock.hasDecision()` up-front precondition
+    check, converting `close()`'s one remaining failure mode (a reused `decisionId`) into a deterministic REJECTED
+    outcome before any closure evidence is durably persisted, so a failed `close()` can never leave a false CLOSED
+    manifest behind; (5) `orchestrator.ts`'s `bootstrapProject()` now selects an ephemeral (in-memory-only)
+    CostEngine ONLY when the routed model is both `tier: "MOCK"` AND `costPerCall === 0` — any other model
+    (including one whose STATIC estimate happens to be zero) gets the durable, `FileStateStore`-backed CostEngine,
+    so a real provider's actual positive cost can never be silently lost to an in-memory-only ledger on restart;
+    (6) `scripts/secret-scan.mjs` gained a dedicated pattern for the canonical AWS JSON credential format
+    (`"SecretAccessKey": "..."`, PascalCase, no underscores) which neither the pre-existing snake_case assignment
+    pattern nor the generic secret-assignment pattern could ever match; (7) `runtime/telemetry/logger.ts`'s
+    `redactSecretsInString()` gained a `BARE_PROVIDER_CREDENTIAL_PATTERN` covering bare, unlabeled
+    `sk-proj-.../sk-ant-.../ghp_.../github_pat_.../xoxb-.../AKIA.../ASIA...` credentials embedded anywhere in an
+    ordinary string value, not just under a suspicious-looking key or a labeled assignment; (8) `budget.ts`'s
+    successful `BUDGET_RESERVATION_COMMITTED` audit event's `confirmedScope` now includes `runId`, matching the
+    reservation event and both failure events, which already carried it — the ONE event type that had silently
+    dropped it; (9) `runtime/project-isolation/isolation.ts`'s `ProjectIsolationView.get()` now returns a FRESH
+    `deepFreezeClone()` of the stored value on every call instead of the stored bucket reference itself, since
+    `Object.freeze()` cannot block `Map.set()`/`Set.add()` on a Map/Set-typed value — a caller mutating a Map/Set
+    obtained from `get()` can no longer reach this store's own authoritative bucket entry; (10)
+    `runtime/cache/file-lock.ts`'s `acquireFileLock()` now rechecks the authoritative deadline immediately after a
+    RETRY's `mkdirSync()` succeeds (never the very first attempt, preserving the documented `timeoutMs: 0`
+    contract) and releases what it just created if the deadline had already elapsed during the preceding sleep,
+    and that sleep is now capped to `Math.min(pollIntervalMs, remainingMs)` so it can never itself overshoot the
+    remaining budget; (11)-(12) `runtime/governance/scope-lock.ts`'s `ScopeLock.loadFrom()` and
+    `BacklogRouter.loadFrom()` restore loops now both reject a duplicate `phaseId`/`itemId` (failing the entire
+    restore closed via the SAME `CorruptPersisted*Error` classes already used for other structural corruption)
+    instead of silently overwriting an earlier persisted record via unconditional `Map.set()` — `BacklogRouter`'s
+    live `route()` already enforced this uniqueness invariant; restore now matches it. A narrow root-cause audit
+    against the round's own 10 named shared classes (A: approval-fingerprint-vs-installed-state divergent reads;
+    B: lossy canonicalization fallback; C: shallow/fake immutability; D: governance state/evidence persisted
+    transactionally decoupled; E: estimated-vs-actual cost accounting durability; F: known provider secret syntax
+    gaps; G: authoritative identity lost on the successful evidence path; H: mutable collections escaping the
+    trust boundary; I: timeout deadline checked only on the failure path; J: live uniqueness invariant not
+    enforced during restore) found NO further genuine direct instances beyond the twelve fixed above — checked
+    every `loadFrom()` restore site (assumption-register.ts and decision-ledger.ts already enforce duplicate-id
+    rejection from prior rounds), every Map/Set-returning accessor, every real-time deadline-polling loop
+    (sandbox.ts already independently rechecks its deadline on both its resolve and reject paths from a prior
+    round), every `auditLog?.append()` call site (budget.ts was the only file with multiple sibling event types
+    sharing a scope shape), every `new CostEngine()` construction site, and every caller-controlled-accessor /
+    lossy-fallback canonicalization site. Full required sequence re-run and green: lint, typecheck, build,
+    1453/1453 tests (50 files), validate:requirements (46 schema-valid records, unchanged), history-and-
+    current-tree-aware secret-scan (PASS, 125 current-tree files + 663 unique historical blobs, zero unreadable),
+    Factory Doctor (READY), all 9 P0 proofs green. No requirement status raised beyond what this round's real
+    evidence supports. P0's persisted Scope Lock state is UNCHANGED by this round (still LOCKED_FOR_CLOSURE /
+    READY_FOR_INDEPENDENT_REVIEW from round 35) — this round ran no phase-transition API call, since (per its own
+    explicit instruction) it supplied no new independent review result of its own to act on. P0 remains explicitly
+    NOT CLOSED; the next step is an independent FINAL P0 CLOSURE REVIEW. Per explicit instruction, this round does
+    NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a
+    new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -6777,3 +6842,25 @@ exact_next_action: >
   SQLite-backed StateStore, get a Founder decision on P0-sufficiency and
   licensing (section 206). The autonomous-merge governance question stays
   closed absent new Founder-initiated context.
+
+  UPDATE (round 37, "P0 FINAL CLOSURE REMEDIATION ROUND" — supersedes the round-36 "current status" statement
+  above; see `p0_status`'s own final paragraph for the complete round-37 narrative): P0 REMAINS
+  READY_FOR_INDEPENDENT_REVIEW — still NOT CLOSED, and this round did not change the persisted Scope Lock state
+  (`project-state/governance/scope-lock.json` still reads LOCKED_FOR_CLOSURE from round 35; no phase-transition
+  API call was made this round, per its own explicit instruction, since it supplied no new independent review
+  result of its own to act on). This round's task was explicitly scope-locked: close a 37th independent Codex
+  review's 12 findings (8 P1, 4 P2) as one consolidated batch, plus a narrow same-root-cause audit against the
+  round's own 10 named classes — no new P1/feature work, no new governance subsystem, no new branch, no merge, no
+  Codex invocation, no CLOSED declaration. All 12 findings are fixed, individually regression-tested, and
+  individually bypass-verified (each fix was temporarily reverted in place and the exact predicted test(s) — never
+  more, never fewer — were confirmed to fail before the fix was restored and the full suite reconfirmed green).
+  The narrow audit found no further genuine direct instances of any of the 10 classes beyond those 12 fixes. Full
+  required verification sequence is green: lint, typecheck, build, 1453/1453 tests (50 files), validate:requirements
+  (46 schema-valid records, unchanged), history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY),
+  all 9 P0 proofs. No requirement status was raised beyond what this round's real evidence supports. The next step
+  is an independent FINAL P0 CLOSURE REVIEW — P0 may only become CLOSED after that review explicitly returns
+  INDEPENDENT_REVIEW_RESULT: CLEAN against this round's commit; until then, retain the exact_next_action guidance
+  above (resume wiring the remaining foundation modules, SQLite-backed StateStore, Founder decision on
+  P0-sufficiency/licensing) as what follows a clean review. Per explicit instruction, this round did not merge, did
+  not move to P1, did not declare P0 CLOSED, did not invoke Codex itself, and did not create a new branch — all
+  work stayed on claude/ai-factory-baseline-v1-seawq7.

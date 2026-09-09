@@ -110,6 +110,26 @@ export class ScopeLock {
     return this.#phases.get(phaseId)?.state ?? "OPEN";
   }
 
+  /**
+   * P1 fix (37th independent review round, finding 4, "make phase closure
+   * and manifest persistence atomic"): a read-only check for whether
+   * `decisionId` is already a known decision in this ScopeLock's backing
+   * Decision Ledger — the ONE realistic way `lock()`/`close()` below can
+   * still throw (`DuplicateDecisionError`) once a caller has already
+   * independently re-verified every OTHER precondition those methods check
+   * (`currentState`/`guardReport`) moments before calling them. A caller
+   * that must durably persist OTHER evidence (bkz. `phase-closure.ts`'in
+   * `attemptPhaseClosure()`'ı, which persists a closure manifest) BEFORE
+   * calling `close()` needs to PROVE `close()` cannot fail first — otherwise
+   * that evidence could durably claim an outcome (`CLOSED`) the actual state
+   * transition then fails to achieve. This is read-only: it never consumes
+   * or reserves `decisionId`, it only reports whether calling `record()`
+   * with it right now would throw.
+   */
+  hasDecision(decisionId: string): boolean {
+    return this.#ledger.get(decisionId) !== undefined;
+  }
+
   get(phaseId: string): PhaseLockRecord | undefined {
     const record = this.#phases.get(phaseId);
     return record ? freezeRecord(record) : undefined;
@@ -204,6 +224,29 @@ export class ScopeLock {
     store.write(path, [...this.#phases.values()]);
   }
 
+  // P1 fix (37th independent review round, finding 11, "live uniqueness
+  // invariant not enforced during restore"): this loop used to call
+  // `lock.#phases.set(candidate.phaseId, ...)` unconditionally for every
+  // persisted record — `Map.set()` on an ALREADY-present key silently
+  // OVERWRITES the earlier entry with no error, no warning, and no trace
+  // of the discarded one. A persisted phase-lock file containing two
+  // records for the SAME `phaseId` (corruption, a concurrent-write race
+  // on the underlying `StateStore`, or a hand-edited file) would silently
+  // restore only the LAST one, discarding the phase's genuine transition
+  // history (e.g. an earlier LOCKED_FOR_CLOSURE record) with no evidence
+  // it ever existed — corrupting exactly the authoritative governance
+  // state (baseline section 147/303: "no silent architectural deletion")
+  // this class exists to protect. The class's OWN live mutators
+  // (`lock()`/`close()`/`reopen()`) never need this check because they all
+  // route through `getState()`'s transition-validity gate first — restore
+  // is the ONE path that bypasses that gate entirely (it re-establishes
+  // state directly), so it needs its OWN, explicit uniqueness check. Fixed
+  // by failing the ENTIRE restore closed (never repairing/dropping/merging
+  // one of the two records) via the SAME `CorruptPersistedPhaseLockError`
+  // already used for every other structural-corruption case in this
+  // function, exactly matching `FounderDecisionLedger.loadFrom()`'s own
+  // "reject wholesale, don't silently accept corrupt persisted state"
+  // precedent this file's other error classes already cite.
   static loadFrom(store: StateStore, path: string, ledger: FounderDecisionLedger): ScopeLock {
     const lock = new ScopeLock(ledger);
     const records = store.read<unknown[]>(path) ?? [];
@@ -213,6 +256,9 @@ export class ScopeLock {
         throw new CorruptPersistedPhaseLockError(index, failure);
       }
       const candidate = record as MutablePhaseLockRecord;
+      if (lock.#phases.has(candidate.phaseId)) {
+        throw new CorruptPersistedPhaseLockError(index, `duplicate phaseId '${candidate.phaseId}'`);
+      }
       lock.#phases.set(candidate.phaseId, { ...candidate });
     });
     return lock;
@@ -355,6 +401,22 @@ export class BacklogRouter {
     store.write(path, [...this.#routed.values()]);
   }
 
+  // P2 fix (37th independent review round, finding 12, "live uniqueness
+  // invariant not enforced during restore" — same root class as
+  // `ScopeLock.loadFrom()`'s own fix above): `route()`'s live path already
+  // rejects a duplicate `itemId` outright (`DuplicateBacklogItemError`,
+  // bkz. yukarısı) — "each item may only be routed once" is this class's
+  // OWN documented invariant. This restore loop used to enforce that
+  // invariant NOWHERE: `router.#routed.set(candidate.itemId, ...)` ran
+  // unconditionally, so two persisted records sharing an `itemId` would
+  // silently collapse into whichever one happened to be read LAST,
+  // discarding the other's routing decision/evidence with no error —
+  // restore accepting corrupt persisted state the class's own live
+  // mutator would have refused outright. Fixed by checking for the SAME
+  // duplicate BEFORE inserting, exactly mirroring `route()`'s own live
+  // check, and failing the whole restore closed via
+  // `CorruptPersistedBacklogRecordError` (this function's own established
+  // fail-closed error) rather than silently accepting the corruption.
   static loadFrom(store: StateStore, path: string, scopeLock: ScopeLock, ledger: FounderDecisionLedger): BacklogRouter {
     const router = new BacklogRouter(scopeLock, ledger);
     const records = store.read<unknown[]>(path) ?? [];
@@ -364,6 +426,9 @@ export class BacklogRouter {
         throw new CorruptPersistedBacklogRecordError(index, failure);
       }
       const candidate = record as MutableBacklogRouteRecord;
+      if (router.#routed.has(candidate.itemId)) {
+        throw new CorruptPersistedBacklogRecordError(index, `duplicate itemId '${candidate.itemId}'`);
+      }
       router.#routed.set(candidate.itemId, { ...candidate });
     });
     return router;

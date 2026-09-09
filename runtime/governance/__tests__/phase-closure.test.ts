@@ -352,4 +352,66 @@ describe("attemptPhaseClosure", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (37th independent review round, finding 4, 'make phase closure and manifest persistence " +
+      "atomic'): a durable manifest must never claim CLOSED for a closure that scopeLock.close() itself " +
+      "would then refuse — a colliding decisionId is now a REJECTED precondition, never a post-persist surprise",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: attempting closure with a decisionId that ALREADY names an " +
+          "existing Decision Ledger entry (the one precondition ScopeLock.close() itself still checks) is " +
+          "REJECTED up front — the phase never closes and no manifest is ever left durably claiming CLOSED",
+        () => {
+          const deps = makeDeps();
+          const evidenceFile = join(deps.tempRoot, "proof.log");
+          writeFileSync(evidenceFile, "verification output");
+          // "d1" is already a real decision (the lock() call itself).
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          // Attempting closure while REUSING "d1" as the closure's own
+          // decisionId — before this fix, `deps.store.write()` (manifest,
+          // outcome: CLOSED) would have run FIRST, and only THEN would
+          // `scopeLock.close(..., "d1")` throw `DuplicateDecisionError` —
+          // leaving a durable manifest that WRONGLY claims CLOSED for a
+          // phase that never actually closed.
+          const manifest = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+            "manifest-reused-decision",
+            "d1",
+            deps
+          );
+
+          expect(manifest.outcome).toBe("REJECTED");
+          expect(manifest.rejectionReasons.some((r) => r.includes("already names an existing Decision Ledger entry"))).toBe(
+            true
+          );
+          expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+          expect(deps.ledger.allFor("P0")).toHaveLength(1); // only the original lock() decision — no false close()
+
+          // The durable manifest genuinely reflects REJECTED, on disk —
+          // never a stale/incorrect CLOSED claim.
+          const stored = readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-reused-decision");
+          expect(stored?.outcome).toBe("REJECTED");
+        }
+      );
+
+      it("no regression: a genuinely fresh, never-before-used decisionId still closes normally", () => {
+        const deps = makeDeps();
+        const evidenceFile = join(deps.tempRoot, "proof.log");
+        writeFileSync(evidenceFile, "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+        const manifest = attemptPhaseClosure(
+          baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+          "manifest-fresh-decision",
+          "d-fresh",
+          deps
+        );
+
+        expect(manifest.outcome).toBe("CLOSED");
+        expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+      });
+    }
+  );
 });

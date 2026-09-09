@@ -41,13 +41,40 @@ export function freezeRecords<T extends object>(values: readonly T[]): readonly 
  * gibi bir mutasyon hâlâ mümkün kalır. `deepFreeze`, bir nesne grafiğinin
  * HER seviyesini (nesneler ve diziler dahil) özyinelemeli olarak dondurur.
  */
-export function deepFreeze<T>(value: T): T {
-  if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
+/**
+ * P1 fix (37th independent review round, finding 3, "deep-freeze nested
+ * provider state under a frozen root"): this used to early-return whenever
+ * `Object.isFrozen(value)` was already true for the CURRENT node — treating
+ * "the root is frozen" as proof "everything reachable from it is already
+ * frozen too." That is false for a caller who did `Object.freeze({nested:
+ * {endpoint: "A"}})` themselves before handing the object to this function:
+ * `Object.freeze()` is SHALLOW (bkz. `freezeRecord()`'ın üstündeki not, aynı
+ * dosyada) — the top-level object is frozen, but `.nested` is a genuinely
+ * SEPARATE object that was never itself frozen, so `deepFreeze()` would see
+ * `Object.isFrozen(root) === true`, return immediately, and never even look
+ * at `.nested` — leaving it silently mutable forever, defeating the entire
+ * point of calling `deepFreeze()` in the first place. Fixed by dropping
+ * `Object.isFrozen()` as the "already handled" signal entirely and tracking
+ * VISITED nodes instead, via a `WeakSet` threaded through the recursion —
+ * this still terminates safely on a genuine reference cycle (a node already
+ * seen in THIS traversal is skipped, exactly as `Object.isFrozen()` used to
+ * prevent infinite recursion for), but no longer treats an already-frozen
+ * node as evidence that its OWN children were ever visited. `Object.freeze()`
+ * on an already-frozen object is a no-op per spec (never throws), so
+ * re-freezing a node this function reaches a second time (from a different,
+ * unrelated top-level call) costs nothing beyond the traversal itself.
+ */
+export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
+  if (value === null || typeof value !== "object") {
     return value;
   }
+  if (seen.has(value)) {
+    return value;
+  }
+  seen.add(value);
   Object.freeze(value);
   for (const key of Object.getOwnPropertyNames(value)) {
-    deepFreeze((value as Record<string, unknown>)[key]);
+    deepFreeze((value as Record<string, unknown>)[key], seen);
   }
   return value;
 }

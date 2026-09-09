@@ -5,6 +5,7 @@ import {
   DuplicateProviderIdError,
   ProviderInvocationError,
   UnsafeProviderConfigurationError,
+  UnsupportedProviderConfigurationError,
   computeModelInvocationIdentityDigest,
   computeProviderReplacementIdentityDigest,
   type ModelInvocationResponse
@@ -1669,6 +1670,290 @@ describe("ModelGateway + MockProvider", () => {
           expect(readCount).toBeGreaterThan(0);
         }
       );
+    }
+  );
+
+  describe(
+    "P1 fix (37th independent review round, finding 1, 'bind provider approval to the genuinely installed " +
+      "snapshot'): a stateful/Proxy-backed provider getter must not answer differently between the moment " +
+      "replaceProvider() computes its approval digest and the moment it actually installs the binding",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: an approval matching the candidate's FIRST accessor read " +
+          "must install THAT exact configuration — a second, independent read of the same stateful getter " +
+          "(the shape this finding closes) must never be what ends up installed",
+        async () => {
+          class StatefulConfigProvider implements ModelProvider {
+            readonly id = "mock";
+            #reads = 0;
+            constructor() {
+              // An OWN (instance-level) accessor — bkz. `detachFromCallerMutation()`'ın
+              // yalnızca instance'ın KENDİ (Reflect.ownKeys) özelliklerini işlediğine
+              // dair notu; a class-body `get endpoint()` would live on the
+              // prototype instead and never be reached by this code path.
+              Object.defineProperty(this, "endpoint", {
+                get: () => {
+                  this.#reads++;
+                  return this.#reads === 1 ? "https://good.example.com" : "https://evil.example.com";
+                },
+                configurable: true,
+                enumerable: true
+              });
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return {
+                modelId: "m",
+                provider: "mock",
+                costUsd: 0,
+                output: `endpoint:${(this as unknown as { endpoint: string }).endpoint}`
+              };
+            }
+          }
+
+          const auditLog = new AuditLog();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals, auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          // A SEPARATE instance, used ONLY to compute the digest an approver
+          // would have seen — its OWN counter starts fresh, so ITS first
+          // read ALSO produces "good", exactly matching what the REAL
+          // candidate's own first (and, post-fix, ONLY) read will produce.
+          const approverView = new StatefulConfigProvider();
+          const description = "Replace provider adapter 'mock'";
+          approvals.requestFor("appr-1", {
+            actionType: "model.provider.replace",
+            description,
+            risk: 0,
+            identityDigest: computeProviderReplacementIdentityDigest(approverView, "mock")
+          });
+          approvals.approve("appr-1", "founder@example.com");
+
+          // The REAL candidate — a fresh instance whose own counter has
+          // never been read yet.
+          const candidate = new StatefulConfigProvider();
+          await expect(
+            gateway.replaceProvider(candidate, {
+              policy: permissivePolicy(),
+              risk: 0,
+              description,
+              approvalId: "appr-1"
+            })
+          ).resolves.not.toThrow();
+
+          const model = mockModel({ provider: "mock" });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          // The installed binding must reflect the SAME snapshot the
+          // approval was granted for ("good") — never a second, later,
+          // independent read of the same stateful getter ("evil").
+          expect(response.output).toBe("endpoint:https://good.example.com");
+        }
+      );
+
+      it("no regression: an ordinary, non-stateful accessor-backed provider still replaces and installs exactly as before", async () => {
+        class StableAccessorProvider implements ModelProvider {
+          readonly id = "mock";
+          constructor() {
+            Object.defineProperty(this, "endpoint", {
+              get: () => "https://stable.example.com",
+              configurable: true,
+              enumerable: true
+            });
+          }
+          async invoke(): Promise<ModelInvocationResponse> {
+            return {
+              modelId: "m",
+              provider: "mock",
+              costUsd: 0,
+              output: `endpoint:${(this as unknown as { endpoint: string }).endpoint}`
+            };
+          }
+        }
+        const auditLog = new AuditLog();
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals, auditLog);
+        gateway.registerProvider(new MockProvider());
+
+        const candidate = new StableAccessorProvider();
+        const description = "Replace provider adapter 'mock'";
+        approvals.requestFor("appr-1", {
+          actionType: "model.provider.replace",
+          description,
+          risk: 0,
+          identityDigest: computeProviderReplacementIdentityDigest(candidate, "mock")
+        });
+        approvals.approve("appr-1", "founder@example.com");
+
+        await expect(
+          gateway.replaceProvider(candidate, { policy: permissivePolicy(), risk: 0, description, approvalId: "appr-1" })
+        ).resolves.not.toThrow();
+
+        const model = mockModel({ provider: "mock" });
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("endpoint:https://stable.example.com");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (37th independent review round, finding 2, 'reject lossy provider configuration fingerprints'): " +
+      "a provider configuration that cannot be canonically serialized (a circular reference) must fail closed, " +
+      "never fall back to a lossy placeholder like '[object Object]' under which different configurations " +
+      "could collide",
+    () => {
+      class CyclicConfigProvider implements ModelProvider {
+        readonly id = "mock";
+        config: Record<string, unknown> = {};
+        constructor(seed: string) {
+          this.config.seed = seed;
+          this.config.self = this.config;
+        }
+        async invoke(): Promise<ModelInvocationResponse> {
+          return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: computing a replacement identity digest for a provider with " +
+          "a circular configuration object fails closed instead of silently succeeding with a lossy fingerprint",
+        () => {
+          const candidate = new CyclicConfigProvider("good");
+          expect(() => computeProviderReplacementIdentityDigest(candidate, "mock")).toThrow(
+            UnsupportedProviderConfigurationError
+          );
+        }
+      );
+
+      it(
+        "root-cause proof: two MATERIALLY DIFFERENT cyclic configurations would have collapsed onto the exact " +
+          "same lossy '[object Object]' fingerprint under the old fallback — both must now fail closed instead " +
+          "of silently sharing a digest",
+        () => {
+          const good = new CyclicConfigProvider("good");
+          const evil = new CyclicConfigProvider("evil");
+          expect(() => computeProviderReplacementIdentityDigest(good, "mock")).toThrow(
+            UnsupportedProviderConfigurationError
+          );
+          expect(() => computeProviderReplacementIdentityDigest(evil, "mock")).toThrow(
+            UnsupportedProviderConfigurationError
+          );
+        }
+      );
+
+      it("no regression: an ordinary provider with a plain, non-circular configuration object still computes a stable fingerprint", () => {
+        class PlainConfigProvider implements ModelProvider {
+          readonly id = "mock";
+          config = { endpoint: "https://good.example.com" };
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const provider = new PlainConfigProvider();
+        expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).not.toThrow();
+        expect(computeProviderReplacementIdentityDigest(provider, "mock")).toBe(
+          computeProviderReplacementIdentityDigest(provider, "mock")
+        );
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (37th independent review round, finding 3, 'deep-freeze nested provider state under a frozen " +
+      "root'): a caller who already did a SHALLOW Object.freeze() on a config value themselves must not be " +
+      "able to keep mutating a NESTED object one level down",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: register a provider whose config object was already " +
+          "Object.freeze()'d by the caller (top-level only) -> the caller mutates the still-live nested " +
+          "object reference -> the gateway must still observe the ORIGINAL nested value, never the mutation",
+        async () => {
+          class PreFrozenConfigProvider implements ModelProvider {
+            readonly id = "preFrozenConfig";
+            readonly config: { readonly nested: { endpoint: string } };
+            constructor() {
+              // A caller who ALREADY calls Object.freeze() themselves,
+              // believing this makes `config` (and everything under it)
+              // immutable — Object.freeze() is shallow, so `.nested` is a
+              // genuinely separate, still-mutable object.
+              this.config = Object.freeze({ nested: { endpoint: "https://good.example.com" } });
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return {
+                modelId: "m",
+                provider: "preFrozenConfig",
+                costUsd: 0,
+                output: `endpoint:${this.config.nested.endpoint}`
+              };
+            }
+          }
+
+          const gateway = new ModelGateway();
+          const provider = new PreFrozenConfigProvider();
+          gateway.registerProvider(provider);
+
+          // The top-level `config` was already frozen by the CALLER before
+          // registration — confirm that really is the case (this test would
+          // be meaningless otherwise).
+          expect(Object.isFrozen(provider.config)).toBe(true);
+
+          // The nested object must now ALSO be locked by registration —
+          // mutating it must fail closed (TypeError), never succeed.
+          expect(() => {
+            (provider.config.nested as { endpoint: string }).endpoint = "https://evil.example.com";
+          }).toThrow(TypeError);
+          expect(provider.config.nested.endpoint).toBe("https://good.example.com");
+
+          const model = mockModel({ provider: "preFrozenConfig" });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toBe("endpoint:https://good.example.com");
+        }
+      );
+
+      it("no regression: an ordinary provider with an UNFROZEN plain config object still gets its nested state frozen exactly as before", async () => {
+        class OrdinaryNestedConfigProvider implements ModelProvider {
+          readonly id = "ordinaryNestedConfig";
+          config = { nested: { endpoint: "https://good.example.com" } };
+          async invoke(): Promise<ModelInvocationResponse> {
+            return {
+              modelId: "m",
+              provider: "ordinaryNestedConfig",
+              costUsd: 0,
+              output: `endpoint:${this.config.nested.endpoint}`
+            };
+          }
+        }
+        const gateway = new ModelGateway();
+        const provider = new OrdinaryNestedConfigProvider();
+        gateway.registerProvider(provider);
+
+        expect(() => {
+          (provider.config.nested as { endpoint: string }).endpoint = "https://evil.example.com";
+        }).toThrow(TypeError);
+
+        const model = mockModel({ provider: "ordinaryNestedConfig" });
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("endpoint:https://good.example.com");
+      });
     }
   );
 

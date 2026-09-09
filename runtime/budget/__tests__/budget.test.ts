@@ -442,6 +442,85 @@ describe("BudgetGuard", () => {
     });
   });
 
+  describe(
+    "P2 fix (37th independent review round, finding 8, 'authoritative identity lost on the successful " +
+      "evidence path'): a successful BUDGET_RESERVATION_COMMITTED event's confirmedScope must include " +
+      "runId, matching the reservation event and both failure events, which already carry it",
+    () => {
+      it("BLOCKER regression, exact reproduction: a successful commit()'s audit event carries runId in confirmedScope", () => {
+        const costEngine = new CostEngine();
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 5 }, () => new Date(), auditLog);
+
+        const reservation = guard.reserve({ taskId: "t1", runId: "run-committed-scope", provider: "mock", modelId: "m1" }, 0.6);
+        guard.commit(reservation.id, {
+          taskId: "t1",
+          runId: "run-committed-scope",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.6
+        });
+
+        const committed = auditLog.all().find((r) => r.type === "BUDGET_RESERVATION_COMMITTED")!;
+        expect(committed).toBeDefined();
+        expect((committed.payload as { confirmedScope: { runId?: string } }).confirmedScope.runId).toBe(
+          "run-committed-scope"
+        );
+      });
+
+      it("no-regression: confirmedScope still omits runId (undefined) when the caller never supplied one, mirroring the reservation/failure events' own behavior", () => {
+        const costEngine = new CostEngine();
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 5 }, () => new Date(), auditLog);
+
+        const reservation = guard.reserve({ taskId: "t1", provider: "mock", modelId: "m1" }, 0.6);
+        guard.commit(reservation.id, { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+
+        const committed = auditLog.all().find((r) => r.type === "BUDGET_RESERVATION_COMMITTED")!;
+        expect((committed.payload as { confirmedScope: { runId?: string } }).confirmedScope.runId).toBeUndefined();
+      });
+
+      it("no-regression: the OTHER confirmedScope fields (taskId/projectId/agentId/provider/modelId) and the failure-path events are unaffected", () => {
+        const costEngine = new CostEngine();
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 5 }, () => new Date(), auditLog);
+
+        const reservation = guard.reserve(
+          {
+            taskId: "t1",
+            projectId: "proj-1",
+            agentId: "agent-1",
+            runId: "run-x",
+            provider: "mock",
+            modelId: "m1"
+          },
+          0.6
+        );
+        guard.commit(reservation.id, {
+          taskId: "t1",
+          projectId: "proj-1",
+          agentId: "agent-1",
+          runId: "run-x",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.6
+        });
+
+        const committed = auditLog.all().find((r) => r.type === "BUDGET_RESERVATION_COMMITTED")!;
+        expect(committed.payload).toMatchObject({
+          confirmedScope: {
+            taskId: "t1",
+            projectId: "proj-1",
+            agentId: "agent-1",
+            runId: "run-x",
+            provider: "mock",
+            modelId: "m1"
+          }
+        });
+      });
+    }
+  );
+
   describe("P1 fix: limits ownership (caller-owned config object cannot mutate authoritative ceilings)", () => {
     it("mutating the ORIGINAL limits object after construction does not change internal ceilings", () => {
       const costEngine = new CostEngine();

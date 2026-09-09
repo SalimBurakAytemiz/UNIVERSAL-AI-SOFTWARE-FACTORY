@@ -9,6 +9,7 @@ import {
   GovernanceInvariantViolationError,
   DuplicateBacklogItemError,
   CorruptPersistedPhaseLockError,
+  CorruptPersistedBacklogRecordError,
   type BacklogItem
 } from "../scope-lock.js";
 import { FounderDecisionLedger, DuplicateDecisionError } from "../../decisions/decision-ledger.js";
@@ -169,6 +170,38 @@ describe("ScopeLock: persistence", () => {
     const ledger = new FounderDecisionLedger();
     expect(() => ScopeLock.loadFrom(store, path, ledger)).toThrow(CorruptPersistedPhaseLockError);
   });
+
+  it(
+    "P1 fix (37th independent review round, finding 11, 'live uniqueness invariant not enforced during " +
+      "restore'): BLOCKER regression, exact reproduction — two persisted records sharing the SAME phaseId " +
+      "fail the ENTIRE restore closed instead of the later one silently overwriting the earlier one",
+    () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-dup-phase-"));
+      const store = new FileStateStore();
+      const path = join(tempRoot, "scope-lock.json");
+      store.write(path, [
+        { phaseId: "P0", state: "LOCKED_FOR_CLOSURE", reason: "first record", updatedAt: new Date().toISOString() },
+        { phaseId: "P0", state: "OPEN", reason: "second, duplicate-phaseId record", updatedAt: new Date().toISOString() }
+      ]);
+      const ledger = new FounderDecisionLedger();
+      expect(() => ScopeLock.loadFrom(store, path, ledger)).toThrow(CorruptPersistedPhaseLockError);
+    }
+  );
+
+  it("no-regression: two persisted records for DIFFERENT phaseIds both restore correctly", () => {
+    tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-two-phases-"));
+    const store = new FileStateStore();
+    const path = join(tempRoot, "scope-lock.json");
+    const ledger = new FounderDecisionLedger();
+    const lock = new ScopeLock(ledger);
+    lock.lock("P0", "ready", CLEAN_REPORT, "d1");
+    lock.lock("P1", "also ready", CLEAN_REPORT, "d2");
+    lock.saveTo(store, path);
+
+    const restored = ScopeLock.loadFrom(store, path, ledger);
+    expect(restored.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+    expect(restored.getState("P1")).toBe("LOCKED_FOR_CLOSURE");
+  });
 });
 
 describe("BacklogRouter", () => {
@@ -245,4 +278,80 @@ describe("BacklogRouter", () => {
       expect(router.list()).toHaveLength(0);
     }
   );
+});
+
+describe("BacklogRouter: persistence", () => {
+  let tempRoot: string;
+  afterEach(() => {
+    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  function makeItem(overrides: Partial<BacklogItem> = {}): BacklogItem {
+    return { itemId: "item-1", phaseId: "P0", description: "a new ask", category: "FEATURE", ...overrides };
+  }
+
+  it("round-trips state through saveTo/loadFrom", () => {
+    tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-"));
+    const store = new FileStateStore();
+    const path = join(tempRoot, "backlog.json");
+    const ledger = new FounderDecisionLedger();
+    const lock = new ScopeLock(ledger);
+    lock.lock("P0", "ready", CLEAN_REPORT, "d1");
+    const router = new BacklogRouter(lock, ledger);
+    router.route(makeItem(), "d2");
+    router.saveTo(store, path);
+
+    const restored = BacklogRouter.loadFrom(store, path, lock, ledger);
+    expect(restored.get("item-1")?.decision).toBe("ROUTE_TO_BACKLOG");
+  });
+
+  it(
+    "P2 fix (37th independent review round, finding 12, 'live uniqueness invariant not enforced during " +
+      "restore', same root class as ScopeLock.loadFrom()'s own fix): BLOCKER regression, exact reproduction " +
+      "— two persisted records sharing the SAME itemId fail the ENTIRE restore closed instead of the later " +
+      "one silently overwriting the earlier one (route()'s own live check already refuses this exact case)",
+    () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-dup-item-"));
+      const store = new FileStateStore();
+      const path = join(tempRoot, "backlog.json");
+      store.write(path, [
+        {
+          itemId: "item-1",
+          phaseId: "P0",
+          description: "first record",
+          category: "FEATURE",
+          decision: "ROUTE_TO_BACKLOG",
+          routedAt: new Date().toISOString()
+        },
+        {
+          itemId: "item-1",
+          phaseId: "P1",
+          description: "second, duplicate-itemId record",
+          category: "FIX",
+          decision: "ACCEPT_INTO_PHASE",
+          routedAt: new Date().toISOString()
+        }
+      ]);
+      const ledger = new FounderDecisionLedger();
+      const lock = new ScopeLock(ledger);
+      expect(() => BacklogRouter.loadFrom(store, path, lock, ledger)).toThrow(CorruptPersistedBacklogRecordError);
+    }
+  );
+
+  it("no-regression: two persisted records for DIFFERENT itemIds both restore correctly", () => {
+    tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-two-items-"));
+    const store = new FileStateStore();
+    const path = join(tempRoot, "backlog.json");
+    const ledger = new FounderDecisionLedger();
+    const lock = new ScopeLock(ledger);
+    lock.lock("P0", "ready", CLEAN_REPORT, "d1");
+    const router = new BacklogRouter(lock, ledger);
+    router.route(makeItem(), "d2");
+    router.route(makeItem({ itemId: "item-2", phaseId: "P1" }));
+    router.saveTo(store, path);
+
+    const restored = BacklogRouter.loadFrom(store, path, lock, ledger);
+    expect(restored.get("item-1")?.decision).toBe("ROUTE_TO_BACKLOG");
+    expect(restored.get("item-2")?.decision).toBe("ACCEPT_INTO_PHASE");
+  });
 });

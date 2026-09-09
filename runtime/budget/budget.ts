@@ -851,10 +851,26 @@ export class BudgetGuard {
       actor: "budget-guard",
       payload: {
         reservationId,
+        // P2 fix (37th independent review round, finding 8, "authoritative
+        // identity lost on the successful evidence path"): `runId` was
+        // present on the RESERVATION event (`BUDGET_RESERVATION_CREATED`)
+        // and on BOTH failure events above
+        // (`BUDGET_RESERVATION_OWNERSHIP_MISMATCH`'s `suppliedRunId`,
+        // `BUDGET_RESERVATION_COMMIT_FAILED`'s `confirmedScope.runId`) —
+        // but was silently dropped from exactly this one, SUCCESSFUL
+        // commit event's `confirmedScope`. A reviewer auditing a
+        // successful spend (the common case, and the one this event type
+        // exists to evidence) could not reconstruct which RUN it belonged
+        // to from this event alone, unlike every sibling event recording
+        // the identical scope. Fixed by including `runId` here too, for
+        // parity with the reservation/failure events and with
+        // `buildCeilingChecks()` two lines above, which already reads
+        // `snapshot.runId` for this exact commit.
         confirmedScope: {
           taskId: snapshot.taskId,
           projectId: snapshot.projectId,
           agentId: snapshot.agentId,
+          runId: snapshot.runId,
           provider: snapshot.provider,
           modelId: snapshot.modelId
         },

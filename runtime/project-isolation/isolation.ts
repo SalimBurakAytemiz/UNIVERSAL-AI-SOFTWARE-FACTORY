@@ -103,13 +103,34 @@ export class ProjectIsolationStore<T> {
         bucket.set(key, deepFreezeClone(value));
         data.set(trustedProjectId, bucket);
       },
-      // `get()` returns the SAME already-deep-frozen, already-detached
-      // value `set()` stored — no further cloning is needed on read, since
-      // that value can never be mutated (attempting to throws `TypeError`)
-      // and was never shared with any other project's bucket in the first
-      // place.
+      // P2 fix (37th independent review round, finding 9, "mutable
+      // collections escaping the trust boundary"): the comment this
+      // replaced claimed the stored value "can never be mutated (attempting
+      // to throws TypeError)" on the strength of `deepFreeze()` alone — true
+      // for a plain object/array, but FALSE for a `Map`/`Set` (or any value
+      // containing one at any depth): `Object.freeze()` only blocks adding/
+      // removing/reassigning the object's OWN PROPERTIES, but `Map`/`Set`
+      // store their entries in an internal slot, not as ordinary properties
+      // — `.set()`/`.add()`/`.delete()` mutate that slot directly and are
+      // completely unaffected by the object being frozen (bkz. `deepFreeze()`'ın
+      // üstündeki fix notu, aynı sınıf). `get()` used to return the EXACT
+      // SAME reference `set()` stored in this project's own bucket — a
+      // caller holding a `Map`/`Set`-typed `T` could call `view.get(key).set(...)`/
+      // `.add(...)` and silently mutate THIS project's own authoritative
+      // bucket entry in place, corrupting every future `get()` for that key
+      // with no error, no detection, and no distinguishable "this store is
+      // supposed to be immutable" signal. Fixed by returning a FRESH
+      // `deepFreezeClone()` of the retrieved value on every `get()` call —
+      // completely detached from the stored bucket entry via its own
+      // independent `structuredClone()` (which itself supports Map/Set,
+      // preserving their entries) — so mutating whatever `get()` returns can
+      // never reach back into this store's own authoritative state, exactly
+      // mirroring the SAME detachment guarantee `set()` already provides on
+      // the write side (bkz. yukarıdaki fix notu, 26. bağımsız inceleme
+      // turu, bulgu 5).
       get(key: string): T | undefined {
-        return data.get(trustedProjectId)?.get(key);
+        const value = data.get(trustedProjectId)?.get(key);
+        return value === undefined ? undefined : deepFreezeClone(value);
       },
       keys(): readonly string[] {
         return [...(data.get(trustedProjectId)?.keys() ?? [])];

@@ -684,12 +684,48 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
 
   mkdirSync(dirname(lockDirPath), { recursive: true });
 
+  // P2 fix (37th independent review round, finding 10, "timeout deadline
+  // checked only on the failure path"): `firstAttempt` preserves the
+  // documented "timeoutMs: 0 means try once, never wait" contract (bkz.
+  // aşağıdaki notun devamı) — the very first `mkdirSync` attempt always
+  // runs regardless of the deadline, since `deadline = Date.now() + 0`
+  // would otherwise already be (or be about to become) satisfied by the
+  // time it's checked, purely from the microseconds of code executed
+  // between computing `deadline` and reaching this check. Every SUBSEQUENT
+  // attempt, however, only ever happens after this waiter has already gone
+  // through at least one non-reclaimed EEXIST + deadline-check + sleep
+  // cycle below — exactly the retry this finding is about.
+  let firstAttempt = true;
+
   for (;;) {
     try {
       // Atomik: hedef zaten varsa bu satır EEXIST ile başarısız olur —
       // "var mı diye kontrol et, sonra oluştur" arasında ASLA bir pencere
       // yoktur, çünkü ikisi tek bir syscall'dır.
       mkdirSync(lockDirPath);
+      // P2 fix (37th independent review round, finding 10): the deadline
+      // used to be rechecked ONLY on the EEXIST/failure branch below —
+      // never here, on the SUCCESS branch. Codex's reproduction: a waiter
+      // whose `pollIntervalMs`-long sleep (below) already carried it PAST
+      // its own `deadline` would still reach this `mkdirSync()` call on the
+      // next loop iteration; if the previous owner happened to release the
+      // lock during that exact sleep window, this call would succeed and
+      // the function would return a GENUINE lock to a caller whose timeout
+      // had already, provably, elapsed — silently violating the caller's
+      // own timeout budget. Fixed: a retry (never the very first attempt —
+      // bkz. `firstAttempt` yukarıdaki fix notu) that only succeeds AFTER
+      // the deadline has already passed is not treated as a valid
+      // acquisition. Since `mkdirSync()` just succeeded, WE unambiguously
+      // own this lock right now (no other process could have raced in
+      // between) — so cleanup here is a direct, unconditional `rmSync`
+      // (no token/ownership check needed or possible, since metadata
+      // hasn't even been written yet), never `releaseFileLock()`'s
+      // ownership-verified path, which exists for a DIFFERENT threat model
+      // (another process may already believe it owns this same path).
+      if (!firstAttempt && Date.now() >= deadline) {
+        rmSync(lockDirPath, { recursive: true, force: true });
+        throw new FileLockTimeoutError(lockDirPath, timeoutMs);
+      }
       try {
         const meta: LockMeta = { pid: process.pid, token, acquiredAt: Date.now() };
         writeFileSync(metaPath, JSON.stringify(meta), "utf8");
@@ -705,8 +741,10 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
         releaseFileLock(lockDirPath, metaPath, token);
       };
     } catch (err) {
+      if (err instanceof FileLockTimeoutError) throw err;
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
+    firstAttempt = false;
 
     // Buraya SADECE EEXIST üzerinden ulaşılır. Reclaim denemesinin SONUCU
     // ne olursa olsun (başarılı, başarısız, kapı kaybedildi, sahip hâlâ
@@ -715,7 +753,8 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
     // atlayamaz (bkz. yukarıdaki fonksiyon-seviyesi fix notu).
     const reclaimed = isLockStale(lockDirPath, metaPath, staleMs) ? tryReclaimStaleLock(lockDirPath, metaPath, staleMs) : false;
 
-    if (Date.now() >= deadline) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
       throw new FileLockTimeoutError(lockDirPath, timeoutMs);
     }
 
@@ -725,7 +764,17 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
       // ZAMAN uyu — asla sıkı (busy) döngüye girme. Reclaim GERÇEKTEN
       // başarılıysa (dizin kanıtlanmış şekilde boşaltıldıysa) uyku
       // atlanır — gecikmesiz yeniden deneme meşru bir ilerlemedir.
-      sleepSync(pollIntervalMs);
+      //
+      // P2 fix (37th independent review round, finding 10, "sleep duration
+      // must never exceed remaining timeout"): this used to be an
+      // unconditional `sleepSync(pollIntervalMs)` — when the remaining
+      // budget (`remainingMs`) is SHORTER than a full poll interval (a
+      // small `timeoutMs`, or several already-elapsed retries), sleeping
+      // the full interval overshoots the deadline before it is ever
+      // rechecked, needlessly widening the exact "stale timeout, lucky
+      // late acquisition" window this fix closes above. Capped to whichever
+      // is smaller — never sleeps past this waiter's own deadline.
+      sleepSync(Math.min(pollIntervalMs, remainingMs));
     }
   }
 }

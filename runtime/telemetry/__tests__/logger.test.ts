@@ -538,6 +538,91 @@ describe("Logger", () => {
   );
 
   describe(
+    "P1 fix (37th independent review round, finding 7, 'redact bare, unlabeled provider credential " +
+      "signatures'): a real provider credential recognizable by its OWN FORMAT ALONE, with no preceding " +
+      "label (no 'Authorization:', no 'key=', no URL userinfo), embedded anywhere in an ordinary string " +
+      "value, must still be redacted",
+    () => {
+      it("BLOCKER regression, exact reproduction: a bare OpenAI project-scoped key inside a plain error message", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        const fakeKey = "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // secret-scan:allow (fake fixture value)
+        logger.log({
+          eventType: "provider.error",
+          message: `provider call failed for key ${fakeKey}: rate limited`
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain(fakeKey);
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("provider call failed for key");
+        expect(line).toContain("rate limited");
+      });
+
+      it("root-cause proof: the SAME bare key is NOT redacted by any pre-existing pattern (no label, no assignment, no URL)", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        const fakeKey = "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // secret-scan:allow (fake fixture value)
+        // A minimal string containing ONLY the bare credential — isolates
+        // the new pattern specifically, with no assignment/label/header
+        // wording nearby that a pre-existing pattern could coincidentally match.
+        logger.log({ eventType: "debug", message: fakeKey } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain(fakeKey);
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it.each([
+        ["Anthropic key", "sk-ant-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"], // secret-scan:allow (fake fixture value)
+        ["GitHub classic PAT", "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123"], // secret-scan:allow (fake fixture value)
+        ["GitHub fine-grained PAT", "github_pat_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789"], // secret-scan:allow (fake fixture value)
+        ["Slack bot token", "xoxb-thisisnotarealtokenvalueusedonlyfortests"], // secret-scan:allow (fake fixture value)
+        ["AWS access key id", "AKIAABCDEFGHIJKLMNOP"] // secret-scan:allow (fake fixture value)
+      ])("redacts a bare %s embedded in an otherwise-innocuous field, with no label at all", (_name, fakeCredential) => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "debug",
+          details: `unexpected value observed: ${fakeCredential} during retry`
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain(fakeCredential);
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain("unexpected value observed");
+        expect(line).toContain("during retry");
+      });
+
+      it("no-regression: does not flag ordinary prose containing 'risk-'/'desk-'-style hyphenated words (same anchoring as secret-scan.mjs's own OpenAI pattern)", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "debug",
+          message: "the risk-5-never-weakens-an-explicit-DENY logic was exercised during this run"
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("[REDACTED]");
+        expect(line).toContain("risk-5-never-weakens-an-explicit-DENY");
+      });
+
+      it("no-regression: pre-existing labeled-credential redaction (Authorization header) still works unchanged alongside the new bare-credential pattern", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "http.request",
+          description: "curl -H 'Authorization: Bearer fake-embedded-token-should-not-appear' https://api.example.com" // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("fake-embedded-token-should-not-appear");
+        expect(line).toContain("[REDACTED]");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (32nd independent review round, finding 2, 'redact quoted secrets containing delimiters'): " +
       "a quoted secret assignment whose value legitimately contains a space/comma/semicolon must still be " +
       "fully redacted, not silently left unmatched",

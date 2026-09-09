@@ -189,6 +189,79 @@ describe("ProjectIsolationStore", () => {
   );
 
   describe(
+    "P2 fix (37th independent review round, finding 9, 'mutable collections escaping the trust boundary'): " +
+      "Object.freeze() does not block Map.set()/Set.add() — a Map/Set value returned by get() must not let a " +
+      "caller mutate this store's own authoritative bucket entry",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: mutating a Map returned by get() does not change what a " +
+          "subsequent get() call for the SAME key on the SAME project returns",
+        () => {
+          const store = new ProjectIsolationStore<Map<string, string>>();
+          store.viewFor("proj-a").set("k", new Map([["x", "original"]]));
+
+          const returned = store.viewFor("proj-a").get("k")!;
+          // Object.freeze() cannot block Map.set() — this line does NOT throw,
+          // it silently succeeds. Before the fix, this reached back into the
+          // store's own authoritative bucket entry because get() returned the
+          // exact same stored reference.
+          returned.set("x", "smuggled-mutation");
+          returned.set("y", "smuggled-new-entry");
+
+          const again = store.viewFor("proj-a").get("k")!;
+          expect(again.get("x")).toBe("original");
+          expect(again.has("y")).toBe(false);
+        }
+      );
+
+      it("mutating a Set returned by get() does not change what a subsequent get() call returns", () => {
+        const store = new ProjectIsolationStore<Set<string>>();
+        store.viewFor("proj-a").set("k", new Set(["only-original"]));
+
+        const returned = store.viewFor("proj-a").get("k")!;
+        returned.add("smuggled");
+        returned.delete("only-original");
+
+        const again = store.viewFor("proj-a").get("k")!;
+        expect(again.has("only-original")).toBe(true);
+        expect(again.has("smuggled")).toBe(false);
+      });
+
+      it("mutating a Map returned by get() for one project never leaks into another project's stored data", () => {
+        const store = new ProjectIsolationStore<Map<string, string>>();
+        store.viewFor("proj-a").set("k", new Map([["x", "a-value"]]));
+        store.viewFor("proj-b").set("k", new Map([["x", "b-value"]]));
+
+        const returnedA = store.viewFor("proj-a").get("k")!;
+        returnedA.set("x", "smuggled-from-a");
+
+        expect(store.viewFor("proj-a").get("k")!.get("x")).toBe("a-value");
+        expect(store.viewFor("proj-b").get("k")!.get("x")).toBe("b-value");
+      });
+
+      it("no-regression: two separate get() calls for a Map value return independently mutable-safe clones, not the same reference", () => {
+        const store = new ProjectIsolationStore<Map<string, string>>();
+        store.viewFor("proj-a").set("k", new Map([["x", "original"]]));
+
+        const first = store.viewFor("proj-a").get("k")!;
+        const second = store.viewFor("proj-a").get("k")!;
+        expect(first).not.toBe(second);
+        expect(first).toEqual(second);
+      });
+
+      it("no-regression: plain-object values are still deep-frozen (throw on mutation attempts) exactly as before", () => {
+        const store = new ProjectIsolationStore<{ items: string[] }>();
+        store.viewFor("proj-a").set("k", { items: ["only-for-a"] });
+
+        const returned = store.viewFor("proj-a").get("k")!;
+        expect(() => {
+          returned.items.push("smuggled");
+        }).toThrow(TypeError);
+      });
+    }
+  );
+
+  describe(
     "P1 targeted-audit fix (26th independent review round, same root class as finding 2, 'cost ledger state must " +
       "be runtime-private'): the internal data Map now uses a genuine ECMAScript #private field, not TypeScript's " +
       "compile-time-only `private`",

@@ -273,6 +273,32 @@ export function attemptPhaseClosure(
     );
   }
 
+  // P1 fix (37th independent review round, finding 4, "make phase closure
+  // and manifest persistence atomic"): `deps.scopeLock.close(...)` below is
+  // called AFTER the manifest has already been durably persisted with
+  // `outcome: "CLOSED"` (bkz. aşağısı, ve bu fonksiyonun kendi 36th round
+  // fix notu, "durable evidence FIRST") — meaning if `close()` itself then
+  // throws, the manifest would ALREADY, WRONGLY claim CLOSED for a phase
+  // that never actually closed. `close()`'s own preconditions
+  // (`currentState`/`guardReport`) are already re-verified with the SAME
+  // values just above/below, with no intervening yield point, so they
+  // cannot disagree by the time `close()` actually runs — but `close()`
+  // has ONE more failure mode neither of those checks covers:
+  // `this.#ledger.record(decisionId, ...)` throws `DuplicateDecisionError`
+  // if `decisionId` was already used for an earlier decision. Checked HERE,
+  // read-only, via `ScopeLock.hasDecision()` — BEFORE anything is persisted
+  // — so a colliding `decisionId` becomes an ordinary REJECTED outcome
+  // (like every other precondition above), never a durable "CLOSED" claim
+  // for a transition that then fails. With this precondition also proven,
+  // `close()` below is now guaranteed not to throw.
+  if (rejectionReasons.length === 0 && deps.scopeLock.hasDecision(decisionId)) {
+    rejectionReasons.push(
+      `decisionId '${decisionId}' already names an existing Decision Ledger entry — closure requires a fresh, ` +
+        `never-before-used decisionId (this is exactly the one precondition ScopeLock.close() itself would ` +
+        `otherwise fail on, after durable closure evidence had already been persisted)`
+    );
+  }
+
   // Whether this attempt WOULD close the phase, pending only the final
   // commit step below — no side effect has happened yet at this point.
   const willClose = rejectionReasons.length === 0;

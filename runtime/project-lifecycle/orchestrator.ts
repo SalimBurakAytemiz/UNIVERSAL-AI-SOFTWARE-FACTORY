@@ -502,12 +502,50 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // authoritative, restart-surviving ledger — exactly what
   // `dailyUsd`/`monthlyUsd`/`perRunUsd` ceilings need to mean anything
   // across more than a single process lifetime.
+  // P1 fix (37th independent review round, finding 5, "durably persist
+  // real spend even when the ESTIMATE was zero"): the check above used
+  // `modelDecision.model.costPerCall > 0` alone — the registry's STATIC
+  // per-call ESTIMATE, known before the model is ever actually invoked.
+  // Nothing stops a real `ModelProvider.invoke()` implementation from
+  // reporting an ACTUAL `costUsd` in its response that is POSITIVE even
+  // though its own registry entry advertises `costPerCall: 0` (a
+  // mis-configured/miscategorized registry entry, a provider whose true
+  // pricing the registry hasn't caught up with, or simply a provider
+  // adapter bug) — `budget.commit()` (bkz. `gateway.invoke()`'in kendi
+  // fix notu) records that ACTUAL amount into WHATEVER `costEngine`
+  // instance this call already selected, unconditionally. If that engine
+  // is the bare in-memory `new CostEngine()` this branch used to fall
+  // back to for every `costPerCall === 0` model — real, unrelated tier
+  // or not — the genuinely-incurred spend is recorded successfully in
+  // THIS process's memory, then vanishes the moment it exits: never
+  // durable, never enforced against `dailyUsd`/`monthlyUsd` on a
+  // subsequent run, exactly the "no silent spending" violation baseline
+  // section 147 forbids. Since the actual cost is not knowable before
+  // invocation, this decision can only be made SAFELY by construction —
+  // by narrowing "known to never cost anything" to the ONE combination
+  // this codebase's own test suite already establishes as a genuinely
+  // free, test-only path (bkz. the "$0 (mock/free) model keeps the exact
+  // prior in-memory-only default" regression in orchestrator.test.ts):
+  // tier `"MOCK"` (this codebase's OWN dedicated "not a real, billable
+  // provider" marker — bkz. `models/registry.ts`'in `ModelTier`'ının
+  // tanımı) AND an advertised `costPerCall` of EXACTLY zero. Any OTHER
+  // model — including a real/provider-capable tier advertised as
+  // currently free (`costPerCall: 0` but tier `STANDARD`/`VERY_LOW_COST`/
+  // etc.) — now gets the SAME durable-backed `CostEngine` a genuinely
+  // priced model already did, so a provider that ends up reporting a
+  // surprise positive actual cost still has that cost durably recorded.
+  // A `tier: "MOCK"` fixture with a NON-zero `costPerCall` (this
+  // codebase's own established pattern for exercising the durable path
+  // without a real registry entry — bkz. round 30's own regression
+  // fixtures) is UNAFFECTED: it was already durable before this fix (its
+  // estimate is not zero) and remains durable now.
   const stateStore = callerStateStore ?? new FileStateStore();
+  const isKnownFreeModel = modelDecision.model.tier === "MOCK" && modelDecision.model.costPerCall === 0;
   const costEngine =
     callerCostEngine ??
-    (modelDecision.model.costPerCall > 0
-      ? new CostEngine(() => new Date(), { store: stateStore, path: join(baseDir, "cost-ledger.json") })
-      : new CostEngine());
+    (isKnownFreeModel
+      ? new CostEngine()
+      : new CostEngine(() => new Date(), { store: stateStore, path: join(baseDir, "cost-ledger.json") }));
   const budget = new BudgetGuard(costEngine, budgetGuardLimits);
   const modelGateway = callerModelGateway ?? defaultBootstrapModelGateway();
 
