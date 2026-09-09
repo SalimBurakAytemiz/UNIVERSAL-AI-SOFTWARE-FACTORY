@@ -458,6 +458,37 @@ export class AssumptionRegister {
         `'${supersededBy}' is itself SUPERSEDED and cannot serve as an active replacement`
       );
     }
+    // P1 fix (33rd independent review round, finding 5 / root class D,
+    // "make live assumption supersession obey the persisted graph
+    // invariant"): unlike `decision-ledger.ts`'s own `supersede()` (which
+    // always CREATES its replacement fresh via `record()` — an existing id
+    // is structurally impossible to pass as the new one, since `record()`
+    // itself rejects duplicates), THIS class's `supersededBy` names an
+    // ALREADY-EXISTING assumption. Nothing above stopped a second, distinct
+    // predecessor from ALSO naming that same `supersededBy` as ITS
+    // replacement — e.g. `supersede("A", "C")` then `supersede("B", "C")`
+    // both succeeded live, leaving two records that each claim to have
+    // been replaced by "C". `describeInvalidPersistedAssumptionGraph()`
+    // (used by `loadFrom()`, bkz. üstündeki fix notu) has ALWAYS rejected
+    // exactly this shape as "merged supersession chains are not a valid
+    // lifecycle" — meaning the live API could reach a state that
+    // `saveTo()` would happily persist, but a subsequent `loadFrom()`
+    // would then refuse to restore: a genuinely valid, already-running
+    // in-memory register would become UNRESTARTABLE the moment it was
+    // saved, exactly the "a valid live sequence must always be reloadable"
+    // guarantee root class D requires. Fixed: the live API now enforces
+    // the SAME "at most one predecessor per successor" invariant the
+    // restore-time graph validator already did, BEFORE any mutation.
+    for (const other of this.#assumptions.values()) {
+      if (other.id !== id && other.supersededBy === supersededBy) {
+        throw new InvalidAssumptionSupersessionError(
+          id,
+          supersededBy,
+          `'${supersededBy}' is already claimed as the replacement by '${other.id}' — merged supersession ` +
+            `chains are not a valid lifecycle (an assumption may be superseded by at most one predecessor)`
+        );
+      }
+    }
     if (this.#supersessionChainReaches(supersededBy, id)) {
       throw new InvalidAssumptionSupersessionError(id, supersededBy, "this would create a supersession cycle");
     }

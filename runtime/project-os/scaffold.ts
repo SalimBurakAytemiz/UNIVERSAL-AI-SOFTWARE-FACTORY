@@ -6,7 +6,24 @@
 import { mkdirSync } from "node:fs";
 import { assertFilesystemConfinement, assertValidProjectId } from "../sandbox/sandbox.js";
 
-export const PROJECT_OS_SUBDIRECTORIES = [
+/**
+ * P1 fix (33rd independent review round, root class A, "freeze authoritative
+ * tier ordering at runtime" — same class applied here to Project OS's
+ * exported directory list): `as const` is a TypeScript-only inference hint
+ * (it narrows the array's TYPE to a readonly tuple of string literals) — it
+ * does NOT call `Object.freeze()` and has ZERO effect on the emitted JS,
+ * which remains an ordinary, mutable array. Any caller holding this export
+ * (`scaffoldProjectOs()` itself, and any other code that imports the list to
+ * reason about a project's expected structure) could bypass the type system
+ * with `as any`/`as string[]` and `.push()`/`.splice()`/index-assign a
+ * different directory name in, silently changing which subdirectories EVERY
+ * future project bootstrap creates (bölüm 26) — including removing a
+ * security-relevant one (`security`) or renaming one a downstream consumer
+ * expects, with no error and no audit trail. Fixed: `Object.freeze()` makes
+ * the runtime itself (not merely the type checker) reject any element
+ * mutation on this exact array.
+ */
+export const PROJECT_OS_SUBDIRECTORIES = Object.freeze([
   "project-definition",
   "project-genome",
   "business",
@@ -31,7 +48,7 @@ export const PROJECT_OS_SUBDIRECTORIES = [
   "cost",
   "artifacts",
   "state"
-] as const;
+] as const);
 
 export interface ScaffoldResult {
   readonly projectRoot: string;

@@ -259,7 +259,7 @@ export class UnresolvedReconciliationError extends Error {
  * directly-exploitable channel for the same information.
  */
 export class ReservationOwnershipMismatchError extends Error {
-  constructor(operation: "commit" | "release", reservationId: string, _reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership) {
+  constructor(operation: "commit" | "release" | "reconcile", reservationId: string, _reservationScope: Readonly<ReservationOwnership>, suppliedScope: ReservationOwnership) {
     super(
       `${operation}(reservationId=${reservationId}) supplied ownership (taskId=${String(suppliedScope.taskId)}, ` +
         `projectId=${String(suppliedScope.projectId)}, agentId=${String(suppliedScope.agentId)}, ` +
@@ -1274,6 +1274,56 @@ export class CostEngine {
         throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
       }
       this.#reservations.delete(id);
+      this.#persist();
+      return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
+    });
+  }
+
+  /**
+   * P1 fix (33rd independent review round, finding 1 / root class F,
+   * "billable provider failure reconciliation"): a provider call can fail
+   * AFTER the external provider has already accepted and possibly billed
+   * the request (a timeout waiting for a response that was already
+   * generated, a connection drop after submission, a 5xx returned once
+   * work already started) — `ModelGateway.invoke()` used to treat EVERY
+   * provider throw identically to `releaseReservation()`'s own documented
+   * "nothing was ever incurred" case, silently assuming zero cost with no
+   * actual evidence either way. This method is the missing THIRD outcome:
+   * for a failure the caller cannot prove incurred zero cost, the
+   * reservation is neither deleted (as `releaseReservation()` would) nor
+   * quietly left "ACTIVE" as if nothing happened — it transitions into the
+   * SAME `RECONCILIATION_FAILED` protection `commitReservation()`'s own
+   * failure path already established (round 12/28: "a reservation whose
+   * true cost could not be safely recorded must remain protected, and
+   * `releaseReservation()` must refuse it — bkz. `UnresolvedReconciliationError`'ın
+   * notu"). Reusing that EXACT status, rather than inventing a fourth,
+   * parallel one, means every existing protection already proven for it —
+   * restore-time validation (`assertValidPersistedCostState()`), rejection
+   * by `releaseReservation()`, safe retry via `commitReservation()` once
+   * the real cost becomes known — applies here with no new state machine
+   * to separately re-verify. Ownership is checked the SAME way
+   * `releaseReservation()`'s own does (25th independent review round):
+   * only the caller who actually holds this reservation's scope may
+   * transition it — an attacker who merely learns a reservation id cannot
+   * mark someone else's ACTIVE reservation as unresolved. Already-
+   * RECONCILIATION_FAILED is accepted as a idempotent no-op (a second,
+   * independent provider failure signal about the same reservation is not
+   * an error — the reservation is already exactly as protected as this
+   * call would have made it).
+   */
+  markReservationUnresolved(id: string, callerScope: ReservationOwnership): LedgerReservation {
+    return this.#withDurableMutation(() => {
+      const reservation = this.#reservations.get(id);
+      if (!reservation) {
+        throw new UnknownReservationError(id);
+      }
+      if (reservation.status === "RECONCILIATION_FAILED") {
+        return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
+      }
+      if (ownershipMismatches(reservation.scope, callerScope)) {
+        throw new ReservationOwnershipMismatchError("reconcile", id, reservation.scope, callerScope);
+      }
+      reservation.status = "RECONCILIATION_FAILED";
       this.#persist();
       return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
     });

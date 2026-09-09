@@ -44,6 +44,72 @@ export interface ModelInvocationResponse {
   readonly output: string;
 }
 
+/**
+ * P1 fix (33rd independent review round, finding 1 / root class F,
+ * "billable provider failure reconciliation"): `invoke()` used to treat
+ * EVERY provider throw identically — "no real cost occurred" — and
+ * unconditionally release its budget reservation. That assumption is
+ * false in general: a real provider adapter can fail AFTER the external
+ * provider already accepted (and possibly billed) the request — a
+ * network timeout waiting for an already-generated response, a dropped
+ * connection after submission, a 5xx returned once work already started.
+ * A `ModelProvider.invoke()` implementation that CAN determine what
+ * actually happened communicates it by throwing (or, per Node's
+ * `Error.cause` convention, wrapping) a `ProviderInvocationError` with an
+ * explicit `billingStatus`:
+ *  - `"NOT_BILLED"`: the caller has authoritative evidence no cost was
+ *    ever incurred (e.g. a local validation error, a connection refused
+ *    before any request left this process). `invoke()` releases the
+ *    reservation exactly as before — this is the ONLY case that ever did.
+ *  - `"BILLED"`, with `incurredCostUsd` known exactly: `invoke()` commits
+ *    that EXACT amount, so the real spend is durably recorded rather than
+ *    silently erased, while the original failure still propagates to the
+ *    caller.
+ *  - `"BILLED"` without a known exact amount, `"UNKNOWN"`, or (the fail-
+ *    closed DEFAULT) any error that is not a `ProviderInvocationError` at
+ *    all (a plain, unclassified `Error` — what `MockProvider`/most naive
+ *    adapters throw): the reservation is preserved and marked
+ *    reconciliation-required (bkz. `BudgetGuard.markProviderFailureUnresolved()`),
+ *    never silently released. This last branch is the fix's actual
+ *    behavior change: "no classification at all" used to mean "assume
+ *    zero cost" (fail OPEN); it now means "assume cost MAY have been
+ *    incurred" (fail CLOSED) — exactly baseline section 147's "no silent
+ *    spending" applied to the failure path, not only the success path.
+ */
+export type ProviderFailureBillingStatus = "NOT_BILLED" | "BILLED" | "UNKNOWN";
+
+export class ProviderInvocationError extends Error {
+  readonly billingStatus: ProviderFailureBillingStatus;
+  readonly incurredCostUsd?: number;
+
+  constructor(
+    message: string,
+    billingStatus: ProviderFailureBillingStatus,
+    options?: { readonly incurredCostUsd?: number; readonly cause?: unknown }
+  ) {
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "ProviderInvocationError";
+    this.billingStatus = billingStatus;
+    this.incurredCostUsd = options?.incurredCostUsd;
+  }
+}
+
+/**
+ * Classifies an error caught from `ModelProvider.invoke()` into the
+ * billing-status contract above. Anything that is not a genuine
+ * `ProviderInvocationError` — including every plain `Error` this
+ * repository's own `MockProvider`/`FailingProvider` test fixtures throw —
+ * is conservatively `"UNKNOWN"`, never `"NOT_BILLED"`: the whole point of
+ * this classification is that "no evidence" must never be read as
+ * "evidence of zero cost".
+ */
+function classifyProviderFailure(err: unknown): { readonly billingStatus: ProviderFailureBillingStatus; readonly incurredCostUsd?: number } {
+  if (err instanceof ProviderInvocationError) {
+    return { billingStatus: err.billingStatus, incurredCostUsd: err.incurredCostUsd };
+  }
+  return { billingStatus: "UNKNOWN" };
+}
+
 export interface ModelProvider {
   readonly id: string;
   invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse>;
@@ -660,10 +726,37 @@ export class ModelGateway {
         try {
           response = await this.#rawInvoke(authorizedModel, authorizedRequest);
         } catch (err) {
-          // Belgelenen mutabakat kuralı: provider hata fırlatırsa hiçbir
-          // gerçek maliyet oluşmadığı varsayılır, rezervasyon TAMAMEN
-          // serbest bırakılır (bkz. budget.ts release() notu).
-          budget.release(reservation.id, reservation.scope);
+          // P1 fix (33rd independent review round, finding 1 / root class
+          // F, "billable provider failure reconciliation"): the OLD,
+          // documented mutabakat kuralı ("provider hata fırlatırsa hiçbir
+          // gerçek maliyet oluşmadığı varsayılır") is exactly the "provider
+          // threw == cost is zero" assumption this round's finding
+          // forbids — bkz. `ProviderInvocationError`'ın üstündeki fix
+          // notu for the full three-way classification this replaces it
+          // with. `executionScope`/`authorizedModel` (the SAME
+          // pre-authorized snapshots `budget.reserve()` above and the
+          // success-path `budget.commit()` below already use — never
+          // `context` again) supply the identity for every branch here,
+          // consistent with this method's own 13th/31st round fix notes.
+          const failure = classifyProviderFailure(err);
+          if (failure.billingStatus === "NOT_BILLED") {
+            budget.release(reservation.id, reservation.scope);
+          } else if (failure.billingStatus === "BILLED" && failure.incurredCostUsd !== undefined) {
+            budget.commit(reservation.id, {
+              taskId: executionScope.taskId,
+              projectId: executionScope.projectId,
+              runId: executionScope.runId,
+              agentId: executionScope.agentId,
+              provider: authorizedModel.provider,
+              modelId: authorizedModel.modelId,
+              amountUsd: failure.incurredCostUsd
+            });
+          } else {
+            // "BILLED" with no known exact amount, "UNKNOWN", or (the
+            // fail-closed default) an unclassified plain Error — never
+            // silently erase possible real spend.
+            budget.markProviderFailureUnresolved(reservation.id, reservation.scope);
+          }
           throw err;
         }
 

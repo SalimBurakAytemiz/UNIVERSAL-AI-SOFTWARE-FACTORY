@@ -80,6 +80,46 @@ function hashOf(record: Omit<AuditRecord, "hash">): string {
  * `JSON.stringify()`), so the forensic evidence this codebase's own "no
  * silent spending" philosophy relies on is preserved without weakening
  * this contract.
+ *
+ * P1 fix (33rd independent review round, finding 4 / root class C, "reject
+ * or canonicalize undefined audit values before hashing"): the 31st/32nd
+ * round checks above (`value === null || value === undefined) return;`)
+ * treated `undefined` as an already-safe, "already JSON-shaped" value —
+ * but it is not: `JSON.stringify()` (which `hashOf()` runs over) silently
+ * DROPS an object property whose value is `undefined` entirely
+ * (`JSON.stringify({a: undefined})` → `"{}"`, no `"a"` key at all), while
+ * `structuredClone()` (used above to detach `event` from the caller, and
+ * again by `deepFreezeClone()` for every record `all()` returns) PRESERVES
+ * that same key with its `undefined` value intact. That is exactly this
+ * file's own "the record actually stored and the record the hash
+ * authenticates disagree about what the payload contains" defect class
+ * (see the Map/Set fix note above) — a caller reading `auditLog.all()`
+ * would see a `payload` field literally present (as `undefined`), while
+ * the hash was computed as though that field never existed, and a second,
+ * genuinely field-less record would hash IDENTICALLY. Inside an ARRAY the
+ * collision is worse: `JSON.stringify([undefined])` → `"[null]"`, so an
+ * `undefined` array element is indistinguishable, once hashed, from a
+ * legitimate `null` one — the same "two different meanings collapse to
+ * one hash" defect the 32nd round already fixed for NaN/Infinity vs.
+ * `null`. Fixed with the round's explicit "reject or explicitly
+ * normalize" option, applied per-context rather than uniformly (a single
+ * blanket rejection of every `undefined` was tried and rejected during
+ * this investigation — legitimate, common call sites such as
+ * `policy-engine.ts`'s `matchedRule` and `approval.ts`'s `decidedBy`/
+ * `evidenceRef`/`changeRequestReason`/`failureReason` routinely pass
+ * `undefined` for "this optional field does not apply to this event",
+ * exactly JavaScript's own idiom for an absent object property — rejecting
+ * that outright would have made ordinary, non-malicious audit calls fail
+ * closed for no security benefit): `canonicalizeAuditValue()` below
+ * NORMALIZES an `undefined` object-PROPERTY value by omitting the key
+ * entirely, BEFORE storage — the exact same thing `JSON.stringify()` was
+ * already silently doing at hash-time, now applied to the value that is
+ * actually stored too, so `all()`'s output and the computed hash can never
+ * disagree again. An `undefined` ARRAY element, which has no equivalent
+ * "just omit it" option (every index must hold a real value) and would
+ * otherwise collide with a legitimate `null`, is REJECTED outright via
+ * `UnsupportedAuditPayloadError`, consistent with the NaN/Infinity
+ * precedent.
  */
 export class UnsupportedAuditPayloadError extends Error {
   constructor(path: string, reason: string) {
@@ -95,16 +135,36 @@ export class UnsupportedAuditPayloadError extends Error {
   }
 }
 
-function assertJsonCompatibleValue(value: unknown, path: string): void {
-  if (value === null || value === undefined) return;
+/**
+ * Validates AND normalizes `value` into the exact shape that will be
+ * stored (pushed into `#records`) and hashed — the two must be the SAME
+ * object graph, not merely two independently-computed values that happen
+ * to usually agree. See `UnsupportedAuditPayloadError`'s fix note above for
+ * the full rationale, in particular for why `undefined` is handled
+ * differently depending on whether it appears as an object property (
+ * normalized: the key is omitted) or an array element (rejected: no safe
+ * normalization exists that would not collide with a legitimate `null`).
+ */
+function canonicalizeAuditValue(value: unknown, path: string): unknown {
+  if (value === null) return null;
+  if (value === undefined) {
+    // Reached only for a value that is NOT an object property (the object
+    // branch below filters `undefined` properties out before recursing
+    // here) — i.e. an array element, or the whole event itself. Both cases
+    // are ambiguous once JSON-serialized; fail closed rather than guess.
+    throw new UnsupportedAuditPayloadError(
+      path,
+      "undefined in a position with no safe 'omit' equivalent (an array element, or the event itself) — " +
+        "JSON.stringify() would silently turn this into null, indistinguishable from a genuine null"
+    );
+  }
   const type = typeof value;
   if (type === "number" && !Number.isFinite(value)) {
     throw new UnsupportedAuditPayloadError(path, `a non-finite number (${String(value)})`);
   }
-  if (type === "string" || type === "boolean" || type === "number") return;
+  if (type === "string" || type === "boolean" || type === "number") return value;
   if (Array.isArray(value)) {
-    value.forEach((item, index) => assertJsonCompatibleValue(item, `${path}[${index}]`));
-    return;
+    return value.map((item, index) => canonicalizeAuditValue(item, `${path}[${index}]`));
   }
   if (type === "object") {
     // Only a genuine plain object (Object.prototype, or a null-prototype
@@ -119,10 +179,12 @@ function assertJsonCompatibleValue(value: unknown, path: string): void {
         `an instance of '${Object.prototype.toString.call(value)}' rather than a plain object`
       );
     }
+    const result: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      assertJsonCompatibleValue(nested, `${path}.${key}`);
+      if (nested === undefined) continue;
+      result[key] = canonicalizeAuditValue(nested, `${path}.${key}`);
     }
-    return;
+    return result;
   }
   // function / symbol / bigint.
   throw new UnsupportedAuditPayloadError(path, `of unsupported type '${type}'`);
@@ -188,18 +250,21 @@ export class AuditLog {
    */
   append(event: AuditEvent): AuditRecord {
     const detachedEvent = structuredClone(event);
-    // P1 fix (31st independent review round, finding 7, "reject or
-    // canonically serialize non-JSON audit payloads"): bkz.
-    // `assertJsonCompatibleValue()`'ın üstündeki fix notu — runs on the
+    // P1 fix (31st/33rd independent review rounds, "reject or canonically
+    // serialize non-JSON audit payloads" / root class C): runs on the
     // ALREADY-detached clone (never the caller's original `event`), before
-    // any hash is computed or anything is pushed onto `#records`.
-    assertJsonCompatibleValue(detachedEvent, "event");
+    // any hash is computed or anything is pushed onto `#records` — and,
+    // since the 33rd round, its RETURN VALUE (not `detachedEvent`) is what
+    // gets stored and hashed, so an `undefined` object property is omitted
+    // from BOTH, never just from the hash (bkz. `canonicalizeAuditValue()`'s
+    // own fix note above).
+    const canonicalEvent = canonicalizeAuditValue(detachedEvent, "event") as AuditEvent;
     const previousHash = this.#records.length > 0
       ? this.#records[this.#records.length - 1]!.hash
       : AuditLog.GENESIS_HASH;
 
     const base = {
-      ...detachedEvent,
+      ...canonicalEvent,
       sequence: this.#records.length,
       previousHash
     };

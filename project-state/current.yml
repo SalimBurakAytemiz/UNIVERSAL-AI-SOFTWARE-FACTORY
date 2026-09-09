@@ -1133,6 +1133,55 @@ factory:
     NOT move to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch —
     all work stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    A 33rd independent Codex review found 7 findings (5 P1, 2 P2) but instructed root-CAUSE closure rather than
+    line-by-line patching: fix the 7 findings AND eliminate their shared root causes centrally across 6 named
+    classes. Root class A ("authoritative runtime immutability"): `models/registry.ts`'s `TIER_ORDER` and
+    `project-os/scaffold.ts`'s `PROJECT_OS_SUBDIRECTORIES` were `readonly`/`as const` typed but never
+    `Object.freeze()`d at runtime — a type-bypassed caller could mutate either, corrupting cheapest-capable
+    routing or Project OS structure for the whole process; both now frozen. Root class B ("authoritative
+    validation parity"): `scripts/validate-requirements.mjs` (CI) had always rejected duplicate requirement ids
+    but the runtime `loadRequirementsFromDir()` (the path `factory baseline status`/`trace requirement`/bootstrap
+    preflight all actually use) never checked — fixed by adding the check to the runtime loader (new
+    `DuplicateRequirementIdError`) AND making the CI script DELEGATE to the compiled runtime function instead of
+    reimplementing its own validation, so there is genuinely one authoritative validator. Root class C ("canonical
+    audit data"): `audit/audit-log.ts` treated `undefined` as already-safe, but `structuredClone()` (stores)
+    preserves an `undefined` object property while `JSON.stringify()` (hashes) drops it — the stored record and
+    the hash could disagree about whether a field existed; fixed by normalizing `undefined` object properties
+    (omit the key, matching JSON.stringify's own behavior) before storage, while rejecting an `undefined` ARRAY
+    element outright (no safe "omit" equivalent, would collide with a legitimate null). Root class D ("live
+    lifecycle must match restore lifecycle"): `assumptions/assumption-register.ts`'s `supersede()` had no check
+    preventing two different predecessors from both naming the same successor — a state
+    `describeInvalidPersistedAssumptionGraph()` (restore) had ALWAYS rejected as a "merged chain" — so the live
+    API could reach a state that could never be reloaded after a restart; fixed by adding the identical
+    at-most-one-predecessor check live (`decision-ledger.ts`'s own `supersede()` was re-verified and found
+    structurally immune, since its replacement is always a fresh id `record()` itself rejects as a duplicate).
+    Root class E ("lock ownership must not rely on PID alone"): `cache/file-lock.ts`'s confirmed-alive branch had
+    always trusted `isProcessAlive(pid)` unconditionally and forever — a documented, accepted PID-reuse limitation
+    that made a PID-reused zombie lock permanently unreclaimable; fixed with a new `maxOwnerAgeMs` option
+    (default 24h) bounding even a confirmed-alive owner, routing an implausibly-old lock into the same governed
+    reclaim path every other stale lock already uses. Root class F ("billable provider failure reconciliation"):
+    `models/gateway.ts`'s `invoke()` had always assumed "provider threw == cost is zero" and unconditionally
+    released the budget reservation on any provider failure — fixed with an explicit `ProviderInvocationError`
+    billing-status classification (NOT_BILLED/BILLED/UNKNOWN); only NOT_BILLED still releases, BILLED-with-exact-
+    amount commits the real cost, and everything else (including any plain unclassified Error — the fail-closed
+    default) now marks the reservation RECONCILIATION_FAILED via a new `budget.markProviderFailureUnresolved()`
+    rather than silently freeing possibly-real spend. Every fix carries deterministic regression tests (including
+    exact BLOCKER reproductions) verified via a genuine temporary in-place bypass reproducing the predicted
+    failure, then fully reverted. A narrow root-class audit (background agent, scoped to exactly these 6 classes)
+    found NO further genuine instances in `runtime/` — every superficially similar case (other module-private
+    arrays, other scripts/ validators, other hash computations, `decision-ledger.ts`'s own supersede(), every
+    other `process.kill()` call site, every other reserve-then-release-on-catch pattern) was individually checked
+    and ruled out with a stated reason. Full required sequence re-run and green: lint, typecheck, build,
+    1234/1234 tests (44 files, +43 net new across all 6 root classes), validate:requirements (42 schema-valid
+    records), history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY), all 9 P0 proofs,
+    `factory baseline status` CLI smoke test. No status raised on any requirement beyond what real evidence
+    supports. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next (34th) independent Codex review to return
+    INDEPENDENT_REVIEW_RESULT: CLEAN — per this round's own explicit framing, that review is intended as the
+    FINAL P0 closure review, with P0 blockers restricted to reproducible violations of an EXISTING documented P0
+    invariant (not new feature requests or low-impact edge cases, which are BACKLOG). Per explicit instruction,
+    this round does NOT merge, does NOT move to P1, does NOT declare P0 complete, does NOT invoke Codex itself,
+    and did NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4022,6 +4071,45 @@ completed_milestones:
     awaiting the next (33rd) independent Codex review to return CLEAN. Per explicit instruction, this round does
     not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself, and did not
     create a new branch.
+  - >-
+    Round 33 (fresh, independent Codex closure review, 7 findings mapping to 6 named root-cause classes,
+    explicit instruction to fix root causes centrally rather than patch each location): (A) "authoritative
+    runtime immutability" — `models/registry.ts`'s `TIER_ORDER` and `project-os/scaffold.ts`'s
+    `PROJECT_OS_SUBDIRECTORIES` were `readonly`/`as const` typed (compile-time only) but never
+    `Object.freeze()`d at runtime; both now frozen, with a BLOCKER regression proving a type-bypassed mutation
+    attempt throws `TypeError` and the shared state is unaffected. (B) "authoritative validation parity" —
+    `scripts/validate-requirements.mjs` (CI) had always rejected duplicate requirement ids but the runtime
+    `loadRequirementsFromDir()` never checked; fixed by adding the check to the runtime loader
+    (`DuplicateRequirementIdError`) and making the CI script delegate to the compiled runtime function instead
+    of reimplementing its own validation. (C) "canonical audit data" — `audit/audit-log.ts` treated `undefined`
+    as already-safe, but `structuredClone()` (stores) preserves an `undefined` object property while
+    `JSON.stringify()` (hashes) drops it, so the stored record and its hash could disagree; fixed by
+    normalizing `undefined` object properties (omit the key) before storage, while rejecting an `undefined`
+    array element outright. (D) "live lifecycle must match restore lifecycle" —
+    `assumptions/assumption-register.ts`'s `supersede()` had no check preventing two predecessors from naming
+    the same successor, a state the restore-time graph validator had always rejected; fixed by adding the
+    identical check live (`decision-ledger.ts`'s own `supersede()` re-verified as structurally immune). (E)
+    "lock ownership must not rely on PID alone" — `cache/file-lock.ts`'s confirmed-alive branch trusted
+    `isProcessAlive(pid)` unconditionally forever, a documented PID-reuse limitation; fixed with a new
+    `maxOwnerAgeMs` option (default 24h) bounding even a confirmed-alive owner, with deterministic regression
+    evidence for PID reuse. (F) "billable provider failure reconciliation" — `models/gateway.ts`'s `invoke()`
+    had always assumed "provider threw == cost is zero" and unconditionally released the reservation; fixed
+    with an explicit `ProviderInvocationError` billing-status classification (NOT_BILLED/BILLED/UNKNOWN) — only
+    NOT_BILLED still releases, BILLED-with-exact-amount commits the real cost, and everything else (including
+    any plain unclassified Error, the fail-closed default) now marks the reservation RECONCILIATION_FAILED via
+    a new `budget.markProviderFailureUnresolved()`. Every fix carries deterministic regression tests (including
+    exact BLOCKER reproductions) verified via a genuine temporary in-place bypass reproducing the predicted
+    failure, then fully reverted and reconfirmed clean. A narrow root-class audit (scoped to exactly these 6
+    classes) found NO further genuine instances in `runtime/` — every superficially similar candidate (other
+    module-private arrays, other scripts/ validators, other hash computations, decision-ledger.ts's own
+    supersede(), every other process.kill() call site, every other reserve-then-release-on-catch pattern) was
+    individually checked and ruled out with a stated reason. Re-ran the full required sequence: lint,
+    typecheck, build, 1234/1234 tests (44 files, +43 net new), validate:requirements (42 schema-valid
+    records), history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY), all 9 P0 proofs,
+    `factory baseline status` CLI smoke test. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next (34th,
+    intended per this round's own framing as the FINAL P0 closure) independent Codex review to return CLEAN.
+    Per explicit instruction, this round does not merge, does not move to P1, does not declare P0 complete,
+    does not invoke Codex itself, and did not create a new branch.
 
 known_limitations:
   - >-
@@ -4703,6 +4791,18 @@ blockers:
     this round does not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself,
     and did not create a new branch.
 
+    A 33rd independent Codex review found 7 findings mapping to 6 root causes and required a root-cause closure
+    pass rather than line-by-line patches (see `factory.p0_status` for the full 6-class breakdown: exported
+    authoritative array mutability, a weaker runtime vs. CI requirement validator, undefined-vs-hash audit
+    ambiguity, live/restore assumption-supersession graph parity, PID-reuse lock-ownership trust, and
+    "provider threw == zero cost" reservation handling). All 6 root classes fixed centrally (not merely at the 7
+    reported locations), each with deterministic regression tests bypass-verified against a genuine temporary
+    revert. A narrow, explicitly-scoped root-class audit for the same 6 classes found no further genuine
+    instances. Tested (1234/1234 tests, +43 net new) and verified per the full required sequence. P0 remains
+    BLOCKED_PENDING_REVIEW, awaiting the next (34th, intended as the FINAL P0 closure) independent Codex review to
+    return CLEAN. Per explicit instruction, this round does not merge, does not move to P1, does not declare P0
+    complete, does not invoke Codex itself, and did not create a new branch.
+
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
   autonomous PR-merge authority into main — including a variant using a
@@ -4719,6 +4819,77 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 33). A fresh,
+  independent Codex review of the complete branch found 7 findings (5 P1,
+  2 P2) but explicitly instructed a ROOT-CAUSE closure pass rather than
+  line-by-line patching: fix the findings AND eliminate their shared root
+  causes across 6 named classes. All 6 fixed centrally: (A) "authoritative
+  runtime immutability" — `models/registry.ts`'s `TIER_ORDER` and
+  `project-os/scaffold.ts`'s `PROJECT_OS_SUBDIRECTORIES` were `readonly`/
+  `as const` typed but never `Object.freeze()`d at runtime (a type-bypassed
+  caller could mutate either, corrupting cheapest-capable routing or
+  Project OS structure for the whole process) — both now frozen; (B)
+  "authoritative validation parity" — `scripts/validate-requirements.mjs`
+  (CI) had always rejected duplicate requirement ids but the runtime
+  `loadRequirementsFromDir()` (the path `factory baseline status`/`trace
+  requirement`/bootstrap preflight all actually use) never checked — fixed
+  by adding the check to the runtime loader (`DuplicateRequirementIdError`)
+  AND making the CI script DELEGATE to the compiled runtime function
+  instead of reimplementing its own validation; (C) "canonical audit
+  data" — `audit/audit-log.ts` treated `undefined` as already-safe, but
+  `structuredClone()` (stores) preserves an `undefined` object property
+  while `JSON.stringify()` (hashes) drops it, so the stored record and the
+  hash could disagree about whether a field existed — fixed by normalizing
+  `undefined` object properties (omit the key) before storage, while
+  rejecting an `undefined` ARRAY element outright (no safe "omit"
+  equivalent); (D) "live lifecycle must match restore lifecycle" —
+  `assumptions/assumption-register.ts`'s `supersede()` had no check
+  preventing two different predecessors from naming the same successor, a
+  state the restore-time graph validator had ALWAYS rejected as a "merged
+  chain" — fixed by adding the identical check live (`decision-ledger.ts`'s
+  own `supersede()` was re-verified and found structurally immune); (E)
+  "lock ownership must not rely on PID alone" — `cache/file-lock.ts`'s
+  confirmed-alive branch had always trusted `isProcessAlive(pid)`
+  unconditionally and forever, a documented PID-reuse limitation that made
+  a PID-reused zombie lock permanently unreclaimable — fixed with a new
+  `maxOwnerAgeMs` option (default 24h) bounding even a confirmed-alive
+  owner; (F) "billable provider failure reconciliation" —
+  `models/gateway.ts`'s `invoke()` had always assumed "provider threw ==
+  cost is zero" and unconditionally released the budget reservation on any
+  provider failure — fixed with an explicit `ProviderInvocationError`
+  billing-status classification (NOT_BILLED/BILLED/UNKNOWN); only
+  NOT_BILLED still releases, BILLED-with-exact-amount commits the real
+  cost, and everything else (including any plain unclassified Error, the
+  fail-closed default) now marks the reservation RECONCILIATION_FAILED via
+  a new `budget.markProviderFailureUnresolved()`. Every fix carries
+  deterministic regression tests (including exact BLOCKER reproductions)
+  verified via a genuine temporary in-place bypass reproducing the
+  predicted failure, then fully reverted. A narrow root-class audit
+  (scoped to exactly these 6 classes) found NO further genuine instances
+  in `runtime/`. Full required sequence re-run and green: lint, typecheck,
+  build, 1234/1234 tests (44 files, +43 net new), validate:requirements
+  (42 schema-valid records), history-and-current-tree-aware secret-scan
+  (PASS), Factory Doctor (READY), all 9 P0 proofs, `factory baseline
+  status` CLI smoke test. No status raised on any requirement beyond what
+  real evidence supports. Requirement registry updated (UASF-REQ-0007,
+  0011, 0022, 0024, 0025, 0029, 0030, 0036, 0041) from this real evidence
+  only. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next (34th,
+  intended per this round's own framing as the FINAL P0 closure) Codex
+  review — for that review, P0 blockers are restricted to reproducible
+  violations of an EXISTING documented P0 invariant (security/default-deny,
+  Founder approval, project isolation, real spending/accounting,
+  authoritative state corruption, secret leakage, evidence/audit
+  integrity, production/runtime correctness, concurrency that loses/
+  corrupts authoritative state); new feature requests, speculative
+  hardening, architectural preferences, and low-impact edge cases that do
+  NOT violate an existing P0 requirement are BACKLOG, not P0 blockers. Per
+  explicit instruction, this round does NOT merge, does NOT move to P1,
+  does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT
+  create a new branch — all work stayed on claude/ai-factory-baseline-v1-
+  seawq7.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 32). A fresh,
   independent Codex review of the complete branch (forwarded by the
   Founder) found NINE actionable findings (P1/P2) and required them fixed

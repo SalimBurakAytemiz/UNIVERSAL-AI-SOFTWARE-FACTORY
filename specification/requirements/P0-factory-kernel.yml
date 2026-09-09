@@ -490,6 +490,19 @@
     on an unknown/failing provider, nominal-not-actual cost recorded, and
     the exact orphaned-project-tree race), then fully reverted.
 
+    P1 fix (33rd independent review round, root class A, "freeze
+    authoritative tier ordering at runtime"): `PROJECT_OS_SUBDIRECTORIES`
+    was typed `as const` — a TypeScript-only, compile-time literal-tuple
+    hint with zero effect on the emitted JS array, which remained
+    ordinary and mutable. A caller bypassing the type system (`as any`)
+    could `.push()`/index-assign a different subdirectory list in,
+    silently changing which subdirectories every future project bootstrap
+    creates process-wide. Fixed with `Object.freeze()` around the array
+    literal (kept alongside `as const` for the type-level benefit) —
+    verified with a BLOCKER regression proving a type-bypassed mutation
+    attempt throws `TypeError` and the list is unchanged, plus
+    `Object.isFrozen()` and a no-regression scaffold test.
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -801,6 +814,21 @@
     that a plain JS consumer cannot smuggle a HIGH-impact assumption into ACCEPTED this way. Verified via a
     temporary bypass (reverting to `private assumptions`) — confirmed exactly the 3 predicted tests failed, then
     reverted and re-confirmed all tests passing.
+
+    P1 fix (33rd independent review round, finding 5 / root class D, "make live assumption supersession obey
+    the persisted graph invariant"): `describeInvalidPersistedAssumptionGraph()` (used by `loadFrom()`) had
+    ALWAYS rejected a persisted graph where two different predecessors both claim the same successor ("merged
+    supersession chains"), but the LIVE `supersede()` API had no such check — unlike `decision-ledger.ts`'s own
+    `supersede()` (which structurally cannot produce this, since its replacement is always a FRESH id created
+    via `record()`, which itself rejects duplicates), this register's `supersededBy` names an ALREADY-EXISTING
+    assumption, so nothing stopped `supersede("A","C")` then `supersede("B","C")` from both succeeding live —
+    reaching a state `saveTo()` would persist but a subsequent `loadFrom()` would then REFUSE to restore,
+    violating "a valid live sequence must always be reloadable." Fixed: `supersede()` now rejects a second,
+    distinct predecessor naming an already-claimed replacement, mirroring the restore-time check exactly.
+    Regression tests prove: the second `supersede()` call now throws `InvalidAssumptionSupersessionError` with
+    the first supersession left intact, two DIFFERENT successors for two different predecessors still works,
+    and a normal chain (A -> B -> C) still works. Verified via a temporary bypass (removing the new check) —
+    confirmed exactly the 2 predicted BLOCKER tests failed, then reverted and re-confirmed all 56 tests passing.
 
 - id: UASF-REQ-0012
   title: Requirements engine
@@ -1591,6 +1619,26 @@
     history this way. Verified via a temporary bypass (reverting to `private records`) — confirmed exactly the 3
     predicted tests failed, then reverted and re-confirmed all tests passing.
 
+    P1 fix (33rd independent review round, finding 4 / root class C, "reject or canonicalize undefined audit
+    values before hashing"): `undefined` was treated as an already-safe value by `assertJsonCompatibleValue()`,
+    but `structuredClone()` (used to detach/store the event) PRESERVES an `undefined` object property while
+    `JSON.stringify()` (used by `hashOf()`) DROPS it entirely — so the record `all()` actually returns and the
+    record the hash authenticates could disagree about whether a field existed at all, and a genuinely
+    field-less record would hash IDENTICALLY to one carrying `field: undefined`. Inside an array, `undefined`
+    additionally collapses to `null` under `JSON.stringify`, colliding with a legitimate `null` (the same
+    defect class the 32nd round already fixed for NaN/Infinity). Fixed with the round's "reject or explicitly
+    normalize" option, applied per context: `canonicalizeAuditValue()` now NORMALIZES an `undefined`
+    object-property value by omitting the key entirely BEFORE storage (so the stored record and the hash can
+    never disagree again) — chosen over a blanket rejection because legitimate, common call sites
+    (`policy-engine.ts`'s `matchedRule`, `approval.ts`'s `decidedBy`/`evidenceRef`/`changeRequestReason`/
+    `failureReason`) routinely pass `undefined` for "this optional field does not apply" — while an `undefined`
+    ARRAY element (no safe "omit" equivalent) is REJECTED outright via `UnsupportedAuditPayloadError`. BLOCKER
+    regressions prove: an undefined object-property field is stripped from the STORED record (not merely
+    hash-time), a record with the field vs. one that never had it now hash IDENTICALLY, an undefined array
+    element throws, and nested undefined values are stripped at any depth. Verified via a temporary bypass
+    (disabling both the property-strip and the array-element rejection) — confirmed exactly the 2 predicted
+    BLOCKER tests failed, then reverted and re-confirmed all 38 tests passing.
+
 - id: UASF-REQ-0023
   title: Artifact foundation
   description: Minimal artifact classification/storage abstraction.
@@ -1889,6 +1937,27 @@
     negative/blocked-case tests correctly stayed green, since they could never have succeeded either way), then
     reverted and re-confirmed all tests passing.
 
+    P1 fix (33rd independent review round, finding 1 / root class F, "billable provider failure
+    reconciliation"): `invoke()`'s catch block had ALWAYS treated every provider throw identically —
+    "no real cost occurred, release the reservation" — silently assuming "provider threw == cost is zero" with
+    zero evidence, even though a real provider adapter can fail AFTER the external provider already accepted
+    (and possibly billed) the request (a timeout after an already-generated response, a dropped connection
+    after submission, a 5xx once work already started). Fixed with an explicit, structured classification: a
+    `ModelProvider.invoke()` implementation MAY throw a new `ProviderInvocationError` carrying a
+    `billingStatus` (`"NOT_BILLED"` / `"BILLED"` / `"UNKNOWN"`) and, when known, an exact `incurredCostUsd`.
+    `invoke()`'s catch block now: releases the reservation ONLY for `"NOT_BILLED"` (the sole case that ever
+    did); commits the EXACT reported amount for `"BILLED"` with a known cost, so real spend is never silently
+    erased even though the call still fails; and — the actual behavior change — marks the reservation
+    `RECONCILIATION_FAILED` via the new `BudgetGuard.markProviderFailureUnresolved()` (see UASF-REQ-0030) for
+    `"BILLED"` without a known amount, `"UNKNOWN"`, OR any plain, unclassified `Error` (what `MockProvider`/
+    most naive adapters throw) — the fail-closed DEFAULT, never a silent release. Regression tests prove: a
+    plain unclassified `Error` no longer frees the reservation's capacity (a second call under the same ceiling
+    is still blocked); the exact reported `incurredCostUsd` is durably recorded for a BILLED-with-exact-amount
+    failure; a BILLED-without-amount failure is protected the same as UNKNOWN; and the one unchanged case
+    (NOT_BILLED) still releases and frees capacity for a real call. Verified via a temporary bypass (restoring
+    the old unconditional `release()`) — confirmed exactly the 4 predicted new tests failed, then reverted and
+    re-confirmed all 69 tests passing.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -2016,6 +2085,16 @@
     via property access or any reflection API, and that a plain JS consumer cannot revive a DEPRECATED model
     this way. Verified via a temporary bypass (reverting to `private models`) — confirmed exactly the 3
     predicted tests failed, then reverted and re-confirmed all tests passing.
+
+    P1 fix (33rd independent review round, root class A, "freeze authoritative tier ordering at runtime"):
+    `TIER_ORDER` was typed `readonly ModelTier[]` — a TypeScript-only compile-time annotation with zero
+    runtime effect, so a caller bypassing the type system (`as any`) could `.push()`/`.reverse()`/index-assign
+    this exact array, silently corrupting the ONE authoritative ordering `CheapestCapableModelRouter` relies on
+    to select "the cheapest capable model" for the ENTIRE process lifetime. Fixed with `Object.freeze()` — a
+    BLOCKER regression proves a type-bypassed mutation attempt throws `TypeError` on both `.push()` and
+    index-assignment (with the pre-fix bypass shown to genuinely mutate shared state and corrupt an unrelated,
+    later `tierRank()` assertion in the same test file — direct evidence of the real-world severity), plus
+    `Object.isFrozen()` and a no-regression `tierRank()` sanity check.
 
 - id: UASF-REQ-0026
   title: MockProvider
@@ -2441,6 +2520,21 @@
     joined by `reservationId`, rather than from the rejected caller's own return value. Verified via temporary
     bypasses of both the `getReservation()` redaction and the error-message redaction independently — confirmed
     the exact predicted tests failed in each case, then both reverted and all tests re-confirmed passing.
+
+    P1 fix (33rd independent review round, finding 1 / root class F, "billable provider failure
+    reconciliation" — full narrative on UASF-REQ-0024): added `CostEngine.markReservationUnresolved(id,
+    callerScope)`, the ledger-level entry point `BudgetGuard.markProviderFailureUnresolved()` (UASF-REQ-0030)
+    calls when a provider failure carries no authoritative evidence of zero cost. It transitions an ACTIVE
+    reservation into the SAME `RECONCILIATION_FAILED` protection a failed `commitReservation()` already
+    produces (never deletes it), validates ownership the same way `releaseReservation()` does
+    (`ReservationOwnershipMismatchError`, extended with a new `"reconcile"` operation name), and is idempotent
+    on an already-`RECONCILIATION_FAILED` reservation. Six new regression tests prove: the transition and
+    protection (BLOCKER), that `releaseReservation()` is then rejected exactly like any other unresolved
+    reservation, that a corrected `commitReservation()` retry on the same id still works, ownership-mismatch
+    rejection with no mutation, `UnknownReservationError` for a nonexistent/already-resolved id, and the
+    idempotent no-op. Verified via a temporary bypass (leaving the reservation's status unchanged) — confirmed
+    4 of the 6 predicted tests failed (the id-not-found and commit-retry tests correctly stayed green, since
+    they do not depend on the transition itself), then reverted and re-confirmed all 99 tests passing.
 
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
@@ -2964,6 +3058,17 @@
     `#costEngine`/`#now`/`#auditLog` fields back to TS-private constructor-parameter properties for the audit
     follow-up), then fully reverted: all 119 `budget.test.ts` tests and the full `cost-engine.test.ts` suite
     re-confirmed passing after each revert.
+
+    P1 fix (33rd independent review round, finding 1 / root class F, "billable provider failure
+    reconciliation" — full narrative on UASF-REQ-0024): added `BudgetGuard.markProviderFailureUnresolved
+    (reservationId, callerScope)`, the entry point `ModelGateway.invoke()` now calls instead of `release()`
+    whenever a provider call fails with no authoritative evidence that no cost was incurred. It never deletes
+    the reservation — it delegates to `CostEngine.markReservationUnresolved()` (UASF-REQ-0029) to transition
+    it into the SAME `RECONCILIATION_FAILED` protection a failed `commit()` already produces, then records a
+    new `BUDGET_PROVIDER_FAILURE_RECONCILIATION_REQUIRED` audit event (or
+    `BUDGET_PROVIDER_FAILURE_RECONCILIATION_REJECTED_OWNERSHIP_MISMATCH` on a rejected mismatch), following
+    the same audit-event pattern `release()`/`commit()` already establish. See `gateway.ts`'s own regression
+    tests (UASF-REQ-0024) and `cost-engine.ts`'s own (UASF-REQ-0029) for the verification evidence.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -4023,6 +4128,28 @@
     bypass (reverting all three comparisons to strict `<`) — confirmed the exact predicted 3 tests (cache.ts)
     and 4 tests (file-cache.ts) failed, then reverted and re-confirmed all 79 tests in runtime/cache/ passing.
 
+    P1 fix (33rd independent review round, finding 6 / root class E, "lock ownership must not rely on PID
+    alone"): `isLockStale()`'s CONFIRMED-ALIVE branch (`isProcessAlive(meta.pid)` true) had always been trusted
+    UNCONDITIONALLY and permanently (17th round's own deliberate design) — this file's own header comment had
+    always documented, as an ACCEPTED P0 limitation, that OS PID reuse (the original owner dies; the OS
+    reassigns the exact same PID to a later, unrelated process) could make this check falsely report "alive"
+    forever, since a portable, dependency-free way to read a PID's actual process-start time does not exist in
+    Node.js without a native addition or a Linux-only `/proc` path. This round required closing it. Fixed with
+    a new `maxOwnerAgeMs` option (default 24h, several orders of magnitude larger than any legitimate critical
+    section this codebase performs): the CONFIRMED-ALIVE branch is no longer an unconditional, permanent grant
+    — it is now ALSO checked against the lock's own recorded `acquiredAt` via `maxOwnerAgeMs`, falling through
+    to the SAME governed, authenticated, single-winner reclaim path every other stale/dead/unknown-owner lock
+    already uses once exceeded, never an instant unauthenticated steal. A genuinely long-lived, still-running
+    owner remains fully protected for any realistic duration. Deterministic regression evidence for PID reuse
+    (using THIS TEST PROCESS' OWN guaranteed-alive pid paired with a fabricated, implausibly old `acquiredAt` —
+    from `isLockStale()`'s perspective indistinguishable from a real PID-reused zombie) proves: such a lock is
+    eventually reclaimed rather than blocking forever (BLOCKER), the SAME fixture is protected under the
+    default 24h ceiling with no override, a confirmed-dead owner is still reclaimed near-instantly regardless
+    of `maxOwnerAgeMs`, and the new option is validated (finite, positive) the same way `timeoutMs`/`staleMs`/
+    `pollIntervalMs` already are. Verified via a temporary bypass (removing the `maxOwnerAgeMs` check from the
+    confirmed-alive branch) — confirmed the exact predicted BLOCKER test failed (timed out after 5s rather than
+    reclaiming), then reverted and re-confirmed all 64 tests passing.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
@@ -4370,6 +4497,20 @@
     prototype pollution occurs from processing any of these. Confirmed
     via git-stash that all 4 of these tests fail against the pre-fix code
     with exactly the corrupted-count (string-concatenation) symptom.
+
+    P1 fix (33rd independent review round, finding 3 / root class B, "authoritative validation parity" —
+    "reject duplicate requirement IDs in the runtime loader"): `scripts/validate-requirements.mjs` (CI-time)
+    had ALWAYS rejected two requirement records sharing the same `id`, but `loadRequirementsFromDir()` — the
+    ONE runtime path `factory baseline status`/`factory trace requirement`/`bootstrapProject()`'s own preflight
+    check all actually execute through — never checked for duplicates at all, a genuine "weaker validator at
+    runtime than at CI" split. Fixed two ways: (1) `loadRequirementsFromDir()` now tracks every id seen across
+    all files and throws a new `DuplicateRequirementIdError` on a collision, verified via a BLOCKER regression
+    (same id across two files, and twice within one file, both rejected) bypass-tested by temporarily removing
+    the check; (2) `scripts/validate-requirements.mjs` no longer reimplements its own YAML/schema/duplicate-id
+    logic — it now DELEGATES entirely to the compiled runtime's `loadRequirementsFromDir()` (with a clear,
+    actionable error if `dist/` is missing, since CI always runs `npm run build` first), so there is genuinely
+    ONE authoritative validator, not two independently-evolving ones. Confirmed `npm run validate:requirements`
+    still reports `OK` against the real registry with the rewritten script.
 
 - id: UASF-REQ-0042
   title: P0 end-to-end proof

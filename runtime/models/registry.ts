@@ -14,14 +14,34 @@ export type ModelTier =
   | "PREMIUM"
   | "CRITICAL_REVIEW";
 
-export const TIER_ORDER: readonly ModelTier[] = [
+/**
+ * P1 fix (33rd independent review round, root class A, "freeze authoritative
+ * tier ordering at runtime"): this array used to be typed `readonly
+ * ModelTier[]` — a TypeScript-only annotation. TypeScript's `readonly`
+ * modifier is checked ONLY at compile time; the emitted JS array is an
+ * ordinary, mutable object. Any caller holding this export (every module
+ * that imports `TIER_ORDER`, directly or via `tierRank()`) could bypass the
+ * type system with `as any`/`as ModelTier[]` and call `.push()`/`.reverse()`/
+ * `.sort()`/index-assign on it, silently corrupting the ONE authoritative
+ * ordering `CheapestCapableModelRouter` (bkz. `router.ts`) relies on to
+ * select "the cheapest capable model" (bölüm 60/61) — a reordered or
+ * mutated `TIER_ORDER` could make routing silently prefer `PREMIUM`/
+ * `CRITICAL_REVIEW` over `MOCK`/`LOCAL_FREE` for every future invocation,
+ * with no error, no audit trail, and no test able to observe the change
+ * without already knowing to look for it. Fixed: `Object.freeze()` makes
+ * every element-mutation attempt on this EXACT array a silent no-op in
+ * sloppy mode or a `TypeError` in strict mode (this codebase's ESM modules
+ * are strict by default) — the runtime, not merely the type checker, now
+ * enforces that this ordering can never change after module load.
+ */
+export const TIER_ORDER: readonly ModelTier[] = Object.freeze([
   "MOCK",
   "LOCAL_FREE",
   "VERY_LOW_COST",
   "STANDARD",
   "PREMIUM",
   "CRITICAL_REVIEW"
-];
+]);
 
 export function tierRank(tier: ModelTier): number {
   return TIER_ORDER.indexOf(tier);

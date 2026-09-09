@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ModelRegistry, createDefaultModelRegistry, tierRank, DuplicateModelIdError, ModelNotFoundError } from "../registry.js";
+import { ModelRegistry, createDefaultModelRegistry, tierRank, TIER_ORDER, DuplicateModelIdError, ModelNotFoundError } from "../registry.js";
 import { InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
 
 function baseModel(overrides: Partial<Parameters<ModelRegistry["register"]>[0]> = {}) {
@@ -341,6 +341,31 @@ describe("ModelRegistry", () => {
         registry.register(hostile);
         expect(reads).toBe(1);
         expect(registry.all()[0]!.costPerCall).toBe(0.01);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (33rd independent review round, root class A, 'freeze authoritative tier ordering at runtime'): " +
+      "TIER_ORDER's TypeScript 'readonly' annotation is compile-time only — the runtime array must ALSO be " +
+      "genuinely frozen",
+    () => {
+      it("BLOCKER regression, exact reproduction: attempting to mutate TIER_ORDER via a type-system bypass throws, and the ordering is unchanged", () => {
+        const mutable = TIER_ORDER as unknown as string[];
+        expect(() => mutable.push("ROGUE_TIER")).toThrow(TypeError);
+        expect(() => {
+          mutable[0] = "PREMIUM";
+        }).toThrow(TypeError);
+        expect(TIER_ORDER).toEqual(["MOCK", "LOCAL_FREE", "VERY_LOW_COST", "STANDARD", "PREMIUM", "CRITICAL_REVIEW"]);
+      });
+
+      it("TIER_ORDER is genuinely frozen (Object.isFrozen)", () => {
+        expect(Object.isFrozen(TIER_ORDER)).toBe(true);
+      });
+
+      it("no regression: tierRank() still ranks every tier correctly", () => {
+        expect(tierRank("MOCK")).toBe(0);
+        expect(tierRank("CRITICAL_REVIEW")).toBe(TIER_ORDER.length - 1);
       });
     }
   );

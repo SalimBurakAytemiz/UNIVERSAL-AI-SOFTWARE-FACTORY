@@ -585,6 +585,71 @@ describe("AssumptionRegister", () => {
         expect(() => register.supersede("c", "a")).toThrow(InvalidAssumptionSupersessionError);
       });
 
+      describe(
+        "P1 fix (33rd independent review round, finding 5 / root class D, 'make live assumption supersession " +
+          "obey the persisted graph invariant'): the live API must never be able to reach a graph shape the " +
+          "restore-time validator would then refuse to reload",
+        () => {
+          it("BLOCKER regression, exact reproduction: a second, distinct predecessor naming an already-claimed replacement is rejected live, not merely at restore time", () => {
+            const register = new AssumptionRegister();
+            register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+            register.supersede("a", "c");
+            expect(() => register.supersede("b", "c")).toThrow(InvalidAssumptionSupersessionError);
+            // The first, legitimate supersession must remain intact, and "b" must
+            // remain untouched — the rejected call must not have mutated anything.
+            expect(register.get("a")!.status).toBe("SUPERSEDED");
+            expect(register.get("a")!.supersededBy).toBe("c");
+            expect(register.get("b")!.status).toBe("PROPOSED");
+          });
+
+          it("root-cause proof: a register state the old code would have allowed live can no longer be persisted and silently become unrestorable — saveTo()/loadFrom() never even sees the invalid shape, because supersede() itself now refuses to create it", () => {
+            const register = new AssumptionRegister();
+            register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.supersede("a", "c");
+
+            expect(() => register.supersede("b", "c")).toThrow(InvalidAssumptionSupersessionError);
+
+            // Had the rejected call above been allowed to succeed, saveTo()/
+            // loadFrom() would reproduce exactly the restore-time rejection
+            // already covered by "a persisted merged supersession chain ...
+            // is rejected" above — proving the two paths now agree BEFORE the
+            // fact, rather than only after a save/restore round-trip exposes
+            // the disagreement.
+            expect(register.get("c")!.status).toBe("PROPOSED");
+          });
+
+          it("no regression: two different predecessors superseded by two DIFFERENT replacements is still allowed", () => {
+            const register = new AssumptionRegister();
+            register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "d", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+            expect(() => register.supersede("a", "c")).not.toThrow();
+            expect(() => register.supersede("b", "d")).not.toThrow();
+            expect(register.get("a")!.supersededBy).toBe("c");
+            expect(register.get("b")!.supersededBy).toBe("d");
+          });
+
+          it("no regression: a normal chain (A -> B -> C, each superseded by exactly one predecessor) is still allowed", () => {
+            const register = new AssumptionRegister();
+            register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "b", description: "d", reason: "r", impact: "LOW", source: "s" });
+            register.propose({ id: "c", description: "d", reason: "r", impact: "LOW", source: "s" });
+
+            expect(() => register.supersede("a", "b")).not.toThrow();
+            expect(() => register.supersede("b", "c")).not.toThrow();
+            expect(register.get("a")!.supersededBy).toBe("b");
+            expect(register.get("b")!.supersededBy).toBe("c");
+          });
+        }
+      );
+
       it("supersede() is rejected a second time on an already-SUPERSEDED assumption", () => {
         const register = new AssumptionRegister();
         register.propose({ id: "a", description: "d", reason: "r", impact: "LOW", source: "s" });

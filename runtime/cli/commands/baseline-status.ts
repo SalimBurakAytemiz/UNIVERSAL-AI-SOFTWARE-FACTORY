@@ -74,6 +74,41 @@ export class MalformedRequirementRegistryError extends Error {
   }
 }
 
+/**
+ * P1 fix (33rd independent review round, finding 3 / root class B,
+ * "authoritative validation parity" — "reject duplicate requirement IDs in
+ * the runtime loader"): `scripts/validate-requirements.mjs` (a separate,
+ * CI-time-only script) has ALWAYS rejected two records sharing the same
+ * `id` — but this runtime loader, the ONE path `factory baseline status`/
+ * `factory trace requirement`/`bootstrapProject()`'s own preflight check
+ * all actually execute through, never checked for duplicates at all. A
+ * duplicate id smuggled in (a bad merge resolution, a hand edit made
+ * outside the pre-commit `validate:requirements` convention, or simply
+ * running the Factory against a registry nobody re-validated) would be
+ * silently accepted by every RUNTIME consumer even though the CI script
+ * would have rejected it — exactly the "one validator for CI, a weaker one
+ * at runtime" split baseline section 294 ("no unsupported upgrades") and
+ * 303 ("no claim without evidence") forbid: two requirement records
+ * secretly sharing one identity could let a caller's evidence-tracing for
+ * ONE requirement silently attach to (or hide behind) the other. Fixed:
+ * the SAME duplicate-id rejection `validate-requirements.mjs` has always
+ * enforced now ALSO runs here, in the one authoritative runtime path —
+ * see this class's own fix note on `scripts/validate-requirements.mjs`
+ * itself, which now DELEGATES to this exact function rather than
+ * maintaining an independent, parallel implementation of the same check.
+ */
+export class DuplicateRequirementIdError extends Error {
+  constructor(id: string, firstFile: string, duplicateFile: string) {
+    super(
+      `Refusing to load requirement registry: id '${id}' is declared in both '${firstFile}' and ` +
+        `'${duplicateFile}'. A requirement id is a permanent, unique authoritative identity (baseline section ` +
+        `293) — two records sharing one id would let evidence/status tracking for one silently apply to, or ` +
+        `hide behind, the other.`
+    );
+    this.name = "DuplicateRequirementIdError";
+  }
+}
+
 let cachedValidator: ValidateFunction | undefined;
 
 function getRequirementValidator(): ValidateFunction {
@@ -128,6 +163,11 @@ export function loadRequirementsFromDir(dir: string): RequirementRecord[] {
   }
   const validate = getRequirementValidator();
   const all: RequirementRecord[] = [];
+  // P1 fix (33rd independent review round, finding 3 / root class B):
+  // tracks every id seen so far, across ALL files (not merely within one),
+  // so a duplicate declared in a DIFFERENT file is caught too — see
+  // `DuplicateRequirementIdError`'s own fix note above.
+  const seenIds = new Map<string, string>();
   for (const file of files) {
     const content = readFileSync(join(dir, file), "utf8");
     const parsed = yaml.load(content);
@@ -147,6 +187,12 @@ export function loadRequirementsFromDir(dir: string): RequirementRecord[] {
           `record '${(record as { id?: unknown })?.id ?? "<no id>"}' failed schema validation: ${details}`
         );
       }
+      const id = (record as { id: string }).id;
+      const firstFile = seenIds.get(id);
+      if (firstFile !== undefined) {
+        throw new DuplicateRequirementIdError(id, firstFile, file);
+      }
+      seenIds.set(id, file);
     }
     all.push(...(parsed as RequirementRecord[]));
   }

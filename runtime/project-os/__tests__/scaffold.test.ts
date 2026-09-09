@@ -77,4 +77,35 @@ describe("scaffoldProjectOs", () => {
       rmSync(outside, { recursive: true, force: true });
     });
   });
+
+  describe(
+    "P1 fix (33rd independent review round, root class A, 'freeze authoritative tier ordering at runtime' — " +
+      "same class applied to Project OS's exported directory list): 'as const' is a compile-time-only type " +
+      "hint, not a runtime freeze",
+    () => {
+      it("BLOCKER regression, exact reproduction: attempting to mutate PROJECT_OS_SUBDIRECTORIES via a type-system bypass throws, and the list is unchanged", () => {
+        const original = [...PROJECT_OS_SUBDIRECTORIES];
+        const mutable = PROJECT_OS_SUBDIRECTORIES as unknown as string[];
+        expect(() => mutable.push("rogue-dir")).toThrow(TypeError);
+        expect(() => {
+          mutable[0] = "hijacked";
+        }).toThrow(TypeError);
+        expect([...PROJECT_OS_SUBDIRECTORIES]).toEqual(original);
+      });
+
+      it("PROJECT_OS_SUBDIRECTORIES is genuinely frozen (Object.isFrozen)", () => {
+        expect(Object.isFrozen(PROJECT_OS_SUBDIRECTORIES)).toBe(true);
+      });
+
+      it("no regression: scaffoldProjectOs() still creates every expected subdirectory", () => {
+        const root = mkdtempSync(join(tmpdir(), "uasf-project-os-frozen-"));
+        try {
+          const result = scaffoldProjectOs(root, "proj-frozen-check");
+          expect(result.createdDirectories).toHaveLength(PROJECT_OS_SUBDIRECTORIES.length);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+    }
+  );
 });

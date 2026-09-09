@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { ModelGateway, UnknownProviderError, DuplicateProviderIdError, type ModelInvocationResponse } from "../gateway.js";
+import {
+  ModelGateway,
+  UnknownProviderError,
+  DuplicateProviderIdError,
+  ProviderInvocationError,
+  type ModelInvocationResponse
+} from "../gateway.js";
 import { AuditLog } from "../../audit/audit-log.js";
 import { createDefaultModelRegistry } from "../registry.js";
 import { MockProvider } from "../providers/mock-provider.js";
@@ -88,11 +94,43 @@ class ControllableProvider implements ModelProvider {
   }
 }
 
-/** A provider that always throws, to exercise the provider-failure reconciliation rule. */
+/**
+ * A provider that always throws a PLAIN, unclassified Error — to exercise
+ * root class F's actual fail-closed default: no billing evidence at all
+ * must be treated as "cost may have been incurred", never as proof of
+ * zero cost.
+ */
 class FailingProvider implements ModelProvider {
   readonly id = "failing";
   async invoke(): Promise<ModelInvocationResponse> {
     throw new Error("provider unavailable");
+  }
+}
+
+/** A provider that fails with explicit, authoritative evidence that NO cost was ever incurred. */
+class NotBilledFailingProvider implements ModelProvider {
+  readonly id = "not-billed-failing";
+  async invoke(): Promise<ModelInvocationResponse> {
+    throw new ProviderInvocationError("rejected before any request left this process", "NOT_BILLED");
+  }
+}
+
+/** A provider that fails AFTER billing, but reports the EXACT incurred amount. */
+class BilledExactFailingProvider implements ModelProvider {
+  constructor(private readonly incurredCostUsd: number) {}
+  readonly id = "billed-exact-failing";
+  async invoke(): Promise<ModelInvocationResponse> {
+    throw new ProviderInvocationError("billed by the provider, then the connection dropped", "BILLED", {
+      incurredCostUsd: this.incurredCostUsd
+    });
+  }
+}
+
+/** A provider that fails and reports it WAS billed, but does not know the exact amount. */
+class BilledUnknownAmountFailingProvider implements ModelProvider {
+  readonly id = "billed-unknown-failing";
+  async invoke(): Promise<ModelInvocationResponse> {
+    throw new ProviderInvocationError("billed by the provider, exact amount unavailable", "BILLED");
   }
 }
 
@@ -244,16 +282,16 @@ describe("ModelGateway + MockProvider", () => {
         expect(costEngine.total()).toBe(0.4); // ...but the cost is still recorded.
       });
 
-      it("a failing provider call releases its reservation instead of recording a cost (documented reconciliation rule)", async () => {
+      it("a provider call that explicitly proves NO_BILLED releases its reservation, freeing the budget for a real call (unchanged, documented rule for THIS ONE evidence-backed case)", async () => {
         const gateway = new ModelGateway();
-        gateway.registerProvider(new FailingProvider());
+        gateway.registerProvider(new NotBilledFailingProvider());
         const costEngine = new CostEngine();
         const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
-        const model = mockModel({ provider: "failing", costPerCall: 0.6 });
+        const model = mockModel({ provider: "not-billed-failing", costPerCall: 0.6 });
 
         await expect(
           gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
-        ).rejects.toThrow("provider unavailable");
+        ).rejects.toThrow("rejected before any request left this process");
         expect(costEngine.total()).toBe(0); // nothing was ever incurred, so nothing is recorded
 
         // The released reservation frees the budget back up for a real, successful call.
@@ -264,6 +302,78 @@ describe("ModelGateway + MockProvider", () => {
         expect(response.costUsd).toBe(0.6);
         expect(costEngine.total()).toBe(0.6);
       });
+
+      describe(
+        "P1 fix (33rd independent review round, finding 1 / root class F, 'billable provider failure " +
+          "reconciliation'): 'provider threw == cost is zero' is no longer assumed by default",
+        () => {
+          it("BLOCKER regression, exact reproduction: a provider that throws a PLAIN, unclassified Error no longer has its reservation silently released — the reservation is preserved and protected instead", async () => {
+            const gateway = new ModelGateway();
+            gateway.registerProvider(new FailingProvider());
+            const costEngine = new CostEngine();
+            const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+            const model = mockModel({ provider: "failing", costPerCall: 0.6 });
+
+            await expect(
+              gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
+            ).rejects.toThrow("provider unavailable");
+            expect(costEngine.total()).toBe(0); // nothing is durably recorded YET...
+
+            // ...but the capacity is NOT freed: a second $0.60 call under
+            // the SAME $1.00 perRunUsd ceiling must still be blocked,
+            // proving the reservation is still outstanding, not released.
+            const gateway2 = new ModelGateway();
+            gateway2.registerProvider(new MockProvider());
+            const workingModel = mockModel({ provider: "mock", costPerCall: 0.6 });
+            await expect(
+              gateway2.invoke(workingModel, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t2" })
+            ).rejects.toThrow(BudgetExceededError);
+          });
+
+          it("root-cause proof: total reserved capacity for the scope remains fully outstanding after the failure — proving the reservation was preserved, not released", async () => {
+            const gateway = new ModelGateway();
+            gateway.registerProvider(new FailingProvider());
+            const costEngine = new CostEngine();
+            const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+            const model = mockModel({ provider: "failing", costPerCall: 0.6 });
+
+            await expect(
+              gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
+            ).rejects.toThrow("provider unavailable");
+
+            expect(costEngine.reservedTotal({ taskId: "t1" })).toBe(0.6);
+          });
+
+          it("a provider that reports BILLED with an EXACT incurred cost has that exact amount committed, never erased, even though the call itself still fails", async () => {
+            const gateway = new ModelGateway();
+            gateway.registerProvider(new BilledExactFailingProvider(0.35));
+            const costEngine = new CostEngine();
+            const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+            const model = mockModel({ provider: "billed-exact-failing", costPerCall: 0.6 });
+
+            await expect(
+              gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
+            ).rejects.toThrow("billed by the provider, then the connection dropped");
+
+            // The REAL incurred cost (0.35, not the estimated 0.6) is durably recorded.
+            expect(costEngine.total()).toBe(0.35);
+          });
+
+          it("a provider that reports BILLED without a known exact amount is treated the same as UNKNOWN — protected, not released", async () => {
+            const gateway = new ModelGateway();
+            gateway.registerProvider(new BilledUnknownAmountFailingProvider());
+            const costEngine = new CostEngine();
+            const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+            const model = mockModel({ provider: "billed-unknown-failing", costPerCall: 0.6 });
+
+            await expect(
+              gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
+            ).rejects.toThrow("billed by the provider, exact amount unavailable");
+            expect(costEngine.total()).toBe(0);
+            expect(costEngine.reservedTotal({ taskId: "t1" })).toBe(0.6);
+          });
+        }
+      );
 
       it(
         "BLOCKER regression (10th independent review round, exact reproduction): two concurrent $0.60 calls " +

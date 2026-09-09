@@ -409,4 +409,111 @@ describe("AuditLog", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (33rd independent review round, finding 4 / root class C, 'reject or canonicalize undefined audit " +
+      "values before hashing'): an undefined value must never let the stored record and the hashed record " +
+      "disagree about what the payload contains",
+    () => {
+      it(
+        "root-cause proof: structuredClone() PRESERVES an undefined object property while JSON.stringify() " +
+          "DROPS it — this divergence is exactly why the stored record and the hash used to disagree",
+        () => {
+          const cloned = structuredClone({ a: undefined, b: 1 });
+          expect(Object.prototype.hasOwnProperty.call(cloned, "a")).toBe(true);
+          expect(JSON.stringify(cloned)).toBe(JSON.stringify({ b: 1 }));
+        }
+      );
+
+      it("BLOCKER regression, exact reproduction: an undefined object-property payload value no longer appears in the stored record, and the record's hash matches ONLY that stripped-down shape", () => {
+        const log = new AuditLog();
+        const timestamp = "2026-01-01T00:00:00.000Z";
+        const record = log.append({
+          type: "OK",
+          actor: "x",
+          payload: { decidedBy: undefined, keep: "value" },
+          timestamp
+        });
+
+        // The key is gone entirely from the STORED record, not merely from
+        // some separate hash-time view of it.
+        expect(Object.prototype.hasOwnProperty.call(record.payload, "decidedBy")).toBe(false);
+        expect(record.payload).toEqual({ keep: "value" });
+
+        const expectedHash = createHash("sha256")
+          .update(
+            JSON.stringify({
+              type: "OK",
+              actor: "x",
+              payload: { keep: "value" },
+              timestamp,
+              sequence: 0,
+              previousHash: "0".repeat(64)
+            })
+          )
+          .digest("hex");
+        expect(record.hash).toBe(expectedHash);
+      });
+
+      it("BLOCKER regression: a record with an undefined field and a record that never had the field at all now hash IDENTICALLY (both stored AND hashed forms genuinely agree, rather than merely coincidentally matching)", () => {
+        const withUndefined = new AuditLog();
+        const withoutField = new AuditLog();
+        const timestamp = "2026-01-01T00:00:00.000Z";
+
+        const r1 = withUndefined.append({
+          type: "OK",
+          actor: "x",
+          payload: { decidedBy: undefined, keep: "value" },
+          timestamp
+        });
+        const r2 = withoutField.append({
+          type: "OK",
+          actor: "x",
+          payload: { keep: "value" },
+          timestamp
+        });
+
+        expect(r1.hash).toBe(r2.hash);
+        expect(r1.payload).toEqual(r2.payload);
+      });
+
+      it("BLOCKER regression, exact reproduction: an undefined ARRAY element is rejected outright (no safe 'omit' equivalent — would otherwise collide with a legitimate null)", () => {
+        const log = new AuditLog();
+        const payload = { list: [1, undefined, 3] } as unknown as Record<string, unknown>;
+        expect(() =>
+          log.append({ type: "BAD", actor: "x", payload, timestamp: new Date().toISOString() })
+        ).toThrow(UnsupportedAuditPayloadError);
+        expect(log.all()).toHaveLength(0);
+      });
+
+      it("an undefined value nested arbitrarily deep inside an otherwise-plain object payload is still stripped, not just at the top level", () => {
+        const log = new AuditLog();
+        const record = log.append({
+          type: "OK",
+          actor: "x",
+          payload: { outer: { inner: { droppedField: undefined, kept: 1 } } },
+          timestamp: new Date().toISOString()
+        });
+        expect(record.payload).toEqual({ outer: { inner: { kept: 1 } } });
+      });
+
+      it("no regression: a payload with no undefined values at all is unaffected", () => {
+        const log = new AuditLog();
+        const record = log.append({
+          type: "OK",
+          actor: "x",
+          payload: { a: 1, b: "two", c: null },
+          timestamp: new Date().toISOString()
+        });
+        expect(record.payload).toEqual({ a: 1, b: "two", c: null });
+      });
+
+      it("no regression: verifyIntegrity() still passes for a chain containing a canonicalized (undefined-stripped) record", () => {
+        const log = new AuditLog();
+        log.append({ type: "A", actor: "x", payload: { skip: undefined, keep: 1 }, timestamp: new Date().toISOString() });
+        log.append({ type: "B", actor: "x", payload: { keep: 2 }, timestamp: new Date().toISOString() });
+        expect(log.verifyIntegrity()).toBe(true);
+      });
+    }
+  );
 });

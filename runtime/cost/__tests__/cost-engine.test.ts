@@ -277,6 +277,82 @@ describe("CostEngine", () => {
   );
 
   describe(
+    "P1 fix (33rd independent review round, finding 1 / root class F, 'billable provider failure " +
+      "reconciliation'): markReservationUnresolved() is the entry point ModelGateway.invoke() uses for a " +
+      "provider failure with no authoritative evidence of zero cost — it must protect exactly like a failed " +
+      "commitReservation() already does, never delete, and validate ownership the same way releaseReservation() " +
+      "does",
+    () => {
+      it("BLOCKER regression, exact reproduction: an ACTIVE reservation transitions to RECONCILIATION_FAILED and is NOT removed", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+
+        const result = engine.markReservationUnresolved(reservation.id, { taskId: "t1" });
+
+        expect(result.status).toBe("RECONCILIATION_FAILED");
+        expect(engine.getReservation(reservation.id)?.status).toBe("RECONCILIATION_FAILED");
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5); // capacity still protected
+        expect(engine.totalFor({ taskId: "t1" })).toBe(0); // nothing durably recorded yet
+      });
+
+      it("root-cause proof: once marked unresolved, releaseReservation() is rejected exactly like any other RECONCILIATION_FAILED reservation", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+        engine.markReservationUnresolved(reservation.id, { taskId: "t1" });
+
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5);
+      });
+
+      it("no regression: a corrected commitReservation() retry on the same id still works after markReservationUnresolved()", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+        engine.markReservationUnresolved(reservation.id, { taskId: "t1" });
+
+        const recorded = engine.commitReservation(reservation.id, {
+          taskId: "t1",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.5
+        });
+
+        expect(recorded.amountUsd).toBe(0.5);
+        expect(engine.totalFor({ taskId: "t1" })).toBe(0.5);
+        expect(engine.getReservation(reservation.id)).toBeUndefined(); // committed, removed
+      });
+
+      it("BLOCKER: rejects a caller whose supplied ownership does not match the reservation's own authoritative scope, and does not mutate the reservation", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1", provider: "openai" }, 0.5);
+
+        expect(() =>
+          engine.markReservationUnresolved(reservation.id, { taskId: "t1", provider: "anthropic" })
+        ).toThrow(ReservationOwnershipMismatchError);
+        expect(engine.getReservation(reservation.id)?.status).toBe("ACTIVE"); // untouched
+      });
+
+      it("throws UnknownReservationError for a nonexistent or already-resolved id", () => {
+        const engine = new CostEngine();
+        expect(() => engine.markReservationUnresolved("never-existed", {})).toThrow(UnknownReservationError);
+
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.1);
+        engine.releaseReservation(reservation.id, { taskId: "t1" });
+        expect(() => engine.markReservationUnresolved(reservation.id, { taskId: "t1" })).toThrow(UnknownReservationError);
+      });
+
+      it("is idempotent: calling it twice on an already-RECONCILIATION_FAILED reservation is a safe no-op, not an error", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
+        engine.markReservationUnresolved(reservation.id, { taskId: "t1" });
+
+        expect(() => engine.markReservationUnresolved(reservation.id, { taskId: "t1" })).not.toThrow();
+        expect(engine.getReservation(reservation.id)?.status).toBe("RECONCILIATION_FAILED");
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5);
+      });
+    }
+  );
+
+  describe(
     "P1 fix (25th independent review round, 'reservation ownership must be validated inside CostEngine'): " +
       "commitReservation() itself (not only BudgetGuard, one layer above) must reject a commit whose supplied " +
       "ownership does not match the reservation's own authoritative scope",

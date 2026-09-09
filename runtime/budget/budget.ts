@@ -959,4 +959,45 @@ export class BudgetGuard {
       timestamp: this.#now().toISOString()
     });
   }
+
+  /**
+   * P1 fix (33rd independent review round, finding 1 / root class F,
+   * "billable provider failure reconciliation"): the entry point
+   * `ModelGateway.invoke()` now calls INSTEAD of `release()` whenever a
+   * provider call fails without authoritative evidence that no cost was
+   * incurred (bkz. `runtime/models/gateway.ts`'in kendi fix notu — the
+   * `ProviderFailureBillingStatus` classification that decides which of
+   * `release()`/`commit()`/this method actually runs). This method never
+   * deletes the reservation — it transitions the reservation into the
+   * SAME `RECONCILIATION_FAILED` protection a failed `commit()` attempt
+   * already produces (bkz. `CostEngine.markReservationUnresolved()`'in
+   * kendi fix notu), so the protected capacity remains reserved until
+   * either a corrected `commit()` records the real incurred cost, or a
+   * human operator resolves it out-of-band with genuine evidence. Ownership
+   * is validated the same way `release()`'s own is — only the caller who
+   * actually holds this reservation's scope may mark it unresolved.
+   */
+  markProviderFailureUnresolved(reservationId: string, callerScope: ReservationOwnership): void {
+    let result;
+    try {
+      result = this.#costEngine.markReservationUnresolved(reservationId, callerScope);
+    } catch (err) {
+      if (err instanceof ReservationOwnershipMismatchError) {
+        this.#auditLog?.append({
+          type: "BUDGET_PROVIDER_FAILURE_RECONCILIATION_REJECTED_OWNERSHIP_MISMATCH",
+          actor: "budget-guard",
+          payload: { reservationId, suppliedScope: callerScope },
+          timestamp: this.#now().toISOString()
+        });
+      }
+      throw err;
+    }
+
+    this.#auditLog?.append({
+      type: "BUDGET_PROVIDER_FAILURE_RECONCILIATION_REQUIRED",
+      actor: "budget-guard",
+      payload: { reservationId, scope: callerScope, reservedAmountUsd: result.amountUsd },
+      timestamp: this.#now().toISOString()
+    });
+  }
 }

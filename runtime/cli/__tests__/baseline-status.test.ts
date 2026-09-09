@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
+  DuplicateRequirementIdError,
   EmptyRequirementRegistryError,
   MalformedRequirementRegistryError,
   computeBaselineStatus,
@@ -212,6 +213,56 @@ describe(
       );
       const records = loadRequirementsFromDir(tempRoot);
       expect(records).toHaveLength(2);
+    });
+  }
+);
+
+describe(
+  "P1 fix (33rd independent review round, finding 3 / root class B, 'authoritative validation parity' — " +
+    "'reject duplicate requirement IDs in the runtime loader')",
+  () => {
+    let tempRoot: string;
+
+    afterEach(() => {
+      if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    function validRecord(id: string): string {
+      return [
+        `- id: ${id}`,
+        "  title: t",
+        "  description: d",
+        "  source_baseline: 'BASELINE-V1 section 0'",
+        "  category: P0",
+        "  priority: LOW",
+        "  status: DEFINED",
+        ""
+      ].join("\n");
+    }
+
+    it("BLOCKER regression, exact reproduction: the same id declared across two different files throws DuplicateRequirementIdError", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-baseline-status-dupid-crossfile-"));
+      writeFileSync(join(tempRoot, "a.yml"), validRecord("UASF-REQ-9101"));
+      writeFileSync(join(tempRoot, "b.yml"), validRecord("UASF-REQ-9101"));
+      expect(() => loadRequirementsFromDir(tempRoot)).toThrow(DuplicateRequirementIdError);
+    });
+
+    it("BLOCKER regression, exact reproduction: the same id declared twice within one file throws DuplicateRequirementIdError", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-baseline-status-dupid-samefile-"));
+      writeFileSync(join(tempRoot, "a.yml"), validRecord("UASF-REQ-9102") + validRecord("UASF-REQ-9102"));
+      expect(() => loadRequirementsFromDir(tempRoot)).toThrow(DuplicateRequirementIdError);
+    });
+
+    it("no regression: distinct ids across multiple files still load correctly", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-baseline-status-dupid-distinct-"));
+      writeFileSync(join(tempRoot, "a.yml"), validRecord("UASF-REQ-9103"));
+      writeFileSync(join(tempRoot, "b.yml"), validRecord("UASF-REQ-9104"));
+      const records = loadRequirementsFromDir(tempRoot);
+      expect(records).toHaveLength(2);
+    });
+
+    it("no regression: the REAL requirement registry (specification/requirements) contains no duplicate ids", () => {
+      expect(() => loadRequirementsFromDir(requirementsDir)).not.toThrow(DuplicateRequirementIdError);
     });
   }
 );
