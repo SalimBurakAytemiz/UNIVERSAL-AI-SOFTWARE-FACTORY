@@ -516,4 +516,86 @@ describe("AuditLog", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (36th independent review round, finding 9, 'store __proto__ as normal audit data'): a " +
+      "JSON-derived payload's own '__proto__' key must be stored (and hashed) as ordinary data, never " +
+      "interpreted as the legacy prototype-mutation accessor",
+    () => {
+      it(
+        "root-cause proof: bracket-assigning a '__proto__' key on a plain object invokes the inherited " +
+          "accessor and mutates its prototype instead of creating an own property — this is exactly why " +
+          "canonicalizeAuditValue() cannot use plain assignment",
+        () => {
+          const obj: Record<string, unknown> = {};
+          obj["__proto__"] = { polluted: true };
+          expect(Object.prototype.hasOwnProperty.call(obj, "__proto__")).toBe(false);
+          expect(Object.getPrototypeOf(obj)).toEqual({ polluted: true });
+        }
+      );
+
+      it(
+        "BLOCKER regression, exact reproduction: a payload carrying its own '__proto__' data property " +
+          "(set via a computed key, never the object-literal special form) is stored as an ordinary " +
+          "own property — not silently dropped, and never applied as this object's actual prototype",
+        () => {
+          const log = new AuditLog();
+          const timestamp = "2026-01-01T00:00:00.000Z";
+          // A computed property key bypasses the object-literal special case
+          // for `__proto__` (which sets the prototype) — this is exactly how
+          // a JSON.parse()'d payload legitimately ends up with `__proto__`
+          // as a genuine OWN property, since `JSON.parse('{"__proto__":1}')`
+          // also produces an own data property, never a prototype change.
+          const payload = { ["__proto__"]: { polluted: true }, keep: "value" };
+
+          const record = log.append({ type: "OK", actor: "x", payload, timestamp });
+
+          expect(Object.prototype.hasOwnProperty.call(record.payload, "__proto__")).toBe(true);
+          expect((record.payload as Record<string, unknown>)["__proto__"]).toEqual({ polluted: true });
+          expect(record.payload).toEqual({ ["__proto__"]: { polluted: true }, keep: "value" });
+          // The record's OWN actual prototype must be entirely unaffected —
+          // no prototype pollution occurred anywhere in the pipeline.
+          expect(Object.getPrototypeOf(record.payload)).toBe(Object.prototype);
+
+          const expectedHash = createHash("sha256")
+            .update(
+              JSON.stringify({
+                type: "OK",
+                actor: "x",
+                payload: { ["__proto__"]: { polluted: true }, keep: "value" },
+                timestamp,
+                sequence: 0,
+                previousHash: "0".repeat(64)
+              })
+            )
+            .digest("hex");
+          expect(record.hash).toBe(expectedHash);
+        }
+      );
+
+      it("no regression: verifyIntegrity() still passes for a chain containing a record with an own '__proto__' payload key", () => {
+        const log = new AuditLog();
+        log.append({
+          type: "A",
+          actor: "x",
+          payload: { ["__proto__"]: "not-a-real-prototype", keep: 1 },
+          timestamp: new Date().toISOString()
+        });
+        log.append({ type: "B", actor: "x", payload: { keep: 2 }, timestamp: new Date().toISOString() });
+        expect(log.verifyIntegrity()).toBe(true);
+      });
+
+      it("no regression: a payload with no '__proto__' key at all is unaffected", () => {
+        const log = new AuditLog();
+        const record = log.append({
+          type: "OK",
+          actor: "x",
+          payload: { a: 1, b: "two" },
+          timestamp: new Date().toISOString()
+        });
+        expect(record.payload).toEqual({ a: 1, b: "two" });
+        expect(Object.getPrototypeOf(record.payload)).toBe(Object.prototype);
+      });
+    }
+  );
 });

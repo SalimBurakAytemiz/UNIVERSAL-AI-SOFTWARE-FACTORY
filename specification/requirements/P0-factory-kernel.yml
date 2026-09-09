@@ -5386,6 +5386,114 @@
     the new Phase Closure Manifest's own independentReviewResult gate, not merely by convention). This round does
     NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, and does NOT invoke Codex itself — all work stayed
     on claude/ai-factory-baseline-v1-seawq7.
+
+    Round 36 (a 36th independent Codex review found ELEVEN actionable findings — 9 P1, 2 P2 — fixed as ONE
+    consolidated closure batch; explicitly STRICTLY corrective, not a governance-feature-expanding round):
+    (1) `scripts/secret-scan.mjs`'s direct-CLI-invocation check compared `` `file://${process.argv[1]}` `` against
+    `import.meta.url` by naive string concatenation — a path containing spaces, non-ASCII characters, or Windows
+    drive-letter/backslash semantics could make the comparison silently fail, skipping mandatory secret scanning
+    entirely; fixed with a new exported `isDirectCliInvocation()` using `pathToFileURL()` (the genuine, platform-
+    correct inverse operation), proven end-to-end with a real git repo built inside a temp directory deliberately
+    named with a space and non-ASCII characters. (2)+(3)+(4) `runtime/governance/phase-closure.ts`'s
+    `attemptPhaseClosure()`: generated manifest filenames from caller-supplied `phaseId`/`manifestId` via `join()`
+    with no confinement (a `manifestId` of `"../../outside"` could escape the manifest directory) — fixed with a
+    new `assertSafeGovernanceIdentifier()` (rejecting separators/`.`/`..`) plus `assertFilesystemConfinement()` (the
+    same symlink-aware, TOCTOU-hardened primitive `sandbox.ts` already provides); a duplicate phase/manifest
+    identity could silently overwrite earlier durable closure evidence — fixed by checking `store.exists()` before
+    ever writing, throwing a new `DuplicateClosureManifestError`, making manifests genuinely append-only; and
+    `scopeLock.close()` could transition a phase to CLOSED before its mandatory closure manifest was durably
+    persisted (leaving `phase = CLOSED, manifest = missing` if the write failed) — fixed with a staged protocol
+    (construct and validate the manifest, persist it successfully, THEN commit the closure transition), so a failed
+    manifest write leaves the phase non-CLOSED with no false closure ever recorded. (5)
+    `runtime/requirements-traceability/traceability.ts`'s `isVerifiedEvidenceRef()` treated any existing on-disk
+    path as "verified" regardless of whether the underlying test/proof actually passed, or whether the path was
+    merely a generic directory — fixed with an additive `StructuredEvidenceRef` shape (`{path, type, outcome}`)
+    distinguishing TEST_RESULT/PROOF_RESULT/SECURITY_RESULT/REVIEW_RESULT/ARTIFACT_REFERENCE evidence and requiring
+    a PASS/CLEAN/SUCCESS-family outcome for the four outcome-bearing types before counting as verified — legacy bare
+    string refs remain accepted (96 already-verified real registry entries preserved), and the SAME authoritative
+    function is what the Phase Closure Manifest and Implementation Reality Matrix already consume, so this closes
+    the gap for all three governance surfaces at once, not just this one. (6)+(7) `runtime/models/gateway.ts`'s
+    `invoke()` returned `#rawInvoke()`'s result verbatim — the exact live object reference a provider adapter could
+    retain and mutate after returning, letting billing/validation observe a value that later silently changed —
+    fixed by detaching a frozen snapshot (`freezeRecord({...rawResponse})`) immediately, before any billing read or
+    caller handoff; and `detachFromCallerMutation()` only locked a provider's OWN top-level property slots (shallow,
+    matching `freezeRecord` elsewhere), leaving a NESTED plain-object value (e.g. `provider.config.endpoint`) freely
+    mutable after registration, silently redirecting an already-authorized provider's real execution target — fixed
+    by recursively deep-freezing nested plain OBJECTS (via `isPlainConfigValue()`) and evaluating any accessor
+    property once at registration time into a frozen data property, while deliberately EXCLUDING arrays from the
+    deep-freeze (this codebase's own established `ControllableProvider`-style self-tracking bookkeeping pattern —
+    `receivedModels.push()`/`pending.splice()` inside a provider's own `invoke()` — relies on arrays remaining
+    mutable in place; the finding's own named example is a nested OBJECT, so excluding arrays closes the exact gap
+    named without regressing this established, already-tested pattern). (8) an `UnknownProviderError` (thrown
+    entirely locally, before any provider is ever invoked — no external system could have been billed) was
+    classified as ambiguous `"UNKNOWN"` billing status by `classifyProviderFailure()`, routing it into
+    `BudgetGuard.markProviderFailureUnresolved()` and stranding the reservation in RECONCILIATION_FAILED for a
+    failure that was never actually ambiguous — fixed by special-casing `UnknownProviderError` to `"NOT_BILLED"`,
+    so the reservation is genuinely released and capacity freed. (9) `runtime/audit/audit-log.ts`'s
+    `canonicalizeAuditValue()` built its per-property result object via ordinary bracket assignment
+    (`result[key] = ...`) — for a JSON-derived payload carrying an own `"__proto__"` key, this invoked
+    `Object.prototype`'s legacy `__proto__` ACCESSOR instead of creating a normal data property, silently mutating
+    the constructed object's actual prototype (or discarding the value entirely, for a non-object/non-null value)
+    rather than storing it — fixed with `Object.defineProperty()`, which always creates a genuine own data property
+    under the exact key given, never consulting any inherited accessor. (10) `runtime/cost/cost-engine.ts`'s
+    `record()` validated only `amountUsd` before persisting a `CostEntry` — `taskId`/`provider`/`modelId` (required)
+    and `agentId`/`projectId`/`runId` (optional-but-must-be-string) were never checked, while
+    `assertValidPersistedCostState()` (the SAME file's own restore-time validator) DOES reject an entry with an
+    empty/non-string identity field — meaning a live `record()` call could durably persist an entry the very next
+    process restart would refuse to load, taking the entire cost ledger down with `CorruptCostStateError` — fixed
+    with a new `assertValidCostEntryIdentity()` applying the EXACT SAME rule restore uses, at the one shared choke
+    point (`#recordSnapshot()`) both `record()` and `#recordCommitted()` already funnel through, so "would restore
+    reject this?" is now answered and enforced BEFORE any mutation or persistence. (11) EVERY mutating
+    `cost-engine.ts` method (`record()`/`createReservation()`/`commitReservation()`/`releaseReservation()`) mutated
+    `#entries`/`#reservations` directly and only THEN called `#persist()` — if that write failed (a durable-storage
+    I/O error), the in-memory mutation had already happened and was never undone, leaving RAM ahead of disk with no
+    way for a caller to know which was authoritative — fixed with a new `#publish(nextEntries, nextReservations)`
+    that stages the complete next snapshot onto the live fields, attempts `#persist()`, and on failure immediately
+    restores the exact previous references before rethrowing ("compute next -> persist next -> publish next," never
+    "mutate now, persist maybe"); this required making `ReservationEntry.status` readonly and every reservation
+    state TRANSITION construct a fresh object in a fresh Map rather than writing a property on the live map's own
+    value (a shared-object in-place write would have corrupted the very "previous" snapshot being rolled back to).
+    ONE explicit, deliberate EXCEPTION was preserved: the THREE places that mark a reservation
+    RECONCILIATION_FAILED (an ownership mismatch or any other failure during `commitReservation()`, and
+    `markReservationUnresolved()`) are NOT routed through `#publish()` — this transition is a fail-safe LOCK
+    established precisely because whether a real cost was incurred is uncertain, and it must hold in memory
+    regardless of whether the follow-up persist itself succeeds; rolling it back on a second, independent
+    persistence failure would silently return an uncertain-cost reservation to ACTIVE-and-releasable, regressing
+    the 28th round's own "every failed commit must enter RECONCILIATION_FAILED" invariant (an existing regression
+    test in `runtime/cost/__tests__/cost-engine.test.ts` catches exactly this — it was run and confirmed still
+    green after this distinction was made). A narrow root-cause audit for exactly the 10 named shared classes (CLI
+    direct-execution checks that can silently skip mandatory security work; generated governance paths lacking
+    filesystem confinement; append-only governance evidence being overwriteable; authoritative state transition
+    committed before mandatory evidence persistence; evidence existence mistaken for successful outcome;
+    provider-owned mutable response/config references crossing trust boundaries; pre-invocation failures classified
+    as potentially billable; prototype-sensitive canonical object construction; live persistence accepting state
+    restore would reject; memory mutation published before durable write succeeds) found no further genuine
+    instances: other `import.meta.url` usages are plain `dirname()`/`fileURLToPath()` calls, not CLI-invocation
+    guards; `scope-lock.ts`'s `saveTo()`/`loadFrom()` take one fixed, trusted path per store, never a per-record
+    generated filename; `assumption-register.ts`/`decision-ledger.ts`/`workers/registry.ts`/`service-catalog.ts`
+    either already closed this exact "live API accepts what restore rejects" gap in prior rounds (round 33, root
+    class D) or use a manual, caller-invoked `saveTo()` rather than cost-engine.ts's auto-persist-on-mutation
+    design, so finding 11's precise "mutate then auto-persist" pattern does not apply to them; `file-cache.ts` keeps
+    no persistent in-memory mirror at all (every operation freshly reloads from disk), so it is architecturally
+    immune to finding 11's divergence class; `logger.ts`'s equivalent object-construction loop already uses
+    `Object.create(null)`, making prototype-accessor mutation structurally impossible; `file-store.ts`'s equivalent
+    loop is a read-only validation walk that never constructs a new object. Every fix was individually
+    bypass-verified (a temporary in-place revert confirmed to reproduce the EXACT predicted regression-test
+    failures — no more, no fewer — then restored and reconfirmed green), and the full suite was re-run after each
+    fix to catch cross-cutting regressions. Full required sequence green: lint, typecheck, build, 1410/1410 tests
+    (50 files, +50 net new across all eleven fixes), validate:requirements (46 schema-valid records),
+    history-and-current-tree-aware secret-scan (PASS), Factory Doctor (READY), all 9 P0 proofs, all 128 governance
+    (Central Invariant Guard / Scope Lock / Backlog Router / Phase Closure Manifest / Implementation Reality Matrix
+    / Decision Ledger / traceability) tests green — confirming NONE of the four governance mechanisms were expanded
+    or altered beyond this round's corrective fixes, exactly per this round's explicit "do NOT expand them, only
+    harden and correct the reported behavior" instruction. No status raised on any requirement beyond what real
+    evidence supports. P0's persisted Scope Lock state is UNCHANGED by this round (still `LOCKED_FOR_CLOSURE`,
+    i.e. READY_FOR_INDEPENDENT_REVIEW, from round 35) — this round did not run a phase-transition API call, since
+    no new independent review result was supplied and none of the fixes constitute a phase-state change; P0
+    remains explicitly NOT CLOSED, awaiting a LATER independent Codex review to return
+    INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this round does NOT merge, does NOT move to P1,
+    does NOT declare P0 CLOSED, and does NOT invoke Codex itself — all work stayed on
+    claude/ai-factory-baseline-v1-seawq7.
 - id: UASF-REQ-0043
   title: Central Invariant Guard
   description: >

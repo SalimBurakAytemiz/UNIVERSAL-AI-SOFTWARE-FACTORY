@@ -6,6 +6,7 @@
 // "no unsupported upgrades" kuralının denetlenebilir hâlidir.
 
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 
 export type RequirementStatus =
@@ -21,12 +22,42 @@ export type RequirementStatus =
   | "DEPRECATED"
   | "SUPERSEDED";
 
+/**
+ * P1 fix (36th independent review round, finding 5, "require outcome
+ * evidence, not simple path existence"): an evidence ref may either be a
+ * plain string (unchanged legacy shape — every existing record in
+ * `specification/requirements/*.yml` uses this form today, and it
+ * continues to work exactly as before, no migration required) or this
+ * richer, OPTIONAL structured form for a ref whose artifact carries a
+ * known PASS/FAIL-shaped outcome (a test run, a proof run, a security
+ * scan, a review). `type: "ARTIFACT_REFERENCE"` (the plain-string form's
+ * implicit type) makes no outcome claim at all — it only asserts "this
+ * artifact exists" — so it is never required to carry `outcome`; the other
+ * four types DO make an outcome claim, and that claim is checked (see
+ * `isVerifiedEvidenceRef()` below).
+ */
+export type EvidenceRefType = "TEST_RESULT" | "PROOF_RESULT" | "SECURITY_RESULT" | "REVIEW_RESULT" | "ARTIFACT_REFERENCE";
+
+/** The narrow set of outcome values that count as "this evidence supports the claim it is cited for". Anything else — including a genuinely-recorded failure — does not. */
+export type EvidenceSuccessOutcome = "PASS" | "CLEAN" | "SUCCESS";
+
+export interface StructuredEvidenceRef {
+  readonly path: string;
+  readonly type: EvidenceRefType;
+  readonly outcome?: string;
+}
+
+/** An evidence ref is either the legacy bare path, or the richer typed/outcome-bearing form above. */
+export type EvidenceRef = string | StructuredEvidenceRef;
+
+const EVIDENCE_SUCCESS_OUTCOMES: ReadonlySet<string> = new Set<EvidenceSuccessOutcome>(["PASS", "CLEAN", "SUCCESS"]);
+
 export interface TraceableRequirement {
   readonly id: string;
   readonly status: RequirementStatus;
-  readonly implementationRefs: readonly string[];
-  readonly testRefs: readonly string[];
-  readonly proofRefs: readonly string[];
+  readonly implementationRefs: readonly EvidenceRef[];
+  readonly testRefs: readonly EvidenceRef[];
+  readonly proofRefs: readonly EvidenceRef[];
 }
 
 export type TraceabilityIssueType =
@@ -169,18 +200,65 @@ function looksLikeFilePath(ref: string): boolean {
  * single authoritative evidence path instead of a second one drifting
  * alongside it.
  */
-export function isVerifiedEvidenceRef(ref: string, rootDir: string): boolean {
-  if (!looksLikeFilePath(ref)) return false;
+/**
+ * P1 fix (36th independent review round, finding 5, "require outcome
+ * evidence, not simple path existence"): this function used to treat mere
+ * `existsSync(resolved)` as sufficient — a resolved path being ANY kind of
+ * filesystem entry (crucially, including a DIRECTORY) that happens to
+ * exist was accepted as full evidence, regardless of what it actually
+ * demonstrates. Codex reproduced two distinct consequences of that same
+ * root cause ("evidence existence is not evidence success"):
+ *
+ * (1) A trivially generic reference — `proof_refs: ["."]`, i.e. the
+ * confinement root itself — "exists" for literally every possible claim
+ * in the registry (the repository root always exists), so it satisfied
+ * PROOF_VERIFIED-grade evidence for absolutely anything. Fixed: a
+ * resolved ref that refers to the SAME directory as `rootDir` itself is
+ * rejected — a ref must point at something narrower than "the whole
+ * confinement root", not just anything existing beneath it. A genuinely-
+ * scoped module directory (e.g. `runtime/audit/`, already cited as real
+ * evidence by several existing, previously-verified requirements in this
+ * repository's own registry) is UNCHANGED by this — only the degenerate
+ * root-identity case (`.`, an empty ref, or anything else that resolves to
+ * exactly `rootDir`) is newly rejected, so no previously-verified
+ * requirement's evidence is weakened.
+ *
+ * (2) A ref that DOES carry a known, structured outcome (a test run, a
+ * proof run, a security scan, a review — see `StructuredEvidenceRef`
+ * above) could claim PROOF_VERIFIED-grade evidence even when that
+ * outcome was a recorded FAILURE, since only the artifact's mere
+ * existence was ever checked, never what it actually says. Fixed: for the
+ * four outcome-bearing evidence types (everything except the legacy
+ * `ARTIFACT_REFERENCE`/plain-string shape, which makes no outcome claim
+ * to begin with), `outcome` must be one of `EVIDENCE_SUCCESS_OUTCOMES`
+ * ("PASS"/"CLEAN"/"SUCCESS") — a missing, failing, or otherwise
+ * unrecognized outcome value means the ref does NOT count as verified
+ * evidence, no matter how real the artifact on disk is.
+ */
+export function isVerifiedEvidenceRef(ref: EvidenceRef, rootDir: string): boolean {
+  const path = typeof ref === "string" ? ref : ref.path;
+  const type: EvidenceRefType = typeof ref === "string" ? "ARTIFACT_REFERENCE" : ref.type;
+
+  if (!looksLikeFilePath(path)) return false;
+
   let resolved: string;
   try {
-    resolved = assertFilesystemConfinement(rootDir, ref);
+    resolved = assertFilesystemConfinement(rootDir, path);
   } catch {
     return false;
   }
-  return existsSync(resolved);
+  if (!existsSync(resolved)) return false;
+  if (resolved === resolve(rootDir)) return false;
+
+  if (type !== "ARTIFACT_REFERENCE") {
+    const outcome = typeof ref === "string" ? undefined : ref.outcome;
+    if (outcome === undefined || !EVIDENCE_SUCCESS_OUTCOMES.has(outcome)) return false;
+  }
+
+  return true;
 }
 
-function hasVerifiedEvidence(refs: readonly string[], rootDir: string): boolean {
+function hasVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boolean {
   return refs.some((ref) => isVerifiedEvidenceRef(ref, rootDir));
 }
 
@@ -236,9 +314,9 @@ export function detectTraceabilityIssues(
 export function adaptRequirementRecord(record: {
   readonly id: string;
   readonly status: string;
-  readonly implementation_refs?: readonly string[];
-  readonly test_refs?: readonly string[];
-  readonly proof_refs?: readonly string[];
+  readonly implementation_refs?: readonly EvidenceRef[];
+  readonly test_refs?: readonly EvidenceRef[];
+  readonly proof_refs?: readonly EvidenceRef[];
 }): TraceableRequirement {
   return {
     id: record.id,

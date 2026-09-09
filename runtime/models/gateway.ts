@@ -30,7 +30,7 @@ import { CapabilityGateway } from "../capability-gateway/gateway.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
 import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import type { BudgetGuard } from "../budget/budget.js";
-import { freezeRecord } from "../util/immutable.js";
+import { freezeRecord, deepFreeze } from "../util/immutable.js";
 import type { AuditLog } from "../audit/audit-log.js";
 
 /**
@@ -220,10 +220,27 @@ export class ProviderInvocationError extends Error {
  * is conservatively `"UNKNOWN"`, never `"NOT_BILLED"`: the whole point of
  * this classification is that "no evidence" must never be read as
  * "evidence of zero cost".
+ *
+ * P1 fix (36th independent review round, finding 8, "treat unknown
+ * providers as definitely unbilled"): `UnknownProviderError` (bkz.
+ * `#rawInvoke()` below) is a distinct, NARROWER case than "no evidence" —
+ * it is thrown by THIS module, entirely LOCALLY, before `provider.invoke()`
+ * is ever reached (no registered provider exists to call at all), so no
+ * external system could possibly have been contacted, let alone billed.
+ * Treating it as `"UNKNOWN"` (the fail-closed default for genuine
+ * ambiguity) used to route it into
+ * `BudgetGuard.markProviderFailureUnresolved()` — stranding the
+ * reservation in `RECONCILIATION_FAILED` for a failure that was never
+ * ambiguous in the first place. This is the ONE case where "no
+ * `ProviderInvocationError`" still has POSITIVE evidence of zero cost: the
+ * failure's own type proves invocation never started.
  */
 function classifyProviderFailure(err: unknown): { readonly billingStatus: ProviderFailureBillingStatus; readonly incurredCostUsd?: number } {
   if (err instanceof ProviderInvocationError) {
     return { billingStatus: err.billingStatus, incurredCostUsd: err.incurredCostUsd };
+  }
+  if (err instanceof UnknownProviderError) {
+    return { billingStatus: "NOT_BILLED" };
   }
   return { billingStatus: "UNKNOWN" };
 }
@@ -350,16 +367,116 @@ export class UnsafeProviderConfigurationError extends Error {
   }
 }
 
+/**
+ * A genuine plain data object (`{}`/`Object.create(null)`) — never an array,
+ * and never a class instance. Arrays are deliberately excluded even though
+ * they are structurally "plain": this codebase's own established provider
+ * pattern (bkz. `ControllableProvider` in gateway.test.ts, documented right
+ * above its `#counters` field since the 34th independent review round) uses
+ * a plain OWN array property (`receivedModels`, `pending`) as the provider's
+ * SELF-TRACKING BOOKKEEPING container, mutated in place (`.push()`,
+ * `.splice()`) by the provider's own `invoke()` on every call — exactly the
+ * "provider's own internal mutability, unrelated to caller-facing
+ * configuration" this function's own docstring already carves out for class
+ * instances. A configuration surface is something the CALLER hands the
+ * provider at construction time and the provider only ever reads
+ * (`provider.config.endpoint`, the finding's own example); freezing that is
+ * this fix's actual target. Structurally, a plain array cannot be told apart
+ * from the other kind by shape alone, so this fix scopes itself to plain
+ * OBJECTS only — closing the exact gap the finding names without also
+ * breaking the array-shaped bookkeeping pattern the codebase already relies
+ * on and tests against.
+ */
+function isPlainConfigValue(value: unknown): value is Record<PropertyKey, unknown> {
+  if (value === null || typeof value !== "object") return false;
+  if (Array.isArray(value)) return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * P1 fix (36th independent review round, finding 7, "detach nested
+ * provider configuration"): the fix note above this function already
+ * documented the gap this closes as a KNOWN, ACCEPTED limitation —
+ * "[locking] is shallow, exactly like `freezeRecord` elsewhere in this
+ * codebase... nested objects/arrays an existing property already pointed
+ * to remain freely mutable IN PLACE." Codex reproduced the concrete
+ * consequence: `provider.config = { endpoint: "https://good" }` gets its
+ * TOP-LEVEL `config` slot locked (a caller can no longer do
+ * `provider.config = somethingElse`), but the OBJECT that slot points to
+ * was never itself frozen — `provider.config.endpoint = "https://evil"`
+ * still succeeded freely, silently redirecting an already-registered,
+ * already-approved provider's real execution target with no new
+ * registration, approval, or audit event. Fixed in two parts:
+ *
+ * (1) For a data property whose value is a genuine PLAIN object or array
+ * (bkz. `isPlainConfigValue()` — deliberately NOT any class instance,
+ * which may legitimately need continued internal mutability for reasons
+ * unrelated to caller-facing configuration, e.g. an internal connection
+ * pool), the nested value is now recursively frozen too (`deepFreeze()`,
+ * the SAME already-proven recursive-freeze primitive `audit-log.ts` uses
+ * for its own "never mutable again" records) — in place, not cloned away,
+ * so the provider's OWN internal code can still read it, just never
+ * write through it again.
+ *
+ * (2) An ACCESSOR property (a getter) used to be skipped ENTIRELY — "genuine
+ * ECMAScript private field OR an accessor, `Object.defineProperty` with
+ * `writable` is meaningless for it" — but a getter backed by a caller-
+ * mutable closure variable or field could legitimately return a DIFFERENT
+ * config object on every single read, meaning `invoke()`'s own read of
+ * `this.config` at call time could observe a value that was never seen,
+ * let alone approved, at registration time at all — this is exactly the
+ * finding's own "accessor-backed configuration must be evaluated safely
+ * into the authoritative snapshot" requirement. Fixed: the getter is
+ * invoked ONCE, right now, and its return value is baked in as a frozen,
+ * ordinary DATA property — replacing the accessor entirely — so every
+ * future read of that property (including the provider's own `invoke()`)
+ * observes this exact, registration-time snapshot, never a live
+ * re-evaluation of whatever the getter's original backing store holds
+ * later. A write-only accessor (a setter with no getter) has nothing to
+ * snapshot and is left as-is — it cannot itself EXPOSE mutable state to a
+ * reader, only accept writes, so it carries no read-time risk this fix
+ * needs to close.
+ */
 function detachFromCallerMutation(provider: ModelProvider, id: string): void {
   for (const key of Reflect.ownKeys(provider)) {
     const descriptor = Object.getOwnPropertyDescriptor(provider, key);
-    if (!descriptor || !("value" in descriptor) || !(descriptor.writable || descriptor.configurable)) {
+    if (!descriptor) continue;
+
+    if (!("value" in descriptor)) {
+      if (!descriptor.get) continue;
+      let snapshot: unknown;
+      try {
+        snapshot = descriptor.get.call(provider);
+      } catch (err) {
+        throw new UnsafeProviderConfigurationError(id, key, err);
+      }
+      if (isPlainConfigValue(snapshot)) {
+        deepFreeze(snapshot);
+      }
+      try {
+        Object.defineProperty(provider, key, {
+          value: snapshot,
+          writable: false,
+          configurable: false,
+          enumerable: descriptor.enumerable
+        });
+      } catch (err) {
+        throw new UnsafeProviderConfigurationError(id, key, err);
+      }
       continue;
     }
-    try {
-      Object.defineProperty(provider, key, { ...descriptor, writable: false, configurable: false });
-    } catch (err) {
-      throw new UnsafeProviderConfigurationError(id, key, err);
+
+    if (descriptor.writable || descriptor.configurable) {
+      try {
+        Object.defineProperty(provider, key, { ...descriptor, writable: false, configurable: false });
+      } catch (err) {
+        throw new UnsafeProviderConfigurationError(id, key, err);
+      }
+    }
+
+    if (isPlainConfigValue(descriptor.value) && !Object.isFrozen(descriptor.value)) {
+      deepFreeze(descriptor.value);
     }
   }
 }
@@ -1001,7 +1118,34 @@ export class ModelGateway {
 
         let response: ModelInvocationResponse;
         try {
-          response = await this.#rawInvoke(authorizedModel, authorizedRequest);
+          const rawResponse = await this.#rawInvoke(authorizedModel, authorizedRequest);
+          // P1 fix (36th independent review round, finding 6, "snapshot
+          // provider responses before validation"): `#rawInvoke()` returns
+          // `provider.invoke(...)`'s result VERBATIM — the exact same
+          // object reference the provider adapter itself constructed and
+          // may still hold onto (e.g. a provider that caches or logs its
+          // own last response). Without detaching it here, EVERY later
+          // consumer of `response` — this method's own `response.costUsd`
+          // billing read below, the caller this promise resolves to, and
+          // that caller's own downstream validation (e.g. `router.ts`'s
+          // `routeAndExecute()` calls a caller-supplied
+          // `validate(response)` predicate AFTER `invoke()` returns) — all
+          // observe the SAME live, provider-owned object. A provider that
+          // mutates `output`/`costUsd` on that object after returning it
+          // (whether via a stray reference it kept, or a hostile/buggy
+          // adapter) could let content pass a caller's validation and then
+          // change before that same caller actually uses it — exactly the
+          // "validate what you got, not what changed after" gap this
+          // codebase's own established pattern (bkz. `authorizedModel`/
+          // `authorizedRequest`/`executionScope` above, all `freezeRecord`d
+          // the moment they are read, never re-read from a caller-owned
+          // source afterward) already closes for every OTHER value this
+          // method touches. Fixed the same way: a fresh, detached, frozen
+          // copy is taken immediately, before this method's own billing
+          // read and before the response is ever handed back to a caller —
+          // every subsequent read anywhere (here, in the caller, in that
+          // caller's own validation) sees this exact, immutable snapshot.
+          response = freezeRecord({ ...rawResponse });
         } catch (err) {
           // P1 fix (33rd independent review round, finding 1 / root class
           // F, "billable provider failure reconciliation"): the OLD,

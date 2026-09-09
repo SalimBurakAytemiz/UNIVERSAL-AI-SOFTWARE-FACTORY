@@ -23,6 +23,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const PATTERNS = [
   // P2 fix (18th independent review round targeted audit, same root class
@@ -468,7 +469,36 @@ function main() {
   process.exitCode = 1;
 }
 
+/**
+ * P1 fix (36th independent review round, finding 1, "use a URL-safe
+ * secret-scan CLI entry-point check"): the old comparison built a file URL
+ * by naive string concatenation (`` `file://${process.argv[1]}` ``) — this
+ * does NOT percent-encode anything, whereas `import.meta.url` (produced by
+ * the JS runtime itself from the module's real path) IS a properly
+ * percent-encoded URL. A repository checked out to a path containing a
+ * space (encoded as `%20`), a non-ASCII character (encoded as UTF-8
+ * percent-escapes), or using Windows path semantics (backslashes, a drive
+ * letter) would make the two strings compare UNEQUAL even when they
+ * genuinely refer to the SAME file — silently taking the "imported as a
+ * module, don't run main()" branch instead, so `npm run secret-scan`
+ * would exit 0 having scanned NOTHING at all, exactly the "mandatory
+ * security work silently skipped" failure class this finding names. Fixed
+ * by building the comparison URL the same way Node's own runtime would:
+ * `pathToFileURL()` (the exact inverse of what produced `import.meta.url`
+ * in the first place) percent-encodes and normalizes platform path syntax
+ * correctly on every OS, so the two sides are always comparable on equal
+ * terms regardless of spaces, non-ASCII characters, or Windows drive-letter/
+ * backslash paths. Extracted into its own exported, pure function (no
+ * dependency on the live `process.argv`/`import.meta.url` globals) so this
+ * exact comparison can be unit-tested directly against adversarial path
+ * strings, without needing to spawn a real child process for every case.
+ */
+export function isDirectCliInvocation(argv1, moduleUrl) {
+  if (!argv1) return false;
+  return moduleUrl === pathToFileURL(argv1).href;
+}
+
 // Only run as a CLI, not when imported for tests (tests/secret-scan.test.mjs).
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectCliInvocation(process.argv[1], import.meta.url)) {
   main();
 }

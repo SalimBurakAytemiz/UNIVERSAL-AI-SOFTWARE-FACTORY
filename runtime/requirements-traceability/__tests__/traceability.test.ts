@@ -106,6 +106,104 @@ describe(
 });
 
 describe(
+  "P1 fix (36th independent review round, finding 5, 'require outcome evidence, not simple path existence'): " +
+    "evidence existence alone must never be treated as evidence success",
+  () => {
+    it("BLOCKER regression, exact reproduction: an existing test artifact recorded with a FAILED outcome cannot support PROOF_VERIFIED", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-FAIL",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "FAIL" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "FAIL" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue)).toEqual(
+        expect.arrayContaining(["MISSING_TEST_REFS", "MISSING_PROOF_REFS"])
+      );
+    });
+
+    it("BLOCKER regression, exact reproduction: an existing generic directory ('.') cannot support PROOF_VERIFIED — it 'exists' for every possible claim", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-ROOT",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["."],
+            testRefs: ["."],
+            proofRefs: ["."]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue)).toEqual(
+        expect.arrayContaining(["MISSING_IMPLEMENTATION_REFS", "MISSING_TEST_REFS", "MISSING_PROOF_REFS"])
+      );
+    });
+
+    it("no-regression: a structured evidence ref with a genuine PASS outcome DOES count as verified evidence", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-PASS",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "CLEAN" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues).toHaveLength(0);
+    });
+
+    it("no-regression: a structured ARTIFACT_REFERENCE with no outcome still counts (it makes no outcome claim to begin with)", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-ARTIFACT",
+            status: "UNIT_TESTED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: "package.json", type: "ARTIFACT_REFERENCE" }],
+            proofRefs: []
+          }
+        ],
+        repoRoot
+      );
+      expect(issues).toHaveLength(0);
+    });
+
+    it("no-regression: a genuinely-scoped, previously-accepted module directory (not the confinement root itself) still counts as evidence", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-MODULE-DIR",
+            status: "UNIT_TESTED",
+            implementationRefs: ["runtime/audit"],
+            testRefs: ["runtime/audit"],
+            proofRefs: []
+          }
+        ],
+        repoRoot
+      );
+      expect(issues).toHaveLength(0);
+    });
+
+    it("no-regression: a plain bare-string ref (the legacy shape) still resolves and counts exactly as before, when it exists and is not the root", () => {
+      const issues = detectTraceabilityIssues(
+        [{ id: "R-LEGACY", status: "UNIT_TESTED", implementationRefs: ["package.json"], testRefs: ["package.json"], proofRefs: [] }],
+        repoRoot
+      );
+      expect(issues).toHaveLength(0);
+    });
+  }
+);
+
+describe(
   "P1 fix (29th independent review round, finding 5, 'proof references must resolve to real evidence'): a " +
     "path-shaped ref only counts as evidence if it genuinely exists on disk inside the given root",
   () => {

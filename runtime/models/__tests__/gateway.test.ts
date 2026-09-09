@@ -400,6 +400,65 @@ describe("ModelGateway + MockProvider", () => {
         }
       );
 
+      describe(
+        "P1 fix (36th independent review round, finding 8, 'treat unknown providers as definitely " +
+          "unbilled'): an UnknownProviderError happens entirely LOCALLY, before any provider is ever " +
+          "invoked, so — unlike a genuinely ambiguous failure — it must free the reservation, never strand " +
+          "it as reconciliation-required",
+        () => {
+          it(
+            "BLOCKER regression, exact reproduction: invoking a model whose provider id was never " +
+              "registered releases the reservation instead of marking it reconciliation-required — a " +
+              "second, working call under the SAME tight budget still succeeds",
+            async () => {
+              const gateway = new ModelGateway();
+              // Deliberately no provider registered for "nonexistent".
+              const costEngine = new CostEngine();
+              const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+              const model = mockModel({ provider: "nonexistent", costPerCall: 0.6 });
+
+              await expect(
+                gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
+              ).rejects.toThrow(UnknownProviderError);
+
+              // Zero cost was ever recorded or remains outstanding — the
+              // capacity was genuinely FREED, not merely left uncommitted.
+              expect(costEngine.total()).toBe(0);
+              expect(costEngine.reservedTotal({ taskId: "t1" })).toBe(0);
+
+              // A second, real $0.60 call under the SAME $1.00 ceiling must
+              // succeed — proving the first reservation was released, not
+              // stranded in RECONCILIATION_FAILED (which would have kept
+              // consuming capacity and, per `release()`'s own ownership
+              // rules, made this reservation id permanently unreleasable).
+              gateway.registerProvider(new MockProvider());
+              const workingModel = mockModel({ provider: "mock", costPerCall: 0.6 });
+              await expect(
+                gateway.invoke(workingModel, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t2" })
+              ).resolves.toMatchObject({ costUsd: 0.6 });
+            }
+          );
+
+          it(
+            "no regression: a provider that IS registered but throws a plain, unclassified Error (genuine " +
+              "ambiguity, not local resolution failure) still keeps its reservation protected exactly as " +
+              "root class F requires",
+            async () => {
+              const gateway = new ModelGateway();
+              gateway.registerProvider(new FailingProvider());
+              const costEngine = new CostEngine();
+              const budget = new BudgetGuard(costEngine, { perRunUsd: 1 });
+              const model = mockModel({ provider: "failing", costPerCall: 0.6 });
+
+              await expect(
+                gateway.invoke(model, { prompt: "x" }, { policy: permissivePolicy(), budget, risk: 0, taskId: "t1" })
+              ).rejects.toThrow("provider unavailable");
+              expect(costEngine.reservedTotal({ taskId: "t1" })).toBe(0.6);
+            }
+          );
+        }
+      );
+
       it(
         "BLOCKER regression (10th independent review round, exact reproduction): two concurrent $0.60 calls " +
           "against a $1.00 ceiling cannot both execute — only the first-reserved invocation ever reaches the provider",
@@ -2417,6 +2476,205 @@ describe("ModelGateway + MockProvider", () => {
           taskId: "t1"
         });
         expect(response.output).toBe("unchanged");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (36th independent review round, finding 6, 'snapshot provider responses before validation'): " +
+      "invoke()'s returned response must be a detached, frozen snapshot the provider can no longer mutate",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a provider that retains and later mutates the exact response " +
+          "object it returned cannot change what the caller (or that caller's own subsequent validation) observes",
+        async () => {
+          let retainedResponse: { output: string; costUsd: number } | undefined;
+          class MutatingProvider implements ModelProvider {
+            readonly id = "mutating";
+            async invoke(): Promise<ModelInvocationResponse> {
+              const response = { modelId: "m", provider: "mutating", costUsd: 0.01, output: "original-output" };
+              retainedResponse = response;
+              return response;
+            }
+          }
+          const gateway = new ModelGateway();
+          gateway.registerProvider(new MutatingProvider());
+          const model = mockModel({ provider: "mutating", costPerCall: 0.01 });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toBe("original-output");
+
+          // The provider mutates the SAME object reference it returned —
+          // simulating a provider adapter that kept the response around
+          // (a cache, a log buffer) and changes it after the fact.
+          expect(retainedResponse).toBeDefined();
+          retainedResponse!.output = "swapped-after-return";
+          retainedResponse!.costUsd = 999;
+
+          // The gateway's returned response must be UNAFFECTED — it is a
+          // detached snapshot, not a live view onto the provider's object.
+          expect(response.output).toBe("original-output");
+          expect(response.costUsd).toBe(0.01);
+        }
+      );
+
+      it("BLOCKER: the returned response object itself is frozen — a caller cannot mutate it in place either", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider());
+        const model = mockModel();
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(() => {
+          (response as { output: string }).output = "tampered";
+        }).toThrow(TypeError);
+      });
+
+      it("no-regression: a well-behaved provider's response still returns normally with the expected values", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider({ fixedOutput: "well-behaved" }));
+        const model = mockModel();
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("well-behaved");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (36th independent review round, finding 7, 'detach nested provider configuration'): a " +
+      "registered provider's own NESTED plain-object configuration is now frozen too, not just the " +
+      "top-level slot that points to it",
+    () => {
+      class NestedConfigProvider implements ModelProvider {
+        readonly id = "nested-config";
+        config = { endpoint: "https://good.example.com" };
+        async invoke(): Promise<ModelInvocationResponse> {
+          return { modelId: "m", provider: "nested-config", costUsd: 0, output: `endpoint:${this.config.endpoint}` };
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: register provider -> mutate provider.config.endpoint -> " +
+          "the mutation fails closed and the authoritative binding remains unchanged",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new NestedConfigProvider();
+          gateway.registerProvider(provider);
+
+          expect(() => {
+            provider.config.endpoint = "https://evil.example.com";
+          }).toThrow(TypeError);
+          expect(provider.config.endpoint).toBe("https://good.example.com");
+
+          const model = mockModel({ provider: "nested-config" });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toBe("endpoint:https://good.example.com");
+        }
+      );
+
+      it(
+        "BLOCKER regression: an accessor-backed (getter) configuration object is evaluated ONCE at " +
+          "registration time — a later change to the getter's backing store cannot redirect an " +
+          "already-registered provider's execution",
+        async () => {
+          let backingEndpoint = "https://good.example.com";
+          class AccessorConfigProvider implements ModelProvider {
+            readonly id = "accessor-config";
+            constructor() {
+              // An OWN (instance-level) accessor property — a class-body
+              // `get config()` would live on the PROTOTYPE instead, which
+              // `detachFromCallerMutation()` deliberately never touches (it
+              // only locks the provider INSTANCE's own properties, exactly
+              // like `OddDescriptorProvider` above does for its own
+              // instance-level `endpoint` data property).
+              Object.defineProperty(this, "config", {
+                get: () => ({ endpoint: backingEndpoint }),
+                configurable: true,
+                enumerable: true
+              });
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return {
+                modelId: "m",
+                provider: "accessor-config",
+                costUsd: 0,
+                output: `endpoint:${(this as unknown as { config: { endpoint: string } }).config.endpoint}`
+              };
+            }
+          }
+          const gateway = new ModelGateway();
+          const provider = new AccessorConfigProvider();
+          gateway.registerProvider(provider);
+
+          // Mutating the backing store after registration must not change
+          // what the now-baked-in, frozen snapshot property returns.
+          backingEndpoint = "https://evil.example.com";
+          expect((provider as unknown as { config: { endpoint: string } }).config.endpoint).toBe(
+            "https://good.example.com"
+          );
+
+          const model = mockModel({ provider: "accessor-config" });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toBe("endpoint:https://good.example.com");
+        }
+      );
+
+      it(
+        "no regression: a provider's own nested PLAIN ARRAY used for self-tracking bookkeeping (the " +
+          "ControllableProvider pattern — receivedModels.push() inside its own invoke()) remains mutable " +
+          "in place after registration",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ControllableProvider();
+          gateway.registerProvider(provider);
+
+          const model = mockModel({ provider: "controllable" });
+          const invocation = gateway.invoke(model, { prompt: "hello" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(provider.receivedModels).toHaveLength(1);
+          provider.resolveAll();
+          await invocation;
+          expect(provider.receivedRequests).toHaveLength(1);
+        }
+      );
+
+      it("no regression: an ordinary provider with no nested configuration invokes exactly as before", async () => {
+        const gateway = new ModelGateway();
+        gateway.registerProvider(new MockProvider({ fixedOutput: "unaffected" }));
+        const model = mockModel();
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("unaffected");
       });
     }
   );

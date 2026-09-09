@@ -179,10 +179,37 @@ function canonicalizeAuditValue(value: unknown, path: string): unknown {
         `an instance of '${Object.prototype.toString.call(value)}' rather than a plain object`
       );
     }
+    // P1 fix (36th independent review round, finding 9, "store __proto__ as
+    // normal audit data"): a JSON-derived payload can legitimately carry an
+    // OWN property literally named `"__proto__"` (e.g. an attacker's
+    // reported input, quoted verbatim into the audit trail for forensic
+    // evidence) — `Object.entries()` above sees it as an ordinary string
+    // key like any other. But `result[key] = ...` for THAT specific key is
+    // not an ordinary property write: because `result` is a plain object
+    // (`Object.prototype` in its chain), bracket/dot assignment to
+    // `"__proto__"` invokes `Object.prototype`'s legacy `__proto__`
+    // ACCESSOR instead of creating an own data property — silently
+    // changing `result`'s actual prototype (or being ignored entirely, for
+    // a value the accessor's setter rejects) rather than storing the value
+    // at all. The stored record would then be missing the very property
+    // the caller supplied, `hashOf()` (bkz. yukarısı, `JSON.stringify()`
+    // tabanlı) would hash whatever ended up on `result` instead, and a
+    // record with a mutated prototype is itself an unaudited mutation this
+    // append-only log must never produce. `Object.defineProperty()` always
+    // creates/redefines a genuine OWN data property under the exact key
+    // given, never consulting any inherited accessor of that name — so
+    // `"__proto__"` is stored and later serialized (`JSON.stringify`,
+    // `Object.entries`) exactly like any other ordinary key, with zero
+    // effect on `result`'s actual prototype.
     const result: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
       if (nested === undefined) continue;
-      result[key] = canonicalizeAuditValue(nested, `${path}.${key}`);
+      Object.defineProperty(result, key, {
+        value: canonicalizeAuditValue(nested, `${path}.${key}`),
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
     }
     return result;
   }

@@ -1,8 +1,14 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { attemptPhaseClosure, readPhaseClosureManifest, type PhaseClosureAttempt } from "../phase-closure.js";
+import {
+  attemptPhaseClosure,
+  readPhaseClosureManifest,
+  InvalidGovernanceIdentifierError,
+  DuplicateClosureManifestError,
+  type PhaseClosureAttempt
+} from "../phase-closure.js";
 import { ScopeLock } from "../scope-lock.js";
 import { FounderDecisionLedger } from "../../decisions/decision-ledger.js";
 import { InvariantGuard, type InvariantCheckResult } from "../../invariants/invariant-guard.js";
@@ -195,4 +201,155 @@ describe("attemptPhaseClosure", () => {
       (manifest.invariantViolations[0] as { detail: string }).detail = "tampered";
     }).toThrow(TypeError);
   });
+
+  describe(
+    "P1 fix (36th independent review round, finding 2, 'confine generated phase-manifest paths'): " +
+      "phaseId/manifestId must be validated as safe identifiers and filesystem-confined",
+    () => {
+      it("BLOCKER regression, exact reproduction: manifestId = '../../outside' fails closed and creates no file outside the manifest directory", () => {
+        const deps = makeDeps();
+        const outsideMarker = join(deps.tempRoot, "..", "outside-marker-should-not-exist.json");
+        expect(() =>
+          attemptPhaseClosure(baseAttempt({ independentReviewResult: "PENDING" }), "../../outside", "d1", deps)
+        ).toThrow(InvalidGovernanceIdentifierError);
+        expect(existsSync(outsideMarker)).toBe(false);
+        expect(existsSync(deps.manifestDir)).toBe(false);
+      });
+
+      it("BLOCKER: a phaseId containing a path separator fails closed", () => {
+        const deps = makeDeps();
+        expect(() =>
+          attemptPhaseClosure(
+            baseAttempt({ phaseId: "P0/../escape", independentReviewResult: "PENDING" }),
+            "m1",
+            "d1",
+            deps
+          )
+        ).toThrow(InvalidGovernanceIdentifierError);
+      });
+
+      it("BLOCKER: a manifestId of exactly '..' fails closed", () => {
+        const deps = makeDeps();
+        expect(() => attemptPhaseClosure(baseAttempt({ independentReviewResult: "PENDING" }), "..", "d1", deps)).toThrow(
+          InvalidGovernanceIdentifierError
+        );
+      });
+
+      it("no-regression: readPhaseClosureManifest also rejects a malicious manifestId rather than reading outside the manifest directory", () => {
+        const deps = makeDeps();
+        expect(() => readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "../../etc/passwd")).toThrow(
+          InvalidGovernanceIdentifierError
+        );
+      });
+
+      it("no-regression: an ordinary alphanumeric phaseId/manifestId still works exactly as before", () => {
+        const deps = makeDeps();
+        const manifest = attemptPhaseClosure(baseAttempt({ independentReviewResult: "PENDING" }), "manifest-1", "d1", deps);
+        expect(manifest.outcome).toBe("REJECTED");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (36th independent review round, finding 3, 'reject duplicate closure-manifest identifiers'): " +
+      "manifests are append-only, a reused manifestId must fail closed without touching the original",
+    () => {
+      it("BLOCKER regression, exact reproduction: writing manifest X twice fails on the second attempt and leaves the original byte-for-byte unchanged", () => {
+        const deps = makeDeps();
+        const first = attemptPhaseClosure(baseAttempt({ independentReviewResult: "PENDING" }), "manifest-x", "d1", deps);
+
+        expect(() =>
+          attemptPhaseClosure(baseAttempt({ independentReviewResult: "CLEAN" }), "manifest-x", "d2", deps)
+        ).toThrow(DuplicateClosureManifestError);
+
+        const stillThere = readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-x");
+        expect(stillThere).toEqual(first);
+      });
+
+      it("rejects a duplicate manifestId even when the phase has since transitioned (LOCKED_FOR_CLOSURE -> the second call would otherwise have closed it)", () => {
+        const deps = makeDeps();
+        attemptPhaseClosure(baseAttempt({ independentReviewResult: "PENDING" }), "manifest-y", "d1", deps);
+        const evidenceFile = join(deps.tempRoot, "proof.log");
+        writeFileSync(evidenceFile, "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d2");
+        expect(() =>
+          attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+            "manifest-y",
+            "d3",
+            deps
+          )
+        ).toThrow(DuplicateClosureManifestError);
+        // The phase must not have been closed by the rejected duplicate attempt.
+        expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (36th independent review round, finding 4, 'make phase closure and manifest persistence " +
+      "atomic'): the phase must never become CLOSED before its manifest is durably persisted",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: forcing StateStore.write() to fail during an otherwise-successful " +
+          "closure attempt means close() is never invoked and the phase remains LOCKED_FOR_CLOSURE",
+        () => {
+          const deps = makeDeps();
+          const evidenceFile = join(deps.tempRoot, "proof.log");
+          writeFileSync(evidenceFile, "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const failingStore: typeof deps.store = {
+            write: () => {
+              throw new Error("simulated disk failure");
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+              "manifest-atomic",
+              "d2",
+              { ...deps, store: failingStore }
+            )
+          ).toThrow("simulated disk failure");
+
+          expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+          expect(deps.ledger.allFor("P0")).toHaveLength(1); // only the lock() decision, never a close() decision
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-atomic")).toBeUndefined();
+        }
+      );
+
+      it("no-regression: when persistence succeeds, the manifest is written and THEN the phase closes, in that order", () => {
+        const deps = makeDeps();
+        const evidenceFile = join(deps.tempRoot, "proof.log");
+        writeFileSync(evidenceFile, "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+        const writeOrder: string[] = [];
+        const originalWrite = deps.store.write.bind(deps.store);
+        const observingStore: typeof deps.store = {
+          write: (path: string, data: unknown) => {
+            writeOrder.push("manifest-write");
+            originalWrite(path, data);
+          },
+          read: deps.store.read.bind(deps.store),
+          exists: deps.store.exists.bind(deps.store)
+        };
+
+        const manifest = attemptPhaseClosure(
+          baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+          "manifest-order",
+          "d2",
+          { ...deps, store: observingStore }
+        );
+
+        expect(manifest.outcome).toBe("CLOSED");
+        expect(writeOrder).toEqual(["manifest-write"]);
+        expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+      });
+    }
+  );
 });

@@ -6,6 +6,27 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "title", "description", "source_baseline", "category", "priority", "status"],
+  "definitions": {
+    "evidenceRef": {
+      "description": "Either a bare repo-relative path (legacy shape, no outcome claim beyond 'this artifact exists') or a structured ref carrying a known PASS/CLEAN/SUCCESS-or-otherwise outcome (36th independent review round, finding 5, 'require outcome evidence, not simple path existence' — see runtime/requirements-traceability/traceability.ts's isVerifiedEvidenceRef()).",
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "type"],
+          "properties": {
+            "path": { "type": "string" },
+            "type": {
+              "type": "string",
+              "enum": ["TEST_RESULT", "PROOF_RESULT", "SECURITY_RESULT", "REVIEW_RESULT", "ARTIFACT_REFERENCE"]
+            },
+            "outcome": { "type": "string" }
+          }
+        }
+      ]
+    }
+  },
   "properties": {
     "id": {
       "type": "string",
@@ -46,20 +67,20 @@
     },
     "implementation_refs": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": { "$ref": "#/definitions/evidenceRef" },
       "description": "Repo-relative paths implementing this requirement."
     },
     "test_refs": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": { "$ref": "#/definitions/evidenceRef" }
     },
     "proof_refs": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": { "$ref": "#/definitions/evidenceRef" }
     },
     "security_refs": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": { "$ref": "#/definitions/evidenceRef" }
     },
     "dependencies": {
       "type": "array",

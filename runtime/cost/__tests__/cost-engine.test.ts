@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   CorruptCostStateError,
   CostEngine,
+  InvalidCostEntryIdentityError,
   InvalidMonetaryAmountError,
   ReservationOwnershipMismatchError,
   UnknownReservationError,
@@ -52,6 +53,99 @@ describe("CostEngine", () => {
       expect(() => engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 0 })).not.toThrow();
     });
   });
+
+  describe(
+    "P2 fix (36th independent review round, finding 10, 'enforce restore-time identity checks before " +
+      "record() persistence'): record() must reject the EXACT SAME malformed identity shapes " +
+      "assertValidPersistedCostState() would refuse on the next restart, BEFORE mutating or persisting " +
+      "anything — never only after the fact",
+    () => {
+      it.each([
+        ["empty taskId", { taskId: "", provider: "mock", modelId: "m1" }],
+        ["empty provider", { taskId: "t1", provider: "", modelId: "m1" }],
+        ["empty modelId", { taskId: "t1", provider: "mock", modelId: "" }]
+      ])("BLOCKER regression, exact reproduction: rejects %s before mutating state", (_label, identity) => {
+        const engine = new CostEngine();
+        expect(() => engine.record({ ...identity, amountUsd: 1 } as never)).toThrow(InvalidCostEntryIdentityError);
+        expect(engine.all()).toHaveLength(0);
+        expect(engine.total()).toBe(0);
+      });
+
+      it.each([
+        ["agentId", { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1, agentId: 42 }],
+        ["projectId", { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1, projectId: 42 }],
+        ["runId", { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1, runId: 42 }]
+      ])("BLOCKER regression: rejects a non-string, non-undefined %s (the exact shape restore would also refuse)", (_label, entry) => {
+        const engine = new CostEngine();
+        expect(() => engine.record(entry as never)).toThrow(InvalidCostEntryIdentityError);
+        expect(engine.all()).toHaveLength(0);
+      });
+
+      it(
+        "root-cause proof: an entry record() now refuses is the EXACT same shape " +
+          "assertValidPersistedCostState() (bkz. #loadFromStore()'un restore-time doğrulaması) would have " +
+          "refused on the next restart — proving the two checks are now genuinely aligned, not merely " +
+          "coincidentally similar",
+        () => {
+          const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-identity-alignment-"));
+          try {
+            const store = new FileStateStore();
+            const statePath = join(tempRoot, "cost-state.json");
+            const engine = new CostEngine(() => new Date(), { store, path: statePath });
+
+            // record() refuses this BEFORE it ever reaches durable storage —
+            // so there is nothing malformed on disk for a restart to trip
+            // over. This is the fix: previously this call would have
+            // SUCCEEDED, persisted, and only the NEXT restart would have
+            // discovered the problem (as CorruptCostStateError, taking the
+            // whole ledger down).
+            expect(() =>
+              engine.record({ taskId: "", provider: "mock", modelId: "m1", amountUsd: 1 })
+            ).toThrow(InvalidCostEntryIdentityError);
+
+            // A genuinely fresh instance against the same file restores
+            // cleanly — nothing corrupt was ever written.
+            const after = new CostEngine(() => new Date(), { store, path: statePath });
+            expect(() => after.all()).not.toThrow();
+            expect(after.all()).toHaveLength(0);
+          } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+          }
+        }
+      );
+
+      it("no regression: a fully valid entry (including optional agentId/projectId/runId) is recorded and survives a real restart", () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-identity-valid-roundtrip-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const before = new CostEngine(() => new Date(), { store, path: statePath });
+          before.record({
+            taskId: "t1",
+            agentId: "a1",
+            projectId: "p1",
+            runId: "r1",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.5
+          });
+          expect(before.total()).toBeCloseTo(0.5);
+
+          const after = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(after.total()).toBeCloseTo(0.5);
+          expect(after.all()).toHaveLength(1);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("no regression: omitting the optional agentId/projectId/runId fields entirely is still accepted", () => {
+        const engine = new CostEngine();
+        expect(() => engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 })).not.toThrow();
+        expect(engine.all()).toHaveLength(1);
+      });
+    }
+  );
 
   describe("assertValidMonetaryAmount (shared validation primitive)", () => {
     it("passes through finite, non-negative amounts silently", () => {
@@ -1544,4 +1638,132 @@ describe("CostEngine", () => {
       expect(engine.total()).toBeCloseTo(0.25);
     });
   });
+
+  describe(
+    "P2 fix (36th independent review round, finding 11, 'roll back ledger mutations when persistence " +
+      "fails'): a mutating method whose durable write fails must leave in-memory state EXACTLY as it was " +
+      "before the call — never mutated-then-abandoned — so RAM and disk never disagree and a retry is safe",
+    () => {
+      /** Fails on exactly the Nth write call (1-indexed); every other call succeeds. */
+      function storeThatFailsOnlyOnCall(failOnCall: number): StateStore {
+        let calls = 0;
+        return {
+          write: () => {
+            calls += 1;
+            if (calls === failOnCall) {
+              throw new Error("simulated durable-storage I/O failure");
+            }
+          },
+          read: () => undefined,
+          exists: () => false
+        };
+      }
+
+      /** Fails on every write call from the Nth one onward (1-indexed). */
+      function storeThatFailsFromCall(failFromCall: number): StateStore {
+        let calls = 0;
+        return {
+          write: () => {
+            calls += 1;
+            if (calls >= failFromCall) {
+              throw new Error("simulated durable-storage I/O failure");
+            }
+          },
+          read: () => undefined,
+          exists: () => false
+        };
+      }
+
+      it("BLOCKER regression, exact reproduction: record() whose persist fails leaves total()/all() completely unchanged, not showing a phantom cost", () => {
+        const engine = new CostEngine(() => new Date(), { store: storeThatFailsOnlyOnCall(1), path: "x.json" });
+        expect(() => engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 5 })).toThrow(
+          "simulated durable-storage I/O failure"
+        );
+        expect(engine.all()).toHaveLength(0);
+        expect(engine.total()).toBe(0);
+      });
+
+      it("BLOCKER regression, exact reproduction: createReservation() whose persist fails leaves reservedTotal() completely unchanged, not showing a phantom reservation", () => {
+        const engine = new CostEngine(() => new Date(), { store: storeThatFailsOnlyOnCall(1), path: "x.json" });
+        expect(() => engine.createReservation({ taskId: "t1" }, 5)).toThrow("simulated durable-storage I/O failure");
+        expect(engine.reservedTotal({ taskId: "t1" })).toBe(0);
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: releaseReservation() whose persist fails leaves the " +
+          "reservation genuinely ACTIVE and still protecting its capacity — not silently freed in memory " +
+          "while disk still shows it reserved",
+        () => {
+          // Call 1: createReservation (succeeds). Call 2: releaseReservation's own persist (fails).
+          const engine = new CostEngine(() => new Date(), { store: storeThatFailsFromCall(2), path: "x.json" });
+          const reservation = engine.createReservation({ taskId: "t1" }, 1);
+
+          expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(
+            "simulated durable-storage I/O failure"
+          );
+
+          // Rolled back: the reservation was NEVER actually removed from memory.
+          expect(engine.getReservation(reservation.id)).toEqual({ id: reservation.id, amountUsd: 1, status: "ACTIVE" });
+          expect(engine.reservedTotal({ taskId: "t1" })).toBe(1);
+        }
+      );
+
+      it(
+        "BLOCKER regression, exact reproduction: a commitReservation() whose cost is durably recorded but " +
+          "whose FOLLOW-UP reservation-removal persist fails leaves the reservation genuinely present " +
+          "(rolled back) rather than silently vanished from memory while still on disk — and a retry " +
+          "safely finishes the job once persistence recovers",
+        () => {
+          // Call 1: createReservation. Call 2: commitReservation's own record() persist (succeeds — the
+          // cost IS durably recorded). Call 3: the reservation-removal persist that follows (fails).
+          const engine = new CostEngine(() => new Date(), { store: storeThatFailsOnlyOnCall(3), path: "x.json" });
+          const reservation = engine.createReservation({ taskId: "t1" }, 1);
+          const entry = { taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 };
+
+          expect(() => engine.commitReservation(reservation.id, entry)).toThrow("simulated durable-storage I/O failure");
+
+          // The real cost WAS durably recorded (record()'s own persist, call 2, succeeded).
+          expect(engine.total()).toBeCloseTo(1);
+          // But the reservation-removal itself rolled back — it is still genuinely
+          // present (not silently vanished from memory while disk disagrees).
+          expect(engine.getReservation(reservation.id)).toBeDefined();
+          expect(engine.reservedTotal({ taskId: "t1" })).toBeCloseTo(1);
+
+          // Retrying the SAME commitReservation() call (call 4 — persistence now
+          // recovered) finishes the interrupted removal via the existing
+          // idempotent-retry path, without double-recording the cost.
+          const retried = engine.commitReservation(reservation.id, entry);
+          expect(retried.amountUsd).toBeCloseTo(1);
+          expect(engine.total()).toBeCloseTo(1);
+          expect(engine.getReservation(reservation.id)).toBeUndefined();
+        }
+      );
+
+      it("no regression: an ordinary record() with a healthy persistence store still records and persists normally", () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-publish-no-regression-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const engine = new CostEngine(() => new Date(), { store, path: statePath });
+          engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 2 });
+          expect(engine.total()).toBeCloseTo(2);
+
+          const after = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(after.total()).toBeCloseTo(2);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("no regression: an in-memory-only engine (no persistence configured) is entirely unaffected — record()/createReservation() still work exactly as before", () => {
+        const engine = new CostEngine();
+        engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 });
+        const reservation = engine.createReservation({ taskId: "t2" }, 2);
+        expect(engine.total()).toBeCloseTo(1);
+        expect(engine.reservedTotal({ taskId: "t2" })).toBeCloseTo(2);
+        expect(() => engine.releaseReservation(reservation.id, { taskId: "t2" })).not.toThrow();
+        expect(engine.reservedTotal({ taskId: "t2" })).toBe(0);
+      });
+    }
+  );
 });

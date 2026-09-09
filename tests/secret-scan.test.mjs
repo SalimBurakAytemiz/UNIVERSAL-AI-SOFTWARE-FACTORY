@@ -1,8 +1,9 @@
 import { describe, expect, it, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // P2 fix (24th independent review round, "secret history scan must fail
 // closed on unreadable blobs"): to deterministically prove the fix without
@@ -35,7 +36,8 @@ import {
   findNonPlaceholderEnvLines,
   scanFile,
   scanGitHistory,
-  listHistoricalBlobs
+  listHistoricalBlobs,
+  isDirectCliInvocation
 } from "../scripts/secret-scan.mjs";
 
 describe("secret-scan: findSecretsInText", () => {
@@ -586,3 +588,84 @@ describe("secret-scan: .env.example placeholder checks", () => {
     }
   );
 });
+
+describe(
+  "secret-scan: P1 fix (36th independent review round, finding 1, 'use a URL-safe secret-scan CLI " +
+    "entry-point check') — isDirectCliInvocation() must correctly identify direct execution regardless of " +
+    "spaces, non-ASCII characters, or Windows path syntax in the script's own path",
+  () => {
+    it("BLOCKER regression, exact reproduction: a script path containing a space must still be recognized as direct invocation", () => {
+      const argv1 = "/home/runner/My Repo/scripts/secret-scan.mjs";
+      const moduleUrl = pathToFileURL(argv1).href;
+      expect(isDirectCliInvocation(argv1, moduleUrl)).toBe(true);
+    });
+
+    it("BLOCKER regression: a script path containing non-ASCII characters must still be recognized as direct invocation", () => {
+      const argv1 = "/home/runner/Fabrikamız/scripts/secret-scan.mjs";
+      const moduleUrl = pathToFileURL(argv1).href;
+      expect(isDirectCliInvocation(argv1, moduleUrl)).toBe(true);
+    });
+
+    it("BLOCKER regression: a Windows-style drive-letter/backslash path must still be recognized as direct invocation", () => {
+      const argv1 = "C:\\Users\\Founder\\repo\\scripts\\secret-scan.mjs";
+      const moduleUrl = pathToFileURL(argv1).href;
+      expect(isDirectCliInvocation(argv1, moduleUrl)).toBe(true);
+    });
+
+    it("does not falsely report direct invocation when the module URL genuinely differs (imported, not run directly)", () => {
+      const argv1 = "/home/runner/repo/tests/secret-scan.test.mjs";
+      const moduleUrl = pathToFileURL("/home/runner/repo/scripts/secret-scan.mjs").href;
+      expect(isDirectCliInvocation(argv1, moduleUrl)).toBe(false);
+    });
+
+    it("returns false (never throws) when argv1 is undefined (e.g. a REPL or worker context with no script path)", () => {
+      expect(isDirectCliInvocation(undefined, "file:///anything")).toBe(false);
+    });
+
+    it("no-regression: a plain ASCII path with no spaces still matches exactly as before", () => {
+      const argv1 = "/home/runner/repo/scripts/secret-scan.mjs";
+      const moduleUrl = pathToFileURL(argv1).href;
+      expect(isDirectCliInvocation(argv1, moduleUrl)).toBe(true);
+    });
+  }
+);
+
+describe(
+  "secret-scan: P1 fix (36th independent review round, finding 1) end-to-end proof — the REAL script, run " +
+    "as a real child process from a path containing a space and a non-ASCII character, must actually scan " +
+    "rather than silently exiting 0 having done nothing",
+  () => {
+    let tempRoot;
+
+    afterEach(() => {
+      if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    it("BLOCKER end-to-end regression: running the script directly from a 'space + non-ASCII' path produces real scan output, not silent no-op success", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-secret-scan-cli-"));
+      const weirdDir = join(tempRoot, "repo with space and üñïçødé");
+      mkdirSync(weirdDir, { recursive: true });
+
+      // A minimal, real git repo so the script's own git ls-files/rev-list
+      // calls succeed (required for main() to complete, not just start).
+      execFileSync("git", ["init", "--initial-branch=main"], { cwd: weirdDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: weirdDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: weirdDir });
+      writeFileSync(join(weirdDir, "README.md"), "hello\n");
+      execFileSync("git", ["add", "README.md"], { cwd: weirdDir });
+      execFileSync("git", ["commit", "-m", "init"], { cwd: weirdDir });
+
+      const scriptDest = join(weirdDir, "secret-scan.mjs");
+      const scriptSrc = join(dirname(new URL(import.meta.url).pathname), "..", "scripts", "secret-scan.mjs");
+      writeFileSync(scriptDest, readFileSync(scriptSrc, "utf8"));
+
+      const output = execFileSync("node", [scriptDest], { cwd: weirdDir, encoding: "utf8" });
+      // The pre-fix bug made isDirectCliInvocation()'s predecessor comparison
+      // fail on this exact path shape, so main() never ran and stdout was
+      // empty. The fix must make main() genuinely execute and print its
+      // real banner/result line.
+      expect(output).toContain("Public Repository Secret Scan");
+      expect(output).toContain("Result:");
+    });
+  }
+);

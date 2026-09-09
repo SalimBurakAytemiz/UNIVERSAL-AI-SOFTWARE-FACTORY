@@ -33,13 +33,13 @@
 // (Part F) — so there remains exactly ONE authoritative place a phase
 // transition happens, never a second, parallel "closure" mechanism.
 
-import { join } from "node:path";
 import { isVerifiedEvidenceRef } from "../requirements-traceability/traceability.js";
 import type { InvariantGuard } from "../invariants/invariant-guard.js";
 import type { InvariantViolation } from "../invariants/invariant-guard.js";
-import { ScopeLock, InvalidPhaseTransitionError } from "./scope-lock.js";
+import { ScopeLock } from "./scope-lock.js";
 import { computeRealityMatrix } from "./reality-matrix.js";
 import type { StateStore } from "../state/file-store.js";
+import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 import { deepFreezeClone } from "../util/immutable.js";
 
 export type IndependentReviewResult = "CLEAN" | "PENDING" | "FOUND_ISSUES";
@@ -100,8 +100,84 @@ export interface AttemptPhaseClosureDeps {
   readonly manifestDir: string;
 }
 
+const SAFE_GOVERNANCE_IDENTIFIER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
+
+/**
+ * P1 fix (36th independent review round, finding 2, "confine generated
+ * phase-manifest paths"): thrown when `phaseId`/`manifestId` is not a safe,
+ * self-contained identifier — same validation shape as `sandbox.ts`'s own
+ * `assertValidProjectId()`/`PROJECT_ID_PATTERN`, reused here rather than
+ * inventing a second identifier-validation rule.
+ */
+export class InvalidGovernanceIdentifierError extends Error {
+  constructor(kind: string, value: string, reason: string) {
+    super(
+      `Invalid ${kind} '${value}': ${reason}. A governance identifier must match ` +
+        `${SAFE_GOVERNANCE_IDENTIFIER_PATTERN} — letters, digits, '_', and '-' only, starting with an ` +
+        `alphanumeric character; no path separators, no '.', no '..'.`
+    );
+    this.name = "InvalidGovernanceIdentifierError";
+  }
+}
+
+function assertSafeGovernanceIdentifier(kind: string, value: string): void {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new InvalidGovernanceIdentifierError(kind, String(value), "must be a non-empty string");
+  }
+  if (!SAFE_GOVERNANCE_IDENTIFIER_PATTERN.test(value)) {
+    throw new InvalidGovernanceIdentifierError(
+      kind,
+      value,
+      "contains a disallowed character (path separator, '.', or something else outside [a-zA-Z0-9_-])"
+    );
+  }
+}
+
+/**
+ * P1 fix (36th independent review round, finding 2): `phaseId`/`manifestId`
+ * used to be interpolated directly into a filename with NO validation —
+ * `manifestId = "../../outside"` would resolve OUTSIDE `manifestDir`
+ * entirely (`join()` happily collapses `..` segments), letting a caller
+ * read or write governance-manifest-shaped data anywhere on disk the
+ * process has access to. Fixed with TWO independent layers, mirroring the
+ * defense-in-depth already established elsewhere in this codebase
+ * (`project-genome`'s id pattern + `sandbox.ts`'s filesystem confinement):
+ * (1) `assertSafeGovernanceIdentifier()` rejects any identifier containing
+ * a path separator, `.`, `..`, or any character outside a narrow safe set,
+ * BEFORE the identifier ever reaches a path operation; (2)
+ * `assertFilesystemConfinement()` (the SAME symlink-aware, TOCTOU-hardened
+ * primitive `runtime/requirements-traceability/traceability.ts` already
+ * reuses for evidence refs) re-validates the constructed filename actually
+ * resolves inside `manifestDir`, catching any residual escape a future
+ * identifier-pattern change might otherwise reopen.
+ */
 function manifestPath(manifestDir: string, phaseId: string, manifestId: string): string {
-  return join(manifestDir, `${phaseId}-${manifestId}.json`);
+  assertSafeGovernanceIdentifier("phaseId", phaseId);
+  assertSafeGovernanceIdentifier("manifestId", manifestId);
+  return assertFilesystemConfinement(manifestDir, `${phaseId}-${manifestId}.json`);
+}
+
+/**
+ * P1 fix (36th independent review round, finding 3, "reject duplicate
+ * closure-manifest identifiers"): closure manifests are append-only
+ * historical evidence (baseline section 255, "why didn't this close?" must
+ * always be answerable from what was ACTUALLY recorded at the time) —
+ * reusing a `phaseId`/`manifestId` pair used to silently OVERWRITE the
+ * original manifest with whatever the new attempt concluded, destroying
+ * the original durable evidence. Checked here, unconditionally, before ANY
+ * other work in `attemptPhaseClosure()` — a caller reusing an id gets a
+ * clear, immediate failure regardless of what the new attempt would have
+ * decided, and the original file on disk is never touched.
+ */
+export class DuplicateClosureManifestError extends Error {
+  constructor(phaseId: string, manifestId: string) {
+    super(
+      `A closure manifest already exists for phase '${phaseId}' / manifestId '${manifestId}'. Closure ` +
+        `manifests are append-only historical evidence and must never be overwritten — use a new, distinct ` +
+        `manifestId for this attempt (referencing the prior one in its own reason/notes if it supersedes it).`
+    );
+    this.name = "DuplicateClosureManifestError";
+  }
 }
 
 /**
@@ -112,7 +188,28 @@ function manifestPath(manifestDir: string, phaseId: string, manifestId: string):
  * never throws for an expected-shape rejection (unmet evidence, unresolved
  * invariants, blocked requirements, a non-CLEAN review, or a phase not
  * currently LOCKED_FOR_CLOSURE) — those are all ordinary REJECTED outcomes,
- * not exceptions.
+ * not exceptions. DOES throw for a malformed identifier
+ * (`InvalidGovernanceIdentifierError`), a reused manifest id
+ * (`DuplicateClosureManifestError`), or a failure to durably persist the
+ * manifest — none of those are attempt OUTCOMES, they are reasons this
+ * call could not even be evaluated/recorded at all.
+ *
+ * P1 fix (36th independent review round, finding 4, "make phase closure
+ * and manifest persistence atomic"): the phase transition
+ * (`deps.scopeLock.close()`) used to run BEFORE the manifest was built and
+ * persisted — if `deps.store.write()` then failed (disk full, permissions,
+ * an unserializable value slipping through), the phase was ALREADY
+ * authoritatively CLOSED in memory (and in the Decision Ledger) with NO
+ * corresponding durable evidence file: `CLOSED` with a missing manifest,
+ * exactly the "evidence-backed closure" violation this mechanism exists to
+ * prevent. Fixed by reordering to a staged protocol: validate (no side
+ * effects) -> construct the manifest -> persist it durably -> ONLY THEN
+ * commit the actual phase transition. If persistence fails, `close()` is
+ * NEVER called — the phase remains exactly as it was (LOCKED_FOR_CLOSURE),
+ * the caller receives the thrown error, and retrying with the SAME
+ * `manifestId` is safe (the failed write left no file behind, since
+ * `FileStateStore.write()` is itself atomic — write-to-temp-then-rename,
+ * established since the 8th independent review round).
  */
 export function attemptPhaseClosure(
   attempt: PhaseClosureAttempt,
@@ -120,6 +217,11 @@ export function attemptPhaseClosure(
   decisionId: string,
   deps: AttemptPhaseClosureDeps
 ): PhaseClosureManifestRecord {
+  const path = manifestPath(deps.manifestDir, attempt.phaseId, manifestId);
+  if (deps.store.exists(path)) {
+    throw new DuplicateClosureManifestError(attempt.phaseId, manifestId);
+  }
+
   const rejectionReasons: string[] = [];
 
   if (attempt.verificationEvidenceRefs.length === 0) {
@@ -171,28 +273,10 @@ export function attemptPhaseClosure(
     );
   }
 
-  let outcome: PhaseClosureOutcome = "REJECTED";
-  let closedDecisionId: string | undefined;
-
-  if (rejectionReasons.length === 0) {
-    try {
-      deps.scopeLock.close(attempt.phaseId, attempt.reason, guardReport, decisionId);
-      outcome = "CLOSED";
-      closedDecisionId = decisionId;
-    } catch (err) {
-      // Should be unreachable given the currentState check above, but a
-      // concurrent transition between that check and this call is exactly
-      // the class of race every other authoritative-state mutation in this
-      // codebase already fails closed on rather than assuming away — never
-      // silently swallow it into a generic rejection reason without saying
-      // what actually happened.
-      if (err instanceof InvalidPhaseTransitionError) {
-        rejectionReasons.push(`phase transitioned concurrently before closure could complete: ${err.message}`);
-      } else {
-        throw err;
-      }
-    }
-  }
+  // Whether this attempt WOULD close the phase, pending only the final
+  // commit step below — no side effect has happened yet at this point.
+  const willClose = rejectionReasons.length === 0;
+  const outcome: PhaseClosureOutcome = willClose ? "CLOSED" : "REJECTED";
 
   const manifest: PhaseClosureManifestRecord = {
     manifestId,
@@ -206,11 +290,28 @@ export function attemptPhaseClosure(
     verificationEvidenceRefs: attempt.verificationEvidenceRefs,
     independentReviewResult: attempt.independentReviewResult,
     rejectionReasons,
-    ...(closedDecisionId ? { decisionId: closedDecisionId } : {})
+    ...(willClose ? { decisionId } : {})
   };
-
   const frozen = deepFreezeClone(manifest);
-  deps.store.write(manifestPath(deps.manifestDir, attempt.phaseId, manifestId), frozen);
+
+  // Durable evidence FIRST. If this throws, `scopeLock.close()` below is
+  // never reached — the phase stays exactly as it was, and no manifest
+  // file was left behind for this id (see this function's own fix note).
+  deps.store.write(path, frozen);
+
+  if (willClose) {
+    // In the synchronous, single-process model this module runs in, this
+    // cannot fail: `currentState` was checked moments ago with no
+    // intervening yield point, and closing the SAME phase re-entrantly
+    // from within the invariant guard or the store write above is not a
+    // pattern this codebase's own callers use. If it somehow still throws,
+    // do not silently fabricate a corrected manifest — closure manifests
+    // are append-only (finding 3) and the one just persisted already
+    // stands as durable evidence of this attempt; surface the failure
+    // loudly instead of returning a value that contradicts it.
+    deps.scopeLock.close(attempt.phaseId, attempt.reason, guardReport, decisionId);
+  }
+
   return frozen;
 }
 

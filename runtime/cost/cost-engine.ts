@@ -33,6 +33,63 @@ export function assertValidMonetaryAmount(amount: number, context: string): void
   }
 }
 
+export class InvalidCostEntryIdentityError extends Error {
+  constructor(context: string, reason: string) {
+    super(
+      `Refusing to record cost entry in ${context}: ${reason}. A live entry that fails this exact check is ` +
+        `one 'assertValidPersistedCostState()' (bkz. bu dosyanın restore-time doğrulaması) would ALSO reject ` +
+        `on the next restart — accepting it now would durably persist a live write that restore then refuses, ` +
+        `silently making genuinely-incurred spend unrecoverable after a restart (baseline section 147, 277).`
+    );
+    this.name = "InvalidCostEntryIdentityError";
+  }
+}
+
+/**
+ * P2 fix (36th independent review round, finding 10, "enforce restore-time
+ * identity checks before record() persistence"): `record()`/`#recordCommitted()`
+ * used to validate ONLY `amountUsd` (via `assertValidMonetaryAmount()`) before
+ * persisting a `CostEntry` — `taskId`/`provider`/`modelId` (required, per the
+ * `CostEntry` interface above) and `agentId`/`projectId`/`runId` (optional, but
+ * must be a string when present) were never checked at all. Meanwhile
+ * `assertValidPersistedCostState()` (bkz. aşağısı, `#loadFromStore()`'un
+ * kendi restore-time doğrulaması) DOES reject an entry whose `taskId`/
+ * `provider`/`modelId` is an empty string or non-string. That asymmetry is
+ * exactly this codebase's own "the record actually stored and what a later
+ * read of it accepts disagree" defect class (bkz. `audit-log.ts`'nin
+ * Map/Set/undefined fix notları, aynı kök sınıf): a caller could `record()`
+ * an entry with `taskId: ""` today — it is accepted, pushed into `#entries`,
+ * durably persisted (if `persistence` is configured) — and the NEXT process
+ * restart's `#loadFromStore()` would refuse to load that exact same entry
+ * (`CorruptCostStateError`), taking the ENTIRE cost ledger down with it, not
+ * merely that one entry. Fixed by validating EVERY identity field `record()`
+ * accepts against the EXACT SAME rule restore uses, at the SAME shared choke
+ * point (`#recordSnapshot()`, bkz. aşağısı) both `record()` and
+ * `#recordCommitted()` already funnel through before ANY mutation or
+ * persistence — so "would restore reject this?" is answered, and enforced,
+ * BEFORE `this.#entries.push()` ever runs, never only after the fact.
+ */
+function assertValidCostEntryIdentity(entry: Omit<CostEntry, "timestamp" | "reservationId">, context: string): void {
+  if (typeof entry.taskId !== "string" || entry.taskId.length === 0) {
+    throw new InvalidCostEntryIdentityError(context, "taskId is not a non-empty string");
+  }
+  if (typeof entry.provider !== "string" || entry.provider.length === 0) {
+    throw new InvalidCostEntryIdentityError(context, "provider is not a non-empty string");
+  }
+  if (typeof entry.modelId !== "string" || entry.modelId.length === 0) {
+    throw new InvalidCostEntryIdentityError(context, "modelId is not a non-empty string");
+  }
+  if (entry.agentId !== undefined && typeof entry.agentId !== "string") {
+    throw new InvalidCostEntryIdentityError(context, "agentId is neither a string nor undefined");
+  }
+  if (entry.projectId !== undefined && typeof entry.projectId !== "string") {
+    throw new InvalidCostEntryIdentityError(context, "projectId is neither a string nor undefined");
+  }
+  if (entry.runId !== undefined && typeof entry.runId !== "string") {
+    throw new InvalidCostEntryIdentityError(context, "runId is neither a string nor undefined");
+  }
+}
+
 /**
  * P2 fix (8th independent review round, "floating-point comparisons reject
  * exact budget spend"): Codex, `0.10` sonra `0.20` harcanıp $0.30'luk bir
@@ -163,6 +220,13 @@ export interface ReservationOwnership extends CostScope {
 }
 
 export type ReservationLedgerStatus = "ACTIVE" | "RECONCILIATION_FAILED";
+
+/** The internal, mutable-ledger shape a reservation is stored under in `#reservations` — never exported as mutable state (bkz. `LedgerReservation`/`ReservationView` for the frozen, external-facing shapes). */
+interface ReservationEntry {
+  readonly scope: Readonly<ReservationOwnership>;
+  readonly amountUsd: number;
+  readonly status: ReservationLedgerStatus;
+}
 
 export interface LedgerReservation {
   readonly id: string;
@@ -550,10 +614,7 @@ export class CostEngine {
    * yalnızca ham depolama ve toplama sağlar, tıpkı `record()`/`totalFor()`
    * gibi.
    */
-  #reservations = new Map<
-    string,
-    { scope: Readonly<ReservationOwnership>; amountUsd: number; status: ReservationLedgerStatus }
-  >();
+  #reservations = new Map<string, ReservationEntry>();
   #reservationSeq = 0;
 
   /**
@@ -761,6 +822,57 @@ export class CostEngine {
   }
 
   /**
+   * P2 fix (36th independent review round, finding 11, "roll back ledger
+   * mutations when persistence fails"): every mutating method below used to
+   * mutate `#entries`/`#reservations` DIRECTLY (a `.push()`, a `.set()`, a
+   * `.delete()`, or — worse — a property write on a reservation object
+   * already living inside `#reservations`) and only THEN call `#persist()`.
+   * If that `#persist()` call threw (a durable-storage I/O error, a full
+   * disk, a permissions change mid-run), the exception propagated to the
+   * caller — but the in-memory mutation had ALREADY happened and was never
+   * undone. From that point on, for the remaining lifetime of this process,
+   * `this.#entries`/`#reservations` (and therefore every `total()`/
+   * `totalFor()`/`reservedTotal()` read) reflected a cost or reservation
+   * change the durable file never received: RAM said "new state," disk said
+   * "old state," and a caller catching the thrown error had no way to know
+   * which one was authoritative — exactly the "the record actually stored
+   * and what a later read of it accepts disagree" defect class this file's
+   * OWN `assertValidPersistedCostState()` already exists to prevent for
+   * MALFORMED data, now reproduced for a WELL-FORMED mutation whose
+   * persistence merely failed. Fixed by inverting the order at every call
+   * site: each mutating method now computes the COMPLETE next
+   * `entries`/`reservations` snapshot WITHOUT touching the live fields, then
+   * calls this method — which stages that snapshot onto the live fields,
+   * attempts `#persist()`, and on failure immediately restores the exact
+   * previous `#entries`/`#reservations` references before rethrowing. A
+   * caller observing an exception from ANY mutating method is now
+   * guaranteed that this engine's in-memory state is byte-for-byte
+   * unchanged from before the call — "compute next → persist next →
+   * publish next," never "mutate now, persist maybe." This also required
+   * making every reservation'S OWN state TRANSITION (e.g.
+   * `RECONCILIATION_FAILED`) go through a freshly-constructed reservation
+   * object placed into a freshly-copied `Map`, rather than a property write
+   * on the object already stored in `#reservations` — see `ReservationEntry`
+   * above (now with a `readonly status`, so the compiler itself rejects any
+   * future in-place `reservation.status = ...` write) — since mutating that
+   * shared object in place would corrupt the "previous" snapshot this
+   * method rolls back to, defeating the rollback entirely.
+   */
+  #publish(nextEntries: CostEntry[], nextReservations: Map<string, ReservationEntry>): void {
+    const previousEntries = this.#entries;
+    const previousReservations = this.#reservations;
+    this.#entries = nextEntries;
+    this.#reservations = nextReservations;
+    try {
+      this.#persist();
+    } catch (err) {
+      this.#entries = previousEntries;
+      this.#reservations = previousReservations;
+      throw err;
+    }
+  }
+
+  /**
    * P1 fix (32nd independent review round, finding 1, "reservation id must
    * not be caller-forgeable"): this method's parameter type used to be
    * `Omit<CostEntry, "timestamp">` — which STILL includes `reservationId`
@@ -840,6 +952,13 @@ export class CostEngine {
    * asla erişilemez.
    */
   #recordSnapshot(snapshot: Omit<CostEntry, "timestamp" | "reservationId">, reservationId: string | undefined): CostEntry {
+    // P2 fix (36th independent review round, finding 10): bkz.
+    // `assertValidCostEntryIdentity()`'in üstündeki fix notu — checked HERE,
+    // the ONE shared choke point every `record()`/`#recordCommitted()` call
+    // already funnels through, so no future caller of either can ever reach
+    // `#entries.push()`/`#persist()` below with an identity restore would
+    // refuse.
+    assertValidCostEntryIdentity(snapshot, `CostEngine (taskId=${String(snapshot.taskId)})`);
     // P1 fix (30th independent review round, finding 3, "serialize
     // persistent cost-ledger updates"): the actual mutation (push + persist)
     // now runs inside `#withDurableMutation()` — bkz. bu sınıfın üstündeki
@@ -854,8 +973,11 @@ export class CostEngine {
       // totalInWindow) her zaman motorun kendi, asla dışarı sızmamış
       // kopyasını okur. Object.freeze, bu ayrımın atlanamamasını (örn.
       // "as any" ile alan ataması) TypeError'a çevirerek garanti eder.
-      this.#entries.push(full);
-      this.#persist();
+      // P2 fix (36th independent review round, finding 11): bkz. `#publish()`'in
+      // üstündeki fix notu — the next array is computed WITHOUT touching
+      // `this.#entries` yet, so a persistence failure inside `#publish()`
+      // leaves `this.#entries` completely untouched (rolled back).
+      this.#publish([...this.#entries, full], this.#reservations);
       return freezeRecord(full);
     });
   }
@@ -950,8 +1072,12 @@ export class CostEngine {
     return this.#withDurableMutation(() => {
       const id = `res-${++this.#reservationSeq}-${randomBytes(16).toString("hex")}`;
       const frozenScope = freezeRecord({ ...scope });
-      this.#reservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
-      this.#persist();
+      // P2 fix (36th independent review round, finding 11): bkz. `#publish()`'in
+      // üstündeki fix notu — a fresh Map (copied from the current one) is
+      // built and populated BEFORE `this.#reservations` is ever touched.
+      const nextReservations = new Map(this.#reservations);
+      nextReservations.set(id, { scope: frozenScope, amountUsd, status: "ACTIVE" });
+      this.#publish(this.#entries, nextReservations);
       return freezeRecord({ id, scope: frozenScope, amountUsd, status: "ACTIVE" as ReservationLedgerStatus });
     });
   }
@@ -1165,8 +1291,11 @@ export class CostEngine {
       // file the moment it does not yet agree with memory. Every retry is
       // now a genuine "reconcile durable state to match memory" step, not
       // merely "retry whatever step didn't run last time."
-      this.#reservations.delete(id);
-      this.#persist();
+      // P2 fix (36th independent review round, finding 11): bkz. `#publish()`'in
+      // üstündeki fix notu.
+      const nextReservations = new Map(this.#reservations);
+      nextReservations.delete(id);
+      this.#publish(this.#entries, nextReservations);
       return freezeRecord(alreadyCommitted);
     }
 
@@ -1204,7 +1333,25 @@ export class CostEngine {
       amountUsd: entry.amountUsd
     };
     if (ownershipMismatches(reservation.scope, snapshot)) {
-      reservation.status = "RECONCILIATION_FAILED";
+      // NOT routed through `#publish()` (bkz. onun üstündeki 36th round
+      // finding 11 fix notu) — deliberately, and unlike every OTHER
+      // mutation in this file. This transition is a FAIL-SAFE LOCK, not an
+      // ordinary state change: it exists precisely because whether a real
+      // provider cost was already incurred is now UNCERTAIN, so the
+      // protection it grants (never silently releasable — bkz.
+      // `UnresolvedReconciliationError`'ın notu) must hold in THIS
+      // process's memory even if the write recording that fact durably
+      // fails. Rolling this specific transition back on a persistence
+      // failure (as `#publish()` would) would silently UNDO the exact
+      // protection this branch exists to establish — reverting the
+      // reservation to ACTIVE-and-releasable at the one moment its true
+      // cost is least certain, regressing the 28th round's own "every
+      // failed commit must enter RECONCILIATION_FAILED" invariant. So the
+      // new reservation object is applied to the live Map UNCONDITIONALLY
+      // (never rolled back), and `#persist()` is still attempted — best
+      // effort, exactly as before — but its outcome does not gate whether
+      // the in-memory protection sticks.
+      this.#reservations.set(id, { ...reservation, status: "RECONCILIATION_FAILED" });
       this.#persist();
       throw new ReservationOwnershipMismatchError("commit", id, reservation.scope, snapshot);
     }
@@ -1247,12 +1394,31 @@ export class CostEngine {
       // Rezervasyon SİLİNMEZ — "RECONCILIATION_FAILED" olarak işaretlenip
       // KORUNUR (bkz. üstteki not); ÇAĞIRANIN (BudgetGuard) kendi audit/
       // hata işleme mantığı bu hatayı zaten sarmalar.
-      reservation.status = "RECONCILIATION_FAILED";
+      // Deliberately NOT routed through `#publish()` (bkz. onun üstündeki
+      // 36th round finding 11 fix notu, ve `ownershipMismatches()` dalının
+      // aynı gerekçeli notu hemen yukarıda) — this is the SAME fail-safe
+      // lock, reached via a DIFFERENT failure (any error from
+      // `#recordCommitted()` above, not only an ownership mismatch,
+      // including — per THIS round's own finding 11 — `record()`'s own
+      // `#publish()` call failing to persist the cost entry itself). Since
+      // whether that failure means a real provider cost was already
+      // incurred is exactly as uncertain here as in the ownership-mismatch
+      // branch, this transition must hold in memory REGARDLESS of whether
+      // `#persist()` below itself succeeds — rolling it back on a second,
+      // independent persistence failure would silently return an
+      // uncertain-cost reservation to ACTIVE-and-releasable, regressing
+      // the 28th round's "every failed commit must enter
+      // RECONCILIATION_FAILED" invariant (bkz. bunun altındaki regression
+      // testi).
+      this.#reservations.set(id, { ...reservation, status: "RECONCILIATION_FAILED" });
       this.#persist();
       throw err;
     }
-    this.#reservations.delete(id);
-    this.#persist();
+    // P2 fix (36th independent review round, finding 11): bkz. `#publish()`'in
+    // üstündeki fix notu.
+    const nextReservations = new Map(this.#reservations);
+    nextReservations.delete(id);
+    this.#publish(this.#entries, nextReservations);
     return recorded;
   }
 
@@ -1301,8 +1467,11 @@ export class CostEngine {
       if (ownershipMismatches(reservation.scope, callerScope)) {
         throw new ReservationOwnershipMismatchError("release", id, reservation.scope, callerScope);
       }
-      this.#reservations.delete(id);
-      this.#persist();
+      // P2 fix (36th independent review round, finding 11): bkz. `#publish()`'in
+      // üstündeki fix notu.
+      const nextReservations = new Map(this.#reservations);
+      nextReservations.delete(id);
+      this.#publish(this.#entries, nextReservations);
       return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
     });
   }
@@ -1371,9 +1540,20 @@ export class CostEngine {
       if (reservation.status === "RECONCILIATION_FAILED") {
         return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
       }
-      reservation.status = "RECONCILIATION_FAILED";
+      // Deliberately NOT routed through `#publish()` (bkz. onun üstündeki
+      // 36th round finding 11 fix notu, ve `#commitReservationInner()`'ın
+      // AYNI gerekçeli iki notu) — this method exists SPECIFICALLY to mark
+      // a reservation's true cost as uncertain (bkz. bu sınıfın üstündeki
+      // 33rd round fix notu, "billable provider failure reconciliation");
+      // rolling the transition back on a persistence failure would defeat
+      // its entire purpose by silently returning an uncertain-cost
+      // reservation to ACTIVE-and-releasable. The new object is applied to
+      // the live Map unconditionally; `#persist()` is still attempted best
+      // effort.
+      const updated: ReservationEntry = { ...reservation, status: "RECONCILIATION_FAILED" };
+      this.#reservations.set(id, updated);
       this.#persist();
-      return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
+      return freezeRecord({ id, scope: updated.scope, amountUsd: updated.amountUsd, status: updated.status });
     });
   }
 

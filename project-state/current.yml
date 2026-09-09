@@ -1266,6 +1266,32 @@ factory:
     move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all
     work stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    Round 36 (a 36th independent Codex review found 11 actionable findings — 9 P1, 2 P2 — fixed as one
+    consolidated closure batch; explicitly STRICTLY corrective, not expanding the four round-35 governance
+    mechanisms): see specification/requirements/P0-factory-kernel.yml's UASF-REQ-0042 notes (Round 36 paragraph)
+    for the full, per-finding detail. Summary: a URL-safe CLI-invocation check (secret-scan.mjs); filesystem-
+    confined, append-only, atomically-persisted phase-closure manifests (phase-closure.ts); typed, outcome-bearing
+    evidence refs so a failed test or bare directory can no longer satisfy PROOF_VERIFIED (traceability.ts, the
+    SAME function the Phase Closure Manifest and Reality Matrix both consume); detached/frozen provider responses
+    and recursively-frozen nested provider configuration (models/gateway.ts); NOT_BILLED classification for
+    purely-local pre-invocation provider-resolution failures (models/gateway.ts); prototype-safe canonical object
+    construction via `Object.defineProperty()` instead of bracket assignment (audit-log.ts); restore-time identity
+    validation applied to live `record()` calls, and a new `#publish()` helper giving every cost-ledger mutation
+    compute-next/persist-next/publish-next rollback-on-failure semantics — with the three RECONCILIATION_FAILED
+    fail-safe-lock transitions deliberately exempted from rollback to preserve the pre-existing round-28
+    invariant that an uncertain-cost reservation must never silently revert to releasable (cost-engine.ts). A
+    narrow root-cause audit for the 10 named shared classes found no further genuine instances. Full required
+    sequence re-run and green: lint, typecheck, build, 1410/1410 tests (50 files, +50 net new), validate:requirements
+    (46 schema-valid records — unchanged, no new requirement records this round), history-and-current-tree-aware
+    secret-scan (PASS), Factory Doctor (READY), all 9 P0 proofs, all 128 governance-mechanism tests green
+    (confirming the four round-35 mechanisms were only hardened/corrected, never expanded). No status raised on
+    any requirement beyond what real evidence supports. P0's persisted Scope Lock state is UNCHANGED by this
+    round (still LOCKED_FOR_CLOSURE / READY_FOR_INDEPENDENT_REVIEW from round 35) — this round ran no
+    phase-transition API call, since it supplied no new independent review result. P0 remains explicitly NOT
+    CLOSED. Per explicit instruction, this round does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED,
+    does NOT invoke Codex itself, and did NOT create a new branch — all work stayed on
+    claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4939,7 +4965,57 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
-  P0 IS NOW READY_FOR_INDEPENDENT_REVIEW (this session, round 35) — not CLOSED. A fresh, independent Codex
+  P0 REMAINS READY_FOR_INDEPENDENT_REVIEW (this session, round 36) — not CLOSED, and this round did NOT change that
+  persisted Scope Lock state (still `LOCKED_FOR_CLOSURE` from round 35; no phase-transition API call was made,
+  since this round supplied no new independent review result). A 36th independent Codex review of the branch found
+  ELEVEN actionable findings (9 P1, 2 P2) and required them fixed as ONE consolidated closure batch — explicitly
+  STRICTLY corrective, with instructions not to expand the four round-35 governance mechanisms (Central Invariant
+  Guard, Scope Lock + Backlog Router, Phase Closure Manifest, Implementation Reality Matrix), only harden/correct
+  their reported behavior. All eleven findings fixed: (1) secret-scan.mjs's CLI-invocation check now uses
+  `pathToFileURL()` instead of naive string concatenation, so a path with spaces/non-ASCII/Windows semantics can no
+  longer silently skip mandatory scanning; (2)-(4) phase-closure.ts's generated manifest paths are now confined
+  (`assertSafeGovernanceIdentifier()` + `assertFilesystemConfinement()`), manifests are genuinely append-only
+  (duplicate identity throws `DuplicateClosureManifestError`), and closure now follows a staged
+  persist-then-commit protocol so a failed manifest write can never leave a false CLOSED state; (5)
+  traceability.ts's evidence check now requires a typed, outcome-bearing structured ref (PASS/CLEAN/SUCCESS) for
+  TEST_RESULT/PROOF_RESULT/SECURITY_RESULT/REVIEW_RESULT evidence — a failed test or a bare directory can no
+  longer satisfy PROOF_VERIFIED — and this SAME function is what the Phase Closure Manifest and Reality Matrix
+  both already consume; (6)-(7) models/gateway.ts's invoke() now returns a detached, frozen response snapshot
+  (never the provider's own live object), and nested provider configuration objects are now recursively frozen at
+  registration time too (deliberately excluding arrays, to preserve this codebase's own established
+  self-tracking-bookkeeping pattern); (8) an UnknownProviderError (a purely local, pre-invocation failure) is now
+  classified NOT_BILLED instead of ambiguous UNKNOWN, so it genuinely releases its reservation instead of
+  stranding it; (9) audit-log.ts's canonical object construction now uses `Object.defineProperty()` instead of
+  bracket assignment, so a payload's own `"__proto__"` key is stored as ordinary data instead of silently mutating
+  the constructed object's actual prototype; (10) cost-engine.ts's `record()` now validates every identity field
+  (taskId/provider/modelId/agentId/projectId/runId) against the EXACT SAME rule its own restore-time validator
+  uses, before any mutation, so a live write can no longer durably persist an entry the next restart would refuse
+  to load; (11) every mutating cost-engine.ts method now computes its complete next entries/reservations snapshot
+  and persists it BEFORE publishing it to live state (a new `#publish()` helper, with automatic rollback on
+  persistence failure) — except the three RECONCILIATION_FAILED fail-safe-lock transitions, which are deliberately
+  exempted from rollback (preserving the pre-existing round-28 invariant that an uncertain-cost reservation must
+  never silently revert to releasable). Every fix was individually bypass-verified (temporary in-place revert
+  confirmed to reproduce the exact predicted regression-test failures, then restored), with the full suite re-run
+  after each to catch cross-cutting regressions. A narrow root-cause audit for the 10 named shared classes found
+  no further genuine instances (see specification/requirements/P0-factory-kernel.yml's UASF-REQ-0042 notes, Round
+  36 paragraph, for the full per-class detail). Full required sequence green: lint, typecheck, build, 1410/1410
+  tests (50 files, +50 net new), validate:requirements (46 schema-valid records), history-and-current-tree-aware
+  secret-scan (PASS), Factory Doctor (READY), all 9 P0 proofs, all 128 governance-mechanism tests green
+  (confirming none of the four round-35 mechanisms were expanded or altered beyond this round's corrective
+  fixes). No status raised on any requirement beyond what real evidence supports. Do not proceed to further P0
+  feature work, do not move to P1, and do not declare P0 CLOSED until a 37th independent Codex review of this diff
+  confirms no blocking P0 finding remains and explicitly returns INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit
+  instruction, this round does not merge, does not move to P1, does not declare P0 complete, does not invoke Codex
+  itself, and did not create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7. If/when the
+  next independent review comes back clean, resume from the prior exact_next_action (below): wire the remaining
+  foundation modules (Discovery, Decisions, Assumptions, Technology/Business-Capability registries) into the same
+  integrated pipeline, consider a SQLite-backed StateStore, get a Founder decision on P0-sufficiency and licensing
+  (section 206), and consider whether the four governance mechanisms should gate future rounds' own closure claims
+  going forward. The autonomous-merge governance question stays closed absent new Founder-initiated context.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
+  P0 WAS READY_FOR_INDEPENDENT_REVIEW (round 35). A fresh, independent Codex
   review of the complete branch found TWELVE actionable findings (9 P1, 3 P2) and required them fixed as ONE
   consolidated closure batch, PLUS four new Factory governance mechanisms (Central Invariant Guard, Scope Lock
   + Backlog Router, Phase Closure Manifest, Implementation Reality Matrix) implemented in the same batch,
