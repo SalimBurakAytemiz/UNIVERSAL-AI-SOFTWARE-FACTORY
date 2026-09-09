@@ -332,6 +332,45 @@ export class SandboxTimeoutError extends Error {
 }
 
 /**
+ * P2 fix (34th independent review round, finding 12, "reject non-finite
+ * sandbox timeout values"): `withTimeout()` used to pass `ms` straight
+ * into `Date.now() + ms` (the `deadlineAt` authoritative deadline the 32nd
+ * round's own event-loop-starvation fix, above, relies on) and into
+ * `setTimeout(fn, ms)`, with no validation at all. A `NaN` `ms` produces
+ * `deadlineAt: NaN` — since ANY comparison against `NaN` is `false`,
+ * `Date.now() >= deadlineAt` can NEVER be true, silently DISABLING that
+ * exact 32nd-round protection (the fallback timer, which Node clamps a
+ * NaN delay to ~1ms, still eventually fires — but the authoritative clock
+ * check this file added specifically to NOT depend on that timer having
+ * run yet is defeated). An `Infinity` `ms` produces `deadlineAt: Infinity`
+ * — the same "this comparison can never be true" defeat — while Node
+ * additionally clamps the underlying `setTimeout` delay itself to its own
+ * ~24.8-day (2^31-1 ms) maximum, silently returning a WILDLY different
+ * effective timeout than what the caller believes it configured. A
+ * negative `ms` produces an ALREADY-PAST `deadlineAt`, making the very
+ * first deadline check after `operation` starts declare a timeout
+ * regardless of how fast the operation genuinely completes — distorting
+ * enforcement in the other direction. Fixed: `ms` is validated BEFORE any
+ * timer/deadline calculation runs at all — finite, nonnegative, and within
+ * Node's own supported `setTimeout` delay range (beyond which Node itself
+ * silently clamps rather than honoring the requested delay), or this
+ * function fails closed immediately, before `operation` is ever invoked.
+ */
+const MAX_SANDBOX_TIMEOUT_MS = 2_147_483_647; // Node's setTimeout delay limit (2^31 - 1 ms, ~24.8 days) — beyond this Node silently clamps instead of honoring the requested delay.
+
+export class InvalidSandboxTimeoutError extends Error {
+  constructor(ms: number) {
+    super(
+      `Invalid sandbox timeout '${String(ms)}': must be a finite, nonnegative number of milliseconds no greater ` +
+        `than ${MAX_SANDBOX_TIMEOUT_MS} (Node's own setTimeout delay limit). NaN, Infinity, -Infinity, and ` +
+        `negative values are rejected outright rather than silently disabling the event-loop-starvation deadline ` +
+        `check this file's 32nd independent review round fix relies on, or distorting timeout enforcement.`
+    );
+    this.name = "InvalidSandboxTimeoutError";
+  }
+}
+
+/**
  * P1 fix (27th independent review round, finding 9, "timeout must
  * actually cancel sandbox work"): `withTimeout` used to accept an
  * ALREADY-STARTED, opaque `Promise<T>` and race it against a timer via
@@ -415,6 +454,12 @@ export class SandboxTimeoutError extends Error {
  * event-loop-starvation gap the flag-only check could not see.
  */
 export async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  // P2 fix (34th independent review round, finding 12): validated BEFORE
+  // any timer/deadline calculation runs, and before `operation` is ever
+  // invoked — bkz. `InvalidSandboxTimeoutError`'ın fix notu.
+  if (!Number.isFinite(ms) || ms < 0 || ms > MAX_SANDBOX_TIMEOUT_MS) {
+    throw new InvalidSandboxTimeoutError(ms);
+  }
   const controller = new AbortController();
   let timedOut = false;
   const deadlineAt = Date.now() + ms;

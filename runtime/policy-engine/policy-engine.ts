@@ -29,6 +29,29 @@ export interface PolicyAction {
    */
   readonly projectId?: string;
   readonly actorId?: string;
+  /**
+   * P1 fix (34th independent review round, findings 3 & 4, "approval
+   * evidence not bound to immutable exact action identity"): `actionType`/
+   * `risk`/`description`/`costUsd`/`projectId`/`actorId` are the FULL
+   * identity `CapabilityGateway.authorize()`'s approval-binding check
+   * (`isBoundToExactAction()`, bkz. capability-gateway/gateway.ts) is able
+   * to compare — but several call sites need MORE dimensions bound into
+   * that identity than this shared interface should hardcode by name
+   * (e.g. `models/gateway.ts`'s `model.invoke` needs taskId/runId/agentId/
+   * provider/modelId/prompt all bound; its `model.provider.replace` needs
+   * the CANDIDATE implementation's own identity bound). Rather than
+   * growing `PolicyAction` with an ever-longer list of action-type-specific
+   * named fields (most of which would be meaningless for most OTHER action
+   * types), this single opaque field lets a caller fold EVERY extra
+   * dimension its own action type cares about into one caller-computed
+   * digest (a stable hash over exactly those authoritative, already-
+   * snapshotted values — bkz. `models/gateway.ts`'s `identityDigestOf()`)
+   * — compared for EXACT equality by `isBoundToExactAction()` exactly like
+   * every other field here. An approval requested for one digest can never
+   * satisfy a materially different one, however similar the generic
+   * `description` two such actions might otherwise share.
+   */
+  readonly identityDigest?: string;
 }
 
 export interface PolicyRule {

@@ -256,7 +256,12 @@ describe("CostEngine", () => {
       it("releaseReservation() throws UnresolvedReconciliationError for a RECONCILIATION_FAILED reservation and does not remove it", () => {
         const engine = new CostEngine();
         const reservation = engine.createReservation({ taskId: "t1" }, 0.5);
-        engine.markReservationReconciliationFailed(reservation.id);
+        // P1 fix (34th independent review round, finding 2): the old,
+        // ownership-free `markReservationReconciliationFailed(id)` was
+        // removed entirely — `markReservationUnresolved(id, callerScope)`
+        // is the one authoritative, ownership-checked way to reach this
+        // state from outside.
+        engine.markReservationUnresolved(reservation.id, { taskId: "t1" });
 
         expect(() => engine.releaseReservation(reservation.id, { taskId: "t1" })).toThrow(UnresolvedReconciliationError);
         expect(engine.getReservation(reservation.id)).toBeDefined(); // still protected, not deleted
@@ -348,6 +353,39 @@ describe("CostEngine", () => {
         expect(() => engine.markReservationUnresolved(reservation.id, { taskId: "t1" })).not.toThrow();
         expect(engine.getReservation(reservation.id)?.status).toBe("RECONCILIATION_FAILED");
         expect(engine.reservedTotal({ taskId: "t1" })).toBe(0.5);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (34th independent review round, finding 1, 'check ownership before returning failed " +
+      "reservations'): the idempotent-no-op branch for an already-RECONCILIATION_FAILED reservation must " +
+      "never run before the ownership check — it must not hand a mismatched caller back the reservation's " +
+      "authoritative scope",
+    () => {
+      it("BLOCKER regression, exact reproduction: caller B, merely knowing caller A's reservation id, cannot retrieve A's scope via a mismatched markReservationUnresolved() call on an already-RECONCILIATION_FAILED reservation", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1", provider: "openai" }, 0.5);
+        // Caller A (the genuine owner) legitimately marks it unresolved first.
+        engine.markReservationUnresolved(reservation.id, { taskId: "t1", provider: "openai" });
+        expect(engine.getReservation(reservation.id)?.status).toBe("RECONCILIATION_FAILED");
+
+        // Caller B knows the reservation id but supplies a DIFFERENT scope
+        // (never established any relationship to this reservation). The
+        // call must be rejected as an ownership mismatch — NOT silently
+        // succeed as an "idempotent no-op" that discloses A's true scope.
+        expect(() =>
+          engine.markReservationUnresolved(reservation.id, { taskId: "t1", provider: "anthropic" })
+        ).toThrow(ReservationOwnershipMismatchError);
+      });
+
+      it("no regression: the genuine owner can still call markReservationUnresolved() idempotently on an already-RECONCILIATION_FAILED reservation with their own correct scope", () => {
+        const engine = new CostEngine();
+        const reservation = engine.createReservation({ taskId: "t1", provider: "openai" }, 0.5);
+        engine.markReservationUnresolved(reservation.id, { taskId: "t1", provider: "openai" });
+
+        const result = engine.markReservationUnresolved(reservation.id, { taskId: "t1", provider: "openai" });
+        expect(result.status).toBe("RECONCILIATION_FAILED");
       });
     }
   );
@@ -1424,6 +1462,79 @@ describe("CostEngine", () => {
       expect(engine.total()).toBeCloseTo(0.5);
       expect(engine.all().filter((e) => e.reservationId === reservation.id)).toHaveLength(1);
     });
+
+    describe(
+      "P1 fix (34th independent review round, finding 7, 'validate idempotent retries before returning " +
+        "authoritative entry'): the 'already committed' idempotency branch must not hand back the authoritative " +
+        "entry to a caller whose own retry does not match it",
+      () => {
+        it("BLOCKER regression, exact reproduction: a 'retry' presenting a DIFFERENT scope (provider) than the genuinely committed entry is rejected, not handed the real entry", () => {
+          const engine = new CostEngine();
+          const reservation = engine.createReservation({ taskId: "t1", provider: "openai", modelId: "m1" }, 0.5);
+          engine.commitReservation(reservation.id, {
+            taskId: "t1",
+            provider: "openai",
+            modelId: "m1",
+            amountUsd: 0.5
+          });
+
+          expect(() =>
+            engine.commitReservation(reservation.id, {
+              taskId: "t1",
+              provider: "anthropic",
+              modelId: "m1",
+              amountUsd: 0.5
+            })
+          ).toThrow(ReservationOwnershipMismatchError);
+          // The genuinely committed entry is untouched.
+          expect(engine.total()).toBeCloseTo(0.5);
+          expect(engine.all().filter((e) => e.reservationId === reservation.id)).toHaveLength(1);
+        });
+
+        it("BLOCKER regression: a 'retry' presenting a DIFFERENT amount than the genuinely committed entry is rejected", () => {
+          const engine = new CostEngine();
+          const reservation = engine.createReservation({ taskId: "t1", provider: "mock", modelId: "m1" }, 1);
+          engine.commitReservation(reservation.id, {
+            taskId: "t1",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.5
+          });
+
+          expect(() =>
+            engine.commitReservation(reservation.id, {
+              taskId: "t1",
+              provider: "mock",
+              modelId: "m1",
+              amountUsd: 0.9
+            })
+          ).toThrow(ReservationOwnershipMismatchError);
+          expect(engine.total()).toBeCloseTo(0.5);
+        });
+
+        it("no regression: a genuine retry with the EXACT SAME scope and amount still returns the authoritative entry idempotently", () => {
+          const engine = new CostEngine();
+          const reservation = engine.createReservation({ taskId: "t1", provider: "mock", modelId: "m1", agentId: "a1", runId: "r1" }, 1);
+          const first = engine.commitReservation(reservation.id, {
+            taskId: "t1",
+            provider: "mock",
+            modelId: "m1",
+            agentId: "a1",
+            runId: "r1",
+            amountUsd: 0.5
+          });
+          const retry = engine.commitReservation(reservation.id, {
+            taskId: "t1",
+            provider: "mock",
+            modelId: "m1",
+            agentId: "a1",
+            runId: "r1",
+            amountUsd: 0.5
+          });
+          expect(retry).toEqual(first);
+        });
+      }
+    );
 
     it("no regression: an ordinary direct record() call (no reservation involved at all) is unaffected", () => {
       const engine = new CostEngine();

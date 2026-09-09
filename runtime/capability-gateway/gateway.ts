@@ -64,8 +64,8 @@ export class ApprovalEvidenceMismatchError extends Error {
           : `The approval's recorded identity (actionType='${String(request.actionType)}', ` +
             `description='${request.actionDescription}', risk=${request.risk}, ` +
             `costUsd=${String(request.costUsd)}, projectId=${String(request.projectId)}, ` +
-            `actorId=${String(request.actorId)}) does not fully match this action, or the approval is not ` +
-            `APPROVED (status: ${request.status}).`) +
+            `actorId=${String(request.actorId)}, identityDigest=${String(request.identityDigest)}) does not ` +
+            `fully match this action, or the approval is not APPROVED (status: ${request.status}).`) +
         ` An approval can only authorize the EXACT action it was requested for (baseline section 145/147) — ` +
         `use ApprovalWorkflow.requestFor() to record the complete action identity an approval must be bound to.`
     );
@@ -99,7 +99,15 @@ function isBoundToExactAction(request: ApprovalRequest, action: PolicyAction): b
     request.risk === action.risk &&
     request.costUsd === action.costUsd &&
     request.projectId === action.projectId &&
-    request.actorId === action.actorId
+    request.actorId === action.actorId &&
+    // P1 fix (34th independent review round, findings 3 & 4): bkz.
+    // `PolicyAction.identityDigest`'in fix notu — compared for exact
+    // equality exactly like every other identity field above. An action
+    // that supplies no digest (`undefined`) can only match an approval
+    // that ALSO recorded no digest, the same "an incomplete identity can
+    // never be trusted to match" precedent this file's own 25th-round fix
+    // already established for `actionType`/`costUsd`/`projectId`/`actorId`.
+    request.identityDigest === action.identityDigest
   );
 }
 

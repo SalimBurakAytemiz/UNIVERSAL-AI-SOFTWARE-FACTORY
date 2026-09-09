@@ -4,6 +4,8 @@ import {
   UnknownProviderError,
   DuplicateProviderIdError,
   ProviderInvocationError,
+  computeModelInvocationIdentityDigest,
+  computeProviderReplacementIdentityDigest,
   type ModelInvocationResponse
 } from "../gateway.js";
 import { AuditLog } from "../../audit/audit-log.js";
@@ -41,7 +43,25 @@ function permissiveBudget(costEngine: CostEngine = new CostEngine()): BudgetGuar
  */
 class ControllableProvider implements ModelProvider {
   readonly id = "controllable";
-  invocationCount = 0;
+  /**
+   * P1 fix (34th independent review round, finding 5, "detach provider
+   * execution from caller-owned state"): `ModelGateway.registerProvider()`
+   * now locks every OWN, currently-existing data property of a registered
+   * provider to its value at registration time (bkz. gateway.ts's
+   * `detachFromCallerMutation()`), so a TOP-LEVEL primitive field can no
+   * longer be reassigned once the invoke() call this fixture's own
+   * `invoke()` below runs starts using it. This fixture's own invocation
+   * bookkeeping is therefore routed through a single NESTED, unlocked
+   * container (`#counters`) rather than a bare top-level primitive: the
+   * lock is shallow (matches `freezeRecord` elsewhere in this codebase),
+   * so `this.#counters.invocations++` (mutating a property of the nested
+   * object, never reassigning the top-level `#counters` reference itself)
+   * remains completely unaffected by the registration-time lock.
+   */
+  #counters = { invocations: 0 };
+  get invocationCount(): number {
+    return this.#counters.invocations;
+  }
   /** A snapshot of exactly what `model` looked like AT THE MOMENT this provider was called, for each call. */
   receivedModels: ModelRecord[] = [];
   /**
@@ -71,7 +91,7 @@ class ControllableProvider implements ModelProvider {
   private pending: Array<() => void> = [];
 
   async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
-    this.invocationCount++;
+    this.#counters.invocations++;
     this.receivedModels.push({ ...model, capabilities: [...model.capabilities] });
     return new Promise((resolve) => {
       this.pending.push(() => {
@@ -88,8 +108,12 @@ class ControllableProvider implements ModelProvider {
   }
 
   resolveAll(): void {
-    const toResolve = this.pending;
-    this.pending = [];
+    // Drains `pending` IN PLACE (`.splice()`, never `this.pending = []`) —
+    // see the fix note above `#counters`: a registered provider's `pending`
+    // property is locked to its registration-time ARRAY REFERENCE, so
+    // reassigning it here would throw once this provider is registered.
+    // Splicing mutates that same, still-writable array instead.
+    const toResolve = this.pending.splice(0, this.pending.length);
     for (const resolve of toResolve) resolve();
   }
 }
@@ -1140,13 +1164,21 @@ describe("ModelGateway + MockProvider", () => {
 
         // The SAME identity invoke() will build internally: actionType
         // "model.invoke", the exact description/risk/costUsd/projectId
-        // this call will use.
+        // this call will use, plus (34th independent review round, finding
+        // 3) the SAME identityDigest invoke() will compute from the exact
+        // task/run/agent/provider/model/prompt it will actually invoke.
         approvals.requestFor("appr-1", {
           actionType: "model.invoke",
           description: "risk-5 approved action",
           risk: 5,
           costUsd: 0.4,
-          projectId: "project-x"
+          projectId: "project-x",
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            provider: "controllable",
+            modelId: model.modelId,
+            prompt: "x"
+          })
         });
         approvals.approve("appr-1", "founder@example.com");
 
@@ -1196,7 +1228,13 @@ describe("ModelGateway + MockProvider", () => {
           actionType: "model.invoke",
           description: "reused approval",
           risk: 5,
-          costUsd: 0.2
+          costUsd: 0.2,
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            provider: "controllable",
+            modelId: model.modelId,
+            prompt: "first"
+          })
         });
         approvals.approve("appr-reuse", "founder@example.com");
 
@@ -1277,6 +1315,128 @@ describe("ModelGateway + MockProvider", () => {
           })
         ).rejects.toThrow(ApprovalEvidenceMismatchError);
         expect(provider.invocationCount).toBe(0);
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (34th independent review round, finding 3, 'bind approvals to the exact model invocation'): " +
+      "an approval bound to one prompt/model/run cannot authorize a materially different one, even when " +
+      "actionType/description/risk/costUsd/projectId all happen to match",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: approval for prompt/model/run A -> cannot authorize a " +
+          "materially different prompt B under the SAME description/risk/cost/project",
+        async () => {
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals);
+          const provider = new ControllableProvider();
+          gateway.registerProvider(provider);
+          const model = mockModel({ provider: "controllable", costPerCall: 0.4 });
+
+          approvals.requestFor("appr-a", {
+            actionType: "model.invoke",
+            description: "shared description",
+            risk: 5,
+            costUsd: 0.4,
+            projectId: "project-x",
+            identityDigest: computeModelInvocationIdentityDigest({
+              taskId: "t1",
+              provider: "controllable",
+              modelId: model.modelId,
+              prompt: "prompt A"
+            })
+          });
+          approvals.approve("appr-a", "founder@example.com");
+
+          // Same actionType/description/risk/costUsd/projectId, but a
+          // MATERIALLY DIFFERENT prompt — never approved.
+          await expect(
+            gateway.invoke(model, { prompt: "prompt B" }, {
+              policy: permissivePolicy(),
+              budget: permissiveBudget(),
+              risk: 5,
+              taskId: "t1",
+              projectId: "project-x",
+              description: "shared description",
+              approvalId: "appr-a"
+            })
+          ).rejects.toThrow(ApprovalEvidenceMismatchError);
+          expect(provider.invocationCount).toBe(0);
+        }
+      );
+
+      it("BLOCKER regression: an approval for one runId cannot authorize the SAME prompt/model under a DIFFERENT run", async () => {
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const model = mockModel({ provider: "controllable", costPerCall: 0.4 });
+
+        approvals.requestFor("appr-run-a", {
+          actionType: "model.invoke",
+          description: "run-scoped action",
+          risk: 5,
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            runId: "run-a",
+            provider: "controllable",
+            modelId: model.modelId,
+            prompt: "x"
+          })
+        });
+        approvals.approve("appr-run-a", "founder@example.com");
+
+        await expect(
+          gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 5,
+            taskId: "t1",
+            runId: "run-b",
+            description: "run-scoped action",
+            approvalId: "appr-run-a"
+          })
+        ).rejects.toThrow(ApprovalEvidenceMismatchError);
+        expect(provider.invocationCount).toBe(0);
+      });
+
+      it("no regression: an approval whose digest genuinely matches the exact taskId/runId/agentId/provider/modelId/prompt succeeds", async () => {
+        const approvals = new ApprovalWorkflow();
+        const gateway = new ModelGateway(approvals);
+        const provider = new ControllableProvider();
+        gateway.registerProvider(provider);
+        const model = mockModel({ provider: "controllable", costPerCall: 0.4 });
+
+        approvals.requestFor("appr-exact", {
+          actionType: "model.invoke",
+          description: "exact-match action",
+          risk: 5,
+          costUsd: 0.4,
+          actorId: "agent-a",
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            runId: "run-a",
+            agentId: "agent-a",
+            provider: "controllable",
+            modelId: model.modelId,
+            prompt: "x"
+          })
+        });
+        approvals.approve("appr-exact", "founder@example.com");
+
+        const responsePromise = gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 5,
+          taskId: "t1",
+          runId: "run-a",
+          agentId: "agent-a",
+          description: "exact-match action",
+          approvalId: "appr-exact"
+        });
+        provider.resolveAll();
+        await expect(responsePromise).resolves.toBeDefined();
       });
     }
   );
@@ -1509,11 +1669,21 @@ describe("ModelGateway + MockProvider", () => {
         gateway.registerProvider(new MockProvider());
 
         const description = "Replace provider adapter 'mock'";
-        approvals.requestFor("appr-1", { actionType: "model.provider.replace", description, risk: 5 });
+        // 34th independent review round, finding 4: the approval must be
+        // bound to the EXACT candidate implementation `replaceProvider()`
+        // will actually install — computed from the SAME object reference
+        // passed to `replaceProvider()` below.
+        const candidate = replacement();
+        approvals.requestFor("appr-1", {
+          actionType: "model.provider.replace",
+          description,
+          risk: 5,
+          identityDigest: computeProviderReplacementIdentityDigest(candidate, "mock")
+        });
         approvals.approve("appr-1", "founder@example.com");
 
         await expect(
-          gateway.replaceProvider(replacement(), {
+          gateway.replaceProvider(candidate, {
             policy: permissivePolicy(),
             risk: 5,
             description,
@@ -1540,6 +1710,59 @@ describe("ModelGateway + MockProvider", () => {
         });
         expect(response.output).toBe("replacement");
       });
+
+      it(
+        "BLOCKER regression, exact reproduction (34th independent review round, finding 4): approve replacement " +
+          "implementation X -> attempt installation of Y with the SAME provider id/description -> FAIL, X remains authoritative",
+        async () => {
+          const auditLog = new AuditLog();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals, auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          const description = "Replace provider adapter 'mock'";
+          const implementationX = replacement("implementation-X-output");
+          approvals.requestFor("appr-x", {
+            actionType: "model.provider.replace",
+            description,
+            risk: 5,
+            identityDigest: computeProviderReplacementIdentityDigest(implementationX, "mock")
+          });
+          approvals.approve("appr-x", "founder@example.com");
+
+          // A DIFFERENT candidate object — same provider id, same generic
+          // description — is what actually gets passed to replaceProvider().
+          class ImplementationY implements ModelProvider {
+            readonly id = "mock";
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "implementation-Y-output" };
+            }
+          }
+          const implementationY = new ImplementationY();
+
+          await expect(
+            gateway.replaceProvider(implementationY, {
+              policy: permissivePolicy(),
+              risk: 5,
+              description,
+              approvalId: "appr-x"
+            })
+          ).rejects.toThrow(ApprovalEvidenceMismatchError);
+
+          // No swap occurred — the ORIGINAL MockProvider still serves invocations.
+          expect(auditLog.all().filter((e) => e.type === "MODEL_PROVIDER_REPLACED")).toHaveLength(0);
+          const registry = createDefaultModelRegistry();
+          const model = registry.all()[0]!;
+          const response = await gateway.invoke(model, { prompt: "hello" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toContain("hello");
+          expect(response.output).not.toContain("implementation-Y-output");
+        }
+      );
 
       it("an approval registered in a DIFFERENT ModelGateway's own approvals store cannot authorize this gateway's replacement", async () => {
         const elsewhere = new ApprovalWorkflow();
@@ -1627,7 +1850,16 @@ describe("ModelGateway + MockProvider", () => {
         const gateway = new ModelGateway();
         gateway.registerProvider(provider);
 
-        (provider as { id: string }).id = "renamed";
+        // P1 fix (34th independent review round, finding 5, "detach
+        // provider execution from caller-owned state"): registration now
+        // locks every OWN, currently-existing data property (including
+        // `id`) to its value at that moment — bkz. gateway.ts's
+        // `detachFromCallerMutation()` — so this mutation itself now fails
+        // closed, a STRONGER form of the same "never redirect" invariant
+        // this test was already written to prove.
+        expect(() => {
+          (provider as { id: string }).id = "renamed";
+        }).toThrow(TypeError);
 
         const registry = createDefaultModelRegistry();
         const model = registry.all()[0]!; // still references provider "mock"
@@ -1837,6 +2069,85 @@ describe("ModelGateway + MockProvider", () => {
         const entry = costEngine.all().find((e) => e.taskId === "t1");
         expect(entry?.runId).toBe("run-x");
         expect(entry?.agentId).toBe("agent-x");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (34th independent review round, finding 5, 'detach provider execution from caller-owned " +
+      "state'): a registered provider's own OWN, currently-existing data properties are locked at " +
+      "registration time, so a caller can no longer redirect an already-authorized provider's behavior by " +
+      "mutating its config-like fields after the fact",
+    () => {
+      class ConfigurableProvider implements ModelProvider {
+        readonly id = "configurable";
+        endpoint = "https://good.example.com";
+        async invoke(model: ModelRecord): Promise<ModelInvocationResponse> {
+          return {
+            modelId: model.modelId,
+            provider: model.provider,
+            costUsd: model.costPerCall,
+            output: `endpoint:${this.endpoint}`
+          };
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: register provider -> mutate provider.endpoint -> existing " +
+          "authoritative binding remains unchanged",
+        async () => {
+          const gateway = new ModelGateway();
+          const provider = new ConfigurableProvider();
+          gateway.registerProvider(provider);
+
+          // The mutation itself now fails closed (the property was locked
+          // at registration) rather than silently succeeding and being
+          // ignored — either way, the value the gateway actually uses can
+          // never change.
+          expect(() => {
+            provider.endpoint = "https://evil.example.com";
+          }).toThrow(TypeError);
+          expect(provider.endpoint).toBe("https://good.example.com");
+
+          const model = mockModel({ provider: "configurable" });
+          const response = await gateway.invoke(model, { prompt: "x" }, {
+            policy: permissivePolicy(),
+            budget: permissiveBudget(),
+            risk: 0,
+            taskId: "t1"
+          });
+          expect(response.output).toBe("endpoint:https://good.example.com");
+        }
+      );
+
+      it("no regression: an ordinary provider with no post-registration mutation invokes exactly as before", async () => {
+        const gateway = new ModelGateway();
+        const provider = new ConfigurableProvider();
+        gateway.registerProvider(provider);
+
+        const model = mockModel({ provider: "configurable" });
+        const response = await gateway.invoke(model, { prompt: "x" }, {
+          policy: permissivePolicy(),
+          budget: permissiveBudget(),
+          risk: 0,
+          taskId: "t1"
+        });
+        expect(response.output).toBe("endpoint:https://good.example.com");
+      });
+
+      it("no regression: instrumentation that ADDS a new own property after registration (e.g. spying on a prototype method) is unaffected", () => {
+        const gateway = new ModelGateway();
+        const provider = new MockProvider();
+        gateway.registerProvider(provider);
+
+        // `invoke` is a PROTOTYPE method on MockProvider, not an own
+        // instance property at registration time — the registration-time
+        // lock only touches properties that already exist as OWN data
+        // properties, so adding a brand new own property here (exactly
+        // what spying on a prototype method requires) must not throw.
+        expect(() => {
+          Object.defineProperty(provider, "invoke", { value: async () => {}, configurable: true, writable: true });
+        }).not.toThrow();
       });
     }
   );

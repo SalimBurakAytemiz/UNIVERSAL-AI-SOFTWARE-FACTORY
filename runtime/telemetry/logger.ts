@@ -279,7 +279,19 @@ export class Logger {
 
   log(fields: LogFields): void {
     const redacted = redact({ ...fields }) as Record<string, unknown>;
-    const line = JSON.stringify({ timestamp: new Date().toISOString(), ...redacted });
+    // P2 fix (34th independent review round, finding 8, "preserve logger-
+    // generated timestamps"): `timestamp` used to be spread FIRST, then
+    // `...redacted` — a caller-supplied `fields.timestamp` (LogFields'
+    // `[extra: string]: unknown` index signature accepts any field name,
+    // "timestamp" included) would silently OVERWRITE the logger's own
+    // authoritative value, since a later object-spread key always wins.
+    // This let a caller forge the recorded chronology of its own log line
+    // (`logger.log({ timestamp: "1970-01-01T00:00:00.000Z", ... })`)
+    // completely undetected. Fixed by reordering: `...redacted` now comes
+    // FIRST, and the logger-generated `timestamp` is assigned LAST — any
+    // caller-supplied `timestamp` field is unconditionally overwritten by
+    // the genuine current time, never the other way around.
+    const line = JSON.stringify({ ...redacted, timestamp: new Date().toISOString() });
     this.sink(line);
   }
 }

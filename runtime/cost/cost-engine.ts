@@ -987,28 +987,25 @@ export class CostEngine {
     return freezeRecord({ id, amountUsd: r.amountUsd, status: r.status });
   }
 
-  /**
-   * Bir rezervasyonu "ÇÖZÜLMEMİŞ MUTABAKAT BAŞARISIZLIĞI" durumuna işaretler
-   * — bkz. `runtime/budget/budget.ts`'deki `ReservationStatus`/
-   * `UnresolvedReconciliationError`'ın notu. Rezervasyon zaten yoksa
-   * sessizce hiçbir şey yapmaz (çağıran — `BudgetGuard` — varlığını zaten
-   * `getReservation()` ile doğrulamış olmalıdır; bu yalnızca dahili bir
-   * durum geçişidir, kendi başına bir "bulundu mu?" sözleşmesi değildir).
-   */
-  markReservationReconciliationFailed(id: string): void {
-    // P1 fix (30th independent review round, finding 3, "serialize
-    // persistent cost-ledger updates"): bkz. `record()`'un üstündeki fix
-    // notu — resenkronize edilmeden mutasyona uğratılırsa, bir kardeş
-    // instance'ın bu ARADA oluşturduğu BAŞKA bir rezervasyon burada
-    // sessizce KAYBOLABİLİRDİ.
-    this.#withDurableMutation(() => {
-      const r = this.#reservations.get(id);
-      if (r) {
-        r.status = "RECONCILIATION_FAILED";
-        this.#persist();
-      }
-    });
-  }
+  // P1 fix (34th independent review round, finding 2 / root class 1,
+  // "require ownership for reconciliation state changes"): a public
+  // `markReservationReconciliationFailed(id: string): void` used to live
+  // here — a reservation-status mutation reachable by ANY caller holding a
+  // `CostEngine` reference, with NO ownership proof required at all (unlike
+  // every other reservation-lifecycle mutation — `commitReservation()`/
+  // `releaseReservation()`/`markReservationUnresolved()` — which all
+  // require a matching `callerScope`). An unrelated caller who merely
+  // learned (or predicted) another caller's reservation id could call it
+  // directly and strand that reservation in `RECONCILIATION_FAILED`
+  // forever, with no relationship to it whatsoever. It was never actually
+  // called from anywhere in this file (`#commitReservationInner()` mutates
+  // `reservation.status` in place directly, not through this method) — its
+  // only caller was a test exercising `releaseReservation()`'s own
+  // rejection of a RECONCILIATION_FAILED reservation. Removed entirely
+  // rather than merely made `#private`: `markReservationUnresolved(id,
+  // callerScope)` (added the 33rd round for the identical purpose, WITH an
+  // ownership check) is the one authoritative, externally-safe way to
+  // reach this state from outside; the test now uses that instead.
 
   /**
    * P1 fix (24th independent review round, "reservation deletion must not
@@ -1110,6 +1107,37 @@ export class CostEngine {
   #commitReservationInner(id: string, entry: Omit<CostEntry, "timestamp" | "reservationId">): CostEntry {
     const alreadyCommitted = this.#entries.find((e) => e.reservationId === id);
     if (alreadyCommitted) {
+      // P1 fix (34th independent review round, finding 7, "validate
+      // idempotent retries before returning authoritative entry"): this
+      // branch used to return `alreadyCommitted` unconditionally — ANY
+      // caller presenting `id` (a genuinely committed reservation id,
+      // whether learned legitimately or merely guessed/predicted — ids are
+      // sequential, `res-1`, `res-2`, ...) got back the FULL authoritative
+      // `CostEntry`, including its true `taskId`/`agentId`/`projectId`/
+      // `runId`/`provider`/`modelId`/`amountUsd`, with NO check that this
+      // caller's OWN `entry` argument bears any resemblance to it at all.
+      // A retry is only genuinely idempotent when it is the SAME logical
+      // operation repeated — the caller-supplied `entry` for THIS attempt
+      // must match the already-recorded ownership scope AND the exact
+      // committed amount, the same identity `ownershipMismatches()`
+      // already enforces for a FIRST commit (bkz. aşağısı). Fixed: the
+      // retry's own `entry` is validated against `alreadyCommitted` BEFORE
+      // it is ever returned — a caller whose scope OR amount disagrees is
+      // rejected with `ReservationOwnershipMismatchError`, exactly as a
+      // mismatched first-time commit already is, rather than silently
+      // handed back someone else's authoritative committed entry.
+      const retrySnapshot: Omit<CostEntry, "timestamp" | "reservationId"> = {
+        taskId: entry.taskId,
+        agentId: entry.agentId,
+        projectId: entry.projectId,
+        runId: entry.runId,
+        provider: entry.provider,
+        modelId: entry.modelId,
+        amountUsd: entry.amountUsd
+      };
+      if (ownershipMismatches(alreadyCommitted, retrySnapshot) || retrySnapshot.amountUsd !== alreadyCommitted.amountUsd) {
+        throw new ReservationOwnershipMismatchError("commit", id, alreadyCommitted, retrySnapshot);
+      }
       // P1 fix (30th independent review round, finding 2, "persist
       // reservation deletion on idempotent retry"): this used to call
       // `#persist()` ONLY `if (this.#reservations.has(id))` — but that
@@ -1310,6 +1338,26 @@ export class CostEngine {
    * independent provider failure signal about the same reservation is not
    * an error — the reservation is already exactly as protected as this
    * call would have made it).
+   *
+   * P1 fix (34th independent review round, finding 1, "check ownership
+   * before returning failed reservations"): the idempotent-no-op branch
+   * above used to run BEFORE the ownership check — Codex reproduced that
+   * caller B, merely knowing (or predicting) caller A's reservation id,
+   * could call this method on an ALREADY-`RECONCILIATION_FAILED`
+   * reservation and receive back the FULL `LedgerReservation`, including
+   * `scope` — A's authoritative ownership — with NO relationship to that
+   * reservation whatsoever, since the early return happened before
+   * `ownershipMismatches()` ever ran. This is exactly the class of leak
+   * `getReservation()`'s own 26th-round fix closed for the read path; here
+   * it reopened via a WRITE path's idempotency shortcut. Fixed: the
+   * ownership check now runs FIRST, unconditionally, for every status —
+   * only after `callerScope` is proven to match does either branch (the
+   * idempotent already-failed case, or the genuine ACTIVE-to-
+   * RECONCILIATION_FAILED transition) ever construct a `scope`-bearing
+   * return value, mirroring `releaseReservation()`'s own ordering (whose
+   * status-based short-circuit is safe only because it THROWS
+   * `UnresolvedReconciliationError`, a scope-free error, never returns
+   * `scope` itself).
    */
   markReservationUnresolved(id: string, callerScope: ReservationOwnership): LedgerReservation {
     return this.#withDurableMutation(() => {
@@ -1317,11 +1365,11 @@ export class CostEngine {
       if (!reservation) {
         throw new UnknownReservationError(id);
       }
-      if (reservation.status === "RECONCILIATION_FAILED") {
-        return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
-      }
       if (ownershipMismatches(reservation.scope, callerScope)) {
         throw new ReservationOwnershipMismatchError("reconcile", id, reservation.scope, callerScope);
+      }
+      if (reservation.status === "RECONCILIATION_FAILED") {
+        return freezeRecord({ id, scope: reservation.scope, amountUsd: reservation.amountUsd, status: reservation.status });
       }
       reservation.status = "RECONCILIATION_FAILED";
       this.#persist();

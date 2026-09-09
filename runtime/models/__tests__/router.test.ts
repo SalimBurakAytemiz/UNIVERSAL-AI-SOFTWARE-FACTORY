@@ -8,9 +8,15 @@ import {
   NoCapableModelError,
   PremiumFallbackBlockedError
 } from "../router.js";
+import { computeModelInvocationIdentityDigest } from "../gateway.js";
 import type { ModelInvocationResponse, ModelProvider } from "../gateway.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
-import { CapabilityDeniedError, CapabilityApprovalRequiredError } from "../../capability-gateway/gateway.js";
+import {
+  CapabilityDeniedError,
+  CapabilityApprovalRequiredError,
+  ApprovalEvidenceMismatchError
+} from "../../capability-gateway/gateway.js";
+import { ApprovalWorkflow } from "../../policy-engine/approval.js";
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetGuard, BudgetExceededError } from "../../budget/budget.js";
 
@@ -556,6 +562,158 @@ describe("CheapestCapableModelRouter authorization gate (P1 fix, 9th independent
     expect(providerInvokeSpy).not.toHaveBeenCalled();
   });
 });
+
+describe(
+  "P1 fix (34th independent review round, finding 6, 'support distinct approval evidence for fallback " +
+    "invocations'): a fallback step is authorized only by evidence explicitly scoped to it, never by reusing " +
+    "the initial candidate's approval",
+  () => {
+    // Mirrors this file's own established pattern (bkz. "authorization
+    // gate" describe block above): risk stays 0 (so tier selection starts
+    // at MOCK, matching the registry below), and a custom policy rule
+    // forces APPROVAL_REQUIRED specifically for the premium candidate —
+    // exactly like the pre-existing "a fallback candidate requiring
+    // approval is not invoked without a valid approval" test does for
+    // CapabilityApprovalRequiredError, just now exercising the DISTINCT
+    // approval-evidence contract on top.
+    function setupApprovalGatedEscalationScenario() {
+      const registry = new ModelRegistry();
+      registry.register({
+        provider: "mock",
+        modelId: "tier-mock",
+        tier: "MOCK",
+        costPerCall: 0,
+        capabilities: ["escalation-capability"],
+        status: "ACTIVE"
+      });
+      registry.register({
+        provider: "mock",
+        modelId: "tier-premium",
+        tier: "PREMIUM",
+        costPerCall: 0.5,
+        capabilities: ["escalation-capability"],
+        status: "ACTIVE"
+      });
+      const approvals = new ApprovalWorkflow();
+      const gateway = new ModelGateway(approvals);
+      gateway.registerProvider(new MockProvider());
+      const router = new CheapestCapableModelRouter(registry);
+      const policy = new PolicyEngine();
+      policy.addRule(lowRiskAllowRule(5));
+      policy.addRule({
+        name: "approval-required-for-premium",
+        priority: 10,
+        evaluate: (action) => (action.description.includes("tier-premium") ? "APPROVAL_REQUIRED" : null)
+      });
+      const budget = permissiveBudget();
+      return { registry, gateway, approvals, router, policy, budget };
+    }
+
+    it(
+      "BLOCKER regression, exact reproduction: a fallback candidate requiring approval is never invoked when " +
+        "no evidence scoped to it was ever supplied — the initial candidate's own approval is not reused",
+      async () => {
+        const { router, gateway, policy, budget } = setupApprovalGatedEscalationScenario();
+
+        // No approval evidence supplied AT ALL — the initial candidate
+        // (tier-mock) needs none (its own policy rule ALLOWs it), and no
+        // `fallbackApprovalIds` was ever given for the premium fallback.
+        await expect(
+          router.routeAndExecute(
+            { taskId: "t1", risk: 0, requiredCapabilities: ["escalation-capability"] },
+            gateway,
+            { prompt: "x" },
+            () => false,
+            policy,
+            budget,
+            { allowPremiumFallback: true }
+          )
+        ).rejects.toThrow(CapabilityApprovalRequiredError);
+      }
+    );
+
+    it(
+      "no regression: a fallback candidate succeeds when evidence explicitly scoped to ITS OWN exact " +
+        "task/model/prompt is supplied via fallbackApprovalIds",
+      async () => {
+        const { router, gateway, approvals, policy, budget } = setupApprovalGatedEscalationScenario();
+
+        approvals.requestFor("appr-fallback", {
+          actionType: "model.invoke",
+          description: "Invoke model 'tier-premium' (PREMIUM) for task t1",
+          risk: 0,
+          costUsd: 0.5,
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "t1",
+            provider: "mock",
+            modelId: "tier-premium",
+            prompt: "x"
+          })
+        });
+        approvals.approve("appr-fallback", "founder@example.com");
+
+        const validate = vi.fn((response: ModelInvocationResponse) => response.modelId === "tier-premium");
+
+        const result = await router.routeAndExecute(
+          {
+            taskId: "t1",
+            risk: 0,
+            requiredCapabilities: ["escalation-capability"],
+            fallbackApprovalIds: { PREMIUM: "appr-fallback" }
+          },
+          gateway,
+          { prompt: "x" },
+          validate,
+          policy,
+          budget,
+          { allowPremiumFallback: true }
+        );
+
+        expect(result.decision.model.modelId).toBe("tier-premium");
+        expect(approvals.get("appr-fallback")!.status).toBe("EXECUTED");
+      }
+    );
+
+    it(
+      "BLOCKER regression: presenting an approval scoped to a DIFFERENT task as the fallback's own evidence " +
+        "is rejected — supplying SOME fallbackApprovalIds entry is not itself sufficient",
+      async () => {
+        const { router, gateway, approvals, policy, budget } = setupApprovalGatedEscalationScenario();
+
+        // Approved for a DIFFERENT task than the one actually routed below.
+        approvals.requestFor("appr-wrong-task", {
+          actionType: "model.invoke",
+          description: "Invoke model 'tier-premium' (PREMIUM) for task other-task",
+          risk: 0,
+          identityDigest: computeModelInvocationIdentityDigest({
+            taskId: "other-task",
+            provider: "mock",
+            modelId: "tier-premium",
+            prompt: "x"
+          })
+        });
+        approvals.approve("appr-wrong-task", "founder@example.com");
+
+        await expect(
+          router.routeAndExecute(
+            {
+              taskId: "t1",
+              risk: 0,
+              requiredCapabilities: ["escalation-capability"],
+              fallbackApprovalIds: { PREMIUM: "appr-wrong-task" }
+            },
+            gateway,
+            { prompt: "x" },
+            () => false,
+            policy,
+            budget,
+            { allowPremiumFallback: true }
+          )
+        ).rejects.toThrow(ApprovalEvidenceMismatchError);
+      }
+    );
+  }
+);
 
 describe(
   "P1 fix (12th independent review round, 'routing retries can change execution ownership and fallback " +

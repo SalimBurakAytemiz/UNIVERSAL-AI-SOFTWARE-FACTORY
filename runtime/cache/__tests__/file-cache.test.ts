@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileStateStore } from "../../state/file-store.js";
 import { FileCache, computeWithFileCache } from "../file-cache.js";
+import { InvalidTtlError } from "../cache.js";
 
 describe("FileCache (durable cache, backed by StateStore)", () => {
   let tempRoot: string;
@@ -29,7 +30,7 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
   it("does not reuse an expired entry", () => {
     tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-"));
     const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
-    cache.set("k", "v", -1); // already expired
+    cache.set("k", "v", 0); // ttlMs: 0 -> already expired at the deadline (round 26's fix)
     expect(cache.get("k")).toBeUndefined();
   });
 
@@ -94,7 +95,7 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       const path = join(tempRoot, "cache.json");
       {
         const processA = new FileCache<string>(new FileStateStore(), path);
-        processA.set("stale", "old-value", -1); // already expired at write time
+        processA.set("stale", "old-value", 0); // ttlMs: 0 -> already expired at write time (round 26's fix)
       }
       const processB = new FileCache<string>(new FileStateStore(), path);
       expect(processB.get("stale")).toBeUndefined();
@@ -369,4 +370,76 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       });
     }
   );
+
+  describe("P2 fix (34th independent review round, finding 10, 'distinguish cached undefined from cache miss')", () => {
+    it(
+      "BLOCKER regression, exact reproduction: compute() returns undefined -> the SECOND call reports a cache " +
+        "hit and never recomputes",
+      async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-undefined-"));
+        const cache = new FileCache<string | undefined>(new FileStateStore(), join(tempRoot, "cache.json"));
+        const compute = vi.fn(async () => undefined);
+
+        const first = await computeWithFileCache(cache, "k", compute);
+        const second = await computeWithFileCache(cache, "k", compute);
+
+        expect(first.cached).toBe(false);
+        expect(second.cached).toBe(true);
+        expect(second.value).toBeUndefined();
+        expect(compute).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    it("BLOCKER regression: has() reports true for a key whose cached value is genuinely undefined", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-has-undefined-"));
+      const cache = new FileCache<string | undefined>(new FileStateStore(), join(tempRoot, "cache.json"));
+      cache.set("k", undefined);
+      expect(cache.has("k")).toBe(true);
+    });
+
+    it("no regression: has() still reports false for a genuine miss", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-miss-"));
+      const cache = new FileCache<string | undefined>(new FileStateStore(), join(tempRoot, "cache.json"));
+      expect(cache.has("k")).toBe(false);
+    });
+
+    it("lookup() distinguishes an expired entry (found: false) from a live undefined value (found: true)", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lookup-"));
+      const cache = new FileCache<string | undefined>(new FileStateStore(), join(tempRoot, "cache.json"));
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000_000);
+      cache.set("expired", "v", 0);
+      cache.set("live-undefined", undefined);
+
+      expect(cache.lookup("expired")).toEqual({ found: false, value: undefined });
+      expect(cache.lookup("live-undefined")).toEqual({ found: true, value: undefined });
+      expect(cache.lookup("never-set")).toEqual({ found: false, value: undefined });
+      vi.useRealTimers();
+    });
+  });
+
+  describe("P2 fix (34th independent review round, finding 11, 'validate TTL values before persisting')", () => {
+    it.each([NaN, Infinity, -Infinity, -1, -100])(
+      "BLOCKER regression, exact reproduction: set() rejects a non-finite/negative ttlMs (%s) before it ever reaches disk",
+      (ttlMs) => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        expect(() => cache.set("k", "v", ttlMs)).toThrow(InvalidTtlError);
+        expect(cache.has("k")).toBe(false); // rejected BEFORE persisting
+      }
+    );
+
+    it("no regression: ttlMs: 0 (immediately-expiring) remains explicitly valid", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-zero-"));
+      const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+      expect(() => cache.set("k", "v", 0)).not.toThrow();
+    });
+
+    it("no regression: a genuinely positive ttlMs remains valid", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-positive-"));
+      const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+      expect(() => cache.set("k", "v", 1000)).not.toThrow();
+      expect(cache.get("k")).toBe("v");
+    });
+  });
 });

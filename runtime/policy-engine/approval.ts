@@ -81,6 +81,16 @@ interface MutableApprovalRequest {
   projectId?: string;
   /** The identity of whoever/whatever the approved action is being performed on behalf of, when applicable. */
   actorId?: string;
+  /**
+   * P1 fix (34th independent review round, findings 3 & 4): recorded
+   * verbatim from `action.identityDigest` — bkz. `PolicyAction.identityDigest`'in
+   * fix notu (policy-engine.ts) — so `CapabilityGateway`'s exact-match
+   * check can bind this approval to whatever extra identity dimensions
+   * (task/run/agent/provider/model/prompt for a model invocation, or the
+   * candidate implementation for a provider replacement) the requesting
+   * call site folded into that digest.
+   */
+  identityDigest?: string;
 }
 
 /** Dışa döndürülen her kayıt bunun donmuş, ayrık bir kopyasıdır — asla iç nesnenin kendisi değil. */
@@ -211,6 +221,7 @@ export class ApprovalWorkflow {
       costUsd: action.costUsd,
       projectId: action.projectId,
       actorId: options?.actorId ?? action.actorId,
+      identityDigest: action.identityDigest,
       status: "PENDING",
       requestedAt: new Date().toISOString()
     };
@@ -444,6 +455,7 @@ export class ApprovalWorkflow {
         costUsd: req.costUsd,
         projectId: req.projectId,
         actorId: req.actorId,
+        identityDigest: req.identityDigest,
         status: req.status,
         decidedBy: req.decidedBy,
         evidenceRef: req.evidenceRef,

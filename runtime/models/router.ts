@@ -68,6 +68,29 @@ export interface RoutingRequest {
    * `ModelInvocationContext.approvalId` on every candidate invocation.
    */
   readonly approvalId?: string;
+  /**
+   * P1 fix (34th independent review round, finding 6, "support distinct
+   * approval evidence for fallback invocations"): `approvalId` above used
+   * to be the ONLY approval reference this class carried — reused
+   * UNCHANGED for the initial candidate AND every escalation/fallback
+   * step `routeAndExecute()`'s loop tries. Since (34th round, finding 3)
+   * `gateway.invoke()` now binds each approval to an exact
+   * task/run/agent/provider/model/prompt digest, a fallback step
+   * (necessarily invoking a DIFFERENT model than the initial one) can
+   * never legitimately be authorized by an approval that was actually
+   * requested/approved for the INITIAL model's own digest — but before
+   * this fix there was no field through which a caller could supply
+   * SEPARATE, genuinely-fallback-scoped approval evidence at all, so a
+   * risk-5 route with `allowPremiumFallback=true` had no way to ever
+   * complete a fallback step, approved or not. Chosen contract (the
+   * finding's option A): each escalation step requires its OWN exact
+   * approval evidence, keyed by the TIER that step actually selects
+   * (`RoutingDecision.model.tier` — bkz. `routeAndExecute()`'s escalation
+   * loop) rather than by step INDEX, since `selectModel()` can skip
+   * intermediate tiers with no capable candidate. The initial candidate
+   * keeps using `approvalId` above, unchanged.
+   */
+  readonly fallbackApprovalIds?: Readonly<Partial<Record<ModelTier, string>>>;
 }
 
 export interface RoutingDecision {
@@ -236,7 +259,8 @@ export class CheapestCapableModelRouter {
     gateway: ModelGateway,
     invocationRequest: ModelInvocationRequest,
     policy: PolicyEngine,
-    budget: BudgetGuard
+    budget: BudgetGuard,
+    approvalId: string | undefined
   ): Promise<ModelInvocationResponse> {
     return gateway.invoke(decision.model, invocationRequest, {
       policy,
@@ -256,7 +280,15 @@ export class CheapestCapableModelRouter {
       // P1 fix (25th independent review round, "approval evidence must
       // flow through model invocation path"): bkz. `RoutingRequest.approvalId`'in
       // üstündeki fix notu.
-      approvalId: request.approvalId
+      // P1 fix (34th independent review round, finding 6, "support
+      // distinct approval evidence for fallback invocations"): the CALLER
+      // (bkz. `routeAndExecute()`) now decides WHICH approval id applies
+      // to THIS specific call — `request.approvalId` for the initial
+      // candidate, `request.fallbackApprovalIds[selectedTier]` for an
+      // escalation step — rather than this method always reading the
+      // SAME single field regardless of which candidate is actually being
+      // invoked.
+      approvalId
     });
   }
 
@@ -348,7 +380,15 @@ export class CheapestCapableModelRouter {
     const invocationScope: ModelInvocationRequest = freezeRecord({ ...invocationRequest });
 
     let decision = this.selectModel(routingScope);
-    let response = await this.invokeAuthorized(decision, routingScope, gateway, invocationScope, policy, budget);
+    let response = await this.invokeAuthorized(
+      decision,
+      routingScope,
+      gateway,
+      invocationScope,
+      policy,
+      budget,
+      routingScope.approvalId
+    );
 
     if (validate(response)) {
       return { response, decision };
@@ -372,7 +412,20 @@ export class CheapestCapableModelRouter {
       }
 
       decision = this.selectModel(routingScope, nextTier);
-      response = await this.invokeAuthorized(decision, routingScope, gateway, invocationScope, policy, budget);
+      // P1 fix (34th independent review round, finding 6): a fallback
+      // step is authorized ONLY by evidence explicitly scoped to the
+      // TIER it actually selected — never `routingScope.approvalId`
+      // (which covers ONLY the initial candidate) and never a fixed,
+      // reused id across multiple escalation steps.
+      response = await this.invokeAuthorized(
+        decision,
+        routingScope,
+        gateway,
+        invocationScope,
+        policy,
+        budget,
+        routingScope.fallbackApprovalIds?.[decision.model.tier]
+      );
 
       if (validate(response)) {
         return { response, decision };

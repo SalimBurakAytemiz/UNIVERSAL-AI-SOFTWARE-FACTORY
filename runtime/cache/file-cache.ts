@@ -7,7 +7,8 @@
 // (Proof G'nin "restart sonrası da geçerli" kanıtı, bölüm 306).
 
 import type { StateStore } from "../state/file-store.js";
-import type { CacheEntry } from "./cache.js";
+import type { CacheEntry, CacheLookupResult } from "./cache.js";
+import { assertValidTtl } from "./cache.js";
 import { acquireFileLock, type FileLockOptions } from "./file-lock.js";
 
 /**
@@ -86,10 +87,18 @@ export class FileCache<T = unknown> {
     this.stateStore.write(this.path, [...all.entries()]);
   }
 
-  get(key: string): T | undefined {
+  /**
+   * P2 fix (34th independent review round, finding 10, "distinguish
+   * cached undefined from cache miss"): the one authoritative lookup — bkz.
+   * cache.ts'in `CacheLookupResult`'ının fix notu, identical rationale
+   * applied here so memory and file cache behave identically. `get()`/
+   * `has()`/`computeWithFileCache()` all read their answer from this,
+   * never a separate `!== undefined` check again.
+   */
+  lookup(key: string): CacheLookupResult<T> {
     const all = this.loadAll();
     const entry = all.get(key);
-    if (!entry) return undefined;
+    if (!entry) return { found: false, value: undefined };
     // P2 fix (26th independent review round, finding 7, "cache must expire
     // at the deadline"): identical boundary fix as cache.ts's Cache.get() —
     // `now >= expiresAt`, not strict `<`, so `ttlMs: 0` and an exact
@@ -120,30 +129,39 @@ export class FileCache<T = unknown> {
       // computed. Fixed: the locked re-check now returns EXACTLY what the
       // authoritative re-read found — `latestEntry`'s value if it exists
       // and is genuinely not expired (a concurrent refresh this process
-      // should reuse, not discard), `undefined` if it is still expired
-      // (and gets deleted, as before) or has meanwhile been removed
-      // entirely by another process.
-      return this.withLock(() => {
+      // should reuse, not discard), a miss if it is still expired (and
+      // gets deleted, as before) or has meanwhile been removed entirely by
+      // another process.
+      return this.withLock((): CacheLookupResult<T> => {
         const latest = this.loadAll();
         const latestEntry = latest.get(key);
-        if (!latestEntry) return undefined;
+        if (!latestEntry) return { found: false, value: undefined };
         // Same >= boundary as the initial check above and cache.ts's
         // Cache.get() — bkz. bu dosyadaki fix notu.
         if (latestEntry.expiresAt !== undefined && Date.now() >= latestEntry.expiresAt) {
           latest.delete(key);
           this.saveAll(latest);
-          return undefined;
+          return { found: false, value: undefined };
         }
         // Another process already refreshed this exact key to a fresh,
         // non-expired value while this process was waiting for the lock —
         // reuse it instead of telling the caller to recompute.
-        return latestEntry.value;
+        return { found: true, value: latestEntry.value };
       });
     }
-    return entry.value;
+    return { found: true, value: entry.value };
+  }
+
+  get(key: string): T | undefined {
+    return this.lookup(key).value;
   }
 
   set(key: string, value: T, ttlMs?: number): void {
+    // P2 fix (34th independent review round, finding 11, "validate TTL
+    // values before persisting"): bkz. cache.ts'in `assertValidTtl`'ının
+    // fix notu — validated BEFORE the lock is even acquired, so an invalid
+    // ttlMs never reaches disk at all (fail closed before any mutation).
+    assertValidTtl(ttlMs);
     this.withLock(() => {
       // Kilit ALINDIKTAN SONRA en güncel içerik yeniden okunur — kilit
       // beklerken başka bir process'in tamamladığı yazma burada asla
@@ -159,7 +177,7 @@ export class FileCache<T = unknown> {
   }
 
   has(key: string): boolean {
-    return this.get(key) !== undefined;
+    return this.lookup(key).found;
   }
 
   size(): number {
@@ -182,9 +200,12 @@ export async function computeWithFileCache<T>(
   compute: () => Promise<T> | T,
   ttlMs?: number
 ): Promise<ComputeWithFileCacheResult<T>> {
-  const existing = cache.get(key);
-  if (existing !== undefined) {
-    return { value: existing, cached: true };
+  // P2 fix (34th independent review round, finding 10): bkz. cache.ts'in
+  // `computeWithCache`'inin fix notu — reads `found` from `lookup()`'s
+  // discriminated result, never a `!== undefined` check on the VALUE.
+  const lookup = cache.lookup(key);
+  if (lookup.found) {
+    return { value: lookup.value as T, cached: true };
   }
   const value = await compute();
   cache.set(key, value, ttlMs);

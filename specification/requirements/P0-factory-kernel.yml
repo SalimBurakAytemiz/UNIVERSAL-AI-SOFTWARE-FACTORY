@@ -945,6 +945,26 @@
     get(), cannot affect findApplicable()'s results. Confirmed via
     git-stash that these tests fail on the pre-fix code.
 
+    P2 fix (34th independent review round, finding 9, "reject duplicate
+    business capability IDs"): unlike every other authoritative registry in
+    this codebase (technology-registry, models/registry, workers/registry,
+    artifacts/artifact-registry, service-catalog, assumption-register,
+    decision-ledger — all of which already reject a re-registered ID),
+    `register()` here used a bare `Map.set()`, so registering a second
+    snapshot under an ID already present silently replaced the first
+    entry's delivery_option/metadata with no error and no trace, which for
+    an authoritative capability catalog can silently change which
+    BUILD/INTEGRATE/REUSE/BUY_OR_SAAS/DEFER/NOT_REQUIRED decision a caller
+    observes for that capability. Fixed by adding the same
+    `Duplicate*Error` guard pattern used by the other registries: a new
+    `DuplicateBusinessCapabilityIdError` is thrown before the `.set()` call
+    when the ID already exists, and the original entry is left completely
+    untouched. Regression tests prove: registering the same ID twice throws
+    `DuplicateBusinessCapabilityIdError` and leaves the original data
+    intact, while distinct IDs continue to register normally. Confirmed via
+    reverting the guard that exactly 1 predicted test fails against the
+    pre-fix code, then restored; full suite green after restore.
+
 - id: UASF-REQ-0016
   title: Project organization composer (foundation)
   description: Compose minimum justified project organization from Project Genome + requirements + risk + budget.
@@ -1958,6 +1978,40 @@
     the old unconditional `release()`) — confirmed exactly the 4 predicted new tests failed, then reverted and
     re-confirmed all 69 tests passing.
 
+    P1 fix (34th independent review round, findings 3/4/5, "approval evidence not bound to immutable exact
+    action identity" / "authoritative execution retaining caller-owned mutable state"): three related gaps
+    closed together. (a) `PolicyAction` gained an opaque `identityDigest` field, compared for exact equality by
+    `CapabilityGateway.isBoundToExactAction()` alongside every other identity field; `invoke()` now binds it via
+    a new exported `computeModelInvocationIdentityDigest({taskId, runId, agentId, provider, modelId, prompt})`
+    (all values read from the SAME pre-authorized `executionScope`/`authorizedModel`/`authorizedRequest`
+    snapshots this file's own 11th/12th/13th-round fixes already established), and now also populates `actorId`
+    from `executionScope.agentId` — previously `actorId` was always `undefined` on both sides of the match,
+    trivially agreeing regardless of which agent actually invoked the model, and no field at all bound the
+    approval to the exact prompt/model/run, so an approval requested for one invocation could authorize a
+    materially different one sharing the same generic `actionType`/`description`/`risk`. (b)
+    `replaceProvider()` similarly binds its approval via a new exported
+    `computeProviderReplacementIdentityDigest(provider, id)` (a digest of the provider id, its constructor name,
+    and its `invoke` method's own source text via `Function.prototype.toString()`), snapshotted in this
+    method's own synchronous prefix BEFORE `authorize()` runs — closing a path where an approval requested for
+    one candidate implementation could be replayed to install a materially different implementation under the
+    same provider id/description. (c) `captureProviderBinding()` (called by both `registerProvider()` and
+    `replaceProvider()`) now calls a new `detachFromCallerMutation()` that locks every OWN, currently-existing,
+    configurable DATA property of the registered provider to its value at that exact moment
+    (`Object.defineProperty(..., {writable: false, configurable: false})`, applied per-property, never
+    `Object.freeze()`/`Object.seal()`) — closing a path where a caller could mutate a registered provider's own
+    config-like fields (e.g. an `endpoint`) after registration to silently redirect an already-authorized
+    invocation's real behavior. Deliberately NOT full-object freezing: the provider instance stays extensible,
+    so legitimate instrumentation that ADDS a new own property after registration (e.g. `vi.spyOn(provider,
+    "invoke")`, which shadows a prototype method via a new instance property — an existing round-30 regression
+    test in `router.test.ts` relies on exactly this) is completely unaffected; only reassigning an EXISTING own
+    property is blocked. Regression tests prove: an approval for prompt/model/run A cannot authorize a
+    materially different prompt B, run, or agent under the same generic description/risk/cost/project; an
+    approval for implementation X cannot authorize installing implementation Y under the same provider id; and
+    mutating a registered provider's own config field after registration throws (fails closed) rather than
+    silently changing what a subsequent `invoke()` call actually does. Verified via a temporary in-place bypass
+    of the `identityDigest` comparison and of `detachFromCallerMutation()` — confirmed exactly the predicted
+    BLOCKER tests failed for each, then reverted and reconfirmed all tests passing.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -2324,6 +2378,27 @@
     test, which never reaches the escalation loop, correctly stayed
     green), then reverted.
 
+    P1 fix (34th independent review round, finding 6, "support distinct approval evidence for fallback
+    invocations" — shares its root cause with UASF-REQ-0024's findings 3/4/5): `RoutingRequest.approvalId` used
+    to be reused UNCHANGED for the initial candidate AND every escalation/fallback step `routeAndExecute()`'s
+    loop tries — but since (finding 3/4, UASF-REQ-0024) `gateway.invoke()` now binds each approval to an exact
+    task/run/agent/provider/model/prompt digest, a fallback step invoking a materially different model could
+    never legitimately be authorized by an approval requested for the initial model, yet there was no field
+    through which a caller could supply genuinely fallback-scoped approval evidence at all. Fixed: `RoutingRequest`
+    gained an optional `fallbackApprovalIds: Readonly<Partial<Record<ModelTier, string>>>`, keyed by the TIER a
+    given escalation step actually selects (not step index, since `selectModel()` can skip intermediate tiers
+    with no capable candidate); `invokeAuthorized()` now takes an explicit `approvalId` parameter from its
+    caller rather than always reading `request.approvalId` itself — the initial call passes
+    `routingScope.approvalId`, each escalation call passes `routingScope.fallbackApprovalIds?.[decision.model.tier]`.
+    Regression tests prove: a fallback candidate requiring approval is never invoked when no evidence scoped to
+    it was ever supplied, even though the initial candidate's own approval was valid (BLOCKER); a fallback
+    candidate succeeds when evidence explicitly scoped to its own exact task/model/prompt is supplied via
+    `fallbackApprovalIds`; and presenting an approval scoped to a different task as the fallback's evidence is
+    still rejected (supplying SOME `fallbackApprovalIds` entry is not itself sufficient). Verified via a
+    temporary in-place bypass (reverting the escalation call site to reuse `routingScope.approvalId` instead of
+    the per-tier lookup) — confirmed exactly the 2 predicted tests failed with different, but still-failing,
+    exceptions (proving the fix is what makes the difference), then reverted and reconfirmed all tests passing.
+
 - id: UASF-REQ-0028
   title: Premium fallback policy (default off, evidence-based escalation)
   description: >
@@ -2535,6 +2610,36 @@
     idempotent no-op. Verified via a temporary bypass (leaving the reservation's status unchanged) — confirmed
     4 of the 6 predicted tests failed (the id-not-found and commit-retry tests correctly stayed green, since
     they do not depend on the transition itself), then reverted and re-confirmed all 99 tests passing.
+
+    P1 fix (34th independent review round, findings 1/2/7, "reservation lifecycle mutation before ownership
+    validation" / "idempotency returning before identity validation"): three related gaps in this file's own
+    reservation lifecycle, all closed the same way — validate ownership/identity BEFORE any idempotent early
+    return, never after. (1) `markReservationUnresolved()` used to check `reservation.status ===
+    "RECONCILIATION_FAILED"` (and, if already true, return the reservation's scope) BEFORE checking
+    `ownershipMismatches()` — an unrelated caller B, knowing only reservation A's id, could read back A's
+    authoritative scope from an already-failed reservation without ever proving ownership of it (this was a
+    regression introduced by this file's own round-33 fix above, whose safe precedent —
+    `releaseReservation()`'s own status-first check — is safe only because it throws a scope-free error rather
+    than returning data). Fixed by reordering: the ownership check now runs unconditionally first. (2) the
+    dead, ownership-free `markReservationReconciliationFailed(id): void` (zero internal callers, one external
+    test caller) was removed entirely, since `markReservationUnresolved()` already serves as its
+    ownership-checked, externally-safe replacement — retaining both would itself have reintroduced "two
+    parallel state-transition entry points" (one checked, one not), the exact anti-pattern round 33 closed for
+    the `RECONCILIATION_FAILED` transition. (7) `commitReservation()`'s idempotent-retry branch (an existing
+    entry found for the reservation id) used to return the already-committed entry unconditionally, without
+    validating that the RETRY's own scope/amount actually matches what was committed — a caller presenting a
+    known reservation id with a mismatched scope (different provider/model/task/run/agent) or a mismatched
+    `amountUsd` could read back another caller's committed entry as if it were its own. Fixed by reusing the
+    SAME `ownershipMismatches()` helper (never new validation logic) plus an explicit `amountUsd` exact-equality
+    check, run BEFORE the existing round-30 persist-repair logic and the entry's return, throwing
+    `ReservationOwnershipMismatchError` on a mismatch. Regression tests prove: caller B cannot retrieve
+    reservation A's scope via an already-RECONCILIATION_FAILED read (BLOCKER); the genuine owner's own
+    idempotent retry (matching scope) still works unchanged; a retry with a mismatched provider/scope is
+    rejected without mutating state; a retry with a mismatched amount is rejected the same way; and an
+    exact-match retry remains idempotent (`toEqual` the first commit's result). Verified via three separate
+    temporary in-place bypasses (reverting the ownership-check ordering in `markReservationUnresolved()`;
+    disabling the retry-validation check in `commitReservation()`'s idempotent branch) — confirmed exactly the
+    predicted BLOCKER tests failed in each case (no others), then reverted and reconfirmed all tests passing.
 
 - id: UASF-REQ-0030
   title: Budget engine / cost ceilings
@@ -3430,6 +3535,25 @@
     observable proof that the pre-fix code let the timed-out operation's side effect complete anyway), then fully
     reverted and re-confirmed the marker file is never created post-fix.
 
+    P2 fix (34th independent review round, finding 12, "reject non-finite sandbox timeout values"):
+    `withTimeout(operation, ms)` used to pass `ms` straight into `Date.now() + ms` (the authoritative
+    `deadlineAt` the 32nd round's own event-loop-starvation fix above relies on) and into `setTimeout(fn, ms)`,
+    with no validation. A `NaN`/`Infinity` `ms` produces `deadlineAt: NaN`/`Infinity` — since any comparison
+    against `NaN` is `false` and `Date.now() >= Infinity` is also always `false`, `Date.now() >= deadlineAt` can
+    NEVER be true, silently disabling that exact 32nd-round protection; `Infinity` additionally gets silently
+    clamped by Node's own `setTimeout` to its ~24.8-day (`2^31-1` ms) maximum delay, a wildly different effective
+    timeout than what the caller believes it configured. A negative `ms` produces an already-past `deadlineAt`,
+    distorting enforcement the other way (declaring a timeout on the very first check regardless of how fast the
+    operation completes). Fixed: `ms` is now validated (finite, nonnegative, and no greater than Node's own
+    `2^31-1` ms `setTimeout` delay limit) via a new `InvalidSandboxTimeoutError`, thrown BEFORE any timer/deadline
+    calculation runs and before `operation` is ever invoked. `ms: 0` remains explicitly valid (rejected as an
+    immediately-exceeded deadline via the existing `SandboxTimeoutError`, not as an invalid configuration).
+    Regression tests prove: NaN/Infinity/-Infinity/negative `ms` are all rejected before the operation is ever
+    called; a timeout beyond Node's own `setTimeout` range is rejected; `ms: 0` still throws the ordinary
+    `SandboxTimeoutError` (never `InvalidSandboxTimeoutError`); and an ordinary positive timeout remains
+    unaffected. Verified via a temporary in-place bypass of the new validation — confirmed exactly the predicted
+    BLOCKER tests failed (no others), then reverted and reconfirmed all tests passing.
+
 - id: UASF-REQ-0034
   title: Project isolation (foundation)
   description: Cross-project default-deny isolation of filesystem/state/budget/artifacts.
@@ -4150,6 +4274,34 @@
     confirmed-alive branch) — confirmed the exact predicted BLOCKER test failed (timed out after 5s rather than
     reclaiming), then reverted and re-confirmed all 64 tests passing.
 
+    P2 fix (34th independent review round, findings 10/11, "optional-value sentinel ambiguity" / "non-finite
+    numeric runtime configuration"): two related gaps in `cache.ts`/`file-cache.ts`, closed together. (10)
+    `Cache<T>.get(key): T | undefined` (and the identical `FileCache<T>.get()`) could not distinguish "no entry
+    for this key" from "an entry exists and its cached value genuinely IS `undefined`" — `has()` and
+    `computeWithCache()`/`computeWithFileCache()` both derived their hit/miss decision from a `!== undefined`
+    check on the VALUE, so a legitimately-cached `undefined` result (a memoized lookup that found nothing, say)
+    was indistinguishable from a miss and was silently, unconditionally recomputed on EVERY call — never
+    actually cached at all. Fixed: both classes gained a `lookup(key): CacheLookupResult<T>` (`{found: boolean,
+    value: T | undefined}`) as the ONE authoritative presence check; `get()`/`has()` now derive from it, and
+    `computeWithCache()`/`computeWithFileCache()` read `lookup(key).found` directly, never a `!== undefined`
+    check on the value again. (11) `set(key, value, ttlMs)` passed `ttlMs` straight into `Date.now() + ttlMs`
+    with no validation — a `NaN`/`Infinity` `ttlMs` produces an `expiresAt` no future `Date.now()` comparison can
+    ever exceed (any comparison against `NaN` is `false`; `Date.now() >= Infinity` is also always `false`),
+    silently creating an entry that never expires despite the caller explicitly requesting a short-lived one; a
+    negative `ttlMs` produces a nonsensical, already-backdated `expiresAt`. Fixed: a new shared
+    `assertValidTtl()`/`InvalidTtlError` (exported from `cache.ts`, reused by `file-cache.ts`, so both
+    implementations share the identical TTL semantics) rejects non-finite or negative `ttlMs` before any entry
+    is stored; `ttlMs: 0` remains explicitly valid — this file's own round-26 "expires at the deadline" fix
+    already established it as the correct "immediately-expiring entry" semantic, not an error. Regression tests
+    (in both `cache.test.ts` and `file-cache.test.ts`) prove: `compute()` returning `undefined` is correctly
+    reported as a cache hit on the second call and never recomputed (BLOCKER); `has()` reports `true` for a
+    genuinely-`undefined` cached value; `lookup()` distinguishes an expired entry from a live `undefined` value;
+    `set()` rejects NaN/Infinity/-Infinity/negative `ttlMs` before persisting anything (BLOCKER, parameterized
+    over all four); and `ttlMs: 0` and an ordinary positive `ttlMs` remain valid. Verified via temporary in-place
+    bypasses of the `found`-based checks (reverting `computeWithCache()`/`computeWithFileCache()`/`has()` to
+    their old `!== undefined` form) and of `assertValidTtl()`'s call sites — confirmed exactly the predicted sets
+    of new tests failed in each case (no others), then reverted and reconfirmed all tests passing.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
@@ -4262,6 +4414,25 @@
     the function-stripping itself. Confirmed via git-stash that 4 of these
     tests fail against the pre-fix code with exactly the bypass Codex
     described.
+
+    P2 fix (34th independent review round, finding 8, "preserve
+    logger-generated timestamps"): `log()` built its final emitted record
+    as `{ timestamp: new Date().toISOString(), ...redacted }` — spreading
+    the caller-controlled redacted field bag AFTER the authoritative
+    timestamp, so a caller-supplied `timestamp` field (accidental or
+    forged) silently overwrote the genuine capture time in the emitted
+    JSON, corrupting log ordering/forensic timeline integrity for anyone
+    consuming the sink. Fixed by reversing the spread order —
+    `{ ...redacted, timestamp: new Date().toISOString() }` — so the
+    logger-generated timestamp always wins regardless of what the caller's
+    fields contain; this only changes precedence, not the redaction
+    behavior above (a caller-supplied `timestamp` key is still redacted
+    first if its name matched a sensitive fragment, then unconditionally
+    replaced). Regression tests prove: a call passing a forged past
+    `timestamp` field still emits a genuine current-time timestamp, and
+    ordinary calls with no `timestamp` field are unaffected. Confirmed via
+    reverting the ordering that exactly 1 predicted test fails against the
+    pre-fix code, then restored; full suite green after restore.
 
 - id: UASF-REQ-0039
   title: Turkish source code explanation standard

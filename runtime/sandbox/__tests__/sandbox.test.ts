@@ -5,6 +5,7 @@ import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import {
   HardLinkAliasError,
   InvalidProjectIdError,
+  InvalidSandboxTimeoutError,
   PathEscapeError,
   SandboxTimeoutError,
   assertFilesystemConfinement,
@@ -790,4 +791,39 @@ describe("withTimeout", () => {
       });
     }
   );
+
+  describe("P2 fix (34th independent review round, finding 12, 'reject non-finite sandbox timeout values')", () => {
+    it.each([NaN, Infinity, -Infinity, -1, -100])(
+      "BLOCKER regression, exact reproduction: rejects a non-finite/negative timeout (%s) before starting any timer/operation",
+      async (ms) => {
+        let operationCalled = false;
+        await expect(
+          withTimeout(async () => {
+            operationCalled = true;
+            return "should never run";
+          }, ms)
+        ).rejects.toThrow(InvalidSandboxTimeoutError);
+        expect(operationCalled).toBe(false);
+      }
+    );
+
+    it("BLOCKER regression: rejects a timeout beyond Node's own setTimeout delay limit", async () => {
+      await expect(withTimeout(async () => "x", 2_147_483_648)).rejects.toThrow(InvalidSandboxTimeoutError);
+    });
+
+    it("no regression: ms: 0 remains a VALID configuration (rejected as an immediately-exceeded deadline, not as an invalid value)", async () => {
+      let caught: unknown;
+      try {
+        await withTimeout(async () => "x", 0);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(SandboxTimeoutError);
+      expect(caught).not.toBeInstanceOf(InvalidSandboxTimeoutError);
+    });
+
+    it("no regression: an ordinary positive timeout remains valid", async () => {
+      await expect(withTimeout(async () => "x", 1000)).resolves.toBe("x");
+    });
+  });
 });

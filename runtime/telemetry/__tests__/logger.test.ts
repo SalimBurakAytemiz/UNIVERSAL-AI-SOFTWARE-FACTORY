@@ -231,6 +231,43 @@ describe("Logger", () => {
     });
   });
 
+  describe("P2 fix (34th independent review round, finding 8, 'preserve logger-generated timestamps')", () => {
+    it(
+      "BLOCKER regression, exact reproduction: logger.log({ timestamp: '1970-...' }) -> the stored authoritative " +
+        "timestamp remains logger-generated, current time, never the caller-supplied value",
+      () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        const before = Date.now();
+
+        logger.log({ eventType: "task.completed", timestamp: "1970-01-01T00:00:00.000Z" } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        const parsed = JSON.parse(line);
+        const after = Date.now();
+
+        expect(parsed.timestamp).not.toBe("1970-01-01T00:00:00.000Z");
+        const parsedMs = new Date(parsed.timestamp).getTime();
+        expect(parsedMs).toBeGreaterThanOrEqual(before);
+        expect(parsedMs).toBeLessThanOrEqual(after);
+      }
+    );
+
+    it("no regression: an ordinary log call with no caller-supplied timestamp still gets a genuine current timestamp", () => {
+      const sink = vi.fn();
+      const logger = new Logger(sink);
+      const before = Date.now();
+
+      logger.log({ eventType: "task.completed" });
+
+      const parsed = JSON.parse(sink.mock.calls[0]![0] as string);
+      const after = Date.now();
+      const parsedMs = new Date(parsed.timestamp).getTime();
+      expect(parsedMs).toBeGreaterThanOrEqual(before);
+      expect(parsedMs).toBeLessThanOrEqual(after);
+    });
+  });
+
   describe("P1 fix (8th independent review round): serialization hooks (toJSON) cannot bypass redaction", () => {
     it("a nested enumerable toJSON() cannot reintroduce a redacted Authorization value", () => {
       const sink = vi.fn();

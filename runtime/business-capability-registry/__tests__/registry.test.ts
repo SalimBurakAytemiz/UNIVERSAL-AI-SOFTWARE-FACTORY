@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { BusinessCapabilityRegistry, createDefaultBusinessCapabilityRegistry } from "../registry.js";
+import {
+  BusinessCapabilityRegistry,
+  createDefaultBusinessCapabilityRegistry,
+  DuplicateBusinessCapabilityIdError
+} from "../registry.js";
 
 describe("BusinessCapabilityRegistry", () => {
   it("finds capabilities applicable to a given project family", () => {
@@ -59,6 +63,46 @@ describe("BusinessCapabilityRegistry", () => {
       }).toThrow(TypeError);
 
       expect(registry.findApplicable("game")).toHaveLength(0);
+    });
+  });
+
+  describe("P2 fix (34th independent review round, finding 9, 'reject duplicate business capability IDs')", () => {
+    it(
+      "BLOCKER regression, exact reproduction: register ID X -> register ID X again -> " +
+        "DuplicateBusinessCapabilityIdError, authoritative data untouched",
+      () => {
+        const registry = new BusinessCapabilityRegistry();
+        registry.register({
+          id: "loyalty",
+          purpose: "Customer loyalty points",
+          projectFamilies: ["ecommerce"],
+          dependencies: ["identity"],
+          deliveryOptions: ["DEFER"]
+        });
+
+        expect(() =>
+          registry.register({
+            id: "loyalty",
+            purpose: "HIJACKED",
+            projectFamilies: ["game"],
+            dependencies: [],
+            deliveryOptions: ["BUILD"]
+          })
+        ).toThrow(DuplicateBusinessCapabilityIdError);
+
+        // Original data is untouched — no silent overwrite occurred.
+        const capability = registry.get("loyalty")!;
+        expect(capability.purpose).toBe("Customer loyalty points");
+        expect(capability.projectFamilies).toEqual(["ecommerce"]);
+        expect(capability.deliveryOptions).toEqual(["DEFER"]);
+      }
+    );
+
+    it("no regression: registering distinct ids remains unaffected", () => {
+      const registry = new BusinessCapabilityRegistry();
+      registry.register({ id: "a", purpose: "p1", projectFamilies: ["web"], dependencies: [], deliveryOptions: ["BUILD"] });
+      registry.register({ id: "b", purpose: "p2", projectFamilies: ["web"], dependencies: [], deliveryOptions: ["BUILD"] });
+      expect(registry.all().map((c) => c.id).sort()).toEqual(["a", "b"]);
     });
   });
 

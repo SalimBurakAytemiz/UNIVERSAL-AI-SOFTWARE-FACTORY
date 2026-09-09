@@ -24,6 +24,7 @@
 // edilemez): gerçek yetkilendirme mantığının kendisi bu metodun GÖVDESİNDE
 // çalışır, bu yüzden "yanlış bağlam geçmek" bile yetkilendirmeyi ATLATAMAZ.
 
+import { createHash } from "node:crypto";
 import type { ModelRecord } from "./registry.js";
 import { CapabilityGateway } from "../capability-gateway/gateway.js";
 import type { PolicyEngine, RiskLevel } from "../policy-engine/policy-engine.js";
@@ -31,6 +32,51 @@ import { ApprovalWorkflow } from "../policy-engine/approval.js";
 import type { BudgetGuard } from "../budget/budget.js";
 import { freezeRecord } from "../util/immutable.js";
 import type { AuditLog } from "../audit/audit-log.js";
+
+/**
+ * P1 fix (34th independent review round, findings 3 & 4, "approval
+ * evidence not bound to immutable exact action identity"): a stable digest
+ * over whatever authoritative, already-snapshotted values a call site folds
+ * in — bkz. `PolicyAction.identityDigest`'in fix notu
+ * (policy-engine.ts). Every argument here MUST already be a plain,
+ * already-captured primitive (never re-read from a caller-owned object
+ * after this call), so two invocations of this function produce the SAME
+ * digest if and only if every one of those authoritative values genuinely
+ * agrees.
+ */
+function identityDigestOf(parts: readonly (string | number | undefined)[]): string {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
+/**
+ * Exported so a genuine approval-request workflow (whoever calls
+ * `ApprovalWorkflow.requestFor()` BEFORE the real `invoke()` call this
+ * approval must eventually authorize) can compute the EXACT SAME digest
+ * `invoke()` itself will bind into `PolicyAction.identityDigest` below —
+ * a single, shared source of truth rather than a hand-duplicated formula
+ * that could silently drift from what `invoke()` actually checks.
+ */
+export function computeModelInvocationIdentityDigest(params: {
+  readonly taskId: string;
+  readonly runId?: string;
+  readonly agentId?: string;
+  readonly provider: string;
+  readonly modelId: string;
+  readonly prompt: string;
+}): string {
+  return identityDigestOf([params.taskId, params.runId, params.agentId, params.provider, params.modelId, params.prompt]);
+}
+
+/**
+ * Same rationale as `computeModelInvocationIdentityDigest()` above, for the
+ * `model.provider.replace` action `replaceProvider()` gates — takes the
+ * CANDIDATE provider object itself (never a hand-typed implementation
+ * name/source string) so a caller cannot accidentally compute a digest for
+ * an implementation other than the one it actually holds.
+ */
+export function computeProviderReplacementIdentityDigest(provider: ModelProvider, id: string): string {
+  return identityDigestOf([id, provider.constructor?.name ?? "unknown", provider.invoke.toString()]);
+}
 
 export interface ModelInvocationRequest {
   readonly prompt: string;
@@ -158,7 +204,52 @@ interface ProviderBinding {
  * whatever the CALLER already captured once, never a fresh, independent
  * read of a caller-owned (potentially getter/Proxy-backed) `provider.id`.
  */
+/**
+ * P1 fix (34th independent review round, finding 5, "detach provider
+ * execution from caller-owned state"): `provider.invoke.bind(provider)`
+ * permanently fixes WHICH FUNCTION runs (a later `provider.invoke = evilFn`
+ * reassignment cannot retroactively change what the already-bound wrapper
+ * calls through to — bkz. round 30's fix note above), but it does NOT
+ * protect any OTHER config-like state `invoke()`'s body might read off
+ * `this` at CALL TIME (e.g. `this.endpoint`, `this.apiKey`) — since `this`
+ * is bound to the caller's OWN, still-live, still-mutable `provider`
+ * object, a caller free to keep mutating THAT object after registration
+ * could silently redirect an already-authorized/approved provider's
+ * observable behavior (its real target endpoint, credentials, etc.)
+ * without any new registration, approval, or audit event ever occurring.
+ * Fixed: every OWN, currently-existing, writable DATA property (found via
+ * `Reflect.ownKeys`, which also catches Symbol-keyed properties -- getters/
+ * setters are deliberately skipped, since `Object.defineProperty` with
+ * `writable` is meaningless for an accessor descriptor) is locked to its
+ * value AS OF THIS EXACT MOMENT (`writable: false, configurable: false`).
+ * This is deliberately NOT `Object.freeze()`/`Object.seal()`: the object
+ * stays EXTENSIBLE, so tooling that legitimately needs to ADD a brand new
+ * own property after registration (e.g. `vi.spyOn(provider, "invoke")`,
+ * which shadows a prototype method with a NEW instance-level property --
+ * bkz. router.test.ts's own fix note on this exact pattern) keeps working
+ * unaffected. Nested objects/arrays an existing property already pointed
+ * to remain freely mutable IN PLACE (locking is shallow, exactly like
+ * `freezeRecord` elsewhere in this codebase) -- a provider's own
+ * self-tracking bookkeeping via such a nested container is unaffected,
+ * only a caller's ability to REASSIGN one of the provider's own top-level
+ * fields (its actual attack surface) is removed. Genuine ECMAScript
+ * private (`#`) fields are invisible to `Reflect.ownKeys` and untouched by
+ * `Object.defineProperty` entirely, so a real adapter storing credentials
+ * in a private field keeps working exactly as before -- this fix targets
+ * only the caller-visible, caller-mutable public surface the finding
+ * actually describes.
+ */
+function detachFromCallerMutation(provider: ModelProvider): void {
+  for (const key of Reflect.ownKeys(provider)) {
+    const descriptor = Object.getOwnPropertyDescriptor(provider, key);
+    if (descriptor && "value" in descriptor && descriptor.configurable) {
+      Object.defineProperty(provider, key, { ...descriptor, writable: false, configurable: false });
+    }
+  }
+}
+
 function captureProviderBinding(provider: ModelProvider, id: string): ProviderBinding {
+  detachFromCallerMutation(provider);
   return Object.freeze({
     id,
     invoke: provider.invoke.bind(provider),
@@ -468,13 +559,27 @@ export class ModelGateway {
     const auditLog = this.#auditLog;
     const capabilityGateway = new CapabilityGateway(context.policy, this.#approvals);
     const approvalReference = context.approvalId !== undefined ? { approvalId: context.approvalId } : undefined;
+    // P1 fix (34th independent review round, finding 4, "bind provider-
+    // replacement approval to the implementation"): snapshotted HERE, in
+    // this method's own synchronous prefix — BEFORE `authorize()` (and
+    // therefore before any approval-matching or execution) ever runs — so
+    // the digest genuinely captures the CANDIDATE `provider` this call was
+    // actually invoked with, not a later, possibly-different read. Binding
+    // both the implementation's constructor name AND its actual `invoke`
+    // source text (`Function.prototype.toString()`) means two DIFFERENT
+    // implementations sharing the same provider id/class name (or vice
+    // versa) still produce different digests — an approval genuinely
+    // requested for one candidate's exact digest cannot authorize
+    // installing a materially different implementation under the same id.
+    const candidateDigest = computeProviderReplacementIdentityDigest(provider, id);
 
     await capabilityGateway.authorize(
       {
         actionType: "model.provider.replace",
         risk: context.risk,
         description: context.description ?? `Replace provider adapter '${id}'`,
-        projectId: context.projectId
+        projectId: context.projectId,
+        identityDigest: candidateDigest
       },
       () => {
         // P1 fix (30th independent review round, finding 6, "provider
@@ -688,7 +793,35 @@ export class ModelGateway {
         risk: executionScope.risk,
         description: executionScope.description,
         costUsd: executionScope.costPerCallUsd,
-        projectId: executionScope.projectId
+        projectId: executionScope.projectId,
+        // P1 fix (34th independent review round, finding 3, "bind approvals
+        // to the exact model invocation"): `actorId` used to be left
+        // unset here entirely — meaning it was ALWAYS `undefined` on both
+        // this action and (absent an explicit `options.actorId` at
+        // `requestFor()` time) the approval request itself, so the
+        // `actorId` comparison `isBoundToExactAction()` already performs
+        // trivially matched `undefined === undefined` for every model
+        // invocation regardless of WHICH agent actually invoked it. Now
+        // populated from `executionScope.agentId` (the SAME pre-authorized
+        // snapshot `budget.reserve()`/`commit()` below already use), so an
+        // approval genuinely scoped to one agent cannot authorize a
+        // materially different agent's invocation.
+        actorId: executionScope.agentId,
+        // Binds every OTHER dimension this finding names that `PolicyAction`
+        // has no dedicated field for — task, run, provider, model, and the
+        // actual prompt/request payload — into one exact-match digest (bkz.
+        // `identityDigestOf()`'in fix notu yukarıda). Every value here is
+        // already an authoritative, pre-authorized snapshot (`executionScope`/
+        // `authorizedModel`/`authorizedRequest`), never re-read from the
+        // caller's own, potentially-mutated `context`/`model`/`request`.
+        identityDigest: computeModelInvocationIdentityDigest({
+          taskId: executionScope.taskId,
+          runId: executionScope.runId,
+          agentId: executionScope.agentId,
+          provider: authorizedModel.provider,
+          modelId: authorizedModel.modelId,
+          prompt: authorizedRequest.prompt
+        })
       },
       async () => {
         // Provider ÇAĞRILMADAN ÖNCE, tahmini maliyet (costPerCall) TÜM

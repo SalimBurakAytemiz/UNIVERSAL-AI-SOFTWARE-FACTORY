@@ -1182,6 +1182,66 @@ factory:
     this round does NOT merge, does NOT move to P1, does NOT declare P0 complete, does NOT invoke Codex itself,
     and did NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    A 34th independent Codex review found TWELVE actionable findings (6 P1, 6 P2) to be fixed as ONE consolidated
+    closure batch, plus a narrow root-cause audit for 8 named shared classes. All twelve fixed: (1)
+    `cost-engine.ts`'s `markReservationUnresolved()` now validates caller ownership BEFORE its idempotent
+    RECONCILIATION_FAILED early-return, closing a path where an unrelated caller holding a known reservation id
+    could read back its authoritative scope without ever proving ownership; (2) the dead, ownership-free
+    `markReservationReconciliationFailed()` was removed entirely — `markReservationUnresolved()` is now the one
+    authoritative, ownership-checked path for this transition; (3)+(4)+(6) `PolicyAction` gained an opaque,
+    caller-computed `identityDigest` field, compared for exact equality by `CapabilityGateway`'s
+    `isBoundToExactAction()` alongside every other identity field — `models/gateway.ts`'s `invoke()` binds it to
+    a digest of task/run/agent/provider/model/prompt (via a new exported `computeModelInvocationIdentityDigest()`)
+    and now also populates `actorId` from the invoking agent, while `replaceProvider()` binds it to a digest of
+    the candidate provider's id/implementation source (`computeProviderReplacementIdentityDigest()`), closing a
+    class where an approval requested for one model invocation or provider implementation could be replayed
+    against a materially different one sharing the same generic actionType/description/risk; (5)
+    `captureProviderBinding()` now locks every existing own data property of a registered provider at
+    registration time (`detachFromCallerMutation()`), closing a path where a caller could mutate a registered
+    provider's own config fields (e.g. an endpoint) after registration to silently redirect already-authorized
+    invocations, while deliberately leaving the object extensible so legitimate instrumentation (spying on a
+    prototype method) is unaffected; (6) `router.ts`'s `RoutingRequest` gained an optional `fallbackApprovalIds`
+    map keyed by `ModelTier`, so each escalation/fallback step is authorized only by evidence explicitly scoped
+    to the tier it actually selects, never by reusing the initial candidate's approval (shares its root cause and
+    fix mechanism with (3)/(4)); (7) `commitReservation()`'s idempotent-retry branch now validates the retry's
+    own scope/amount against the already-committed entry (the same `ownershipMismatches()` helper used elsewhere
+    in the file) before returning it, closing a path where a caller presenting a known reservation id with a
+    mismatched scope/amount could read back another caller's committed entry; (8) `telemetry/logger.ts`'s
+    `log()` now spreads redacted fields BEFORE assigning the logger-generated timestamp, not after, so a
+    caller-supplied `timestamp` field can never overwrite the authoritative one; (9)
+    `business-capability-registry/registry.ts`'s `register()` now rejects a colliding id via a new
+    `DuplicateBusinessCapabilityIdError` instead of silently overwriting, aligning it with every other P0
+    registry; (10)+(11) `cache/cache.ts` and `cache/file-cache.ts` gained a shared
+    `CacheLookupResult{found,value}` `lookup()` as the one authoritative presence check — `has()`/
+    `computeWithCache()`/`computeWithFileCache()` all now read `found`, never a `!== undefined` check on the
+    value — closing a path where a legitimately-cached `undefined` result was indistinguishable from a miss and
+    was silently recomputed on every call; both also gained a shared `assertValidTtl()`/`InvalidTtlError`
+    rejecting NaN/Infinity/-Infinity/negative `ttlMs` (0 remains valid — the established "expires at the
+    deadline" semantic) before any entry is persisted; (12) `sandbox.ts`'s `withTimeout()` now rejects a
+    non-finite, negative, or Node-`setTimeout`-range-exceeding `ms` via a new `InvalidSandboxTimeoutError` before
+    starting any timer or invoking the operation, closing a path where a NaN/Infinity `ms` silently disabled the
+    32nd round's own event-loop-starvation deadline check. All twelve fixes carry deterministic regression tests
+    (including exact BLOCKER reproductions using the literal scenarios from the review) verified via a genuine
+    temporary in-place bypass reproducing the exact predicted failure, then fully reverted and reconfirmed clean.
+    A narrow root-class audit (scoped to exactly the 8 named shared classes: reservation lifecycle mutation
+    before ownership validation; approval evidence not bound to immutable exact action identity; authoritative
+    execution retaining caller-owned mutable state; idempotency returning before identity validation; caller data
+    overwriting runtime-authoritative metadata; authoritative registries silently replacing duplicate IDs;
+    optional-value sentinel ambiguity; non-finite numeric runtime configuration) found NO further genuine
+    instances: every other registry (technology, models, workers, artifacts, service-catalog, decision-ledger,
+    assumption-register) already rejects duplicate ids; `budget.ts`'s reservation lifecycle delegates to the
+    now-fixed `cost-engine.ts` ownership check; `policy-engine.ts`'s registered rules and every other numeric
+    runtime config (budget ceilings, file-lock timing, monetary amounts) were already validated in prior rounds;
+    `audit-log.ts`'s caller-supplied timestamp is an intentional, differently-scoped design (trusted internal
+    callers only, never a caller-facing arbitrary field bag the way `Logger.log()`'s index signature is). Full
+    required sequence re-run and green: lint, typecheck, build, 1284/1284 tests (44 files, +50 net new across all
+    twelve fixes), validate:requirements (42 schema-valid records), history-and-current-tree-aware secret-scan
+    (PASS), Factory Doctor (READY), all 9 P0 proofs. No status raised on any requirement beyond what real
+    evidence supports. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next (35th) independent Codex review to
+    return INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit instruction, this round does NOT merge, does NOT move
+    to P1, does NOT declare P0 complete, does NOT invoke Codex itself, and did NOT create a new branch — all work
+    stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4802,6 +4862,42 @@ blockers:
     BLOCKED_PENDING_REVIEW, awaiting the next (34th, intended as the FINAL P0 closure) independent Codex review to
     return CLEAN. Per explicit instruction, this round does not merge, does not move to P1, does not declare P0
     complete, does not invoke Codex itself, and did not create a new branch.
+  - >-
+    Awaiting a 35th independent (Codex) re-review of the pushed fixes — round 34 (Founder-forwarded consolidated
+    closure batch) found TWELVE NEW findings (6 P1, 6 P2) mapping to 8 named shared root-cause classes: reservation
+    lifecycle mutation before ownership validation (`cost-engine.ts`'s `markReservationUnresolved()` returned an
+    idempotent RECONCILIATION_FAILED entry before checking caller ownership, and `commitReservation()`'s own
+    idempotent-retry branch returned an already-committed entry before validating the retry's scope/amount);
+    approval evidence not bound to immutable exact action identity (`PolicyAction`/`CapabilityGateway` had no way
+    to bind an approval to a model invocation's exact task/run/agent/provider/model/prompt or to a provider
+    replacement's exact candidate implementation, nor to give a routing fallback step its own distinct evidence);
+    authoritative execution retaining caller-owned mutable state (`models/gateway.ts`'s registered provider
+    bindings still read live, caller-mutable config off the original provider object); caller data overwriting
+    runtime-authoritative metadata (`telemetry/logger.ts` spread the logger-generated timestamp before caller
+    fields, letting a caller-supplied `timestamp` win); authoritative registries silently replacing duplicate IDs
+    (`business-capability-registry/registry.ts`'s `register()` had no duplicate-id guard, unlike every other P0
+    registry); optional-value sentinel ambiguity (`cache.ts`/`file-cache.ts` used `undefined` as both "cache miss"
+    and a legitimate cached value); and non-finite numeric runtime configuration (`cache.ts`/`file-cache.ts`'s
+    `ttlMs` and `sandbox.ts`'s `withTimeout()` `ms` accepted NaN/Infinity/-Infinity/negative values unvalidated).
+    All twelve fixed: reservation ownership is now checked before any idempotent return in both cost-engine.ts
+    methods (the dead, ownership-free `markReservationReconciliationFailed()` was removed); `PolicyAction` gained
+    an opaque `identityDigest` field compared exactly by `isBoundToExactAction()`, computed via new exported
+    `computeModelInvocationIdentityDigest()`/`computeProviderReplacementIdentityDigest()` helpers and consumed by
+    `models/gateway.ts`'s `invoke()`/`replaceProvider()` and `router.ts`'s new `fallbackApprovalIds` map (keyed by
+    `ModelTier`); `captureProviderBinding()` now locks every existing own data property of a registered provider
+    at registration time while staying extensible for legitimate instrumentation; `Logger.log()` now spreads
+    redacted fields before the authoritative timestamp; `BusinessCapabilityRegistry.register()` now throws a new
+    `DuplicateBusinessCapabilityIdError` on a colliding id; `cache.ts`/`file-cache.ts` gained a shared
+    `CacheLookupResult{found,value}` `lookup()` as the one authoritative presence check plus a shared
+    `assertValidTtl()`/`InvalidTtlError`; `sandbox.ts`'s `withTimeout()` gained a new `InvalidSandboxTimeoutError`
+    guard. All twelve fixed, tested, and verified per the full required sequence: lint, typecheck, build,
+    1284/1284 tests, validate:requirements, history-and-current-tree-aware secret-scan, Factory Doctor, all 9 P0
+    proofs. All twelve root causes, fixes, and regression evidence are detailed in `factory.p0_status`'s round-34
+    entry and the touched files' own fix-note comments. A narrow, explicitly-scoped root-class audit for the same
+    8 classes found no further genuine instances. Tested (1284/1284 tests, +50 net new across all twelve fixes)
+    and verified per the full required sequence. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent
+    Codex review to return CLEAN. Per explicit instruction, this round does not merge, does not move to P1, does
+    not declare P0 complete, does not invoke Codex itself, and did not create a new branch.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement
@@ -4819,6 +4915,101 @@ governance_decision_recorded: >
   decision.
 
 exact_next_action: >
+  P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 34). A fresh,
+  independent Codex review of the complete branch found TWELVE actionable
+  findings (6 P1, 6 P2) and required them fixed as ONE consolidated closure
+  batch, plus a narrow, explicitly-scoped root-class audit for 8 named
+  shared classes. All twelve findings were fixed: (1)+(2) both of
+  `cost-engine.ts`'s ownership-checked-too-late paths closed —
+  `markReservationUnresolved()` now validates caller ownership BEFORE its
+  idempotent RECONCILIATION_FAILED early-return (previously it checked
+  status first, letting an unrelated caller holding a known reservation id
+  read back its authoritative scope), and the dead, ownership-free
+  `markReservationReconciliationFailed()` was removed entirely, leaving
+  `markReservationUnresolved()` as the one authoritative path; (3)+(4)+(6)
+  approval evidence is now bound to immutable exact action identity via a
+  new opaque `PolicyAction.identityDigest` field, compared for exact
+  equality by `CapabilityGateway.isBoundToExactAction()` alongside every
+  other identity field — `models/gateway.ts`'s `invoke()` binds it to a
+  digest of task/run/agent/provider/model/prompt (new exported
+  `computeModelInvocationIdentityDigest()`) and now also populates
+  `actorId` from the invoking agent; `replaceProvider()` binds it to a
+  digest of the candidate provider's id/implementation source (new
+  exported `computeProviderReplacementIdentityDigest()`); `router.ts`'s
+  `RoutingRequest` gained an optional `fallbackApprovalIds` map keyed by
+  `ModelTier`, so each escalation/fallback step is authorized only by
+  evidence explicitly scoped to the tier it actually selects, never by
+  reusing the initial candidate's approval — closing a class where an
+  approval for one model/implementation/tier could be replayed against a
+  materially different one sharing the same generic actionType/
+  description/risk; (5) `models/gateway.ts`'s `captureProviderBinding()`
+  now locks every existing own data property of a registered provider at
+  registration time (`detachFromCallerMutation()`), closing a path where a
+  caller could mutate a registered provider's own config fields (e.g. an
+  endpoint) after registration to silently redirect already-authorized
+  invocations — deliberately NOT `Object.freeze()`/`Object.seal()`, so the
+  object stays extensible and legitimate instrumentation (spying on a
+  prototype method, per an existing regression test in this same file)
+  keeps working; (7) `cost-engine.ts`'s idempotent `commitReservation()`
+  retry branch now validates the retry's own scope/amount against the
+  already-committed entry (the same `ownershipMismatches()` helper used
+  elsewhere in the file) before returning it, closing a path where a
+  caller presenting a known reservation id with a mismatched scope/amount
+  could read back another caller's committed entry; (8)
+  `telemetry/logger.ts`'s `log()` now spreads redacted fields BEFORE
+  assigning the logger-generated timestamp, not after, so a caller-
+  supplied `timestamp` field (accepted via `LogFields`'s own
+  `[extra: string]: unknown` index signature) can never overwrite the
+  authoritative one; (9) `business-capability-registry/registry.ts`'s
+  `register()` now rejects a colliding id via a new
+  `DuplicateBusinessCapabilityIdError` instead of silently overwriting,
+  aligning it with every other P0 registry (technology, models, workers,
+  artifacts, service-catalog, decision-ledger, assumption-register all
+  already had this guard); (10)+(11) `cache/cache.ts` and
+  `cache/file-cache.ts` gained a shared `CacheLookupResult{found,value}`
+  `lookup()` as the one authoritative presence check — `has()`/
+  `computeWithCache()`/`computeWithFileCache()` all now read `found`,
+  never a `!== undefined` check on the value — closing a path where a
+  legitimately-cached `undefined` result was indistinguishable from a
+  miss and silently recomputed on every call; both also gained a shared
+  `assertValidTtl()`/`InvalidTtlError` rejecting NaN/Infinity/-Infinity/
+  negative `ttlMs` (0 remains explicitly valid — the established
+  "expires at the deadline" semantic from round 26) before any entry is
+  persisted; (12) `sandbox.ts`'s `withTimeout()` now rejects a non-finite,
+  negative, or Node-`setTimeout`-range-exceeding (`> 2^31-1`) `ms` via a
+  new `InvalidSandboxTimeoutError`, validated BEFORE any timer/deadline
+  calculation runs and before the operation is ever invoked — closing a
+  path where a NaN/Infinity `ms` silently disabled the 32nd round's own
+  event-loop-starvation deadline check (`Date.now() >= deadlineAt` can
+  never be true against a NaN/Infinity deadline). All twelve fixes carry
+  deterministic regression tests (including exact BLOCKER reproductions
+  using the literal scenarios from the review) and were verified via a
+  genuine temporary in-place bypass reproducing the exact predicted
+  failure, then fully reverted and reconfirmed clean. The root-class audit
+  (limited to these 8 exact classes, not broadened into unrelated
+  architecture) found NO further genuine instances beyond the twelve
+  reported — every other registry already rejects duplicate ids;
+  `budget.ts`'s reservation lifecycle delegates entirely to the now-fixed
+  `cost-engine.ts` ownership checks; `policy-engine.ts`'s registered rules
+  and every other numeric runtime config (budget ceilings, file-lock
+  timing, monetary amounts) were already validated in prior rounds;
+  `audit-log.ts`'s caller-supplied timestamp is an intentional,
+  differently-scoped design (trusted internal callers only, never a
+  caller-facing arbitrary field bag the way `Logger.log()`'s index
+  signature is) and was examined and found genuinely inapplicable. Re-ran
+  the full required sequence: lint, typecheck, build, 1284/1284 tests (44
+  files, +50 net new across all twelve fixes), validate:requirements (42
+  schema-valid records), history-and-current-tree-aware secret-scan
+  (PASS), Factory Doctor (READY), all 9 P0 proofs. No status raised on any
+  requirement beyond what real evidence supports. P0 remains
+  BLOCKED_PENDING_REVIEW, awaiting the next (35th) independent Codex
+  review to return INDEPENDENT_REVIEW_RESULT: CLEAN. Per explicit
+  instruction, this round does NOT merge, does NOT move to P1, does NOT
+  declare P0 complete, does NOT invoke Codex itself, and did NOT create a
+  new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
+  --- Prior exact_next_action (retained for continuity) ---
+
   P0 IS STILL BLOCKED_PENDING_REVIEW (this session, round 33). A fresh,
   independent Codex review of the complete branch found 7 findings (5 P1,
   2 P2) but explicitly instructed a ROOT-CAUSE closure pass rather than

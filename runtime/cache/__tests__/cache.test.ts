@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Cache, computeWithCache } from "../cache.js";
+import { Cache, computeWithCache, InvalidTtlError } from "../cache.js";
 
 describe("Cache / computeWithCache", () => {
   it("Proof G: a valid cached result prevents recomputation", async () => {
@@ -17,7 +17,7 @@ describe("Cache / computeWithCache", () => {
 
   it("does not reuse an expired cache entry", async () => {
     const cache = new Cache<string>();
-    cache.set("k", "v", -1); // already expired
+    cache.set("k", "v", 0); // ttlMs: 0 -> already expired at the deadline (round 26's fix)
     expect(cache.get("k")).toBeUndefined();
   });
 
@@ -83,4 +83,74 @@ describe("Cache / computeWithCache", () => {
       });
     }
   );
+
+  describe("P2 fix (34th independent review round, finding 10, 'distinguish cached undefined from cache miss')", () => {
+    it(
+      "BLOCKER regression, exact reproduction: compute() returns undefined -> the SECOND call reports a cache " +
+        "hit and never recomputes",
+      async () => {
+        const cache = new Cache<string | undefined>();
+        const compute = vi.fn(async () => undefined);
+
+        const first = await computeWithCache(cache, "k", compute);
+        const second = await computeWithCache(cache, "k", compute);
+
+        expect(first.cached).toBe(false);
+        expect(second.cached).toBe(true);
+        expect(second.value).toBeUndefined();
+        expect(compute).toHaveBeenCalledTimes(1); // never recomputed
+      }
+    );
+
+    it("BLOCKER regression: has() reports true for a key whose cached value is genuinely undefined", () => {
+      const cache = new Cache<string | undefined>();
+      cache.set("k", undefined);
+      expect(cache.has("k")).toBe(true);
+    });
+
+    it("no regression: has() still reports false for a genuine miss", () => {
+      const cache = new Cache<string | undefined>();
+      expect(cache.has("k")).toBe(false);
+    });
+
+    it("lookup() distinguishes an expired entry (found: false) from a live undefined value (found: true)", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000_000);
+      const cache = new Cache<string | undefined>();
+      cache.set("expired", "v", 0);
+      cache.set("live-undefined", undefined);
+
+      expect(cache.lookup("expired")).toEqual({ found: false, value: undefined });
+      expect(cache.lookup("live-undefined")).toEqual({ found: true, value: undefined });
+      expect(cache.lookup("never-set")).toEqual({ found: false, value: undefined });
+      vi.useRealTimers();
+    });
+  });
+
+  describe("P2 fix (34th independent review round, finding 11, 'validate TTL values before persisting')", () => {
+    it.each([NaN, Infinity, -Infinity, -1, -100])(
+      "BLOCKER regression, exact reproduction: set() rejects a non-finite/negative ttlMs (%s)",
+      (ttlMs) => {
+        const cache = new Cache<string>();
+        expect(() => cache.set("k", "v", ttlMs)).toThrow(InvalidTtlError);
+        expect(cache.has("k")).toBe(false); // rejected BEFORE persisting
+      }
+    );
+
+    it("no regression: ttlMs: 0 (immediately-expiring) remains explicitly valid", () => {
+      const cache = new Cache<string>();
+      expect(() => cache.set("k", "v", 0)).not.toThrow();
+    });
+
+    it("no regression: a genuinely positive ttlMs remains valid", () => {
+      const cache = new Cache<string>();
+      expect(() => cache.set("k", "v", 1000)).not.toThrow();
+      expect(cache.get("k")).toBe("v");
+    });
+
+    it("no regression: omitting ttlMs entirely (no expiration) remains valid", () => {
+      const cache = new Cache<string>();
+      expect(() => cache.set("k", "v")).not.toThrow();
+    });
+  });
 });

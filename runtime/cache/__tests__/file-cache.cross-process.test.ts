@@ -176,7 +176,7 @@ describe(
         tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-expire-"));
         const cachePath = join(tempRoot, "cache.json");
         const seedCache = new FileCache<string>(new FileStateStore(), cachePath);
-        seedCache.set("expired-key", "stale-value", -1);
+        seedCache.set("expired-key", "stale-value", 0); // ttlMs: 0 -> already expired (round 26's fix)
 
         const [getResult, setResult] = await Promise.all([
           runWorker(["get", cachePath, "expired-key"]),

@@ -17,6 +17,33 @@ export interface BusinessCapabilityRecord {
 }
 
 /**
+ * P2 fix (34th independent review round, finding 9, "reject duplicate
+ * business capability IDs"): `register()` used to call
+ * `this.#capabilities.set(snapshot.id, ...)` unconditionally — a SECOND
+ * `register()` call for an already-registered `id` silently REPLACED the
+ * authoritative purpose/dependencies/projectFamilies/deliveryOptions every
+ * `get()`/`findApplicable()`/build-vs-buy decision downstream relies on,
+ * with no trace anywhere that a real overwrite ever happened — exactly the
+ * "no silent architectural deletion" class baseline section 147/303
+ * forbids, and the SAME root cause already closed for every OTHER P0
+ * registry (`DuplicateProviderIdError` in models/gateway.ts,
+ * `DuplicateApprovalIdError` in policy-engine/approval.ts, the
+ * technology-registry's own duplicate guard). Fixed the same way: a
+ * colliding id now fails closed; there is no supported "replace" operation
+ * — a genuinely revised capability definition needs a distinct id.
+ */
+export class DuplicateBusinessCapabilityIdError extends Error {
+  constructor(id: string) {
+    super(
+      `Business capability id '${id}' is already registered. register() never silently replaces an existing ` +
+        `capability's authoritative purpose/dependencies/projectFamilies/deliveryOptions — register a distinct id ` +
+        `for a genuinely revised capability definition.`
+    );
+    this.name = "DuplicateBusinessCapabilityIdError";
+  }
+}
+
+/**
  * P1 fix (4th independent review round, targeted follow-up ownership
  * audit): register()/get()/all() previously stored and returned the
  * caller's own object references directly. Now register() stores an
@@ -37,6 +64,9 @@ export class BusinessCapabilityRegistry {
 
   register(capability: BusinessCapabilityRecord): void {
     const snapshot: BusinessCapabilityRecord = { ...capability };
+    if (this.#capabilities.has(snapshot.id)) {
+      throw new DuplicateBusinessCapabilityIdError(snapshot.id);
+    }
     this.#capabilities.set(snapshot.id, freezeRecord(snapshot));
   }
 
