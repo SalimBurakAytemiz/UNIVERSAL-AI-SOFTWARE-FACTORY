@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/SalimBurakAytemiz/UNIVERSAL-AI-SOFTWARE-FACTORY/schemas/project-genome.schema.json",
+  "title": "Project Genome",
+  "description": "Machine-readable Project Genome (baseline section 27). Drives the Organization Composer, Technology Engine, Scheduler, Cost Engine, and capability activation for a single project. This is a foundation-level schema: it captures the shape from the baseline's example, not every nested field of every future subsystem.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["project"],
+  "properties": {
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "family"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "family": {
+          "type": "string",
+          "description": "Product family per baseline section 10, e.g. 'web', 'ecommerce', 'game'."
+        },
+        "subtype": { "type": "string" },
+        "domain": { "type": "string" }
+      }
+    },
+    "business": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "model": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "users": { "type": "array", "items": { "type": "string" } },
+    "platforms": { "type": "array", "items": { "type": "string" } },
+    "requirements": { "type": "array", "items": { "type": "string" } },
+    "studios": { "type": "array", "items": { "type": "string" } },
+    "teams": { "type": "array", "items": { "type": "string" } },
+    "agents": { "type": "array", "items": { "type": "string" } },
+    "technologies": { "type": "array", "items": { "type": "string" } },
+    "toolchains": { "type": "array", "items": { "type": "string" } },
+    "services": { "type": "array", "items": { "type": "string" } },
+    "databases": { "type": "array", "items": { "type": "string" } },
+    "integrations": { "type": "array", "items": { "type": "string" } },
+    "data": { "type": "array", "items": { "type": "string" } },
+    "security": { "type": "array", "items": { "type": "string" } },
+    "qa": { "type": "array", "items": { "type": "string" } },
+    "operations": { "type": "array", "items": { "type": "string" } },
+    "workers": { "type": "array", "items": { "type": "string" } },
+    "distribution": { "type": "array", "items": { "type": "string" } },
+    "compliance": { "type": "array", "items": { "type": "string" } },
+    "budget": { "type": "object", "additionalProperties": true },
+    "maturity": { "type": "object", "additionalProperties": true }
+  }
+}
