@@ -1868,6 +1868,178 @@ describe("ModelGateway + MockProvider", () => {
   );
 
   describe(
+    "P1 fix (independent Codex review, 'reject provider state omitted by the approval fingerprint'): a " +
+      "provider's config fingerprint must cover symbol-keyed properties and faithfully distinguish Map/Set " +
+      "values, never silently omit or collapse behaviorally material state",
+    () => {
+      const ENDPOINT_SYMBOL = Symbol("endpoint");
+
+      it(
+        "BLOCKER regression, exact reproduction: two same-class candidates differing ONLY in a symbol-keyed " +
+          "endpoint property produce DIFFERENT identity digests",
+        () => {
+          class SymbolKeyedConfigProvider implements ModelProvider {
+            readonly id = "mock";
+            constructor(endpoint: string) {
+              (this as unknown as Record<symbol, string>)[ENDPOINT_SYMBOL] = endpoint;
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+          const good = new SymbolKeyedConfigProvider("https://good.example.com");
+          const evil = new SymbolKeyedConfigProvider("https://evil.example.com");
+          expect(computeProviderReplacementIdentityDigest(good, "mock")).not.toBe(
+            computeProviderReplacementIdentityDigest(evil, "mock")
+          );
+        }
+      );
+
+      it(
+        "BLOCKER regression: an approval requested for one symbol-keyed endpoint configuration cannot " +
+          "authorize installing a DIFFERENT symbol-keyed endpoint configuration under the same provider id",
+        async () => {
+          class SymbolKeyedConfigProvider implements ModelProvider {
+            readonly id = "mock";
+            constructor(endpoint: string) {
+              (this as unknown as Record<symbol, string>)[ENDPOINT_SYMBOL] = endpoint;
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+          const auditLog = new AuditLog();
+          const approvals = new ApprovalWorkflow();
+          const gateway = new ModelGateway(approvals, auditLog);
+          gateway.registerProvider(new MockProvider());
+
+          const description = "Replace provider adapter 'mock'";
+          const goodCandidate = new SymbolKeyedConfigProvider("https://good.example.com");
+          approvals.requestFor("appr-good", {
+            actionType: "model.provider.replace",
+            description,
+            risk: 5,
+            identityDigest: computeProviderReplacementIdentityDigest(goodCandidate, "mock")
+          });
+          approvals.approve("appr-good", "founder@example.com");
+
+          const evilCandidate = new SymbolKeyedConfigProvider("https://evil.example.com");
+          await expect(
+            gateway.replaceProvider(evilCandidate, {
+              policy: permissivePolicy(),
+              risk: 5,
+              description,
+              approvalId: "appr-good"
+            })
+          ).rejects.toThrow(ApprovalEvidenceMismatchError);
+        }
+      );
+
+      it(
+        "BLOCKER regression, exact reproduction: two same-class candidates differing ONLY in a Map-valued " +
+          "config field produce DIFFERENT identity digests (bare JSON.stringify would collapse both Maps to " +
+          "the identical '{}' representation)",
+        () => {
+          class MapConfigProvider implements ModelProvider {
+            readonly id = "mock";
+            constructor(readonly config: Map<string, string>) {}
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+          const good = new MapConfigProvider(new Map([["endpoint", "https://good.example.com"]]));
+          const evil = new MapConfigProvider(new Map([["endpoint", "https://evil.example.com"]]));
+          expect(JSON.stringify(good.config)).toBe("{}");
+          expect(JSON.stringify(evil.config)).toBe("{}");
+          expect(computeProviderReplacementIdentityDigest(good, "mock")).not.toBe(
+            computeProviderReplacementIdentityDigest(evil, "mock")
+          );
+        }
+      );
+
+      it(
+        "BLOCKER regression, exact reproduction: two same-class candidates differing ONLY in a Set-valued " +
+          "config field produce DIFFERENT identity digests",
+        () => {
+          class SetConfigProvider implements ModelProvider {
+            readonly id = "mock";
+            constructor(readonly scopes: Set<string>) {}
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+          const good = new SetConfigProvider(new Set(["read", "write"]));
+          const evil = new SetConfigProvider(new Set(["read", "admin"]));
+          expect(computeProviderReplacementIdentityDigest(good, "mock")).not.toBe(
+            computeProviderReplacementIdentityDigest(evil, "mock")
+          );
+        }
+      );
+
+      it("no regression: two Map/Set configs holding the SAME entries in a DIFFERENT insertion order still fingerprint identically", () => {
+        class MapSetConfigProvider implements ModelProvider {
+          readonly id = "mock";
+          constructor(
+            readonly config: Map<string, string>,
+            readonly scopes: Set<string>
+          ) {}
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const a = new MapSetConfigProvider(
+          new Map([
+            ["a", "1"],
+            ["b", "2"]
+          ]),
+          new Set(["x", "y"])
+        );
+        const b = new MapSetConfigProvider(
+          new Map([
+            ["b", "2"],
+            ["a", "1"]
+          ]),
+          new Set(["y", "x"])
+        );
+        expect(computeProviderReplacementIdentityDigest(a, "mock")).toBe(computeProviderReplacementIdentityDigest(b, "mock"));
+      });
+
+      it(
+        "BLOCKER regression: unsupported/non-canonicalizable configuration (a class instance, a Date) fails " +
+          "closed rather than silently omitting the value or falling back to a lossy representation",
+        () => {
+          class DateConfigProvider implements ModelProvider {
+            readonly id = "mock";
+            config = { issuedAt: new Date("2024-01-01") };
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+          const provider = new DateConfigProvider();
+          expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).toThrow(
+            UnsupportedProviderConfigurationError
+          );
+        }
+      );
+
+      it("no regression: an ordinary provider with plain string/number/boolean/array/object configuration still computes a stable fingerprint covering nested arrays", () => {
+        class OrdinaryArrayConfigProvider implements ModelProvider {
+          readonly id = "mock";
+          config = { endpoints: ["https://a.example.com", "https://b.example.com"], retries: 3, secure: true };
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const provider = new OrdinaryArrayConfigProvider();
+        expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).not.toThrow();
+        expect(computeProviderReplacementIdentityDigest(provider, "mock")).toBe(
+          computeProviderReplacementIdentityDigest(provider, "mock")
+        );
+      });
+    }
+  );
+
+  describe(
     "P1 fix (37th independent review round, finding 3, 'deep-freeze nested provider state under a frozen " +
       "root'): a caller who already did a SHALLOW Object.freeze() on a config value themselves must not be " +
       "able to keep mutating a NESTED object one level down",

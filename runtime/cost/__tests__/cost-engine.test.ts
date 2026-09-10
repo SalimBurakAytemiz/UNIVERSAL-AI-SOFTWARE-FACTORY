@@ -7,6 +7,7 @@ import {
   CostEngine,
   InvalidCostEntryIdentityError,
   InvalidMonetaryAmountError,
+  MAX_SUPPORTED_MONETARY_AMOUNT_USD,
   ReservationOwnershipMismatchError,
   UnknownReservationError,
   UnresolvedReconciliationError,
@@ -284,6 +285,70 @@ describe("CostEngine", () => {
       expect(exceedsMonetaryAmount(total, 1)).toBe(false);
     });
   });
+
+  describe(
+    "P1 fix (independent Codex review, 'prevent monetary unit overflow from bypassing ceilings'): scaling by " +
+      "MONETARY_PRECISION_SCALE must never overflow/lose precision in a way that destroys comparison ordering",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a very large but finite amount (~1e308) that would overflow " +
+          "to Infinity when scaled still correctly reports as exceeding a smaller (but also huge) finite ceiling",
+        () => {
+          const hugeAmount = 1e308;
+          const hugeLimit = 1e307;
+          // Sanity: scaling either value by MONETARY_PRECISION_SCALE (1e6) overflows to Infinity,
+          // and Infinity > Infinity is false — this is the exact bug this fix closes.
+          expect(hugeAmount * 1_000_000).toBe(Infinity);
+          expect(hugeLimit * 1_000_000).toBe(Infinity);
+          expect(Infinity > Infinity).toBe(false);
+          expect(exceedsMonetaryAmount(hugeAmount, hugeLimit)).toBe(true);
+        }
+      );
+
+      it("no-regression: a smaller huge finite amount does not falsely exceed a larger huge finite ceiling", () => {
+        expect(exceedsMonetaryAmount(1e307, 1e308)).toBe(false);
+      });
+
+      it("no-regression: two equal huge finite amounts never exceed each other", () => {
+        expect(exceedsMonetaryAmount(1e308, 1e308)).toBe(false);
+      });
+
+      it(
+        "boundary: an amount exactly at MAX_SUPPORTED_MONETARY_AMOUNT_USD scales to an exact safe integer and " +
+          "compares correctly against itself and against a smaller value",
+        () => {
+          expect(exceedsMonetaryAmount(MAX_SUPPORTED_MONETARY_AMOUNT_USD, MAX_SUPPORTED_MONETARY_AMOUNT_USD)).toBe(
+            false
+          );
+          expect(exceedsMonetaryAmount(MAX_SUPPORTED_MONETARY_AMOUNT_USD, 1)).toBe(true);
+          expect(exceedsMonetaryAmount(1, MAX_SUPPORTED_MONETARY_AMOUNT_USD)).toBe(false);
+        }
+      );
+
+      it("assertValidMonetaryAmount rejects an amount beyond MAX_SUPPORTED_MONETARY_AMOUNT_USD", () => {
+        expect(() =>
+          assertValidMonetaryAmount(MAX_SUPPORTED_MONETARY_AMOUNT_USD * 10, "test")
+        ).toThrow(InvalidMonetaryAmountError);
+      });
+
+      it("assertValidMonetaryAmount still accepts an amount exactly at the boundary", () => {
+        expect(() => assertValidMonetaryAmount(MAX_SUPPORTED_MONETARY_AMOUNT_USD, "test")).not.toThrow();
+      });
+
+      it("record() fails closed on an amount beyond the maximum supported monetary amount", () => {
+        const engine = new CostEngine();
+        expect(() =>
+          engine.record({
+            taskId: "t1",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: MAX_SUPPORTED_MONETARY_AMOUNT_USD * 10
+          })
+        ).toThrow(InvalidMonetaryAmountError);
+        expect(engine.all()).toHaveLength(0);
+      });
+    }
+  );
 
   describe(
     "P1 fix (24th independent review round, 'reservation deletion must not bypass reconciliation') " +

@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CostEngine, InvalidMonetaryAmountError } from "../../cost/cost-engine.js";
+import { CostEngine, InvalidMonetaryAmountError, MAX_SUPPORTED_MONETARY_AMOUNT_USD } from "../../cost/cost-engine.js";
 import {
   BudgetExceededError,
   BudgetGuard,
@@ -123,6 +123,82 @@ describe("BudgetGuard", () => {
           BudgetExceededError
         );
         expect(costEngine.total()).toBe(0.6);
+      });
+    }
+  );
+
+  describe(
+    "P2 fix (independent Codex review, 'include project identity in per-run budget scopes'): perRunUsd must " +
+      "not combine spend from two DIFFERENT projects that happen to reuse the same runId on the same shared " +
+      "durable ledger",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: Project A (runId=run-1) spends $0.60, then Project B " +
+          "(runId=run-1, perRun ceiling $1) must NOT have its allowance consumed by Project A's spend",
+        () => {
+          const costEngine = new CostEngine();
+          const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+          guard.spend({
+            taskId: "a1",
+            runId: "run-1",
+            projectId: "project-a",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.6
+          });
+
+          // Project B's own run-1 must see a completely fresh $1 allowance —
+          // Project A's spend must not count against it.
+          expect(() =>
+            guard.spend({
+              taskId: "b1",
+              runId: "run-1",
+              projectId: "project-b",
+              provider: "mock",
+              modelId: "m1",
+              amountUsd: 0.9
+            })
+          ).not.toThrow();
+
+          expect(costEngine.totalFor({ projectId: "project-a", runId: "run-1" })).toBe(0.6);
+          expect(costEngine.totalFor({ projectId: "project-b", runId: "run-1" })).toBe(0.9);
+        }
+      );
+
+      it("no-regression: same-project/same-run spending still aggregates and enforces the shared ceiling correctly", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        guard.spend({
+          taskId: "a1",
+          runId: "run-1",
+          projectId: "project-a",
+          provider: "mock",
+          modelId: "m1",
+          amountUsd: 0.6
+        });
+        expect(() =>
+          guard.spend({
+            taskId: "a2",
+            runId: "run-1",
+            projectId: "project-a",
+            provider: "mock",
+            modelId: "m1",
+            amountUsd: 0.6
+          })
+        ).toThrow(BudgetExceededError);
+        expect(costEngine.totalFor({ projectId: "project-a", runId: "run-1" })).toBe(0.6);
+      });
+
+      it("no-regression: a caller supplying runId but NOT projectId keeps the exact prior global-per-run behavior", () => {
+        const costEngine = new CostEngine();
+        const guard = new BudgetGuard(costEngine, { perRunUsd: 1 });
+
+        guard.spend({ taskId: "a1", runId: "run-1", provider: "mock", modelId: "m1", amountUsd: 0.6 });
+        expect(() =>
+          guard.spend({ taskId: "a2", runId: "run-1", provider: "mock", modelId: "m1", amountUsd: 0.6 })
+        ).toThrow(BudgetExceededError);
       });
     }
   );
@@ -381,6 +457,37 @@ describe("BudgetGuard", () => {
       expect(() => new BudgetGuard(costEngine, { dailyUsd: -1 })).toThrow(InvalidBudgetLimitError);
       expect(() => new BudgetGuard(costEngine, { monthlyUsd: -1 })).toThrow(InvalidBudgetLimitError);
     });
+
+    describe(
+      "P1 fix (independent Codex review, 'prevent monetary unit overflow from bypassing ceilings'): a " +
+        "configured ceiling beyond the Factory's maximum supported monetary amount must be rejected before " +
+        "it can ever reach an overflowing comparison",
+      () => {
+        it("BLOCKER regression, exact reproduction: a very large but finite ceiling (~1e307) is rejected at construction time", () => {
+          const costEngine = new CostEngine();
+          expect(() => new BudgetGuard(costEngine, { perTaskUsd: 1e307 })).toThrow(InvalidBudgetLimitError);
+        });
+
+        it("no-regression: a ceiling exactly at the maximum supported monetary amount is still accepted", () => {
+          const costEngine = new CostEngine();
+          expect(() => new BudgetGuard(costEngine, { perTaskUsd: MAX_SUPPORTED_MONETARY_AMOUNT_USD })).not.toThrow();
+        });
+
+        it(
+          "BLOCKER regression: a very large but finite projected spend (~1e308) is rejected against a " +
+            "smaller-but-still-huge configured ceiling (~1e307), never silently passed due to overflow",
+          () => {
+            const costEngine = new CostEngine();
+            // The ceiling itself must be within the supported range to construct the guard —
+            // this test targets the SPEND side of the comparison overflowing, not the ceiling.
+            const guard = new BudgetGuard(costEngine, { perTaskUsd: MAX_SUPPORTED_MONETARY_AMOUNT_USD });
+            expect(() =>
+              guard.spend({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: MAX_SUPPORTED_MONETARY_AMOUNT_USD * 10 })
+            ).toThrow(InvalidMonetaryAmountError);
+          }
+        );
+      }
+    );
 
     it("protects direct CostEngine.record() calls too, bypassing BudgetGuard entirely", () => {
       const costEngine = new CostEngine();

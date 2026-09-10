@@ -32,6 +32,16 @@ interface MutablePhaseLockRecord {
   state: PhaseLockState;
   reason: string;
   updatedAt: string;
+  /**
+   * P1 fix (independent Codex review, "validate restored phase state
+   * against the Decision Ledger"): the Decision Ledger id `record()` bound
+   * this EXACT transition to (bkz. `lock()`/`close()`/`reopen()`'in
+   * gövdesi aşağıda) — persisted alongside the transition itself so
+   * `loadFrom()` can later locate the SAME ledger record and verify this
+   * phase state genuinely has matching, non-stale governance evidence
+   * behind it, rather than trusting the persisted `state` value on its own.
+   */
+  decisionId: string;
 }
 
 export type PhaseLockRecord = Readonly<MutablePhaseLockRecord>;
@@ -86,7 +96,32 @@ function describeInvalidPersistedPhaseLock(value: unknown): string | undefined {
   if (!VALID_PHASE_LOCK_STATES.includes(candidate.state as PhaseLockState)) return "invalid 'state'";
   if (typeof candidate.reason !== "string") return "missing or invalid 'reason'";
   if (typeof candidate.updatedAt !== "string" || candidate.updatedAt.length === 0) return "missing or invalid 'updatedAt'";
+  if (typeof candidate.decisionId !== "string" || candidate.decisionId.length === 0) {
+    return "missing or invalid 'decisionId'";
+  }
   return undefined;
+}
+
+/**
+ * P1 fix (independent Codex review, "validate restored phase state against
+ * the Decision Ledger"): maps a persisted phase `state` to the ONE
+ * `FounderDecisionLedger.record()` `source` string the live transition
+ * method that could have produced it always passes (bkz.
+ * `lock()`/`close()`/`reopen()`'in her birinin kendi `this.#ledger.record(...,
+ * "ScopeLock.lock"/"ScopeLock.close"/"ScopeLock.reopen")` çağrısı) — this
+ * mapping is exhaustive because `#phases.set()` is ONLY ever reached from
+ * inside these three methods, each of which records its OWN, distinct
+ * source string before doing so.
+ */
+function expectedLedgerSourceForPhaseState(state: PhaseLockState): string {
+  switch (state) {
+    case "LOCKED_FOR_CLOSURE":
+      return "ScopeLock.lock";
+    case "CLOSED":
+      return "ScopeLock.close";
+    case "OPEN":
+      return "ScopeLock.reopen";
+  }
 }
 
 /**
@@ -153,7 +188,8 @@ export class ScopeLock {
       phaseId,
       state: "LOCKED_FOR_CLOSURE",
       reason,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      decisionId
     };
     // P1 targeted-audit fix (35th independent review round, "pre-audit
     // transition exposure" root class — same class this round's own Fix 2
@@ -191,7 +227,8 @@ export class ScopeLock {
       phaseId,
       state: "CLOSED",
       reason,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      decisionId
     };
     // Same ordering fix as lock() above, same root class.
     this.#ledger.record(decisionId, phaseId, `Phase '${phaseId}' closed: ${reason}`, "ScopeLock.close");
@@ -212,7 +249,8 @@ export class ScopeLock {
       phaseId,
       state: "OPEN",
       reason,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      decisionId
     };
     // Same ordering fix as lock()/close() above, same root class.
     this.#ledger.record(decisionId, phaseId, `Phase '${phaseId}' reopened: ${reason}`, "ScopeLock.reopen");
@@ -247,6 +285,24 @@ export class ScopeLock {
   // function, exactly matching `FounderDecisionLedger.loadFrom()`'s own
   // "reject wholesale, don't silently accept corrupt persisted state"
   // precedent this file's other error classes already cite.
+  // P1 fix (independent Codex review, "validate restored phase state
+  // against the Decision Ledger"): the checks above (structural validity,
+  // phaseId uniqueness) only ever look AT the persisted phase-lock file
+  // itself — a persisted record claiming `state: "CLOSED"` (or
+  // `LOCKED_FOR_CLOSURE`) has, until now, been trusted on its own say-so,
+  // with NO check that the Decision Ledger this restore was handed
+  // actually contains matching, non-stale evidence for that transition. A
+  // stale, empty, unrelated, or hand-edited ledger passed alongside a
+  // legitimate-LOOKING phase-lock file would restore governance state
+  // (e.g. "P0 is CLOSED") with no real decision behind it — exactly the
+  // "no claim without evidence" invariant (baseline section 147) this
+  // whole class exists to enforce, now applied to RESTORE, not just the
+  // live `lock()`/`close()`/`reopen()` path (which already can't reach an
+  // inconsistent state, since each commits its own ledger record before
+  // ever touching `#phases` — bkz. yukarıdaki "pre-audit transition
+  // exposure" fix notu). Every check below runs BEFORE the candidate ever
+  // enters `lock.#phases`, so a failure here leaves the whole restore
+  // rejected (fail closed), never partially populated.
   static loadFrom(store: StateStore, path: string, ledger: FounderDecisionLedger): ScopeLock {
     const lock = new ScopeLock(ledger);
     const records = store.read<unknown[]>(path) ?? [];
@@ -259,6 +315,46 @@ export class ScopeLock {
       if (lock.#phases.has(candidate.phaseId)) {
         throw new CorruptPersistedPhaseLockError(index, `duplicate phaseId '${candidate.phaseId}'`);
       }
+
+      // Locate the matching Decision Ledger record — missing evidence
+      // (an empty, unrelated, or otherwise non-matching ledger) fails
+      // closed rather than restoring ungrounded governance state.
+      const decision = ledger.get(candidate.decisionId);
+      if (!decision) {
+        throw new CorruptPersistedPhaseLockError(
+          index,
+          `decisionId '${candidate.decisionId}' has no matching record in the Decision Ledger — a persisted ` +
+            `phase transition must have real, locatable governance evidence behind it`
+        );
+      }
+      // Verify phase identity: the ledger record's `project` field is
+      // always set to `phaseId` by every one of lock()/close()/reopen()'s
+      // own `record()` calls — a mismatch means this decisionId belongs to
+      // a DIFFERENT phase (or was never genuinely tied to this one).
+      if (decision.project !== candidate.phaseId) {
+        throw new CorruptPersistedPhaseLockError(
+          index,
+          `decisionId '${candidate.decisionId}' is recorded against project '${decision.project}', not phase ` +
+            `'${candidate.phaseId}' — ledger evidence does not belong to this governance transition`
+        );
+      }
+      // Verify the transition itself: the ledger record's `source` names
+      // exactly ONE of lock()/close()/reopen() (bkz.
+      // `expectedLedgerSourceForPhaseState()`'in fix notu) — a mismatch
+      // (e.g. a persisted `state: "CLOSED"` whose ledger evidence was
+      // actually recorded by `ScopeLock.reopen()`, or by something
+      // entirely unrelated) means the evidence is stale or contradictory,
+      // not proof of THIS specific transition.
+      const expectedSource = expectedLedgerSourceForPhaseState(candidate.state);
+      if (decision.source !== expectedSource) {
+        throw new CorruptPersistedPhaseLockError(
+          index,
+          `decisionId '${candidate.decisionId}' was recorded by '${decision.source}', but a persisted phase in ` +
+            `state '${candidate.state}' requires evidence from '${expectedSource}' — ledger evidence is stale or ` +
+            `contradicts this governance transition`
+        );
+      }
+
       lock.#phases.set(candidate.phaseId, { ...candidate });
     });
     return lock;
@@ -286,6 +382,16 @@ interface MutableBacklogRouteRecord {
   category: BacklogItemCategory;
   decision: BacklogRouteDecision;
   routedAt: string;
+  /**
+   * P1 fix (independent Codex review's own narrow root-cause audit for
+   * class D, "restore governance authority lacks matching Decision Ledger
+   * evidence" — found as a direct sibling of the ScopeLock.loadFrom() fix
+   * in the SAME file): only ever set for a `ROUTE_TO_BACKLOG` decision —
+   * the ledger id `route()` bound that denial to (bkz. aşağıdaki `route()`
+   * gövdesi). An `ACCEPT_INTO_PHASE` record never carries one, since
+   * `route()` itself never records a ledger entry for that outcome.
+   */
+  decisionId?: string;
 }
 
 export type BacklogRouteRecord = Readonly<MutableBacklogRouteRecord>;
@@ -322,6 +428,13 @@ function describeInvalidPersistedBacklogRecord(value: unknown): string | undefin
   if (!VALID_BACKLOG_CATEGORIES.includes(candidate.category as BacklogItemCategory)) return "invalid 'category'";
   if (!VALID_BACKLOG_DECISIONS.includes(candidate.decision as BacklogRouteDecision)) return "invalid 'decision'";
   if (typeof candidate.routedAt !== "string" || candidate.routedAt.length === 0) return "missing or invalid 'routedAt'";
+  if (candidate.decision === "ROUTE_TO_BACKLOG") {
+    if (typeof candidate.decisionId !== "string" || candidate.decisionId.length === 0) {
+      return "missing or invalid 'decisionId' (required for a ROUTE_TO_BACKLOG record)";
+    }
+  } else if (candidate.decisionId !== undefined) {
+    return "'decisionId' must not be present on an ACCEPT_INTO_PHASE record — route() never records one for it";
+  }
   return undefined;
 }
 
@@ -356,7 +469,8 @@ export class BacklogRouter {
       description: item.description,
       category: item.category,
       decision,
-      routedAt: new Date().toISOString()
+      routedAt: new Date().toISOString(),
+      ...(decision === "ROUTE_TO_BACKLOG" ? { decisionId } : {})
     };
     // P1 targeted-audit fix (35th independent review round, same
     // "pre-audit transition exposure" root class as ScopeLock's own
@@ -417,6 +531,23 @@ export class BacklogRouter {
   // check, and failing the whole restore closed via
   // `CorruptPersistedBacklogRecordError` (this function's own established
   // fail-closed error) rather than silently accepting the corruption.
+  //
+  // P1 fix (independent Codex review's own narrow root-cause audit for
+  // class D, "restore governance authority lacks matching Decision Ledger
+  // evidence" — found as a direct sibling of `ScopeLock.loadFrom()`'s own
+  // fix, in the SAME file): this loop used to take a `ledger` parameter
+  // and thread it only into `new BacklogRouter(scopeLock, ledger)` for
+  // LATER live use — it never actually READ from `ledger` during restore
+  // itself. A persisted `ROUTE_TO_BACKLOG` record was restored trusting
+  // only its own fields, with no way to detect a missing, unrelated, or
+  // stale Decision Ledger — exactly the gap `ScopeLock.loadFrom()`
+  // (immediately above in this same file) already closed for phase-lock
+  // records. Fixed the identical way: every restored `ROUTE_TO_BACKLOG`
+  // record's `decisionId` (bkz. `MutableBacklogRouteRecord`'in üstündeki
+  // fix notu) must locate a matching Decision Ledger record whose
+  // `project` is this exact `phaseId` and whose `source` is
+  // `"BacklogRouter.route"` (the ONE source `route()` itself ever records
+  // under) — any mismatch fails the whole restore closed.
   static loadFrom(store: StateStore, path: string, scopeLock: ScopeLock, ledger: FounderDecisionLedger): BacklogRouter {
     const router = new BacklogRouter(scopeLock, ledger);
     const records = store.read<unknown[]>(path) ?? [];
@@ -428,6 +559,30 @@ export class BacklogRouter {
       const candidate = record as MutableBacklogRouteRecord;
       if (router.#routed.has(candidate.itemId)) {
         throw new CorruptPersistedBacklogRecordError(index, `duplicate itemId '${candidate.itemId}'`);
+      }
+      if (candidate.decision === "ROUTE_TO_BACKLOG") {
+        const decision = ledger.get(candidate.decisionId!);
+        if (!decision) {
+          throw new CorruptPersistedBacklogRecordError(
+            index,
+            `decisionId '${candidate.decisionId}' has no matching record in the Decision Ledger — a persisted ` +
+              `ROUTE_TO_BACKLOG denial must have real, locatable governance evidence behind it`
+          );
+        }
+        if (decision.project !== candidate.phaseId) {
+          throw new CorruptPersistedBacklogRecordError(
+            index,
+            `decisionId '${candidate.decisionId}' is recorded against project '${decision.project}', not phase ` +
+              `'${candidate.phaseId}' — ledger evidence does not belong to this backlog routing decision`
+          );
+        }
+        if (decision.source !== "BacklogRouter.route") {
+          throw new CorruptPersistedBacklogRecordError(
+            index,
+            `decisionId '${candidate.decisionId}' was recorded by '${decision.source}', not 'BacklogRouter.route' ` +
+              `— ledger evidence is stale or contradicts this backlog routing decision`
+          );
+        }
       }
       router.#routed.set(candidate.itemId, { ...candidate });
     });

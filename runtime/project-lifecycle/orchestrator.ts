@@ -22,6 +22,7 @@
 //      duruma yazılır; süreç yeniden başlasa bile kaybolmaz (bölüm 277).
 
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseProjectGenome, type ProjectGenome } from "../project-genome/genome.js";
@@ -79,6 +80,52 @@ function defaultBootstrapModelGateway(): ModelGateway {
   const gateway = new ModelGateway();
   gateway.registerProvider(new MockProvider());
   return gateway;
+}
+
+/**
+ * P1 fix (independent Codex review, "bind scaffold approval to the
+ * destination root"): the `project.scaffold` `PolicyAction` this module
+ * builds (bkz. `scaffoldAction` yukarıda/aşağıda) used to bind only
+ * `actionType`/`risk`/`description`/`projectId` into its identity —
+ * `CapabilityGateway.authorize()`'s own `isBoundToExactAction()` check
+ * (bkz. capability-gateway/gateway.ts) compares exactly those fields plus
+ * an optional `identityDigest`, and nothing here ever set one. `baseDir`
+ * (hence the canonical `projectRoot` a scaffold actually mutates) was
+ * therefore NOT part of the bound identity at all: an approval genuinely
+ * requested and APPROVED for project X under destination root A recorded
+ * an identity of `{actionType, risk, description, projectId}` alone —
+ * indistinguishable from (and therefore able to authorize) the SAME
+ * project X being scaffolded under a COMPLETELY DIFFERENT caller-selected
+ * destination root B, since `baseDir`/`projectRoot` never entered the
+ * comparison at all. This is exactly the same "approval bound to an
+ * incomplete identity" class the 25th/34th independent review rounds
+ * already closed for other fields (bkz. `isBoundToExactAction()`'ın kendi
+ * fix notları) — `baseDir`/`projectRoot` was simply a dimension neither of
+ * those rounds had reason to consider for THIS action type.
+ *
+ * Exported (mirrors `models/gateway.ts`'s own exported
+ * `computeModelInvocationIdentityDigest()`/`computeProviderReplacementIdentityDigest()`)
+ * so a genuine approval-request workflow — whoever calls
+ * `ApprovalWorkflow.requestFor()` BEFORE the real `bootstrapProject()`
+ * call this approval must eventually authorize — can compute the EXACT
+ * SAME digest `bootstrapProject()` itself binds into
+ * `scaffoldAction.identityDigest` below: a single, shared source of truth,
+ * never a hand-duplicated formula that could silently drift. `projectRoot`
+ * MUST already be the canonical, filesystem-confinement-validated
+ * destination (bkz. `assertFilesystemConfinement()`'in çağrısı,
+ * `bootstrapProject()`'in kendi senkron ön ekinde, herhangi bir `await`den
+ * ÖNCE çalışır) — never a caller-supplied raw path re-read later, so this
+ * digest cannot itself be defeated by a symlink/traversal trick pointing
+ * two lexically-different `baseDir` strings at the same real destination
+ * (or vice versa): the CANONICAL path is what gets bound, exactly the
+ * same real-filesystem-aware guarantee `assertFilesystemConfinement()`
+ * already provides everywhere else in this module.
+ */
+export function computeScaffoldActionIdentityDigest(params: {
+  readonly projectId: string;
+  readonly projectRoot: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify([params.projectId, params.projectRoot])).digest("hex");
 }
 
 export class PreflightTraceabilityFailedError extends Error {
@@ -454,11 +501,19 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // preserves the prior, safe default: an empty store that can never
   // authorize anything above ALLOW.
   const gateway = new CapabilityGateway(policy, callerApprovals ?? new ApprovalWorkflow());
+  // P1 fix ("bind scaffold approval to the destination root"): `projectRoot`
+  // (bkz. yukarıda, bu fonksiyonun senkron ön ekinde zaten hesaplanmış ve
+  // confinement-doğrulanmış canonical hedef) is now folded into this
+  // action's `identityDigest` — bkz. `computeScaffoldActionIdentityDigest()`'in
+  // üstündeki fix notu. An approval requested for a DIFFERENT destination
+  // root can no longer match this action's identity, however identical
+  // every other field (`projectId`/`risk`/`description`) happens to be.
   const scaffoldAction = {
     actionType: "project.scaffold",
     risk,
     description: `Scaffold Project OS for '${genome.project.id}'`,
-    projectId: genome.project.id
+    projectId: genome.project.id,
+    identityDigest: computeScaffoldActionIdentityDigest({ projectId: genome.project.id, projectRoot })
   };
   const approvalReference: ApprovalReference | undefined = approvalId !== undefined ? { approvalId } : undefined;
 

@@ -15,7 +15,12 @@ function findRepoRootForTest(startDir: string): string {
 }
 const REAL_REPO_ROOT = findRepoRootForTest(dirname(fileURLToPath(import.meta.url)));
 const REAL_REQUIREMENTS_DIR = join(REAL_REPO_ROOT, "specification", "requirements");
-import { bootstrapProject, PreflightTraceabilityFailedError, type BootstrapProjectInput } from "../orchestrator.js";
+import {
+  bootstrapProject,
+  computeScaffoldActionIdentityDigest,
+  PreflightTraceabilityFailedError,
+  type BootstrapProjectInput
+} from "../orchestrator.js";
 import { scaffoldProjectOs } from "../../project-os/scaffold.js";
 import { PolicyEngine, lowRiskAllowRule } from "../../policy-engine/policy-engine.js";
 import { CapabilityDeniedError, CapabilityApprovalRequiredError, ApprovalEvidenceMismatchError } from "../../capability-gateway/gateway.js";
@@ -1788,7 +1793,8 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           actionType: "project.scaffold",
           risk: 5,
           description: `Scaffold Project OS for '${projectId}'`,
-          projectId
+          projectId,
+          identityDigest: computeScaffoldActionIdentityDigest({ projectId, projectRoot: join(tempRoot, projectId) })
         });
         approvals.approve(approvalId, "founder@example.com");
 
@@ -2015,6 +2021,133 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
   );
 
   describe(
+    "P1 fix (independent Codex review, 'bind scaffold approval to the destination root'): an approval " +
+      "genuinely requested and APPROVED for a project under one canonical destination root must not authorize " +
+      "the SAME project being scaffolded under a DIFFERENT, caller-selected destination root",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: approve scaffold under canonical root A, then retry using " +
+          "root B with the identical project/action metadata (approvalId, projectId, description, risk) — " +
+          "exact approval matching FAILS",
+        async () => {
+          const tempRootA = mkdtempSync(join(tmpdir(), "uasf-orchestrator-scaffold-root-a-"));
+          const tempRootB = mkdtempSync(join(tmpdir(), "uasf-orchestrator-scaffold-root-b-"));
+          try {
+            const policy = new PolicyEngine();
+            policy.addRule({
+              name: "allow-model-invoke",
+              priority: 10,
+              evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+            });
+            const projectId = "proj-cross-root-replay";
+            const approvals = new ApprovalWorkflow();
+            const approvalId = "approval-cross-root-replay";
+            // Requested (and approved) with an identity digest bound to
+            // root A's canonical destination — exactly what a genuine,
+            // honest approval request for THIS bootstrap would compute.
+            approvals.requestFor(approvalId, {
+              actionType: "project.scaffold",
+              risk: 5,
+              description: `Scaffold Project OS for '${projectId}'`,
+              projectId,
+              identityDigest: computeScaffoldActionIdentityDigest({
+                projectId,
+                projectRoot: join(tempRootA, projectId)
+              })
+            });
+            approvals.approve(approvalId, "founder@example.com");
+
+            // Bootstrapping under root A (the root the approval was
+            // genuinely requested for) succeeds.
+            await bootstrapProject({
+              genomeCandidate: validGenome(projectId),
+              baseDir: tempRootA,
+              policy,
+              modelRegistry: createDefaultModelRegistry(),
+              risk: 5,
+              approvals,
+              approvalId
+            });
+            expect(existsSync(join(tempRootA, projectId))).toBe(true);
+
+            // Replaying the SAME approvalId/projectId/description/risk —
+            // every field `isBoundToExactAction()` used to compare before
+            // this fix — but targeting a COMPLETELY DIFFERENT destination
+            // root B must NOT be authorized by that same approval. (The
+            // approval is already EXECUTED from the call above, which
+            // alone would also block a replay — a fresh, never-consumed
+            // approval for root A is used below to isolate THIS finding's
+            // exact mechanism: identity mismatch, not mere replay.)
+            const freshApprovalId = "approval-cross-root-replay-fresh";
+            approvals.requestFor(freshApprovalId, {
+              actionType: "project.scaffold",
+              risk: 5,
+              description: `Scaffold Project OS for '${projectId}'`,
+              projectId,
+              identityDigest: computeScaffoldActionIdentityDigest({
+                projectId,
+                projectRoot: join(tempRootA, projectId)
+              })
+            });
+            approvals.approve(freshApprovalId, "founder@example.com");
+
+            await expect(
+              bootstrapProject({
+                genomeCandidate: validGenome(projectId),
+                baseDir: tempRootB,
+                policy,
+                modelRegistry: createDefaultModelRegistry(),
+                risk: 5,
+                approvals,
+                approvalId: freshApprovalId
+              })
+            ).rejects.toThrow(ApprovalEvidenceMismatchError);
+
+            expect(existsSync(join(tempRootB, projectId))).toBe(false);
+          } finally {
+            rmSync(tempRootA, { recursive: true, force: true });
+            rmSync(tempRootB, { recursive: true, force: true });
+          }
+        }
+      );
+
+      it("no-regression: an approval genuinely requested for the SAME canonical destination root the bootstrap actually uses still succeeds", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-scaffold-root-match-"));
+        const policy = new PolicyEngine();
+        policy.addRule({
+          name: "allow-model-invoke",
+          priority: 10,
+          evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
+        });
+        const projectId = "proj-same-root-match";
+        const approvals = new ApprovalWorkflow();
+        const approvalId = "approval-same-root-match";
+        approvals.requestFor(approvalId, {
+          actionType: "project.scaffold",
+          risk: 5,
+          description: `Scaffold Project OS for '${projectId}'`,
+          projectId,
+          identityDigest: computeScaffoldActionIdentityDigest({ projectId, projectRoot: join(tempRoot, projectId) })
+        });
+        approvals.approve(approvalId, "founder@example.com");
+
+        await bootstrapProject({
+          genomeCandidate: validGenome(projectId),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          risk: 5,
+          approvals,
+          approvalId
+        });
+
+        expect(existsSync(join(tempRoot, projectId))).toBe(true);
+        expect(approvals.get(approvalId)?.status).toBe("EXECUTED");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (25th independent review round, 'do not reauthorize after paid bootstrap work'): exactly ONE " +
       "authorization decision gates both the paid model invocation and the scaffold filesystem mutation — a " +
       "stateful policy rule is evaluated only once for project.scaffold, never re-evaluated after cost is committed",
@@ -2156,7 +2289,8 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             actionType: "project.scaffold",
             risk: 5,
             description: `Scaffold Project OS for '${projectId}'`,
-            projectId
+            projectId,
+            identityDigest: computeScaffoldActionIdentityDigest({ projectId, projectRoot: join(tempRoot, projectId) })
           });
           approvals.approve(approvalId, "founder@example.com");
 
@@ -2245,7 +2379,8 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           actionType: "project.scaffold",
           risk: 5,
           description: `Scaffold Project OS for '${projectId}'`,
-          projectId
+          projectId,
+          identityDigest: computeScaffoldActionIdentityDigest({ projectId, projectRoot: join(tempRoot, projectId) })
         });
         approvals.approve(approvalId, "founder@example.com");
 
@@ -2296,7 +2431,8 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             actionType: "project.scaffold",
             risk: 5,
             description: `Scaffold Project OS for '${projectId}'`,
-            projectId
+            projectId,
+            identityDigest: computeScaffoldActionIdentityDigest({ projectId, projectRoot: join(tempRoot, projectId) })
           });
           approvals.approve(approvalId, "founder@example.com");
 

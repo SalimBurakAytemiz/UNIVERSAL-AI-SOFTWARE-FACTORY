@@ -202,6 +202,90 @@ describe("ScopeLock: persistence", () => {
     expect(restored.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
     expect(restored.getState("P1")).toBe("LOCKED_FOR_CLOSURE");
   });
+
+  describe(
+    "P1 fix (independent Codex review, 'validate restored phase state against the Decision Ledger'): a " +
+      "persisted phase transition must have matching, non-stale evidence in the Decision Ledger — a stale, " +
+      "empty, unrelated, or contradictory ledger must fail the restore closed",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: persist phase P0=CLOSED but hand loadFrom() an EMPTY " +
+          "Decision Ledger (no matching decisionId at all) -> restore FAILS",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-empty-ledger-"));
+          const store = new FileStateStore();
+          const path = join(tempRoot, "scope-lock.json");
+          store.write(path, [
+            { phaseId: "P0", state: "CLOSED", reason: "claimed closed", updatedAt: new Date().toISOString(), decisionId: "d-missing" }
+          ]);
+          const emptyLedger = new FounderDecisionLedger();
+          expect(() => ScopeLock.loadFrom(store, path, emptyLedger)).toThrow(CorruptPersistedPhaseLockError);
+        }
+      );
+
+      it(
+        "BLOCKER regression: persist phase P0=CLOSED but the ledger's matching decisionId is recorded " +
+          "against an UNRELATED project -> restore FAILS (evidence does not belong to this phase)",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-unrelated-project-"));
+          const store = new FileStateStore();
+          const path = join(tempRoot, "scope-lock.json");
+          store.write(path, [
+            { phaseId: "P0", state: "CLOSED", reason: "claimed closed", updatedAt: new Date().toISOString(), decisionId: "d1" }
+          ]);
+          const unrelatedLedger = new FounderDecisionLedger();
+          unrelatedLedger.record("d1", "SOME_OTHER_PROJECT", "an unrelated decision", "ScopeLock.close");
+          expect(() => ScopeLock.loadFrom(store, path, unrelatedLedger)).toThrow(CorruptPersistedPhaseLockError);
+        }
+      );
+
+      it(
+        "BLOCKER regression: persist phase P0=CLOSED but the matching ledger record's source is " +
+          "'ScopeLock.reopen' (a DIFFERENT transition than the one claimed) -> restore FAILS (stale/" +
+          "contradictory evidence)",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-wrong-source-"));
+          const store = new FileStateStore();
+          const path = join(tempRoot, "scope-lock.json");
+          store.write(path, [
+            { phaseId: "P0", state: "CLOSED", reason: "claimed closed", updatedAt: new Date().toISOString(), decisionId: "d1" }
+          ]);
+          const staleLedger = new FounderDecisionLedger();
+          staleLedger.record("d1", "P0", "Phase 'P0' reopened: unrelated", "ScopeLock.reopen");
+          expect(() => ScopeLock.loadFrom(store, path, staleLedger)).toThrow(CorruptPersistedPhaseLockError);
+        }
+      );
+
+      it("no-regression: a valid persisted phase with a genuinely matching ledger transition restores successfully", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-valid-ledger-"));
+        const store = new FileStateStore();
+        const path = join(tempRoot, "scope-lock.json");
+        const ledger = new FounderDecisionLedger();
+        const lock = new ScopeLock(ledger);
+        lock.lock("P0", "ready", CLEAN_REPORT, "d1");
+        lock.close("P0", "independent review clean", CLEAN_REPORT, "d2");
+        lock.saveTo(store, path);
+
+        const restored = ScopeLock.loadFrom(store, path, ledger);
+        expect(restored.getState("P0")).toBe("CLOSED");
+      });
+
+      it("no-regression: a genuinely persisted OPEN (reopened) phase with matching ledger evidence restores successfully", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-scope-lock-valid-reopen-"));
+        const store = new FileStateStore();
+        const path = join(tempRoot, "scope-lock.json");
+        const ledger = new FounderDecisionLedger();
+        const lock = new ScopeLock(ledger);
+        lock.lock("P0", "ready", CLEAN_REPORT, "d1");
+        lock.close("P0", "closed", CLEAN_REPORT, "d2");
+        lock.reopen("P0", "new finding surfaced", "d3");
+        lock.saveTo(store, path);
+
+        const restored = ScopeLock.loadFrom(store, path, ledger);
+        expect(restored.getState("P0")).toBe("OPEN");
+      });
+    }
+  );
 });
 
 describe("BacklogRouter", () => {
@@ -354,4 +438,121 @@ describe("BacklogRouter: persistence", () => {
     expect(restored.get("item-1")?.decision).toBe("ROUTE_TO_BACKLOG");
     expect(restored.get("item-2")?.decision).toBe("ACCEPT_INTO_PHASE");
   });
+
+  describe(
+    "P1 fix (independent Codex review's own narrow root-cause audit for class D, 'restore governance " +
+      "authority lacks matching Decision Ledger evidence' — found as a direct sibling of ScopeLock.loadFrom()'s " +
+      "own fix): a persisted ROUTE_TO_BACKLOG denial must have matching, non-stale evidence in the Decision " +
+      "Ledger — a stale, empty, unrelated, or contradictory ledger must fail the restore closed",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: persist a ROUTE_TO_BACKLOG record but hand loadFrom() an " +
+          "EMPTY Decision Ledger (no matching decisionId at all) -> restore FAILS",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-empty-ledger-"));
+          const store = new FileStateStore();
+          const path = join(tempRoot, "backlog.json");
+          store.write(path, [
+            {
+              itemId: "item-1",
+              phaseId: "P0",
+              description: "denied",
+              category: "FEATURE",
+              decision: "ROUTE_TO_BACKLOG",
+              routedAt: new Date().toISOString(),
+              decisionId: "d-missing"
+            }
+          ]);
+          const emptyLedger = new FounderDecisionLedger();
+          const lock = new ScopeLock(emptyLedger);
+          expect(() => BacklogRouter.loadFrom(store, path, lock, emptyLedger)).toThrow(
+            CorruptPersistedBacklogRecordError
+          );
+        }
+      );
+
+      it(
+        "BLOCKER regression: the matching decisionId is recorded against an UNRELATED project -> restore " +
+          "FAILS (evidence does not belong to this backlog routing decision)",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-unrelated-project-"));
+          const store = new FileStateStore();
+          const path = join(tempRoot, "backlog.json");
+          store.write(path, [
+            {
+              itemId: "item-1",
+              phaseId: "P0",
+              description: "denied",
+              category: "FEATURE",
+              decision: "ROUTE_TO_BACKLOG",
+              routedAt: new Date().toISOString(),
+              decisionId: "d1"
+            }
+          ]);
+          const unrelatedLedger = new FounderDecisionLedger();
+          unrelatedLedger.record("d1", "SOME_OTHER_PROJECT", "an unrelated decision", "BacklogRouter.route");
+          const lock = new ScopeLock(unrelatedLedger);
+          expect(() => BacklogRouter.loadFrom(store, path, lock, unrelatedLedger)).toThrow(
+            CorruptPersistedBacklogRecordError
+          );
+        }
+      );
+
+      it(
+        "BLOCKER regression: the matching ledger record's source is NOT 'BacklogRouter.route' -> restore " +
+          "FAILS (stale/contradictory evidence)",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-wrong-source-"));
+          const store = new FileStateStore();
+          const path = join(tempRoot, "backlog.json");
+          store.write(path, [
+            {
+              itemId: "item-1",
+              phaseId: "P0",
+              description: "denied",
+              category: "FEATURE",
+              decision: "ROUTE_TO_BACKLOG",
+              routedAt: new Date().toISOString(),
+              decisionId: "d1"
+            }
+          ]);
+          const staleLedger = new FounderDecisionLedger();
+          staleLedger.record("d1", "P0", "Phase 'P0' locked for closure: unrelated", "ScopeLock.lock");
+          const lock = new ScopeLock(staleLedger);
+          expect(() => BacklogRouter.loadFrom(store, path, lock, staleLedger)).toThrow(
+            CorruptPersistedBacklogRecordError
+          );
+        }
+      );
+
+      it("no-regression: a valid persisted ROUTE_TO_BACKLOG record with a genuinely matching ledger transition restores successfully", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-valid-ledger-"));
+        const store = new FileStateStore();
+        const path = join(tempRoot, "backlog.json");
+        const ledger = new FounderDecisionLedger();
+        const lock = new ScopeLock(ledger);
+        lock.lock("P0", "ready", CLEAN_REPORT, "d1");
+        const router = new BacklogRouter(lock, ledger);
+        router.route(makeItem(), "d2");
+        router.saveTo(store, path);
+
+        const restored = BacklogRouter.loadFrom(store, path, lock, ledger);
+        expect(restored.get("item-1")?.decision).toBe("ROUTE_TO_BACKLOG");
+      });
+
+      it("no-regression: a persisted ACCEPT_INTO_PHASE record (no decisionId) restores successfully with no ledger cross-check", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-backlog-router-accept-"));
+        const store = new FileStateStore();
+        const path = join(tempRoot, "backlog.json");
+        const ledger = new FounderDecisionLedger();
+        const lock = new ScopeLock(ledger);
+        const router = new BacklogRouter(lock, ledger);
+        router.route(makeItem());
+        router.saveTo(store, path);
+
+        const restored = BacklogRouter.loadFrom(store, path, lock, ledger);
+        expect(restored.get("item-1")?.decision).toBe("ACCEPT_INTO_PHASE");
+      });
+    }
+  );
 });

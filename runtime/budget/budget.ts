@@ -13,6 +13,7 @@
 import {
   assertValidMonetaryAmount,
   exceedsMonetaryAmount,
+  MAX_SUPPORTED_MONETARY_AMOUNT_USD,
   ReservationOwnershipMismatchError,
   UnknownReservationError,
   UnresolvedReconciliationError
@@ -60,16 +61,33 @@ export interface BudgetLimits {
 export class InvalidBudgetLimitError extends Error {
   constructor(ceiling: BudgetCeilingName, limit: number) {
     super(
-      `Invalid budget limit for '${ceiling}': ${limit}. Configured ceilings must be ` +
-        `finite and non-negative (NaN/Infinity/-Infinity/negative are rejected).`
+      `Invalid budget limit for '${ceiling}': ${limit}. Configured ceilings must be finite, non-negative, and ` +
+        `no greater than the Factory's maximum supported monetary amount ` +
+        `($${MAX_SUPPORTED_MONETARY_AMOUNT_USD.toLocaleString("en-US")}) — NaN/Infinity/-Infinity/negative/` +
+        `beyond-that-ceiling values are all rejected.`
     );
     this.name = "InvalidBudgetLimitError";
   }
 }
 
+/**
+ * P1 fix (independent Codex review, "prevent monetary unit overflow from
+ * bypassing ceilings"): a configured ceiling used to be validated only for
+ * finiteness/non-negativity — a caller-configured `perTaskUsd: 1e307` (say)
+ * passed this check untouched, then reached `exceedsMonetaryAmount()`
+ * (runtime/cost/cost-engine.ts) as the `limit` operand, where scaling it by
+ * `MONETARY_PRECISION_SCALE` could overflow to `Infinity`, destroying
+ * comparison ordering exactly the way an oversized `amountUsd` would (bkz.
+ * `assertValidMonetaryAmount()`'ın kendi fix notu, cost-engine.ts — the
+ * SAME root cause, the OTHER operand of the same comparison). Both sides of
+ * every `exceedsMonetaryAmount(projected, limit)` call must be bounded the
+ * same way for the comparison itself to stay meaningful — reusing the
+ * EXACT SAME `MAX_SUPPORTED_MONETARY_AMOUNT_USD` constant (never a
+ * separately-invented bound) guarantees that.
+ */
 function assertValidLimit(ceiling: BudgetCeilingName, limit: number | undefined): void {
   if (limit === undefined) return;
-  if (!Number.isFinite(limit) || limit < 0) {
+  if (!Number.isFinite(limit) || limit < 0 || limit > MAX_SUPPORTED_MONETARY_AMOUNT_USD) {
     throw new InvalidBudgetLimitError(ceiling, limit);
   }
 }
@@ -420,8 +438,31 @@ export class BudgetGuard {
     // supply `runId` (every one of the 200+ existing call sites today) see
     // `runScope` degrade to `{}`, which `matchesScope()` treats as "matches
     // everything" — i.e. the exact prior global-sum behavior, unchanged.
+    //
+    // P2 fix (independent Codex review, "include project identity in
+    // per-run budget scopes"): `runScope` above still bound ONLY by
+    // `runId` — `runId` values are caller-chosen strings with NO uniqueness
+    // guarantee ACROSS projects (bkz. `taskId`'nin de kendi başına aynı
+    // sorunu taşıdığı, `perTaskUsd`'nin üstündeki 5th round fix notu, tam
+    // olarak aynı kök sınıf). Two DIFFERENT projects that both happen to
+    // name their run "run-1" on the SAME shared durable `CostEngine` would
+    // therefore have their spend silently COMBINED under one `perRunUsd`
+    // ceiling — project A's spend could exhaust project B's entirely
+    // separate run allowance, or vice versa. Fixed the exact same additive
+    // way `perTaskUsd` already folds `projectId` in above: when the caller
+    // supplies BOTH `runId` and `projectId`, the ceiling is scoped to
+    // `projectId + runId` together (mirroring `taskScope`'s own `projectId +
+    // taskId` shape) — `matchesScope()` already treats a scope field as
+    // "matches everything" when omitted (bkz. yukarısı), so a caller
+    // supplying `runId` alone (no `projectId`) keeps its EXISTING, unchanged
+    // global-per-run behavior; this only NARROWS scoping for callers who
+    // supply both dimensions, never widens it for anyone.
     if (this.#limits.perRunUsd !== undefined) {
-      const runScope: CostScope = scope.runId !== undefined ? { runId: scope.runId } : {};
+      let runScope: CostScope = {};
+      if (scope.runId !== undefined) {
+        runScope =
+          scope.projectId !== undefined ? { runId: scope.runId, projectId: scope.projectId } : { runId: scope.runId };
+      }
       checks.push({
         ceiling: "perRunUsd",
         limit: this.#limits.perRunUsd,

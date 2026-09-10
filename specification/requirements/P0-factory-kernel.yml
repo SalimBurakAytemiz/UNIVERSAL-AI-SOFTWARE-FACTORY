@@ -503,6 +503,23 @@
     attempt throws `TypeError` and the list is unchanged, plus
     `Object.isFrozen()` and a no-regression scaffold test.
 
+    P1 fix (independent Codex review, "bind scaffold approval to the destination root"): the `project.scaffold`
+    `PolicyAction` `bootstrapProject()` builds used to bind only `actionType`/`risk`/`description`/`projectId`
+    into its identity — `baseDir` (hence the canonical `projectRoot` the scaffold actually mutates) was never
+    part of the bound identity at all. An approval genuinely requested and APPROVED for project X under
+    destination root A recorded an identity indistinguishable from — and therefore able to authorize — the SAME
+    project X being scaffolded under a COMPLETELY DIFFERENT caller-selected destination root B. Fixed by folding
+    the already-canonicalized, confinement-validated `projectRoot` (computed via the pre-existing
+    `assertFilesystemConfinement()` call in this function's synchronous prefix, before any await) into a new
+    `identityDigest` on the scaffold action, via an exported `computeScaffoldActionIdentityDigest()` a genuine
+    approval-request workflow can call ahead of time to compute the exact same digest. Regression tests prove:
+    an approval genuinely requested and approved for canonical root A does not authorize the same project being
+    scaffolded under root B (exact-identity matching fails with `ApprovalEvidenceMismatchError`), while an
+    approval requested for the SAME canonical root the bootstrap actually uses still succeeds. Verified via a
+    temporary bypass removing the `identityDigest` binding — confirmed exactly the 6 predicted tests (the 2 new
+    destination-root tests plus 4 previously-passing success-path tests whose approvals now needed the digest
+    added) failed, then reverted and reconfirmed all 68 orchestrator tests passing.
+
 - id: UASF-REQ-0008
   title: Project Genome schema
   description: Machine-readable Project Genome YAML schema and validator.
@@ -2012,6 +2029,42 @@
     of the `identityDigest` comparison and of `detachFromCallerMutation()` — confirmed exactly the predicted
     BLOCKER tests failed for each, then reverted and reconfirmed all tests passing.
 
+    P1 fix (independent Codex review, "reject provider state omitted by the approval fingerprint"):
+    `canonicalProviderConfigFingerprint()` enumerated `Reflect.ownKeys(provider)` but then filtered the result
+    down to string keys only, silently dropping every symbol-keyed own property from the fingerprint before an
+    approval was ever computed against it — a caller could stash behaviorally material state (an endpoint, an
+    account id) behind a symbol key and it would never enter the bound approval identity. Separately, each
+    surviving value was hashed via bare `JSON.stringify()`, which serializes any `Map`/`Set` to the literal
+    empty object `{}` regardless of its actual entries — two providers differing only in Map/Set-typed
+    configuration fingerprinted identically. Fixed with a real recursive canonicalizer
+    (`canonicalizeConfigValueForFingerprint()`) that covers string AND symbol own keys, faithfully encodes
+    `Map`/`Set` as order-independent sorted structures instead of ever handing either to `JSON.stringify()`
+    directly, and fails closed (via the existing `UnsupportedProviderConfigurationError`) on anything else it
+    cannot canonicalize losslessly (Date, RegExp, class instances, symbol VALUES, bigint, non-finite numbers,
+    circular references) — a function VALUE is the one exception, canonicalized by its own source text (mirrors
+    the digest's existing `provider.invoke.toString()` precedent) to avoid regressing the pre-existing
+    plain-object `ModelProvider` candidate test path. Regression tests prove two same-class providers differing
+    only in a symbol-keyed endpoint, a Map value, or a Set value now produce different identity digests (and
+    that an approval for one cannot authorize installing the other), while Map/Set entries in a different
+    insertion order still fingerprint identically. Verified via a temporary bypass restoring the old
+    string-only-filter/bare-JSON.stringify behavior — confirmed exactly the 5 predicted new tests failed, then
+    reverted and reconfirmed all 107 gateway tests passing.
+
+    P1 fix (independent Codex review, "traverse symbol keys when deep-freezing configuration"): this requirement's
+    provider-registration path relies on `runtime/util/immutable.ts`'s `deepFreeze()` (via `detachFromCallerMutation()`)
+    to lock nested provider config state — see that module's own fix note below (bkz. UASF-REQ-0024'ün altındaki
+    ilgili not yerine, immutable.ts kendi başına bir requirement'a bağlı olmadığından bu notu burada
+    tekrarlıyoruz): `deepFreeze()` used `Object.getOwnPropertyNames()` (string keys only) to decide which
+    children to recurse into and freeze, silently skipping any nested object stored behind a symbol key. A
+    provider could store `provider[Symbol("config")] = {endpoint: "A"}`, register it, and still mutate that
+    nested object afterward — undetected by this requirement's own "detach provider execution from caller-owned
+    state" invariant (bkz. üstteki 34th round notu). Fixed by enumerating via `Reflect.ownKeys()` instead, which
+    returns both string and symbol own keys. Regression tests (`runtime/util/__tests__/immutable.test.ts`) prove
+    a symbol-keyed nested object is frozen and can no longer be mutated after `deepFreeze()`, including when the
+    root was already frozen by the caller beforehand; a genuine cycle reached via a symbol key still terminates
+    safely. Verified via a temporary bypass reverting to `Object.getOwnPropertyNames()` — confirmed exactly the
+    2 predicted new tests failed, then reverted and reconfirmed all 7 passing.
+
 - id: UASF-REQ-0025
   title: Model registry
   description: Registry of provider/model records with capabilities, cost_class, tier, status.
@@ -3174,6 +3227,43 @@
     `BUDGET_PROVIDER_FAILURE_RECONCILIATION_REJECTED_OWNERSHIP_MISMATCH` on a rejected mismatch), following
     the same audit-event pattern `release()`/`commit()` already establish. See `gateway.ts`'s own regression
     tests (UASF-REQ-0024) and `cost-engine.ts`'s own (UASF-REQ-0029) for the verification evidence.
+
+    P2 fix (independent Codex review, "include project identity in per-run budget scopes"):
+    `buildCeilingChecks()`'s `perRunUsd` scope was bound only by `runId` — `runId` values are caller-chosen
+    strings with no uniqueness guarantee ACROSS projects (the same root class `perTaskUsd`'s own `projectId +
+    taskId` scoping already closed, 5th round). Two different projects that both happened to name a run
+    "run-1" on the same shared durable `CostEngine` would have their spend silently combined under one
+    `perRunUsd` ceiling. Fixed the same additive way `perTaskUsd` already folds `projectId` in: when the
+    caller supplies BOTH `runId` and `projectId`, the ceiling is scoped to `projectId + runId` together — a
+    caller supplying `runId` alone keeps its existing, unchanged global-per-run behavior. Regression tests
+    prove: Project A spending $0.60 on `runId=run-1` does not consume Project B's separate $1 `perRunUsd`
+    allowance on the SAME `runId=run-1`; same-project/same-run spending still aggregates and enforces
+    correctly; a caller supplying only `runId` is unaffected. Verified via a temporary bypass reverting to
+    `runId`-only scoping — confirmed exactly the 1 predicted BLOCKER test failed, then reverted and
+    reconfirmed all 143 budget tests passing.
+
+    P1 fix (independent Codex review, "prevent monetary unit overflow from bypassing ceilings"):
+    `exceedsMonetaryAmount()`/`toMonetaryUnits()` (runtime/cost/cost-engine.ts) scale an amount by
+    `MONETARY_PRECISION_SCALE` (1,000,000) before comparing — for a very large but finite amount (e.g. ~1e308,
+    near `Number.MAX_VALUE`), that multiplication overflows to `Infinity`; since `Infinity > Infinity` is
+    `false`, a genuinely excessive spend could compare as "does not exceed" a similarly enormous configured
+    ceiling. Fixed with a new exported `MAX_SUPPORTED_MONETARY_AMOUNT_USD` (`Number.MAX_SAFE_INTEGER /
+    MONETARY_PRECISION_SCALE`, ~$9.007 trillion) — the largest USD amount whose scaled microdollar
+    representation is guaranteed to remain an exact safe integer. `assertValidMonetaryAmount()` now rejects
+    any amount beyond this bound (closing the gap for every `record()`/`createReservation()`/
+    `commitReservation()` call site), and `runtime/budget/budget.ts`'s `assertValidLimit()` rejects the SAME
+    bound for a configured ceiling, reusing the identical constant so both operands of every comparison stay
+    bounded together. `exceedsMonetaryAmount()` itself also gained a defense-in-depth fallback: if scaling
+    either operand would not remain a safe integer, it compares the two original, unscaled finite values
+    directly instead (always exact and well-ordered, with no scaling involved) — covering the case where a
+    SUM of individually-valid entries/reservations (`buildCeilingChecks()`'s `projected` total) could in
+    principle still exceed the per-amount bound. Regression tests prove: a ~1e308 amount vs. a ~1e307 ceiling
+    still correctly reports as exceeding (despite both scaling to `Infinity`); ordering stays correct at and
+    around the exact `MAX_SUPPORTED_MONETARY_AMOUNT_USD` boundary; `record()` and `BudgetGuard` construction/
+    spend both fail closed on amounts/ceilings beyond the bound. Verified via a temporary bypass reverting
+    `exceedsMonetaryAmount()`/`assertValidMonetaryAmount()`/`assertValidLimit()` to their pre-fix bodies —
+    confirmed exactly the 5 predicted new tests failed, then reverted and reconfirmed all 272 cost-engine/
+    budget tests passing.
 
 - id: UASF-REQ-0031
   title: Worker registry (foundation)
@@ -5551,6 +5641,37 @@
     complete — the ledger record is now committed BEFORE the authoritative
     state mutation, not after, so a decisionId collision can never leave a
     phase transitioned (or an item backlogged) with no audit trail.
+
+    P1 fix (independent Codex review, "validate restored phase state against the Decision Ledger"):
+    `ScopeLock.loadFrom()`'s structural/uniqueness checks only ever looked AT the persisted phase-lock file
+    itself — a persisted record claiming `state: "CLOSED"` (or `LOCKED_FOR_CLOSURE`) was trusted on its own
+    say-so, with no check that the Decision Ledger handed to `loadFrom()` actually contained matching,
+    non-stale evidence for that transition. A stale, empty, unrelated, or hand-edited ledger paired with a
+    legitimate-looking phase-lock file would restore governance state (e.g. "P0 is CLOSED") with no real
+    decision behind it. Fixed: every persisted phase record now also carries the `decisionId` the live
+    `lock()`/`close()`/`reopen()` call bound its transition to; `loadFrom()` locates that record in the
+    Decision Ledger, verifies it belongs to the SAME `phaseId` (the ledger record's `project` field), and
+    verifies its `source` matches the ONE transition method (`ScopeLock.lock`/`.close`/`.reopen`) that could
+    have produced the persisted `state` — any mismatch (missing decisionId, unrelated project, wrong source)
+    fails the whole restore closed via the existing `CorruptPersistedPhaseLockError`. Regression tests prove:
+    persisting `P0=CLOSED` against an empty, an unrelated-project, or a wrong-source ledger all fail restore;
+    a genuinely matching persisted phase + ledger transition (including a reopened OPEN state) still restores
+    correctly. Verified via a temporary bypass removing the ledger cross-checks — confirmed exactly the 3
+    predicted new tests failed, then reverted and reconfirmed all 32 scope-lock tests passing.
+
+    P1 fix (same round's own narrow root-cause audit for this finding's class): the audit found a DIRECT sibling
+    instance in the SAME file — `BacklogRouter.loadFrom()` took a `ledger: FounderDecisionLedger` parameter but
+    never actually read from it during restore, only threading it into the constructed `BacklogRouter` for later
+    live use. A persisted `ROUTE_TO_BACKLOG` record was restored trusting only its own fields, with the identical
+    "no real evidence required" gap `ScopeLock.loadFrom()` above had just closed. Fixed identically: every
+    persisted `ROUTE_TO_BACKLOG` record now also carries the `decisionId` `route()` bound its denial to (never set
+    for an `ACCEPT_INTO_PHASE` record, since `route()` never records a ledger entry for that outcome); `loadFrom()`
+    locates it in the Decision Ledger, verifies its `project` matches the record's `phaseId`, and verifies its
+    `source` is exactly `"BacklogRouter.route"`. Regression tests prove the same three failure shapes (empty,
+    unrelated-project, wrong-source ledger) all fail restore, while a genuinely matching persisted denial and an
+    `ACCEPT_INTO_PHASE` record (which has no ledger evidence to check at all) both restore correctly. Verified via
+    a temporary bypass removing these cross-checks — confirmed exactly the 3 predicted new tests failed, then
+    reverted and reconfirmed all 37 scope-lock tests passing.
 - id: UASF-REQ-0045
   title: Phase Closure Manifest
   description: >

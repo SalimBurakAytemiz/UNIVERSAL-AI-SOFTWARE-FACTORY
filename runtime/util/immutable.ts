@@ -63,6 +63,24 @@ export function freezeRecords<T extends object>(values: readonly T[]): readonly 
  * on an already-frozen object is a no-op per spec (never throws), so
  * re-freezing a node this function reaches a second time (from a different,
  * unrelated top-level call) costs nothing beyond the traversal itself.
+ *
+ * P1 fix (independent Codex review, "traverse symbol keys when
+ * deep-freezing configuration"): this used `Object.getOwnPropertyNames()`
+ * to enumerate children to recurse into — that call returns STRING own
+ * keys ONLY, per spec; it silently skips every symbol-keyed own property.
+ * A caller could stash a nested, still-mutable object behind a symbol key
+ * (`obj[Symbol("config")] = { endpoint: "A" }`) and this function would
+ * freeze the ROOT (`Object.freeze(value)` above IS shallow-safe against
+ * new property writes, but does nothing for an EXISTING symbol-keyed
+ * property's own nested value) while never even visiting, let alone
+ * freezing, that symbol-keyed child — the caller retains a live, writable
+ * reference to it and can silently redirect the "already registered"
+ * value after the fact, exactly the class of bug `deepFreeze()` exists to
+ * close (bkz. yukarıdaki 37th round fix notu, an equivalent gap for
+ * already-frozen roots with mutable descendants). Fixed by enumerating via
+ * `Reflect.ownKeys()`, which returns BOTH string AND symbol own keys —
+ * every child this function can reach is now frozen and recursed into
+ * exactly the same way, regardless of which kind of key holds it.
  */
 export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
   if (value === null || typeof value !== "object") {
@@ -73,8 +91,8 @@ export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): 
   }
   seen.add(value);
   Object.freeze(value);
-  for (const key of Object.getOwnPropertyNames(value)) {
-    deepFreeze((value as Record<string, unknown>)[key], seen);
+  for (const key of Reflect.ownKeys(value)) {
+    deepFreeze((value as Record<PropertyKey, unknown>)[key], seen);
   }
   return value;
 }

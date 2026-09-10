@@ -10,10 +10,12 @@ import { acquireFileLock, type FileLockOptions } from "../cache/file-lock.js";
 export class InvalidMonetaryAmountError extends Error {
   constructor(context: string, amount: number) {
     super(
-      `Invalid monetary amount in ${context}: ${amount}. Amounts must be finite and ` +
-        `non-negative — NaN, Infinity, -Infinity, and negative values are all rejected. ` +
-        `A negative amount is not a discount or refund; those require an explicitly ` +
-        `modeled refund/credit operation, never a negative amountUsd.`
+      `Invalid monetary amount in ${context}: ${amount}. Amounts must be finite, non-negative, and no greater ` +
+        `than the Factory's maximum supported monetary amount ($${MAX_SUPPORTED_MONETARY_AMOUNT_USD.toLocaleString(
+          "en-US"
+        )}) — NaN, Infinity, -Infinity, negative values, and values beyond that ceiling are all rejected. A ` +
+        `negative amount is not a discount or refund; those require an explicitly modeled refund/credit ` +
+        `operation, never a negative amountUsd.`
     );
     this.name = "InvalidMonetaryAmountError";
   }
@@ -26,9 +28,27 @@ export class InvalidMonetaryAmountError extends Error {
  * (NaN + x = NaN) ve bütçe karşılaştırmaları (`NaN > limit` HER ZAMAN
  * false döner) sessizce geçer — bu yüzden hiçbir duruma dokunulmadan ÖNCE
  * reddedilir (fail closed).
+ *
+ * P1 fix (independent Codex review, "prevent monetary unit overflow from
+ * bypassing ceilings"): finite-and-non-negative alone is NOT sufficient —
+ * `exceedsMonetaryAmount()` below scales every amount by
+ * `MONETARY_PRECISION_SCALE` (1,000,000) before comparing, and a
+ * sufficiently large but still finite amount (e.g. ~1e308, near
+ * `Number.MAX_VALUE`) turns that scaling into `Infinity`
+ * (`amount * 1_000_000` overflows JS's representable range) — `Infinity >
+ * Infinity` is `false`, so a genuinely excessive spend could silently
+ * compare as "does not exceed" a similarly enormous ceiling, exactly the
+ * "authoritative accounting must never be reachable by an unsafe value"
+ * failure this function exists to prevent for NaN/Infinity/negative
+ * amounts. Fixed by rejecting any amount whose scaled microdollar
+ * representation would not itself remain an exact, safely-representable
+ * integer (bkz. `MAX_SUPPORTED_MONETARY_AMOUNT_USD`'in fix notu) BEFORE it
+ * is ever scaled — the same "reject at the boundary, before the unsafe
+ * operation" fail-closed shape this function already used for NaN/
+ * Infinity/negative.
  */
 export function assertValidMonetaryAmount(amount: number, context: string): void {
-  if (!Number.isFinite(amount) || amount < 0) {
+  if (!Number.isFinite(amount) || amount < 0 || amount > MAX_SUPPORTED_MONETARY_AMOUNT_USD) {
     throw new InvalidMonetaryAmountError(context, amount);
   }
 }
@@ -113,6 +133,28 @@ function assertValidCostEntryIdentity(entry: Omit<CostEntry, "timestamp" | "rese
  */
 export const MONETARY_PRECISION_SCALE = 1_000_000;
 
+/**
+ * P1 fix (independent Codex review, "prevent monetary unit overflow from
+ * bypassing ceilings"): `amount * MONETARY_PRECISION_SCALE` (bkz.
+ * `toMonetaryUnits()` aşağıda) is only an EXACT, safely-comparable integer
+ * when the scaled result stays within `Number.MAX_SAFE_INTEGER` — beyond
+ * that, `Math.round()`'s own input has already lost integer precision (or,
+ * further still, the multiplication itself overflows to `Infinity`), and
+ * `Infinity > Infinity` is `false`: two amounts that are genuinely,
+ * enormously different in real value could compare as "neither exceeds the
+ * other." Dividing back down gives the largest USD amount whose scaled
+ * microdollar representation is GUARANTEED exact — this is the Factory's
+ * documented upper bound on a single monetary amount (baseline section
+ * 147's "no claim without evidence" extends to arithmetic: a comparison
+ * outside this bound is not evidence of anything). `assertValidMonetaryAmount()`
+ * (yukarısı) rejects any amount beyond this before it ever reaches
+ * `record()`/`createReservation()`/`commitReservation()`'s persisted state;
+ * `assertValidBudgetLimits()` (runtime/budget/budget.ts) rejects the SAME
+ * bound for a configured ceiling, using this exact same constant — one
+ * authoritative bound for both sides of every comparison.
+ */
+export const MAX_SUPPORTED_MONETARY_AMOUNT_USD = Number.MAX_SAFE_INTEGER / MONETARY_PRECISION_SCALE;
+
 function toMonetaryUnits(amountUsd: number): number {
   return Math.round(amountUsd * MONETARY_PRECISION_SCALE);
 }
@@ -122,9 +164,39 @@ function toMonetaryUnits(amountUsd: number): number {
  * `MONETARY_PRECISION_SCALE`) `b`'yi GERÇEKTEN aşıp aşmadığını döndürür —
  * TAM tavan harcaması (`a === b` niyetiyle) ikili kayan nokta gürültüsü
  * yüzünden asla yanlışlıkla `true` dönmez.
+ *
+ * P1 fix (independent Codex review, "prevent monetary unit overflow from
+ * bypassing ceilings"): every caller reaching this function is EXPECTED to
+ * have already been bounded by `assertValidMonetaryAmount()`/
+ * `assertValidBudgetLimits()` (bkz. `MAX_SUPPORTED_MONETARY_AMOUNT_USD`'in
+ * fix notu) — but a `projected` total (the SUM of many individually-valid
+ * entries/reservations, bkz. `BudgetGuard.buildCeilingChecks()`) could in
+ * principle still exceed that per-amount bound even though every entry
+ * that produced it was individually valid. Defense in depth: if scaling
+ * EITHER operand would not remain an exact safe integer (overflow or
+ * precision loss), this falls back to comparing the two ORIGINAL, unscaled
+ * finite values directly — `>` on two finite numbers is always exact and
+ * well-ordered with no scaling involved, so ordering correctness never
+ * depends on the microdollar precision policy holding at this extreme; it
+ * is exchanged only for the microdollar-level tie-breaking `0.1 + 0.2 ===
+ * 0.3` exactness this function exists to provide within its DOCUMENTED
+ * (bounded) precision range.
  */
 export function exceedsMonetaryAmount(a: number, b: number): boolean {
-  return toMonetaryUnits(a) > toMonetaryUnits(b);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    // NaN/Infinity/-Infinity must never silently authorize a spend by
+    // comparing as "does not exceed" — every legitimate call path already
+    // rejects these before reaching here (bkz. `assertValidMonetaryAmount()`),
+    // so reaching this branch at all means upstream validation was bypassed;
+    // fail closed by reporting "exceeds" rather than risk a silent pass.
+    return true;
+  }
+  const unitsA = toMonetaryUnits(a);
+  const unitsB = toMonetaryUnits(b);
+  if (Number.isSafeInteger(unitsA) && Number.isSafeInteger(unitsB)) {
+    return unitsA > unitsB;
+  }
+  return a > b;
 }
 
 export interface CostEntry {

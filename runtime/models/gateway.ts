@@ -145,6 +145,210 @@ export class UnsupportedProviderConfigurationError extends Error {
 }
 
 /**
+ * P1 fix (independent Codex review, "reject provider state omitted by the
+ * approval fingerprint"): a JSON-serializable canonical shape produced by
+ * `canonicalizeConfigValueForFingerprint()` below — never fed directly to
+ * `JSON.stringify()` in a way that could silently collapse a `Map`/`Set`'s
+ * actual entries to `{}` the way bare `JSON.stringify()` does.
+ */
+type CanonicalFingerprintValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly CanonicalFingerprintValue[]
+  | { readonly [key: string]: CanonicalFingerprintValue };
+
+/**
+ * Deterministic ordering for a list of already-canonicalized values (Map
+ * entries, Set items) whose ORIGINAL relative order must not matter — two
+ * `Map`/`Set` instances holding the exact same entries/items in a
+ * different insertion order must fingerprint identically. Sorting by each
+ * item's own canonical JSON text is stable and total (bkz. `Array.prototype.sort`'ın
+ * ES2019+ kararlılık garantisi).
+ */
+function sortByCanonicalJson<T>(items: readonly T[]): T[] {
+  return items
+    .map((item) => ({ item, json: JSON.stringify(item) }))
+    .sort((a, b) => (a.json < b.json ? -1 : a.json > b.json ? 1 : 0))
+    .map((entry) => entry.item);
+}
+
+/**
+ * P1 fix (independent Codex review, "reject provider state omitted by the
+ * approval fingerprint"): the finding identified TWO independent root
+ * causes in the OLD `canonicalProviderConfigFingerprint()`: (a) it filtered
+ * `Reflect.ownKeys(provider)` down to string keys only, silently dropping
+ * every symbol-keyed own property before fingerprinting it at all — a
+ * caller could stash behaviorally material state (an endpoint, an account
+ * id) behind a symbol key and it would never enter the approval identity;
+ * (b) it fed each value straight to bare `JSON.stringify()`, which
+ * serializes ANY `Map`/`Set` to the literal empty object `{}` regardless
+ * of the map/set's actual entries (neither type exposes its data as an own
+ * enumerable property `JSON.stringify`'s default algorithm can see) — two
+ * providers differing only in Map/Set-typed configuration would fingerprint
+ * identically, letting an approval for candidate A silently authorize
+ * installing candidate B.
+ *
+ * This function replaces the ad-hoc per-value `JSON.stringify()` call with
+ * a real recursive canonicalizer that: (1) explicitly recognizes and
+ * faithfully encodes `Map` (as an order-independent, sorted list of
+ * canonicalized `[key, value]` pairs) and `Set` (as an order-independent,
+ * sorted list of canonicalized items) instead of ever handing either to
+ * `JSON.stringify()` directly; (2) recurses into arrays and plain objects,
+ * covering BOTH string AND symbol own keys (bkz. `canonicalProviderConfigFingerprint()`'in
+ * kendi çağrısı, artık `Reflect.ownKeys()`'i STRING FİLTRESİ OLMADAN
+ * dolaşıyor); (3) fails closed — via the ALREADY-ESTABLISHED
+ * `UnsupportedProviderConfigurationError` (never a new error type, per this
+ * round's "reuse existing governance" instruction) — for anything this
+ * canonicalizer cannot faithfully, losslessly represent: functions,
+ * `bigint`s, symbol VALUES (as opposed to symbol KEYS, which are fully
+ * supported), non-finite numbers (`NaN`/`Infinity`), circular references,
+ * and any object whose prototype is neither `Object.prototype` nor `null`
+ * (a `Date`, a `RegExp`, a class instance — none of which this repository's
+ * own provider configuration shapes currently require, and any of which
+ * COULD hide behaviorally material state this function has no faithful way
+ * to canonicalize). `seen` is a plain (non-`Weak`) `Set` scoped to exactly
+ * ONE top-level fingerprint computation — bkz. `deepFreeze()`'in kendi
+ * `WeakSet` notu (util/immutable.ts): unlike that traversal, THIS one must
+ * be free to re-visit the SAME shared sub-object reached from two
+ * DIFFERENT top-level config properties (that is not a cycle), while still
+ * detecting a genuine cycle WITHIN a single property's own descent — so the
+ * `seen` set is entered/exited around each container via try/finally,
+ * never left populated across sibling properties.
+ */
+function canonicalizeConfigValueForFingerprint(
+  value: unknown,
+  id: string,
+  key: PropertyKey,
+  seen: Set<unknown>
+): CanonicalFingerprintValue {
+  if (value === null) return null;
+  const type = typeof value;
+  if (type === "string" || type === "boolean") return value as string | boolean;
+  if (type === "number") {
+    if (!Number.isFinite(value as number)) {
+      throw new UnsupportedProviderConfigurationError(
+        id,
+        key,
+        new Error(`non-finite numeric configuration value (${String(value)}) cannot be canonically fingerprinted`)
+      );
+    }
+    return value as number;
+  }
+  if (type === "undefined") return { __type: "undefined" };
+  if (type === "function") {
+    // A function VALUE (as opposed to a symbol KEY, which IS fully
+    // supported above) is canonicalized by its own source text rather than
+    // failed closed: this mirrors the ALREADY-ESTABLISHED precedent
+    // `computeProviderReplacementIdentityDigest()` itself uses one level up
+    // (`provider.invoke.toString()`, bkz. yukarıda) — two DIFFERENT function
+    // bodies always produce different source text, so this is faithful and
+    // non-lossy, never a collapsing fallback like `"[object Object]"`. This
+    // also preserves an existing, previously-resolved P0 invariant: a
+    // plain-object `ModelProvider` candidate (no class, `invoke` as an OWN
+    // data property — bkz. `replaceProvider()`'ın kendi testleri, 29th
+    // independent review round) has always had that `invoke` property
+    // itself enter this same per-property fingerprint loop; failing closed
+    // on it here would regress that already-passing governance path.
+    return { __type: "Function", source: (value as (...args: unknown[]) => unknown).toString() };
+  }
+  if (type === "symbol" || type === "bigint") {
+    throw new UnsupportedProviderConfigurationError(
+      id,
+      key,
+      new Error(`unsupported configuration value type '${type}' cannot be canonically fingerprinted`)
+    );
+  }
+  // type === "object" from here on.
+  if (seen.has(value)) {
+    throw new UnsupportedProviderConfigurationError(
+      id,
+      key,
+      new Error("circular reference detected while canonicalizing configuration for fingerprinting")
+    );
+  }
+  if (Array.isArray(value)) {
+    seen.add(value);
+    try {
+      return value.map((item) => canonicalizeConfigValueForFingerprint(item, id, key, seen));
+    } finally {
+      seen.delete(value);
+    }
+  }
+  if (value instanceof Map) {
+    seen.add(value);
+    try {
+      const entries = Array.from(value.entries()).map(
+        ([entryKey, entryValue]) =>
+          [
+            canonicalizeConfigValueForFingerprint(entryKey, id, key, seen),
+            canonicalizeConfigValueForFingerprint(entryValue, id, key, seen)
+          ] as const
+      );
+      return { __type: "Map", entries: sortByCanonicalJson(entries) as unknown as CanonicalFingerprintValue };
+    } finally {
+      seen.delete(value);
+    }
+  }
+  if (value instanceof Set) {
+    seen.add(value);
+    try {
+      const items = Array.from(value.values()).map((item) => canonicalizeConfigValueForFingerprint(item, id, key, seen));
+      return { __type: "Set", items: sortByCanonicalJson(items) };
+    } finally {
+      seen.delete(value);
+    }
+  }
+  const proto = Object.getPrototypeOf(value as object);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new UnsupportedProviderConfigurationError(
+      id,
+      key,
+      new Error(
+        `unsupported configuration object type '${(value as object).constructor?.name ?? "unknown"}' cannot be ` +
+          "canonically fingerprinted"
+      )
+    );
+  }
+  seen.add(value);
+  try {
+    const ownKeys = Reflect.ownKeys(value as object);
+    const stringKeys: string[] = [];
+    const symbolKeys: symbol[] = [];
+    for (const ownKey of ownKeys) {
+      if (typeof ownKey === "symbol") {
+        symbolKeys.push(ownKey);
+      } else {
+        stringKeys.push(ownKey);
+      }
+    }
+    stringKeys.sort();
+    symbolKeys.sort((a, b) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0));
+    const result: Record<string, CanonicalFingerprintValue> = {};
+    for (const ownKey of stringKeys) {
+      result[`str:${ownKey}`] = canonicalizeConfigValueForFingerprint(
+        (value as Record<string, unknown>)[ownKey],
+        id,
+        key,
+        seen
+      );
+    }
+    for (const ownKey of symbolKeys) {
+      result[`sym:${String(ownKey)}`] = canonicalizeConfigValueForFingerprint(
+        (value as Record<PropertyKey, unknown>)[ownKey],
+        id,
+        key,
+        seen
+      );
+    }
+    return result;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+/**
  * P1 fix (37th independent review round, finding 1, "bind provider approval
  * to the genuinely installed snapshot"): bkz. `replaceProvider()`'ın kendi
  * fix notu for the full call-site rationale — `resolvedAccessors` is a
@@ -171,20 +375,30 @@ function canonicalProviderConfigFingerprint(
   id: string,
   resolvedAccessors: ReadonlyMap<PropertyKey, unknown>
 ): string {
-  const entries = Reflect.ownKeys(provider)
-    .filter((key): key is string => typeof key === "string")
-    .sort()
-    .map((key) => {
-      const descriptor = Object.getOwnPropertyDescriptor(provider, key);
-      const value = descriptor && "value" in descriptor ? descriptor.value : resolvedAccessors.get(key);
-      let serialized: string;
-      try {
-        serialized = JSON.stringify(value) ?? String(value);
-      } catch (err) {
-        throw new UnsupportedProviderConfigurationError(id, key, err);
-      }
-      return `${key}:${createHash("sha256").update(serialized).digest("hex")}`;
-    });
+  // P1 fix (independent Codex review, "reject provider state omitted by the
+  // approval fingerprint"): iterate EVERY own key `Reflect.ownKeys()`
+  // reports — string AND symbol — never filter symbol keys out before
+  // fingerprinting (bkz. üstteki fix notu). Sorting mixes both kinds via a
+  // stable, unambiguous label (`str:`/`sym:` prefix) so the two namespaces
+  // never collide with each other and ordering stays deterministic run to
+  // run for the SAME object.
+  const ownKeys = Reflect.ownKeys(provider);
+  const labeled = ownKeys.map((key) => ({
+    key,
+    label: typeof key === "symbol" ? `sym:${String(key)}` : `str:${key}`
+  }));
+  labeled.sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
+
+  const entries = labeled.map(({ key, label }) => {
+    const descriptor = Object.getOwnPropertyDescriptor(provider, key);
+    const value = descriptor && "value" in descriptor ? descriptor.value : resolvedAccessors.get(key);
+    // Canonicalize (never bare `JSON.stringify`, which silently collapses
+    // `Map`/`Set` to `{}`) before hashing — bkz.
+    // `canonicalizeConfigValueForFingerprint()`'in fix notu.
+    const canonical = canonicalizeConfigValueForFingerprint(value, id, key, new Set());
+    const serialized = JSON.stringify(canonical);
+    return `${label}:${createHash("sha256").update(serialized).digest("hex")}`;
+  });
   return entries.join("|");
 }
 
