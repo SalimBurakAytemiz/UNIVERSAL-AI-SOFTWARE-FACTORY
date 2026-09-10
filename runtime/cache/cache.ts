@@ -77,6 +77,27 @@ export function assertValidTtl(ttlMs: number | undefined): void {
 
 export class Cache<T = unknown> {
   private readonly store = new Map<string, CacheEntry<T>>();
+  /**
+   * P2 fix (independent Codex review's own narrow root-cause audit for
+   * "deduplicate concurrent durable cache computations" — the identical
+   * root class found as a direct sibling in `file-cache.ts`'s
+   * `computeWithFileCache()`, applied here to the in-memory cache):
+   * `computeWithCache()` below used to `lookup()` (a miss), then call
+   * `compute()` with NO protection at all — two callers racing the SAME
+   * missing key inside one process could both observe the miss and both
+   * run `compute()`, defeating this cache's own "do not repeat completed
+   * work" contract (section 78) and, for a caller wrapping a paid model
+   * invocation, duplicating real spend. Unlike the file-backed cache, a
+   * single JS process needs no cross-process file lock — JS's single-
+   * threaded execution model means two SYNCHRONOUS calls can never
+   * interleave between "check for an in-flight computation" and "record
+   * this one as in-flight"; only genuine `await` points can yield, and
+   * this map is written to BEFORE the first `await` inside `compute()`.
+   * A LATER-arriving caller for the SAME key therefore always finds and
+   * awaits the SAME in-flight promise instead of starting a second,
+   * redundant computation.
+   */
+  private readonly inFlight = new Map<string, Promise<T>>();
 
   /**
    * The one authoritative lookup — bkz. `CacheLookupResult`'ın fix notu.
@@ -119,6 +140,31 @@ export class Cache<T = unknown> {
   size(): number {
     return this.store.size;
   }
+
+  /**
+   * Single-flight compute for a cache-miss key — bkz. `inFlight`'in
+   * üstündeki fix notu. A caller that finds an already-in-flight
+   * computation for this exact key awaits and reuses ITS result rather
+   * than starting a redundant one; the winner persists via the ordinary
+   * `set()` and clears the in-flight entry in a `finally`, so a `compute()`
+   * failure is never cached as a success and never leaves a permanently
+   * stuck in-flight entry blocking a subsequent retry.
+   */
+  async computeAndSet(key: string, compute: () => Promise<T> | T, ttlMs?: number): Promise<ComputeWithCacheResult<T>> {
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      return { value: await existing, cached: true };
+    }
+    const promise = Promise.resolve().then(compute);
+    this.inFlight.set(key, promise);
+    try {
+      const value = await promise;
+      this.set(key, value, ttlMs);
+      return { value, cached: false };
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
 }
 
 export interface ComputeWithCacheResult<T> {
@@ -145,7 +191,8 @@ export async function computeWithCache<T>(
   if (lookup.found) {
     return { value: lookup.value as T, cached: true };
   }
-  const value = await compute();
-  cache.set(key, value, ttlMs);
-  return { value, cached: false };
+  // P2 fix (independent Codex review's own narrow root-cause audit, same
+  // class as file-cache.ts's computeWithFileCache()): a miss no longer
+  // calls compute() directly — bkz. Cache.computeAndSet()'in fix notu.
+  return cache.computeAndSet(key, compute, ttlMs);
 }

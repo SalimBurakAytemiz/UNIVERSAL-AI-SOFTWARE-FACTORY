@@ -45,6 +45,24 @@ export interface StructuredEvidenceRef {
   readonly path: string;
   readonly type: EvidenceRefType;
   readonly outcome?: string;
+  /**
+   * P1 fix (independent Codex review, "require outcome-backed evidence
+   * references"): required (bkz. `isOutcomeVerifiedEvidenceRef()`) for
+   * every outcome-bearing type (everything except `ARTIFACT_REFERENCE`) —
+   * names WHO or WHAT produced/confirmed this outcome (e.g. "npm test
+   * (vitest) — full repository suite, this closure round", "CI pipeline
+   * run #1234", "independent Codex review"). Without this, a caller could
+   * write `{path, type: "TEST_RESULT", outcome: "PASS"}` with literally
+   * nothing behind the claim beyond their own assertion — structurally
+   * indistinguishable from a fabricated outcome (baseline section 303's
+   * "no claim without evidence" extends to WHO is making the claim, not
+   * only whether a path resolves). This does not make the claim
+   * cryptographically unforgeable, but it does require every
+   * outcome-bearing claim to name its own provenance — the same
+   * discipline `isVerifiedEvidenceRef()` already applies to path
+   * resolution, now applied to the claim's source too.
+   */
+  readonly verificationSource?: string;
 }
 
 /** An evidence ref is either the legacy bare path, or the richer typed/outcome-bearing form above. */
@@ -263,6 +281,46 @@ function hasVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boo
 }
 
 /**
+ * P1 fix (independent Codex review, "require outcome-backed evidence
+ * references"): `isVerifiedEvidenceRef()` above answers "does this
+ * artifact exist (and, for an outcome-bearing type, does it ALSO carry a
+ * success outcome)?" — but `detectTraceabilityIssues()` (bkz. aşağısı) used
+ * to accept ANY verified ref, including a bare `ARTIFACT_REFERENCE` (mere
+ * existence, no outcome claim at all), as sufficient evidence for
+ * UNIT_TESTED/INTEGRATION_TESTED/PROOF_VERIFIED/PRODUCTION_VERIFIED —
+ * status claims that are fundamentally claims about an OUTCOME, not about
+ * an artifact merely existing. `proof_refs: ["package.json"]`, a test
+ * SOURCE file that has never been executed, or a directory all "exist" —
+ * none of them demonstrate that anything ever ran, let alone passed.
+ * Existence must never equal success.
+ *
+ * This function is the stricter gate those four claims actually require:
+ * an existence-verified ref (`isVerifiedEvidenceRef()`) additionally must
+ * (1) carry an outcome-bearing `type` (never the bare-string/
+ * `ARTIFACT_REFERENCE` legacy shape, which makes no outcome claim to begin
+ * with and therefore can NEVER satisfy an outcome claim, no matter how
+ * real the file it points at is), and (2) name its own `verificationSource`
+ * (bkz. `StructuredEvidenceRef.verificationSource`'un fix notu) — a
+ * caller-written `{path, type: "TEST_RESULT", outcome: "PASS"}` with no
+ * stated provenance is exactly as unverifiable as a bare path and is
+ * rejected the same way. `implementationRefs` (bkz.
+ * `detectTraceabilityIssues()`) deliberately keeps using the WEAKER
+ * `isVerifiedEvidenceRef()` check instead — "an implementation exists" is
+ * an existence claim, not an outcome claim, so a plain source-file
+ * reference remains completely legitimate evidence for it.
+ */
+export function isOutcomeVerifiedEvidenceRef(ref: EvidenceRef, rootDir: string): boolean {
+  if (!isVerifiedEvidenceRef(ref, rootDir)) return false;
+  if (typeof ref === "string") return false;
+  if (ref.type === "ARTIFACT_REFERENCE") return false;
+  return typeof ref.verificationSource === "string" && ref.verificationSource.length > 0;
+}
+
+function hasOutcomeVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boolean {
+  return refs.some((ref) => isOutcomeVerifiedEvidenceRef(ref, rootDir));
+}
+
+/**
  * Kayıt defterindeki her gereksinimi tarar ve durumu ile kanıtları
  * arasındaki tutarsızlıkları bulur. BLOCKED/DEPRECATED/SUPERSEDED
  * durumundaki kayıtlar denetlenmez (bölüm 294'te bu durumlar için ayrı bir
@@ -292,8 +350,15 @@ export function detectTraceabilityIssues(
     const rank = progressRank(req.status);
     if (rank === -1) continue;
 
-    const hasProof = hasVerifiedEvidence(req.proofRefs, rootDir);
-    const hasTest = hasVerifiedEvidence(req.testRefs, rootDir);
+    // P1 fix (independent Codex review, "require outcome-backed evidence
+    // references"): `hasProof`/`hasTest` now require OUTCOME-verified
+    // evidence (bkz. `isOutcomeVerifiedEvidenceRef()`'in fix notu) — mere
+    // existence (a bare ARTIFACT_REFERENCE) can never satisfy an outcome
+    // claim. `hasImplementation` deliberately keeps the weaker existence
+    // check: an implementation reference is legitimately just "this file
+    // exists".
+    const hasProof = hasOutcomeVerifiedEvidence(req.proofRefs, rootDir);
+    const hasTest = hasOutcomeVerifiedEvidence(req.testRefs, rootDir);
     const hasImplementation = hasVerifiedEvidence(req.implementationRefs, rootDir);
 
     if (rank >= progressRank("IMPLEMENTATION_IN_PROGRESS") && !hasImplementation && !hasTest && !hasProof) {

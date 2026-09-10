@@ -4,8 +4,14 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { FileStateStore } from "../../state/file-store.js";
 import { FileCache } from "../file-cache.js";
+
+/** Mirrors FileCache's own private computeLockPath() exactly, so tests can fabricate a dead lock on it. */
+function computeLockPathFor(cachePath: string, key: string): string {
+  return `${cachePath}.compute.${createHash("sha256").update(key).digest("hex")}.lock`;
+}
 
 // P2 fix (16th independent review round, "durable cache read-modify-write
 // is not safe across processes"): Codex reproduced the classic
@@ -749,5 +755,152 @@ describe(
       expect(reread.get("good")).toBe("value");
       expect(reread.get("bad")).toBeUndefined();
     });
+
+    describe(
+      "P2 fix (independent Codex review, 'deduplicate concurrent durable cache computations'): " +
+        "computeWithFileCache() must single-flight a cache-miss key across REAL, separate OS processes",
+      () => {
+        it(
+          "BLOCKER regression, exact reproduction: two REAL child processes request the SAME missing key " +
+            "concurrently -> the compute callback runs EXACTLY ONCE, and both callers receive the identical " +
+            "stored result",
+          async () => {
+            tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-compute-"));
+            const cachePath = join(tempRoot, "cache.json");
+            const logPath = join(tempRoot, "compute-log.txt");
+            writeFileSync(logPath, "");
+
+            const [resultA, resultB] = await Promise.all([
+              runWorker(["compute", cachePath, "shared-key", "computed-value", logPath, "150"]),
+              runWorker(["compute", cachePath, "shared-key", "computed-value", logPath, "150"])
+            ]);
+            expect(resultA.code, resultA.stderr).toBe(0);
+            expect(resultB.code, resultB.stderr).toBe(0);
+
+            const parsedA = JSON.parse(resultA.stdout) as { value: string; cached: boolean };
+            const parsedB = JSON.parse(resultB.stdout) as { value: string; cached: boolean };
+            expect(parsedA.value).toBe("computed-value");
+            expect(parsedB.value).toBe("computed-value");
+            // Exactly one of the two genuinely computed it; the other
+            // reused the lease winner's already-persisted result.
+            expect([parsedA.cached, parsedB.cached].sort()).toEqual([false, true]);
+
+            const logLines = readFileSync(logPath, "utf8").split("\n").filter((l) => l.length > 0);
+            expect(logLines).toHaveLength(1);
+
+            const cache = new FileCache<string>(new FileStateStore(), cachePath);
+            expect(cache.get("shared-key")).toBe("computed-value");
+          },
+          20_000
+        );
+
+        it(
+          "high-contention: 5 REAL processes race the SAME missing key -> compute still runs exactly once",
+          async () => {
+            tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-compute-contend-"));
+            const cachePath = join(tempRoot, "cache.json");
+            const logPath = join(tempRoot, "compute-log.txt");
+            writeFileSync(logPath, "");
+            const contenderCount = 5;
+
+            const results = await Promise.all(
+              Array.from({ length: contenderCount }, () =>
+                runWorker(["compute", cachePath, "hot-key", "the-one-true-value", logPath, "100"])
+              )
+            );
+            for (const result of results) expect(result.code, result.stderr).toBe(0);
+
+            const parsed = results.map((r) => JSON.parse(r.stdout) as { value: string; cached: boolean });
+            for (const p of parsed) expect(p.value).toBe("the-one-true-value");
+            expect(parsed.filter((p) => !p.cached)).toHaveLength(1);
+
+            const logLines = readFileSync(logPath, "utf8").split("\n").filter((l) => l.length > 0);
+            expect(logLines).toHaveLength(1);
+          },
+          30_000
+        );
+
+        it(
+          "a compute() failure is never silently cached as a success, and does not deadlock a subsequent caller",
+          async () => {
+            tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-compute-fail-"));
+            const cachePath = join(tempRoot, "cache.json");
+            const logPath = join(tempRoot, "compute-log.txt");
+            writeFileSync(logPath, "");
+
+            const failResult = await runWorker(["compute-fail", cachePath, "flaky-key", logPath]);
+            expect(failResult.code, failResult.stderr).toBe(0);
+            expect(failResult.stdout).toContain("simulated compute failure");
+
+            const cache = new FileCache<string>(new FileStateStore(), cachePath);
+            expect(cache.has("flaky-key")).toBe(false);
+
+            // A subsequent, ordinary compute for the SAME key must succeed
+            // normally — the failed attempt's lease was released, not left
+            // permanently held.
+            const retryResult = await runWorker(["compute", cachePath, "flaky-key", "recovered-value", logPath, "0"]);
+            expect(retryResult.code, retryResult.stderr).toBe(0);
+            const parsed = JSON.parse(retryResult.stdout) as { value: string; cached: boolean };
+            expect(parsed.value).toBe("recovered-value");
+            expect(parsed.cached).toBe(false);
+          },
+          20_000
+        );
+
+        it(
+          "a process crashing while holding the per-key compute lease does not permanently deadlock a " +
+            "subsequent compute for that SAME key (dead-PID detection recovers immediately)",
+          async () => {
+            tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-compute-crash-"));
+            const cachePath = join(tempRoot, "cache.json");
+            const logPath = join(tempRoot, "compute-log.txt");
+            writeFileSync(logPath, "");
+            const computeLockPath = computeLockPathFor(cachePath, "crash-key");
+            const deadPid = spawnDeadPid();
+            const generousStaleOptions = JSON.stringify({ timeoutMs: 10_000, staleMs: 60_000, pollIntervalMs: 20 });
+
+            const createResult = await runWorker(["create-dead-lock", computeLockPath, String(deadPid), "0"]);
+            expect(createResult.code, createResult.stderr).toBe(0);
+            expect(existsSync(computeLockPath)).toBe(true);
+
+            const start = Date.now();
+            const computeResult = await runWorker([
+              "compute",
+              cachePath,
+              "crash-key",
+              "value-after-crash",
+              logPath,
+              "0",
+              generousStaleOptions
+            ]);
+            const elapsedMs = Date.now() - start;
+
+            expect(computeResult.code, computeResult.stderr).toBe(0);
+            expect(elapsedMs).toBeLessThan(5_000);
+            const parsed = JSON.parse(computeResult.stdout) as { value: string; cached: boolean };
+            expect(parsed.value).toBe("value-after-crash");
+
+            const cache = new FileCache<string>(new FileStateStore(), cachePath);
+            expect(cache.get("crash-key")).toBe("value-after-crash");
+          },
+          20_000
+        );
+
+        it("a same-process cache hit never invokes compute() at all, and does not acquire the compute lease", async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-compute-hit-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const cache = new FileCache<string>(new FileStateStore(), cachePath);
+          cache.set("already-there", "existing-value");
+          const { computeWithFileCache } = await import("../file-cache.js");
+          let computeCalls = 0;
+          const result = await computeWithFileCache(cache, "already-there", () => {
+            computeCalls++;
+            return "should-never-be-used";
+          });
+          expect(result).toEqual({ value: "existing-value", cached: true });
+          expect(computeCalls).toBe(0);
+        });
+      }
+    );
   }
 );

@@ -67,7 +67,10 @@ describe("computeRealityMatrix", () => {
         "  status: UNIT_TESTED",
         "  implementation_refs: []",
         "  test_refs:",
-        "    - proof.txt",
+        "    - path: proof.txt",
+        "      type: TEST_RESULT",
+        "      outcome: PASS",
+        "      verificationSource: 'npm test (vitest)'",
         "  proof_refs: []",
         ""
       ].join("\n")

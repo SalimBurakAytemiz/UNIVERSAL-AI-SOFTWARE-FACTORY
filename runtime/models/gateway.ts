@@ -145,6 +145,31 @@ export class UnsupportedProviderConfigurationError extends Error {
 }
 
 /**
+ * P1 fix (independent Codex review, "include opaque provider configuration
+ * in replacement identity"): thrown ONLY when a provider's OWN, opted-in
+ * `getBindingIdentity()` (bkz. `ModelProvider`'ın kendi fix notu) exists but
+ * returns something that cannot possibly serve as a canonical execution
+ * identity — a non-string, or an empty string. A provider that DECLARES it
+ * has opaque material state (by implementing this method at all) but then
+ * fails to actually supply a usable identity is worse than one that never
+ * declared it in the first place: the caller/reviewer would otherwise
+ * reasonably believe the opaque state IS being represented in the approval
+ * digest when it silently is not. Fail closed rather than fold in `""`/
+ * `undefined`/`"[object Object]"`-shaped garbage, which would satisfy
+ * neither "represents the difference" nor "collision-free".
+ */
+export class IncompleteProviderIdentityError extends Error {
+  constructor(id: string, reason: string) {
+    super(
+      `Provider '${id}' implements getBindingIdentity() but it ${reason}. A provider that opts into declaring ` +
+        `opaque/private material configuration must supply a genuine, non-empty, canonical identity string for ` +
+        `it — governed replacement is refused rather than silently fold in an unusable value (baseline section 147).`
+    );
+    this.name = "IncompleteProviderIdentityError";
+  }
+}
+
+/**
  * P1 fix (independent Codex review, "reject provider state omitted by the
  * approval fingerprint"): a JSON-serializable canonical shape produced by
  * `canonicalizeConfigValueForFingerprint()` below — never fed directly to
@@ -324,7 +349,52 @@ function canonicalizeConfigValueForFingerprint(
       }
     }
     stringKeys.sort();
-    symbolKeys.sort((a, b) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0));
+    // P1 fix (independent Codex review, "reject colliding symbol-key
+    // encodings"): a symbol-keyed property used to be labeled by
+    // `String(symbol)` alone — which reflects ONLY a symbol's DESCRIPTION,
+    // never its per-symbol identity. `Symbol("endpoint")` created twice
+    // produces two DISTINCT, mutually-unequal symbols that BOTH stringify
+    // to `"Symbol(endpoint)"` — so a config object keyed by both would
+    // canonicalize to the SAME `sym:Symbol(endpoint)` label twice, and the
+    // second `result[...] = ...` assignment below would SILENTLY OVERWRITE
+    // the first, dropping an entire distinct property (and its value) from
+    // the fingerprint with no error, no warning — two materially different
+    // configurations could then hash identically. `Symbol.for(key)`
+    // (registry symbols), by contrast, genuinely IS a collision-free,
+    // globally-stable identity: two calls to `Symbol.for("x")` always
+    // return the exact SAME symbol (per the ECMAScript global symbol
+    // registry's own contract), so `Symbol.keyFor()` is a faithful,
+    // deterministic label for it. A LOCAL (non-registered) symbol has NO
+    // such stable identity available to this function — canonicalizing it
+    // by description would silently reproduce the exact collision above,
+    // and canonicalizing it by object identity would not be REPRODUCIBLE
+    // (a fresh approval computation for the "same" logical config would
+    // never match). Per this finding's own instruction ("do NOT attempt
+    // magic introspection... for symbols that cannot be stably/canonically
+    // identified -> FAIL CLOSED"), a local symbol key therefore fails
+    // closed rather than risk ever silently dropping a distinct property.
+    const symbolLabels = new Map<symbol, string>();
+    for (const ownKey of symbolKeys) {
+      const registryKey = Symbol.keyFor(ownKey);
+      if (registryKey === undefined) {
+        throw new UnsupportedProviderConfigurationError(
+          id,
+          key,
+          new Error(
+            `symbol-keyed configuration property '${String(ownKey)}' is not a registered Symbol.for() symbol — a ` +
+              "local Symbol() has no collision-free, reproducible identity available for canonical fingerprinting " +
+              "(two distinct local symbols can share the same description) and is rejected rather than risk " +
+              "silently dropping a distinct property"
+          )
+        );
+      }
+      symbolLabels.set(ownKey, `sym:${registryKey}`);
+    }
+    symbolKeys.sort((a, b) => {
+      const la = symbolLabels.get(a)!;
+      const lb = symbolLabels.get(b)!;
+      return la < lb ? -1 : la > lb ? 1 : 0;
+    });
     const result: Record<string, CanonicalFingerprintValue> = {};
     for (const ownKey of stringKeys) {
       result[`str:${ownKey}`] = canonicalizeConfigValueForFingerprint(
@@ -335,7 +405,7 @@ function canonicalizeConfigValueForFingerprint(
       );
     }
     for (const ownKey of symbolKeys) {
-      result[`sym:${String(ownKey)}`] = canonicalizeConfigValueForFingerprint(
+      result[symbolLabels.get(ownKey)!] = canonicalizeConfigValueForFingerprint(
         (value as Record<PropertyKey, unknown>)[ownKey],
         id,
         key,
@@ -441,11 +511,33 @@ export function computeProviderReplacementIdentityDigest(
   id: string,
   resolvedAccessors: ReadonlyMap<PropertyKey, unknown> = resolveProviderAccessors(provider, id)
 ): string {
+  // P1 fix (independent Codex review, "include opaque provider
+  // configuration in replacement identity"): `canonicalProviderConfigFingerprint()`
+  // is faithful for everything `Reflect.ownKeys()` can see, but genuine
+  // `#private` fields and closure-captured state are invisible to every
+  // reflection API by design of the language — no amount of introspection
+  // here can recover them. A provider that carries such opaque,
+  // behaviorally material state opts into representing it by implementing
+  // `getBindingIdentity()` (bkz. `ModelProvider`'ın kendi fix notu); when
+  // present, its value is folded into the digest as an ADDITIONAL,
+  // independent component — never a replacement for the existing
+  // fingerprint, which remains the authoritative source for everything it
+  // CAN see. A provider that omits the method is presumed to have no such
+  // opaque state (the only workable default, since "does this provider
+  // have invisible state" is exactly what cannot be detected from outside).
+  const bindingIdentity = provider.getBindingIdentity?.();
+  if (provider.getBindingIdentity && (typeof bindingIdentity !== "string" || bindingIdentity.length === 0)) {
+    throw new IncompleteProviderIdentityError(
+      id,
+      typeof bindingIdentity !== "string" ? `returned a non-string value (${typeof bindingIdentity})` : "returned an empty string"
+    );
+  }
   return identityDigestOf([
     id,
     provider.constructor?.name ?? "unknown",
     provider.invoke.toString(),
-    canonicalProviderConfigFingerprint(provider, id, resolvedAccessors)
+    canonicalProviderConfigFingerprint(provider, id, resolvedAccessors),
+    bindingIdentity !== undefined ? `binding:${bindingIdentity}` : "no-opaque-binding-identity-declared"
   ]);
 }
 
@@ -547,6 +639,32 @@ function classifyProviderFailure(err: unknown): { readonly billingStatus: Provid
 export interface ModelProvider {
   readonly id: string;
   invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse>;
+  /**
+   * P1 fix (independent Codex review, "include opaque provider
+   * configuration in replacement identity"): `canonicalProviderConfigFingerprint()`
+   * (bkz. aşağısı) can only ever canonicalize what `Reflect.ownKeys()`
+   * exposes — genuine ECMAScript `#private` fields, values captured in a
+   * closure, and other opaque adapter-internal state are, BY DESIGN OF THE
+   * LANGUAGE, invisible to every reflection API this or any other module
+   * could use. Two provider instances of the SAME class differing ONLY in
+   * such invisible state would silently fingerprint identically — an
+   * approval genuinely granted for one materially different configuration
+   * could then authorize installing another. Rather than attempt any form
+   * of "magic introspection" of opaque state (impossible in general), a
+   * provider that carries behaviorally material state outside its own
+   * enumerable/non-enumerable own properties MUST implement this method,
+   * returning a canonical, deterministic, non-secret string identifying
+   * ALL such state (a stable fingerprint/hash is fine — sensitive values
+   * must never appear in plaintext here, since this value is folded
+   * directly into an audit-visible approval digest). A provider that omits
+   * this method is presumed to have NO such opaque state — bkz.
+   * `computeProviderReplacementIdentityDigest()`'in kendi fix notu for why
+   * this presumption, not a blanket fail-closed for every provider, is the
+   * correct default: `canonicalProviderConfigFingerprint()` already
+   * faithfully captures every kind of state a plain, ordinary provider
+   * object can have.
+   */
+  getBindingIdentity?(): string;
 }
 
 /**

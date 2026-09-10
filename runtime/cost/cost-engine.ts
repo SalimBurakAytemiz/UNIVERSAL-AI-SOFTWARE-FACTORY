@@ -1066,17 +1066,46 @@ export class CostEngine {
     return this.#recordSnapshot(snapshot, reservationId);
   }
 
+  /**
+   * P1 fix (independent Codex review, "refresh durable cost ledger state
+   * before authoritative reads"): `all()`/`totalFor()`/`total()`/
+   * `totalInWindow()` below used to read `this.#entries` DIRECTLY — for a
+   * persisted, shared-path `CostEngine`, that reflects only whatever THIS
+   * instance's own last mutation (or the constructor's initial
+   * `#loadFromStore()`) happened to load, never a SIBLING instance's
+   * already-durably-persisted spend recorded since. `#withDurableMutation()`
+   * already solves exactly this staleness for every MUTATING method (lock
+   * -> reload latest -> proceed); this wrapper reuses the IDENTICAL
+   * primitive for a READ — `#withDurableMutation()` never actually
+   * requires its callback to mutate anything, only that it run AFTER the
+   * lock is held and the latest durable state has been reloaded, which is
+   * precisely the property every authoritative read below now needs.
+   * `#lockDepth`'s existing reentrancy means a read called from INSIDE an
+   * already-locked transaction (e.g. `BudgetGuard`'s ceiling check running
+   * inside `withLedgerLock()`) never re-acquires or redundantly re-reloads
+   * — it simply observes the snapshot that OUTER transaction already
+   * refreshed. When no persistence is configured, this degrades to a
+   * plain synchronous call (`#withDurableMutation()`'s own no-persistence
+   * branch) — a single in-memory ledger has no sibling to go stale
+   * relative to.
+   */
+  #withDurableRead<R>(reader: () => R): R {
+    return this.#withDurableMutation(reader);
+  }
+
   all(): readonly CostEntry[] {
-    return this.#entries.map((e) => freezeRecord(e));
+    return this.#withDurableRead(() => this.#entries.map((e) => freezeRecord(e)));
   }
 
   /** Belirli bir kapsam (görev/ajan/proje) için toplam maliyeti hesaplar. */
   totalFor(scope: CostScope): number {
-    return this.#entries.filter((e) => matchesScope(e, scope)).reduce((sum, e) => sum + e.amountUsd, 0);
+    return this.#withDurableRead(() =>
+      this.#entries.filter((e) => matchesScope(e, scope)).reduce((sum, e) => sum + e.amountUsd, 0)
+    );
   }
 
   total(): number {
-    return this.#entries.reduce((sum, e) => sum + e.amountUsd, 0);
+    return this.#withDurableRead(() => this.#entries.reduce((sum, e) => sum + e.amountUsd, 0));
   }
 
   /**
@@ -1087,9 +1116,9 @@ export class CostEngine {
    * olduğundan basit bir string karşılaştırması yeterlidir.
    */
   totalInWindow(scope: CostScope, sinceIso: string): number {
-    return this.#entries
-      .filter((e) => matchesScope(e, scope) && e.timestamp >= sinceIso)
-      .reduce((sum, e) => sum + e.amountUsd, 0);
+    return this.#withDurableRead(() =>
+      this.#entries.filter((e) => matchesScope(e, scope) && e.timestamp >= sinceIso).reduce((sum, e) => sum + e.amountUsd, 0)
+    );
   }
 
   /**
@@ -1180,9 +1209,11 @@ export class CostEngine {
    * first place (bkz. `runtime/budget/budget.ts`'in `Reservation.scope`'ı).
    */
   getReservation(id: string): ReservationView | undefined {
-    const r = this.#reservations.get(id);
-    if (!r) return undefined;
-    return freezeRecord({ id, amountUsd: r.amountUsd, status: r.status });
+    return this.#withDurableRead(() => {
+      const r = this.#reservations.get(id);
+      if (!r) return undefined;
+      return freezeRecord({ id, amountUsd: r.amountUsd, status: r.status });
+    });
   }
 
   // P1 fix (34th independent review round, finding 2 / root class 1,
@@ -1638,13 +1669,15 @@ export class CostEngine {
    * paylaşılmayan bir toplamı vardı (bkz. bu dosyanın üstündeki fix notu).
    */
   reservedTotal(query: CostScope): number {
-    let total = 0;
-    for (const reservation of this.#reservations.values()) {
-      if (matchesScope(reservation.scope, query)) {
-        total += reservation.amountUsd;
+    return this.#withDurableRead(() => {
+      let total = 0;
+      for (const reservation of this.#reservations.values()) {
+        if (matchesScope(reservation.scope, query)) {
+          total += reservation.amountUsd;
+        }
       }
-    }
-    return total;
+      return total;
+    });
   }
 }
 

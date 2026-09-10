@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { detectTraceabilityIssues } from "../traceability.js";
+import { detectTraceabilityIssues, isOutcomeVerifiedEvidenceRef } from "../traceability.js";
 import { traceRequirements } from "../../cli/commands/trace-requirement.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -31,13 +31,15 @@ describe(
     });
 
     it("flags a requirement claiming PROOF_VERIFIED with no proof_refs", () => {
+      // P1 fix (independent Codex review, outcome-backed evidence): testRefs must be
+      // outcome-verified to satisfy the TEST claim at this rank; only proofRefs is missing here.
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R3",
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
-            testRefs: ["package.json"],
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
             proofRefs: []
           }
         ],
@@ -53,8 +55,8 @@ describe(
             id: "R4",
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
-            testRefs: ["package.json"],
-            proofRefs: ["package.json"]
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
           }
         ],
         repoRoot
@@ -145,15 +147,17 @@ describe(
       );
     });
 
-    it("no-regression: a structured evidence ref with a genuine PASS outcome DOES count as verified evidence", () => {
+    it("no-regression: a structured evidence ref with a genuine PASS outcome and named verificationSource DOES count as verified evidence", () => {
+      // P1 fix (independent Codex review, outcome-backed evidence): an outcome-bearing
+      // ref must also name its verificationSource — see isOutcomeVerifiedEvidenceRef().
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R-PASS",
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
-            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS" }],
-            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "CLEAN" }]
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "CLEAN", verificationSource: "npm test (vitest)" }]
           }
         ],
         repoRoot
@@ -161,14 +165,18 @@ describe(
       expect(issues).toHaveLength(0);
     });
 
-    it("no-regression: a structured ARTIFACT_REFERENCE with no outcome still counts (it makes no outcome claim to begin with)", () => {
+    it("no-regression: a structured ARTIFACT_REFERENCE with no outcome still counts for an implementation-level claim (it makes no outcome claim to begin with)", () => {
+      // P1 fix (independent Codex review, outcome-backed evidence): ARTIFACT_REFERENCE
+      // never satisfies a test/proof OUTCOME claim (see isOutcomeVerifiedEvidenceRef()),
+      // so this case is scoped to IMPLEMENTED, where implementationRefs legitimately
+      // keeps using the weaker existence-only check.
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R-ARTIFACT",
-            status: "UNIT_TESTED",
-            implementationRefs: ["package.json"],
-            testRefs: [{ path: "package.json", type: "ARTIFACT_REFERENCE" }],
+            status: "IMPLEMENTED",
+            implementationRefs: [{ path: "package.json", type: "ARTIFACT_REFERENCE" }],
+            testRefs: [],
             proofRefs: []
           }
         ],
@@ -178,13 +186,16 @@ describe(
     });
 
     it("no-regression: a genuinely-scoped, previously-accepted module directory (not the confinement root itself) still counts as evidence", () => {
+      // P1 fix (independent Codex review, outcome-backed evidence): testRefs
+      // must now carry an outcome-bearing structured ref to satisfy UNIT_TESTED;
+      // a bare-string ref makes no outcome claim at all (see isOutcomeVerifiedEvidenceRef).
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R-MODULE-DIR",
             status: "UNIT_TESTED",
             implementationRefs: ["runtime/audit"],
-            testRefs: ["runtime/audit"],
+            testRefs: [{ path: "runtime/audit", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
             proofRefs: []
           }
         ],
@@ -193,9 +204,13 @@ describe(
       expect(issues).toHaveLength(0);
     });
 
-    it("no-regression: a plain bare-string ref (the legacy shape) still resolves and counts exactly as before, when it exists and is not the root", () => {
+    it("no-regression: a plain bare-string ref (the legacy shape) still resolves and counts exactly as before, for an implementation-level claim", () => {
+      // P1 fix (independent Codex review, outcome-backed evidence): the legacy
+      // bare-string shape remains fully sufficient for implementationRefs
+      // (an existence claim), but can no longer alone satisfy a test/proof
+      // outcome claim — so this no-regression case is scoped to IMPLEMENTED.
       const issues = detectTraceabilityIssues(
-        [{ id: "R-LEGACY", status: "UNIT_TESTED", implementationRefs: ["package.json"], testRefs: ["package.json"], proofRefs: [] }],
+        [{ id: "R-LEGACY", status: "IMPLEMENTED", implementationRefs: ["package.json"], testRefs: [], proofRefs: [] }],
         repoRoot
       );
       expect(issues).toHaveLength(0);
@@ -242,14 +257,16 @@ describe(
       mkdirSync(join(root, "proofs", "x"), { recursive: true });
       writeFileSync(join(root, "proofs", "x", "proof.test.ts"), "// real file");
 
+      // P1 fix (independent Codex review, outcome-backed evidence): PROOF_VERIFIED
+      // requires an outcome-bearing testRefs/proofRefs entry, not a bare path.
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R10",
             status: "PROOF_VERIFIED",
             implementationRefs: ["proofs/x/proof.test.ts"],
-            testRefs: ["proofs/x/proof.test.ts"],
-            proofRefs: ["proofs/x/proof.test.ts"]
+            testRefs: [{ path: "proofs/x/proof.test.ts", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: "proofs/x/proof.test.ts", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
           }
         ],
         root
@@ -333,14 +350,16 @@ describe(
       mkdirSync(join(root, "runtime"), { recursive: true });
       writeFileSync(join(root, "runtime", "real.ts"), "// real");
 
+      // P1 fix (independent Codex review, outcome-backed evidence): the genuine
+      // ref must be outcome-bearing to satisfy PROOF_VERIFIED's test/proof claims.
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R15",
             status: "PROOF_VERIFIED",
             implementationRefs: ["runtime/real.ts"],
-            testRefs: ["does/not/exist", "runtime/real.ts"],
-            proofRefs: ["also/does/not/exist", "runtime/real.ts"]
+            testRefs: ["does/not/exist", { path: "runtime/real.ts", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: ["also/does/not/exist", { path: "runtime/real.ts", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
           }
         ],
         root
@@ -460,3 +479,97 @@ describe("detectTraceabilityIssues over the real requirement registry", () => {
     expect(issues).toEqual([]);
   });
 });
+
+describe(
+  "P1 fix (independent Codex review, 'require outcome-backed evidence references'): evidence " +
+    "existence must never be conflated with evidence SUCCESS for a test/proof-level claim",
+  () => {
+    it("BLOCKER regression, exact reproduction: an existing package.json cited as proof_refs cannot satisfy PROOF_VERIFIED", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-PKGJSON",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: ["package.json"],
+            proofRefs: ["package.json"]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue).sort()).toEqual(["MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort());
+    });
+
+    it("BLOCKER regression, exact reproduction: an existing, unexecuted test SOURCE file cannot satisfy PROOF_VERIFIED", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-UNEXECUTED",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: "runtime/requirements-traceability/__tests__/traceability.test.ts", type: "ARTIFACT_REFERENCE" }],
+            proofRefs: [{ path: "runtime/requirements-traceability/__tests__/traceability.test.ts", type: "ARTIFACT_REFERENCE" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue).sort()).toEqual(["MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort());
+    });
+
+    it("BLOCKER regression, exact reproduction: a FAILED test result artifact cannot satisfy PROOF_VERIFIED", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-FAILED",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "FAIL", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "FAIL", verificationSource: "npm test (vitest)" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue).sort()).toEqual(["MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort());
+    });
+
+    it("BLOCKER regression: a caller-written {type, outcome: PASS} with no stated verificationSource cannot satisfy PROOF_VERIFIED", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-NO-SOURCE",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "PASS" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue).sort()).toEqual(["MISSING_PROOF_REFS", "MISSING_TEST_REFS"].sort());
+    });
+
+    it("no-regression: a valid, signed/authoritative PASS artifact WITH a named verificationSource satisfies the corresponding evidence gate", () => {
+      const ref = { path: "package.json", type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest), full repository suite" };
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(true);
+
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-VALID",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [ref],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest), full repository suite" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues).toHaveLength(0);
+    });
+
+    it("a bare directory reference is rejected as proof — it never carries an outcome-bearing type", () => {
+      const ref = "runtime/audit";
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(false);
+    });
+  }
+);

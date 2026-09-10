@@ -21,7 +21,11 @@
               "type": "string",
               "enum": ["TEST_RESULT", "PROOF_RESULT", "SECURITY_RESULT", "REVIEW_RESULT", "ARTIFACT_REFERENCE"]
             },
-            "outcome": { "type": "string" }
+            "outcome": { "type": "string" },
+            "verificationSource": {
+              "type": "string",
+              "description": "Independent Codex review, 'require outcome-backed evidence references': names WHO/WHAT produced this outcome claim. Required by runtime/requirements-traceability/traceability.ts's isOutcomeVerifiedEvidenceRef() for any outcome-bearing type to satisfy UNIT_TESTED+/PROOF_VERIFIED+ claims."
+            }
           }
         }
       ]

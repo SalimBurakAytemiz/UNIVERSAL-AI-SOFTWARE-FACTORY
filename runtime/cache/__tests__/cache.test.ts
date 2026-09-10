@@ -153,4 +153,87 @@ describe("Cache / computeWithCache", () => {
       expect(() => cache.set("k", "v")).not.toThrow();
     });
   });
+
+  describe(
+    "P2 fix (independent Codex review's own narrow root-cause audit, same class as file-cache.ts's " +
+      "'deduplicate concurrent durable cache computations'): concurrent computeWithCache() calls for the " +
+      "SAME missing key must single-flight, never both run compute()",
+    () => {
+      it("BLOCKER regression, exact reproduction: two concurrent calls for the same missing key run compute() exactly once", async () => {
+        const cache = new Cache<string>();
+        let computeCalls = 0;
+        const compute = async () => {
+          computeCalls++;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return "computed-value";
+        };
+
+        const [first, second] = await Promise.all([
+          computeWithCache(cache, "shared-key", compute),
+          computeWithCache(cache, "shared-key", compute)
+        ]);
+
+        expect(computeCalls).toBe(1);
+        expect(first.value).toBe("computed-value");
+        expect(second.value).toBe("computed-value");
+        expect([first.cached, second.cached].sort()).toEqual([false, true]);
+        expect(cache.get("shared-key")).toBe("computed-value");
+      });
+
+      it("high-contention: 5 concurrent calls for the same missing key still run compute() exactly once", async () => {
+        const cache = new Cache<string>();
+        let computeCalls = 0;
+        const compute = async () => {
+          computeCalls++;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return "the-one-true-value";
+        };
+
+        const results = await Promise.all(
+          Array.from({ length: 5 }, () => computeWithCache(cache, "hot-key", compute))
+        );
+
+        expect(computeCalls).toBe(1);
+        for (const r of results) expect(r.value).toBe("the-one-true-value");
+        expect(results.filter((r) => !r.cached)).toHaveLength(1);
+      });
+
+      it("a compute() failure is never cached as a success, and does not permanently block a subsequent retry for the same key", async () => {
+        const cache = new Cache<string>();
+        let caught: unknown;
+        try {
+          await computeWithCache(cache, "flaky-key", () => {
+            throw new Error("simulated failure");
+          });
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toBe("simulated failure");
+
+        expect(cache.has("flaky-key")).toBe(false);
+
+        const retry = await computeWithCache(cache, "flaky-key", () => "recovered-value");
+        expect(retry).toEqual({ value: "recovered-value", cached: false });
+      });
+
+      it("no-regression: concurrent calls for DIFFERENT keys each compute independently", async () => {
+        const cache = new Cache<string>();
+        const calls: string[] = [];
+        const compute = async (key: string) => {
+          calls.push(key);
+          return `value-${key}`;
+        };
+
+        const [a, b] = await Promise.all([
+          computeWithCache(cache, "key-a", () => compute("key-a")),
+          computeWithCache(cache, "key-b", () => compute("key-b"))
+        ]);
+
+        expect(calls.sort()).toEqual(["key-a", "key-b"]);
+        expect(a).toEqual({ value: "value-key-a", cached: false });
+        expect(b).toEqual({ value: "value-key-b", cached: false });
+      });
+    }
+  );
 });

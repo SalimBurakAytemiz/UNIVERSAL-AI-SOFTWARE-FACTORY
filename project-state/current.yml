@@ -1394,6 +1394,84 @@ factory:
     does NOT invoke Codex itself, and did NOT create a new branch — all work stayed on
     claude/ai-factory-baseline-v1-seawq7.
 
+    UPDATE (P0 CLOSURE REMEDIATION round, "current 9 findings only", supersedes nothing above but is the LATEST
+    state): P0 REMAINS READY_FOR_INDEPENDENT_REVIEW (LOCKED_FOR_CLOSURE) — still NOT CLOSED. A further independent
+    Codex review found NINE actionable findings (5 P1, 4 P2), each fixed as one consolidated corrective batch,
+    individually regression-tested and bypass-verified (temporarily reverted the specific fix, confirmed exactly
+    the predicted new test(s) failed and no others, then restored and reconfirmed green): (1)
+    requirements-traceability/traceability.ts now requires OUTCOME-backed evidence (a non-`ARTIFACT_REFERENCE`
+    structured type with a genuine `PASS`/`CLEAN`/`SUCCESS` outcome AND a non-empty `verificationSource`) to
+    satisfy UNIT_TESTED+/PROOF_VERIFIED+ status claims via the new `isOutcomeVerifiedEvidenceRef()` — mere
+    existence (`package.json`, an unexecuted test source file, a bare directory) can no longer satisfy a
+    test/proof claim; `implementationRefs` deliberately keeps the weaker existence-only check. The real
+    `specification/requirements/P0-factory-kernel.yml` registry's 38 qualifying requirements (81 individual
+    test_refs/proof_refs entries) were migrated in place to the new structured, outcome-bearing shape — the SAME
+    underlying facts (these tests/proofs genuinely do pass, verified every round via `npm test`), now honestly
+    represented rather than upgraded on new evidence. (2) governance/phase-closure.ts now requires a structured
+    `IndependentReviewEvidence` record (reviewId/reviewerIdentity/reviewedCommitSha/reviewTimestamp/outcome/
+    evidenceRef, the last resolved through the same Evidence Gate) instead of a bare `independentReviewResult`
+    string, and cross-checks `reviewedCommitSha` against the attempt's own `closingCommitSha` — a review of one
+    commit can no longer close a different one. (3) the SAME file's `attemptPhaseClosure()` now runs a staged,
+    crash-recoverable commit protocol for a closing attempt (durable PREPARE intent -> ScopeLock.close() ->
+    persist Decision Ledger -> persist ScopeLock -> finalize manifest -> mark intent COMMITTED, ledger persisted
+    before ScopeLock specifically because `ScopeLock.loadFrom()` cross-validates against it), with a new
+    `recoverPendingPhaseClosure()` that completes or safely abandons a transaction interrupted between any two
+    stages — `ScopeLock.reconcileFromExistingDecision()` was added so recovery can re-establish state from
+    already-durable ledger evidence without re-recording it (which would throw `DuplicateDecisionError`).
+    (4) models/gateway.ts's provider-replacement identity digest now folds in an OPT-IN
+    `ModelProvider.getBindingIdentity()` when a provider implements it, for behaviorally material state (genuine
+    `#private` fields, closure-captured state) no reflection API can ever see — a provider that omits the method
+    is presumed to have no such opaque state (the only workable default, since "does this provider have invisible
+    state" cannot itself be detected); a provider that implements it but returns an empty/non-string value fails
+    closed (`IncompleteProviderIdentityError`). (5) the SAME file's nested config-fingerprint canonicalization now
+    rejects (fails closed, `UnsupportedProviderConfigurationError`) any symbol-keyed property whose symbol is not
+    a registered `Symbol.for()` symbol — a local `Symbol("x")` has no collision-free, reproducible label available
+    (two distinct local symbols can share one description), so it is refused rather than risk two materially
+    different configs silently colliding onto the same digest via `result[label] = ...` overwrite. (6)
+    policy-engine.ts's `addRule()` and (7) invariants/invariant-guard.ts's `register()` both now capture their
+    caller's evaluator/checker via `.bind()` and read `name`/`priority`/`id`/`description`/`severity` explicitly,
+    instead of `freezeRecord({ ...caller })` — a plain object spread copies only OWN enumerable properties, so a
+    CLASS-based `PolicyRule`/`InvariantDefinition` (evaluator/checker defined on the prototype, the idiomatic
+    class shape) used to silently lose its own behavior at registration, throwing `TypeError: ... is not a
+    function` the first time it ran. (8) cache/file-cache.ts's `computeWithFileCache()` now routes a cache-miss
+    through a new `FileCache.computeAndSet()` single-flight/lease protocol built on the ALREADY-hardened
+    `acquireFileLock()` primitive, keyed per-cache-key (a sha256 hash of the key, never the whole-cache lock) —
+    lock -> re-check the cache (a concurrent winner may have already computed and persisted it) -> only the lease
+    winner calls `compute()` -> persist -> release; a `compute()` failure is never cached as success and the
+    lease is always released in `finally`. (9) cost/cost-engine.ts's `all()`/`totalFor()`/`total()`/
+    `totalInWindow()`/`getReservation()`/`reservedTotal()` now route through a new `#withDurableRead()` (the SAME
+    lock-and-reload-latest primitive `#withDurableMutation()` already used for every mutating method, reused
+    verbatim for a read) — a persistent, shared-path `CostEngine` instance's authoritative reads no longer return
+    a stale construction-time/last-own-mutation in-memory snapshot when a sibling instance has since durably
+    persisted new spend/reservations; `#lockDepth`'s existing reentrancy means a read called from inside an
+    already-locked transaction (e.g. `BudgetGuard`'s ceiling check inside `withLedgerLock()`) never re-acquires or
+    redundantly re-reloads. The narrow root-cause audit (limited to these exact 8 shared root classes, per this
+    round's own explicit scope-discipline instruction) found TWO further items: (a) `cache/cache.ts`'s
+    `computeWithCache()` (the in-memory sibling of the just-fixed `file-cache.ts`) had the IDENTICAL
+    compute-outside-single-flight-protection gap — fixed with an in-process `inFlight: Map<string, Promise<T>>`
+    single-flight lease on the new `Cache.computeAndSet()` (no file lock needed: JS's single-threaded execution
+    model already guarantees no two synchronous calls can interleave between "check for an in-flight
+    computation" and "record this one as in-flight"), with its own deterministic regression tests (exact
+    reproduction, high-contention, compute-failure-not-cached, distinct-keys-compute-independently) and its own
+    bypass-verify cycle; (b) `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` performs three sequential
+    `stateStore.write()` calls (genome.json, organization.json, bootstrap.json) representing one logical
+    bootstrap transaction with no staged intent/recovery record, the SAME shape as finding 3 — but with NO
+    current consumer anywhere in `runtime/` that reads these files back and could misinterpret partial state (a
+    crash between writes leaves an inert, ignored partial directory, not a misread governance decision like
+    phase-closure.ts's real defect), so this is recorded honestly as a found-but-NOT-fixed item and routed to
+    backlog rather than implemented under this round's own scope-discipline instruction ("new architecture ...
+    route to backlog. Do not expand P0") — a full staged-transaction+recovery mechanism for it would be new
+    architecture disproportionate to a currently-unreachable defect, not a narrow fix of a reproducible
+    violation. Full required sequence green: lint, typecheck, build, 1530/1530 tests (51 files, up from 1492),
+    validate:requirements (46 schema-valid records, unchanged), history-and-current-tree-aware secret-scan (PASS),
+    Factory Doctor (READY), all 9 P0 proofs (13 assertions). No requirement status raised beyond what this
+    round's real evidence supports; P0's persisted Scope Lock state is UNCHANGED by this round (still
+    LOCKED_FOR_CLOSURE / READY_FOR_INDEPENDENT_REVIEW from round 35) — this round ran no phase-transition API
+    call, since it supplied no new independent review result of its own to act on. P0 remains explicitly NOT
+    CLOSED; the next step is an independent review of THIS exact commit. Per explicit instruction, this round
+    does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT
+    create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4362,6 +4440,16 @@ known_limitations:
     unrelated architecture work) — introducing agent-scoped model
     invocation end-to-end is a feature addition, not a bug fix within
     existing plumbing.
+  - >-
+    `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` performs three sequential durable writes
+    (project-genome/genome.json, organization/organization.json, state/bootstrap.json) with no staged
+    intent/recovery record — a crash between any two writes leaves a partial project directory. Found during the
+    P0 CLOSURE REMEDIATION (9-finding batch) round's own narrow root-cause audit (same shape as that round's
+    finding 3, "multi-file governance closure without recoverable transaction semantics") but deliberately NOT
+    fixed: no code anywhere in `runtime/` currently reads these three files back to decide "is this project
+    bootstrapped", so a crash-induced partial write is inert today, not a reproducible violation of any live
+    invariant — building a full staged-transaction+recovery mechanism for it now would be new architecture, not a
+    narrow fix. Route to backlog for whenever a real consumer of these files is introduced.
 
 blockers:
   - >-

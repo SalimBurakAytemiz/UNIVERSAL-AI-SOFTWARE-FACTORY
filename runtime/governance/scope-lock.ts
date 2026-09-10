@@ -244,6 +244,50 @@ export class ScopeLock {
    * required: relaxing scope back to "still under active work" cannot
    * itself violate an invariant the way locking/closing can.
    */
+  /**
+   * P1 fix (independent Codex review, "persist phase closure atomically
+   * with its manifest"): a crash-recovery-only entry point for
+   * `phase-closure.ts`'s `recoverPendingPhaseClosure()`. A durable
+   * closure transaction may crash AFTER its Decision Ledger evidence was
+   * already durably persisted (`this.#ledger.saveTo()` already ran in an
+   * earlier process) but BEFORE this ScopeLock's own `#phases` map — and
+   * therefore `scopeLockPath` on disk — captured the matching transition.
+   * Calling `close()` again to finish the job would throw
+   * `DuplicateDecisionError` (the ledger already has `decisionId`); this
+   * method instead re-establishes `#phases` from evidence that ALREADY,
+   * durably exists — it never itself calls `this.#ledger.record()` and
+   * therefore can never manufacture new ledger evidence, only reconcile
+   * state to match evidence that independently checks out. The validation
+   * mirrors `loadFrom()`'s own per-record cross-check exactly (project
+   * identity, expected `source` for the target state) so this can never
+   * be used to force a transition the ledger does not actually support.
+   */
+  reconcileFromExistingDecision(phaseId: string, state: PhaseLockState, reason: string, decisionId: string): PhaseLockRecord {
+    const decision = this.#ledger.get(decisionId);
+    if (!decision) {
+      throw new Error(
+        `reconcileFromExistingDecision: no Decision Ledger record for decisionId '${decisionId}' — this method ` +
+          `only reconciles a transition whose ledger evidence is ALREADY durably recorded, never a fresh one.`
+      );
+    }
+    if (decision.project !== phaseId) {
+      throw new Error(
+        `reconcileFromExistingDecision: decisionId '${decisionId}' is recorded against project ` +
+          `'${decision.project}', not phase '${phaseId}' — ledger evidence does not belong to this transition.`
+      );
+    }
+    const expectedSource = expectedLedgerSourceForPhaseState(state);
+    if (decision.source !== expectedSource) {
+      throw new Error(
+        `reconcileFromExistingDecision: decisionId '${decisionId}' was recorded by '${decision.source}', not ` +
+          `'${expectedSource}' — ledger evidence is stale or contradicts this transition.`
+      );
+    }
+    const record: MutablePhaseLockRecord = { phaseId, state, reason, updatedAt: new Date().toISOString(), decisionId };
+    this.#phases.set(phaseId, record);
+    return freezeRecord(record);
+  }
+
   reopen(phaseId: string, reason: string, decisionId: string): PhaseLockRecord {
     const record: MutablePhaseLockRecord = {
       phaseId,

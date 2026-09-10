@@ -1831,4 +1831,105 @@ describe("CostEngine", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (independent Codex review, 'refresh durable cost ledger state before authoritative reads'): " +
+      "a persistent/shared CostEngine's authoritative reads must observe the latest durable ledger state, " +
+      "not a stale construction-time or last-own-mutation snapshot",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: Engine A and Engine B share the same persistence file; A " +
+          "records cost; WITHOUT B performing any mutation of its own, B's total()/totalFor() must observe " +
+          "A's already-persisted cost",
+        () => {
+          const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-durable-read-"));
+          try {
+            const store = new FileStateStore();
+            const statePath = join(tempRoot, "cost-state.json");
+            const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+            const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+
+            expect(engineB.total()).toBe(0);
+
+            engineA.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 3 });
+
+            // B never mutated anything — the OLD behavior would have kept
+            // returning B's stale, empty-looking construction-time snapshot.
+            expect(engineB.total()).toBeCloseTo(3);
+            expect(engineB.totalFor({ taskId: "t1" })).toBeCloseTo(3);
+            expect(engineB.all()).toHaveLength(1);
+          } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+          }
+        }
+      );
+
+      it(
+        "BLOCKER regression: a budget precheck reading reservedTotal()/getReservation() on Engine B must see " +
+          "a reservation Engine A already durably created",
+        () => {
+          const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-durable-read-reservation-"));
+          try {
+            const store = new FileStateStore();
+            const statePath = join(tempRoot, "cost-state.json");
+            const engineA = new CostEngine(() => new Date(), { store, path: statePath });
+            const engineB = new CostEngine(() => new Date(), { store, path: statePath });
+
+            expect(engineB.reservedTotal({ taskId: "shared-task" })).toBe(0);
+            const reservation = engineA.createReservation({ taskId: "shared-task" }, 5);
+
+            expect(engineB.reservedTotal({ taskId: "shared-task" })).toBeCloseTo(5);
+            expect(engineB.getReservation(reservation.id)?.status).toBe("ACTIVE");
+          } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+          }
+        }
+      );
+
+      it("no-regression: totalInWindow() on Engine B also observes Engine A's already-persisted spend", () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-durable-read-window-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const fixedNow = new Date("2024-06-01T00:00:00.000Z");
+          const engineA = new CostEngine(() => fixedNow, { store, path: statePath });
+          const engineB = new CostEngine(() => fixedNow, { store, path: statePath });
+
+          engineA.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1.5 });
+
+          expect(engineB.totalInWindow({ taskId: "t1" }, "2024-01-01T00:00:00.000Z")).toBeCloseTo(1.5);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("no-regression: an in-memory-only engine's reads still work exactly as before (no persistence configured, nothing to refresh from)", () => {
+        const engine = new CostEngine();
+        engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 1 });
+        expect(engine.total()).toBeCloseTo(1);
+        expect(engine.all()).toHaveLength(1);
+        expect(engine.totalInWindow({ taskId: "t1" }, "2000-01-01T00:00:00.000Z")).toBeCloseTo(1);
+      });
+
+      it("no-regression: reads called from WITHIN an existing withLedgerLock() transaction still see that transaction's own already-reloaded snapshot (no double-lock, no re-entrant deadlock)", () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-durable-read-reentrant-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const engine = new CostEngine(() => new Date(), { store, path: statePath });
+          engine.record({ taskId: "t1", provider: "mock", modelId: "m1", amountUsd: 4 });
+
+          const result = engine.withLedgerLock(() => {
+            // Nested authoritative reads inside an already-held lock must
+            // not attempt to re-acquire it (a real file lock is not
+            // reentrant) — this must simply return normally.
+            return engine.total() + engine.totalFor({ taskId: "t1" });
+          });
+          expect(result).toBeCloseTo(8);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  );
 });

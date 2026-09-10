@@ -5,9 +5,12 @@ import { join } from "node:path";
 import {
   attemptPhaseClosure,
   readPhaseClosureManifest,
+  recoverPendingPhaseClosure,
   InvalidGovernanceIdentifierError,
   DuplicateClosureManifestError,
-  type PhaseClosureAttempt
+  type PhaseClosureAttempt,
+  type IndependentReviewEvidence,
+  type IndependentReviewResult
 } from "../phase-closure.js";
 import { ScopeLock } from "../scope-lock.js";
 import { FounderDecisionLedger } from "../../decisions/decision-ledger.js";
@@ -26,14 +29,38 @@ function dirtyGuard(): InvariantGuard {
   return guard;
 }
 
-function baseAttempt(overrides: Partial<PhaseClosureAttempt> = {}): PhaseClosureAttempt {
+const DEFAULT_COMMIT_SHA = "abc123def456";
+
+/** A structurally-complete, evidence-backed review record — `outcome` is the one field tests usually vary. */
+function reviewFor(outcome: IndependentReviewResult, overrides: Partial<IndependentReviewEvidence> = {}): IndependentReviewEvidence {
+  return {
+    reviewId: "rev-1",
+    reviewerIdentity: "independent-reviewer",
+    reviewedCommitSha: DEFAULT_COMMIT_SHA,
+    reviewTimestamp: new Date().toISOString(),
+    outcome,
+    evidenceRef: "review.log",
+    ...overrides
+  };
+}
+
+interface AttemptOverrides extends Partial<Omit<PhaseClosureAttempt, "independentReview" | "closingCommitSha">> {
+  /** Test-only shorthand: translated into a structurally-complete reviewFor(outcome) below. */
+  independentReviewResult?: IndependentReviewResult;
+  independentReview?: IndependentReviewEvidence;
+  closingCommitSha?: string;
+}
+
+function baseAttempt(overrides: AttemptOverrides = {}): PhaseClosureAttempt {
+  const { independentReviewResult, independentReview, closingCommitSha, ...rest } = overrides;
   return {
     phaseId: "P0",
     requestedBy: "test-suite",
     reason: "all gates passed",
     verificationEvidenceRefs: [],
-    independentReviewResult: "PENDING",
-    ...overrides
+    independentReview: independentReview ?? reviewFor(independentReviewResult ?? "PENDING"),
+    closingCommitSha: closingCommitSha ?? DEFAULT_COMMIT_SHA,
+    ...rest
   };
 }
 
@@ -52,11 +79,25 @@ describe("attemptPhaseClosure", () => {
       join(requirementsDir, "baseline.yml"),
       "- id: UASF-REQ-9200\n  title: x\n  description: x\n  source_baseline: 'BASELINE-V1 section 0'\n  category: P0\n  priority: LOW\n  status: DEFINED\n"
     );
+    writeFileSync(join(tempRoot, "review.log"), "independent review transcript");
     const ledger = new FounderDecisionLedger();
     const scopeLock = new ScopeLock(ledger);
     const store = new FileStateStore();
     const manifestDir = join(tempRoot, "phase-closures");
-    return { tempRoot, requirementsDir, ledger, scopeLock, store, manifestDir, invariantGuard: guard, rootDir: tempRoot };
+    const scopeLockPath = join(tempRoot, "scope-lock.json");
+    const ledgerPath = join(tempRoot, "decision-ledger.json");
+    return {
+      tempRoot,
+      requirementsDir,
+      ledger,
+      scopeLock,
+      store,
+      manifestDir,
+      invariantGuard: guard,
+      rootDir: tempRoot,
+      scopeLockPath,
+      ledgerPath
+    };
   }
 
   it("BLOCKER: REJECTED when no verification evidence references are supplied — tests-passed-alone is never sufficient", () => {
@@ -322,33 +363,276 @@ describe("attemptPhaseClosure", () => {
         }
       );
 
-      it("no-regression: when persistence succeeds, the manifest is written and THEN the phase closes, in that order", () => {
+      it(
+        "no-regression: the durable transaction intent is written BEFORE the final manifest, and the final " +
+          "manifest is written AFTER the ledger and ScopeLock are both durably persisted (independent Codex " +
+          "review, 'persist phase closure atomically with its manifest' — see attemptPhaseClosure()'s staged protocol)",
+        () => {
+          const deps = makeDeps();
+          const evidenceFile = join(deps.tempRoot, "proof.log");
+          writeFileSync(evidenceFile, "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const writeOrder: string[] = [];
+          const originalWrite = deps.store.write.bind(deps.store);
+          const observingStore: typeof deps.store = {
+            write: (path: string, data: unknown) => {
+              writeOrder.push(path);
+              originalWrite(path, data);
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+
+          const manifest = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+            "manifest-order",
+            "d2",
+            { ...deps, store: observingStore }
+          );
+
+          expect(manifest.outcome).toBe("CLOSED");
+          expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+
+          const manifestPath = deps.manifestDir + "/P0-manifest-order.json";
+          const intentPath = deps.manifestDir + "/P0-manifest-order.intent.json";
+          const intentIdx = writeOrder.indexOf(intentPath);
+          const ledgerIdx = writeOrder.indexOf(deps.ledgerPath);
+          const scopeLockIdx = writeOrder.indexOf(deps.scopeLockPath);
+          const manifestIdx = writeOrder.indexOf(manifestPath);
+
+          expect(intentIdx).toBeGreaterThanOrEqual(0);
+          expect(ledgerIdx).toBeGreaterThan(intentIdx);
+          expect(scopeLockIdx).toBeGreaterThan(ledgerIdx);
+          expect(manifestIdx).toBeGreaterThan(scopeLockIdx);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P1 fix (independent Codex review, 'persist phase closure atomically with its manifest'): crash recovery " +
+      "for a staged closure transaction interrupted between persistence stages",
+    () => {
+      it("a crash BEFORE the intent is written leaves the phase completely untouched — nothing to recover", () => {
         const deps = makeDeps();
-        const evidenceFile = join(deps.tempRoot, "proof.log");
-        writeFileSync(evidenceFile, "verification output");
+        writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        // No attemptPhaseClosure() call at all — simulates a crash before step (1).
+        const recovered = recoverPendingPhaseClosure("P0", "never-attempted", deps);
+        expect(recovered).toBeUndefined();
+        expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+      });
+
+      it(
+        "BLOCKER regression: a crash AFTER the intent is written but BEFORE the ledger/ScopeLock are durably " +
+          "persisted is completed by recovery, reaching a fully consistent CLOSED phase + matching ledger + " +
+          "finalized manifest",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          // A store whose write() persists everything EXCEPT the ledger and
+          // scope-lock paths — simulating a crash after step (1) (PREPARE)
+          // but before steps (3)/(4) ever reach disk. The manifest write at
+          // step (5) never happens either, since attemptPhaseClosure() only
+          // reaches it after (3)/(4) — so this reproduces exactly "crash
+          // right after PREPARE, before anything authoritative is durable".
+          const crashingStore: typeof deps.store = {
+            write: (path: string, data: unknown) => {
+              if (path === deps.ledgerPath || path === deps.scopeLockPath) {
+                throw new Error("simulated crash before durable ledger/scope-lock persistence");
+              }
+              deps.store.write(path, data);
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+              "manifest-crash-1",
+              "d2",
+              { ...deps, store: crashingStore }
+            )
+          ).toThrow("simulated crash");
+
+          // Scenario A still holds: no false CLOSED manifest exists yet.
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-crash-1")).toBeUndefined();
+
+          // Recovery, using the REAL store this time, completes the transaction.
+          const recovered = recoverPendingPhaseClosure("P0", "manifest-crash-1", deps);
+          expect(recovered?.outcome).toBe("CLOSED");
+          expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+          expect(deps.ledger.get("d2")).toBeDefined();
+          const finalManifest = readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-crash-1");
+          expect(finalManifest?.outcome).toBe("CLOSED");
+
+          // Idempotent: calling recovery again is a safe no-op.
+          const recoveredAgain = recoverPendingPhaseClosure("P0", "manifest-crash-1", deps);
+          expect(recoveredAgain?.outcome).toBe("CLOSED");
+        }
+      );
+
+      it(
+        "BLOCKER regression: a crash AFTER the ledger is durably persisted but BEFORE ScopeLock's own durable " +
+          "state captured it is completed by reconciling from the already-existing ledger evidence, never by " +
+          "re-recording the decision (which would throw DuplicateDecisionError)",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const crashingStore: typeof deps.store = {
+            write: (path: string, data: unknown) => {
+              if (path === deps.scopeLockPath) {
+                throw new Error("simulated crash before durable scope-lock persistence");
+              }
+              deps.store.write(path, data);
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+              "manifest-crash-2",
+              "d2",
+              { ...deps, store: crashingStore }
+            )
+          ).toThrow("simulated crash");
+
+          // The ledger IS already durable at this point (step 3 completed).
+          expect(deps.store.read(deps.ledgerPath)).toBeDefined();
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-crash-2")).toBeUndefined();
+
+          const recovered = recoverPendingPhaseClosure("P0", "manifest-crash-2", deps);
+          expect(recovered?.outcome).toBe("CLOSED");
+          expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+          // Reconciliation never re-recorded the decision — still exactly one ledger entry for it.
+          expect(deps.ledger.allFor("P0").filter((d) => d.decisionId === "d2")).toHaveLength(1);
+        }
+      );
+
+      it(
+        "no-regression: a crash AFTER the final manifest is already written is a pure no-op for recovery — " +
+          "the manifest is already sufficient proof of full commit (scenario B)",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const manifest = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+            "manifest-fully-committed",
+            "d2",
+            deps
+          );
+          expect(manifest.outcome).toBe("CLOSED");
+
+          const recovered = recoverPendingPhaseClosure("P0", "manifest-fully-committed", deps);
+          expect(recovered).toEqual(manifest);
+        }
+      );
+
+      it("a phase reopened since the crash abandons the pending intent rather than resurrecting a stale closure", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
         deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
 
-        const writeOrder: string[] = [];
-        const originalWrite = deps.store.write.bind(deps.store);
-        const observingStore: typeof deps.store = {
+        const crashingStore: typeof deps.store = {
           write: (path: string, data: unknown) => {
-            writeOrder.push("manifest-write");
-            originalWrite(path, data);
+            if (path === deps.ledgerPath || path === deps.scopeLockPath) {
+              throw new Error("simulated crash");
+            }
+            deps.store.write(path, data);
           },
           read: deps.store.read.bind(deps.store),
           exists: deps.store.exists.bind(deps.store)
         };
 
-        const manifest = attemptPhaseClosure(
-          baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
-          "manifest-order",
-          "d2",
-          { ...deps, store: observingStore }
-        );
+        expect(() =>
+          attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: ["proof.log"], independentReviewResult: "CLEAN" }),
+            "manifest-reopened",
+            "d2",
+            { ...deps, store: crashingStore }
+          )
+        ).toThrow("simulated crash");
 
+        // A human explicitly reopens the phase before recovery ever runs.
+        deps.scopeLock.reopen("P0", "reopened before recovery ran", "d-reopen");
+
+        const recovered = recoverPendingPhaseClosure("P0", "manifest-reopened", deps);
+        expect(recovered).toBeUndefined();
+        expect(deps.scopeLock.getState("P0")).toBe("OPEN");
+        expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-reopened")).toBeUndefined();
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (independent Codex review, 'verify independent review evidence before phase closure'): a bare " +
+      "outcome string can never satisfy closure — the review evidence must be structurally complete, resolve " +
+      "on disk, and match the exact commit being closed",
+    () => {
+      it("BLOCKER regression, exact reproduction: review evidence with no evidenceRef backing it cannot close a phase", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: ["proof.log"],
+            independentReview: reviewFor("CLEAN", { evidenceRef: "does/not/exist.log" })
+          }),
+          "m-bad-evidence",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("does not resolve"))).toBe(true);
+      });
+
+      it(
+        "BLOCKER regression, exact reproduction: a review of commit A must never be allowed to close commit B",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          const manifest = attemptPhaseClosure(
+            baseAttempt({
+              verificationEvidenceRefs: ["proof.log"],
+              independentReview: reviewFor("CLEAN", { reviewedCommitSha: "commit-A" }),
+              closingCommitSha: "commit-B"
+            }),
+            "m-wrong-commit",
+            "d2",
+            deps
+          );
+          expect(manifest.outcome).toBe("REJECTED");
+          expect(manifest.rejectionReasons.some((r) => r.includes("must never close a different commit"))).toBe(true);
+          expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+        }
+      );
+
+      it("no-regression: a fully-structured, evidence-backed review of the EXACT closing commit with outcome CLEAN closes the phase", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, "proof.log"), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: ["proof.log"],
+            independentReview: reviewFor("CLEAN"),
+            closingCommitSha: DEFAULT_COMMIT_SHA
+          }),
+          "m-valid-review",
+          "d2",
+          deps
+        );
         expect(manifest.outcome).toBe("CLOSED");
-        expect(writeOrder).toEqual(["manifest-write"]);
-        expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
       });
     }
   );

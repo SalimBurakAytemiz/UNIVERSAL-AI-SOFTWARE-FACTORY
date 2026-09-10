@@ -7,7 +7,8 @@ import {
   InvariantGuard,
   DuplicateInvariantIdError,
   createDefaultInvariantGuard,
-  type InvariantCheckResult
+  type InvariantCheckResult,
+  type InvariantDefinition
 } from "../invariant-guard.js";
 
 /** Mirrors orchestrator.test.ts's own helper — locates the REAL repo root from this test file's own location. */
@@ -165,7 +166,10 @@ describe("createDefaultInvariantGuard: 'requirement-registry-loads-cleanly' and 
         "  status: UNIT_TESTED",
         "  implementation_refs: []",
         "  test_refs:",
-        "    - proof.txt",
+        "    - path: proof.txt",
+        "      type: TEST_RESULT",
+        "      outcome: PASS",
+        "      verificationSource: 'npm test (vitest)'",
         "  proof_refs: []",
         ""
       ].join("\n")
@@ -199,3 +203,51 @@ describe("createDefaultInvariantGuard: 'policy-engine-default-deny'", () => {
     }
   });
 });
+
+describe(
+  "P1 fix (independent Codex review, 'preserve prototype invariant checks during registration'): a " +
+    "class-based InvariantDefinition whose check() lives on the prototype must not be silently dropped by register()",
+  () => {
+    it("BLOCKER regression, exact reproduction: a class-based InvariantDefinition registers successfully and runAll() executes its check normally", () => {
+      class AlwaysSatisfiedInvariant implements InvariantDefinition {
+        readonly id = "always-satisfied";
+        readonly description = "d";
+        readonly severity = "BLOCKING" as const;
+        check(): InvariantCheckResult {
+          return { satisfied: true, detail: "ok" };
+        }
+      }
+      const guard = new InvariantGuard();
+      guard.register(new AlwaysSatisfiedInvariant());
+      const report = guard.runAll();
+      expect(report.allBlockingSatisfied).toBe(true);
+      expect(report.violations).toHaveLength(0);
+    });
+
+    it("no-regression: caller mutation of the original instance after registration does not mutate the authoritative definition's id/description/severity", () => {
+      class MutableInvariant implements InvariantDefinition {
+        id = "mutable";
+        description = "original";
+        severity: "BLOCKING" | "WARNING" = "BLOCKING";
+        satisfied = false;
+        check(): InvariantCheckResult {
+          return { satisfied: this.satisfied, detail: "checked" };
+        }
+      }
+      const def = new MutableInvariant();
+      const guard = new InvariantGuard();
+      guard.register(def);
+      def.description = "tampered";
+      def.severity = "WARNING";
+      def.satisfied = true;
+      const [registered] = guard.list();
+      expect(registered.description).toBe("original");
+      expect(registered.severity).toBe("BLOCKING");
+      // check is bound to the ORIGINAL instance (bkz. register()'in fix
+      // notu) so it legitimately still reads `this.satisfied` off it —
+      // the finding requires the CHECKER ITSELF survive registration.
+      const report = guard.runAll();
+      expect(report.violations).toHaveLength(0);
+    });
+  }
+);

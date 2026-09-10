@@ -7,9 +7,9 @@
 // the actual cross-process lock file, PID-liveness machinery, or genuine
 // OS-level race timing at all. This file is only ever invoked by `tsx`
 // directly, never imported.
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { FileStateStore } from "../../../state/file-store.js";
-import { FileCache } from "../../file-cache.js";
+import { FileCache, computeWithFileCache } from "../../file-cache.js";
 import { acquireFileLock, type FileLockOptions } from "../../file-lock.js";
 
 function parseLockOptions(raw: string | undefined): FileLockOptions | undefined {
@@ -101,6 +101,52 @@ switch (mode) {
       "utf8"
     );
     process.exit(0);
+    break;
+  }
+  case "compute": {
+    // P2 fix (independent Codex review, "deduplicate concurrent durable
+    // cache computations"): calls the REAL `computeWithFileCache()` on a
+    // cache-miss key, appending to `logPath` exactly once per ACTUAL
+    // `compute()` invocation — the parent test counts lines in that file
+    // across MULTIPLE real processes racing the SAME key to prove the
+    // callback ran exactly once, not once per process.
+    const [cachePath, key, value, logPath, delayMsArg, lockOptionsArg] = rest;
+    const delayMs = delayMsArg ? Number(delayMsArg) : 0;
+    const cache = new FileCache<string>(new FileStateStore(), cachePath, parseLockOptions(lockOptionsArg));
+    computeWithFileCache(cache, key, () => {
+      appendFileSync(logPath, "1\n");
+      if (delayMs > 0) sleepSync(delayMs);
+      return value;
+    })
+      .then((result) => {
+        process.stdout.write(JSON.stringify(result));
+        process.exit(0);
+      })
+      .catch((err: unknown) => {
+        process.stderr.write(err instanceof Error ? (err.stack ?? err.message) : String(err));
+        process.exit(1);
+      });
+    break;
+  }
+  case "compute-fail": {
+    // Proves a compute() failure never gets silently cached as a success
+    // and never leaves the per-key lease permanently held (bkz.
+    // FileCache.computeAndSet()'in fix notu — the lease is released in a
+    // `finally`, so a subsequent caller must be able to proceed normally).
+    const [cachePath, key, logPath, lockOptionsArg] = rest;
+    const cache = new FileCache<string>(new FileStateStore(), cachePath, parseLockOptions(lockOptionsArg));
+    computeWithFileCache(cache, key, () => {
+      appendFileSync(logPath, "1\n");
+      throw new Error("simulated compute failure");
+    })
+      .then(() => {
+        process.stderr.write("expected compute() to throw, but computeWithFileCache resolved normally");
+        process.exit(1);
+      })
+      .catch((err: unknown) => {
+        process.stdout.write(err instanceof Error ? err.message : String(err));
+        process.exit(0);
+      });
     break;
   }
   case "race-reclaim": {

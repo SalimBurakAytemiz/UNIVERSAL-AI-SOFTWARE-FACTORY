@@ -78,16 +78,38 @@ export class InvariantGuard {
    */
   #invariants = new Map<string, InvariantDefinition>();
 
+  /**
+   * P1 fix (independent Codex review, "preserve prototype invariant checks
+   * during registration"): `freezeRecord({ ...def })` below (this method's
+   * own prior "detach the caller's own definition object" fix) copies only
+   * `def`'s OWN ENUMERABLE properties — a CLASS-based `InvariantDefinition`
+   * (`class SomeInvariant implements InvariantDefinition { check() { ... }
+   * }`) defines `check` on `SomeInvariant.prototype`, never as an own
+   * instance property, so `{ ...def }.check` is `undefined` and the frozen
+   * copy actually stored has NO checker at all — `runAll()` below would
+   * throw `TypeError: definition.check is not a function` the moment this
+   * invariant runs, silently breaking every legitimate class-based
+   * `InvariantDefinition` (the SAME root cause `policy-engine.ts`'s
+   * `addRule()` had for class-based `PolicyRule`s — bkz. o dosyanın fix
+   * notu). Fixed the identical way: `id`/`description`/`severity` are read
+   * explicitly (still detached from later caller mutation), and `check` is
+   * captured via `def.check.bind(def)` — an own, callable, bound value that
+   * survives being copied into a plain object and keeps working correctly
+   * if the checker legitimately reads its own `this` state.
+   */
   register(def: InvariantDefinition): void {
     if (this.#invariants.has(def.id)) {
       throw new DuplicateInvariantIdError(def.id);
     }
-    // Detach the caller's own definition object the same way
-    // policy-engine.ts's addRule() detaches registered PolicyRule objects
-    // (bkz. o dosyanın fix notu) — a caller mutating its original `def`
-    // reference after registration must not retroactively change what
-    // this guard checks.
-    this.#invariants.set(def.id, freezeRecord({ ...def }));
+    this.#invariants.set(
+      def.id,
+      freezeRecord({
+        id: def.id,
+        description: def.description,
+        severity: def.severity,
+        check: def.check.bind(def)
+      })
+    );
   }
 
   list(): readonly InvariantDefinition[] {

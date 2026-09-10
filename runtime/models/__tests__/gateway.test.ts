@@ -6,6 +6,7 @@ import {
   ProviderInvocationError,
   UnsafeProviderConfigurationError,
   UnsupportedProviderConfigurationError,
+  IncompleteProviderIdentityError,
   computeModelInvocationIdentityDigest,
   computeProviderReplacementIdentityDigest,
   type ModelInvocationResponse
@@ -2031,6 +2032,160 @@ describe("ModelGateway + MockProvider", () => {
           }
         }
         const provider = new OrdinaryArrayConfigProvider();
+        expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).not.toThrow();
+        expect(computeProviderReplacementIdentityDigest(provider, "mock")).toBe(
+          computeProviderReplacementIdentityDigest(provider, "mock")
+        );
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (independent Codex review, 'reject colliding symbol-key encodings'): two distinct symbols " +
+      "with the same description must never silently collapse onto the same fingerprint entry",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: two DISTINCT Symbol('endpoint') instances used as NESTED " +
+          "config keys, each holding a different value, are rejected as unsupported rather than silently " +
+          "dropping one of them",
+        () => {
+          class TwoDistinctSymbolsProvider implements ModelProvider {
+            readonly id = "mock";
+            config: Record<PropertyKey, string> = {};
+            constructor(a: string, b: string) {
+              // Two SEPARATE calls to Symbol() with the identical description
+              // produce two DISTINCT, mutually unequal symbols.
+              this.config[Symbol("endpoint")] = a;
+              this.config[Symbol("endpoint")] = b;
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+          const provider = new TwoDistinctSymbolsProvider("https://a.example.com", "https://b.example.com");
+          expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).toThrow(
+            UnsupportedProviderConfigurationError
+          );
+        }
+      );
+
+      it("no-regression: a REGISTERED Symbol.for() key has a stable, collision-free identity and is fully supported", () => {
+        class RegisteredSymbolProvider implements ModelProvider {
+          readonly id = "mock";
+          config: Record<PropertyKey, string>;
+          constructor(endpoint: string) {
+            this.config = { [Symbol.for("endpoint")]: endpoint };
+          }
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const good = new RegisteredSymbolProvider("https://good.example.com");
+        const evil = new RegisteredSymbolProvider("https://evil.example.com");
+        expect(() => computeProviderReplacementIdentityDigest(good, "mock")).not.toThrow();
+        expect(computeProviderReplacementIdentityDigest(good, "mock")).not.toBe(
+          computeProviderReplacementIdentityDigest(evil, "mock")
+        );
+        // The SAME registered key, same value, on a fresh instance -> identical fingerprint.
+        const goodAgain = new RegisteredSymbolProvider("https://good.example.com");
+        expect(computeProviderReplacementIdentityDigest(good, "mock")).toBe(
+          computeProviderReplacementIdentityDigest(goodAgain, "mock")
+        );
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (independent Codex review, 'include opaque provider configuration in replacement identity'): " +
+      "a provider's own explicit getBindingIdentity() contract represents behaviorally material state no " +
+      "reflection API can ever see (genuine #private fields, closure-captured state)",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: two same-class providers differing ONLY in a genuine " +
+          "#private field produce the SAME digest when the class does not implement getBindingIdentity() " +
+          "(the exact gap this finding identifies), but DIFFERENT digests once it does",
+        () => {
+          class OpaquePrivateProvider implements ModelProvider {
+            readonly id = "mock";
+            #endpoint: string;
+            constructor(endpoint: string) {
+              this.#endpoint = endpoint;
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: this.#endpoint };
+            }
+          }
+          const good = new OpaquePrivateProvider("https://good.example.com");
+          const evil = new OpaquePrivateProvider("https://evil.example.com");
+          // Without getBindingIdentity(), the #private field is genuinely
+          // invisible to every reflection API — no code change here could
+          // ever recover it without the provider's own cooperation.
+          expect(computeProviderReplacementIdentityDigest(good, "mock")).toBe(
+            computeProviderReplacementIdentityDigest(evil, "mock")
+          );
+
+          class DeclaredOpaqueProvider implements ModelProvider {
+            readonly id = "mock";
+            #endpoint: string;
+            constructor(endpoint: string) {
+              this.#endpoint = endpoint;
+            }
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: this.#endpoint };
+            }
+            getBindingIdentity(): string {
+              return `endpoint:${this.#endpoint}`;
+            }
+          }
+          const goodDeclared = new DeclaredOpaqueProvider("https://good.example.com");
+          const evilDeclared = new DeclaredOpaqueProvider("https://evil.example.com");
+          expect(computeProviderReplacementIdentityDigest(goodDeclared, "mock")).not.toBe(
+            computeProviderReplacementIdentityDigest(evilDeclared, "mock")
+          );
+        }
+      );
+
+      it("BLOCKER regression: a provider whose getBindingIdentity() returns an empty string is rejected — governed replacement fails closed", () => {
+        class BrokenIdentityProvider implements ModelProvider {
+          readonly id = "mock";
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+          getBindingIdentity(): string {
+            return "";
+          }
+        }
+        const provider = new BrokenIdentityProvider();
+        expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).toThrow(
+          IncompleteProviderIdentityError
+        );
+      });
+
+      it("BLOCKER regression: a provider whose getBindingIdentity() returns a non-string value is rejected — governed replacement fails closed", () => {
+        class NonStringIdentityProvider implements ModelProvider {
+          readonly id = "mock";
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+          getBindingIdentity(): string {
+            return null as unknown as string;
+          }
+        }
+        const provider = new NonStringIdentityProvider();
+        expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).toThrow(
+          IncompleteProviderIdentityError
+        );
+      });
+
+      it("no-regression: an ordinary provider that never implements getBindingIdentity() still computes a stable digest exactly as before", () => {
+        class OrdinaryProvider implements ModelProvider {
+          readonly id = "mock";
+          config = { retries: 3 };
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const provider = new OrdinaryProvider();
         expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).not.toThrow();
         expect(computeProviderReplacementIdentityDigest(provider, "mock")).toBe(
           computeProviderReplacementIdentityDigest(provider, "mock")

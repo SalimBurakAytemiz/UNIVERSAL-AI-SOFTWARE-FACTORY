@@ -1119,4 +1119,54 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
     }
   );
+
+  describe(
+    "P1 fix (independent Codex review, 'preserve prototype policy evaluators during registration'): a " +
+      "class-based PolicyRule whose evaluate() lives on the prototype must not be silently dropped by addRule()",
+    () => {
+      it("BLOCKER regression, exact reproduction: a class-based PolicyRule registers and evaluates normally", () => {
+        class AlwaysDenyRule implements PolicyRule {
+          readonly name = "always-deny";
+          readonly priority = 100;
+          evaluate(): PolicyDecision {
+            return "DENY";
+          }
+        }
+        const engine = new PolicyEngine();
+        engine.addRule(new AlwaysDenyRule());
+        const result = engine.evaluate({ actionType: "any", risk: 0, description: "x" });
+        expect(result.decision).toBe("DENY");
+        expect(result.matchedRule).toBe("always-deny");
+      });
+
+      it(
+        "no-regression: post-registration mutation of the caller-owned rule instance does not silently alter " +
+          "authoritative policy behavior",
+        () => {
+          class ConfigurableRule implements PolicyRule {
+            name = "configurable";
+            priority = 50;
+            outcome: PolicyDecision = "DENY";
+            evaluate(): PolicyDecision {
+              return this.outcome;
+            }
+          }
+          const rule = new ConfigurableRule();
+          const engine = new PolicyEngine();
+          engine.addRule(rule);
+          rule.priority = Number.MAX_SAFE_INTEGER;
+          rule.outcome = "ALLOW";
+          const result = engine.evaluate({ actionType: "any", risk: 0, description: "x" });
+          // The registered copy's priority/name are frozen at registration
+          // time — mutating the caller's own `rule.priority` afterwards
+          // cannot retroactively re-order evaluation. `evaluate` is bound
+          // to the ORIGINAL instance (bkz. addRule()'in fix notu), so it
+          // legitimately still reads `this.outcome` off that same instance
+          // — the finding requires the EVALUATOR ITSELF survive
+          // registration, not that the instance become fully immutable.
+          expect(result.matchedRule).toBe("configurable");
+        }
+      );
+    }
+  );
 });

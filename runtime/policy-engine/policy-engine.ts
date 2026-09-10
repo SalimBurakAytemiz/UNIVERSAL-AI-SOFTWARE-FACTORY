@@ -219,8 +219,39 @@ export class PolicyEngine {
    * function object's own closed-over behavior is unrelated, caller-
    * authored logic outside this engine's control either way.
    */
+  /**
+   * P1 fix (independent Codex review, "preserve prototype policy evaluators
+   * during registration"): `freezeRecord({ ...rule })` above (the 27th
+   * round's own "detach registered policy rules" fix) copies only rule's
+   * OWN ENUMERABLE properties — `Object.assign()`/spread semantics.
+   * `name`/`priority` are typically own instance properties (set in a
+   * constructor, or on a plain object literal) and therefore survive, but a
+   * CLASS-based `PolicyRule` (`class SomeRule implements PolicyRule {
+   * evaluate(action) { ... } }`) defines `evaluate` on `SomeRule.prototype`,
+   * never as an own property of the instance — `{ ...rule }.evaluate` is
+   * `undefined`, and the frozen copy this engine actually stores silently
+   * has NO evaluator at all. `evaluate()` below would then throw
+   * `TypeError: rule.evaluate is not a function` the moment this rule's
+   * turn comes up — an entire class of legitimate, idiomatic `PolicyRule`
+   * implementations (anything written as a class rather than a plain object
+   * literal with an arrow-function property) was silently broken. Fixed:
+   * `name`/`priority` are read explicitly (still detached, still immune to
+   * later caller mutation, exactly as the 27th round's fix intended), and
+   * `evaluate` is captured via `rule.evaluate.bind(rule)` — the SAME
+   * pattern `models/gateway.ts`'s `ProviderBinding` already uses for
+   * exactly this reason (bkz. `provider.invoke.bind(provider)`) — which
+   * both survives being copied into a plain object (a bound function is an
+   * own, callable value) AND keeps working correctly if the evaluator reads
+   * its own `this` state (a prototype method legitimately might).
+   */
   addRule(rule: PolicyRule): void {
-    this.#rules.push(freezeRecord({ ...rule }));
+    this.#rules.push(
+      freezeRecord({
+        name: rule.name,
+        priority: rule.priority,
+        evaluate: rule.evaluate.bind(rule)
+      })
+    );
   }
 
   get auditTrail(): AuditLog {

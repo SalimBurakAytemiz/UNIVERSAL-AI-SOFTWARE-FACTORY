@@ -6,6 +6,7 @@
 // ayrı bir process/instance önceden hesaplanmış bir sonucu yeniden kullanabilir
 // (Proof G'nin "restart sonrası da geçerli" kanıtı, bölüm 306).
 
+import { createHash } from "node:crypto";
 import type { StateStore } from "../state/file-store.js";
 import type { CacheEntry, CacheLookupResult } from "./cache.js";
 import { assertValidTtl } from "./cache.js";
@@ -183,6 +184,63 @@ export class FileCache<T = unknown> {
   size(): number {
     return this.loadAll().size;
   }
+
+  /**
+   * P2 fix (independent Codex review, "deduplicate concurrent durable
+   * cache computations"): a distinct lock path PER KEY (never the whole-
+   * cache `lockPath()` `set()`/`lookup()` already use for their own
+   * mutation critical sections, which would serialize EVERY key's compute
+   * against every other key's, defeating the point of a per-key lease) —
+   * derived by hashing the key so arbitrary caller-supplied strings (which
+   * may contain path separators, be extremely long, or collide with the
+   * `__proto__`-shaped concerns this file's own top-of-file note already
+   * documents for OTHER reasons) never need to be filesystem-safe
+   * themselves.
+   */
+  private computeLockPath(key: string): string {
+    return `${this.path}.compute.${createHash("sha256").update(key).digest("hex")}.lock`;
+  }
+
+  /**
+   * P2 fix (independent Codex review, "deduplicate concurrent durable
+   * cache computations"): `computeWithFileCache()` below used to
+   * `lookup()` (a MISS), then call `compute()` completely OUTSIDE any
+   * lock, then `set()` — two callers (in this process, or in two SEPARATE
+   * processes sharing this same durable cache file) racing the SAME
+   * cache-miss key could both observe the miss and both run `compute()`,
+   * defeating this cache's own documented reuse guarantee and, for a
+   * caller wrapping a paid model invocation, duplicating real spend.
+   * Fixed with a single-flight/lease protocol built on the ALREADY-
+   * HARDENED `acquireFileLock()` primitive (never a new, unrelated locking
+   * mechanism — this round's own explicit instruction): acquire a PER-KEY
+   * compute lease -> RE-CHECK the cache (another caller may have already
+   * computed and persisted this exact key while this one waited for the
+   * lease — reusing it here is what makes this "single-flight", not just
+   * "single-writer") -> only the lease WINNER actually calls `compute()`
+   * -> persist via the ordinary, already-locked `set()` -> release. If
+   * `compute()` throws, `set()` is never reached and the lease is still
+   * released in `finally` — a failure never gets silently cached as a
+   * success, and the next caller (or a retry) can immediately attempt its
+   * own fresh compute rather than deadlocking on a lease no one will ever
+   * release. Crash recovery (a process dying while holding this lease) is
+   * inherited for free from `acquireFileLock()`'s own already-hardened
+   * stale-lock reclamation (established across the 18th/20th/21st/22nd
+   * independent review rounds) — no new recovery logic is needed here.
+   */
+  async computeAndSet(key: string, compute: () => Promise<T> | T, ttlMs?: number): Promise<ComputeWithFileCacheResult<T>> {
+    const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
+    try {
+      const recheck = this.lookup(key);
+      if (recheck.found) {
+        return { value: recheck.value as T, cached: true };
+      }
+      const value = await compute();
+      this.set(key, value, ttlMs);
+      return { value, cached: false };
+    } finally {
+      release();
+    }
+  }
 }
 
 export interface ComputeWithFileCacheResult<T> {
@@ -207,7 +265,9 @@ export async function computeWithFileCache<T>(
   if (lookup.found) {
     return { value: lookup.value as T, cached: true };
   }
-  const value = await compute();
-  cache.set(key, value, ttlMs);
-  return { value, cached: false };
+  // P2 fix (independent Codex review, "deduplicate concurrent durable
+  // cache computations"): a MISS here no longer calls `compute()`
+  // directly — bkz. `FileCache.computeAndSet()`'in fix notu for the full
+  // single-flight/lease protocol this now routes through instead.
+  return cache.computeAndSet(key, compute, ttlMs);
 }
