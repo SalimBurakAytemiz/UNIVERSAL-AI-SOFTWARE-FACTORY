@@ -11,24 +11,38 @@
   source_baseline: "BASELINE-V1 section 318, 319"
   category: P0
   priority: CRITICAL
-  status: DEFINED
+  status: UNIT_TESTED
   implementation_refs: []
-  test_refs: []
+  test_refs:
+    - path: "runtime/cli/__tests__/repository-provenance.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — added and verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   proof_refs: []
   security_refs: []
   notes: >
     Performed manually at session start via git status/log; repository was
     effectively empty (single "Initial commit", one-line README, clean
-    working tree, no other branches/history). That observation is true and
-    remains recorded above, but it was never a re-checkable artifact — no
-    file, no test, no CI job backs it, only a one-time manual look. P1 fix
-    (30th independent review round, finding 7, "reject unverifiable
+    working tree, no other branches/history). That observation was true
+    when written but, for many rounds, was never a re-checkable artifact —
+    no file, no test, no CI job backed it, only a one-time manual look. P1
+    fix (30th independent review round, finding 7, "reject unverifiable
     free-text evidence references"): this requirement's status was
-    downgraded from PROOF_VERIFIED to DEFINED, since a prose claim like
-    "Session audit: ..." no longer counts as proof — no unsupported
-    upgrade is retained once the evidence bar it was never able to meet is
-    honestly enforced (baseline section 294, "no unsupported upgrades",
-    applies to keeping an upgrade, not only to making a new one).
+    downgraded from PROOF_VERIFIED to DEFINED then, since a prose claim
+    like "Session audit: ..." did not count as proof.
+    P1 fix (P0 final closure remediation, finding 1, "authoritative P0
+    registry is not closure-ready"): the underlying claim is actually
+    about durable GIT HISTORY, which every clone/CI run can re-derive
+    identically — so, unlike a one-time human observation, it genuinely
+    CAN be turned into a repeatable automated check. Added
+    `runtime/cli/__tests__/repository-provenance.test.ts`, which shells
+    out to `git` itself to confirm the repository has exactly one root
+    commit, that commit's subject is literally "Initial commit", and its
+    only change is the one-line README the original audit described —
+    the exact facts the `notes` field above asserts, now re-verified on
+    every test run rather than trusted from a one-time human's word.
+    Raised to UNIT_TESTED on that genuine, new evidence; this is not the
+    same unsupported prose upgrade the 30th round correctly rejected.
 
 - id: UASF-REQ-0002
   title: Public secret / hygiene audit
@@ -231,14 +245,30 @@
   source_baseline: "BASELINE-V1 section 292"
   category: P0
   priority: CRITICAL
-  status: IMPLEMENTED
+  status: UNIT_TESTED
   implementation_refs:
     - "specification/UNIVERSAL-AI-SOFTWARE-FACTORY-BASELINE-V1.md"
     - "specification/BASELINE.md"
     - "specification/CHANGELOG.md"
-  test_refs: []
+  test_refs:
+    - path: "runtime/cli/__tests__/repository-provenance.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — added and verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   proof_refs: []
   security_refs: []
+  notes: >
+    P1 fix (P0 final closure remediation, finding 1, "authoritative P0
+    registry is not closure-ready"): "stored verbatim" used to be an
+    unverified prose claim — nothing re-checked that the frozen tag
+    genuinely still resolved to the exact specification content, or that
+    BASELINE.md still named the real tag. Added
+    `runtime/cli/__tests__/repository-provenance.test.ts`, which re-derives
+    this from git itself: the `architecture-baseline-v1` annotated tag
+    resolves to a real ancestor of HEAD, the specification file's content
+    at that tag byte-matches the current working-tree file, and
+    BASELINE.md names that same tag and declares FROZEN. Raised to
+    UNIT_TESTED on that genuine evidence.
 
 - id: UASF-REQ-0004
   title: Baseline requirement registry
@@ -248,15 +278,32 @@
   source_baseline: "BASELINE-V1 section 293, 294"
   category: P0
   priority: CRITICAL
-  status: IMPLEMENTATION_IN_PROGRESS
+  status: UNIT_TESTED
   implementation_refs:
     - "schemas/requirement.schema.json"
     - "specification/requirements/P0-factory-kernel.yml"
   test_refs:
     - "scripts/validate-requirements.mjs"
+    - path: "runtime/cli/__tests__/baseline-status.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   proof_refs: []
   security_refs: []
-  notes: "P0-scope batch only; full 323-section decomposition deferred (see requirements/README.md)."
+  notes: >
+    P0-scope batch only; full 323-section decomposition deferred (see
+    requirements/README.md). P1 fix (P0 final closure remediation,
+    finding 1, "authoritative P0 registry is not closure-ready"): this
+    requirement's own promise — schema-validated records with stable,
+    unique IDs — is already genuinely, extensively tested by
+    `runtime/cli/__tests__/baseline-status.test.ts`'s
+    `loadRequirementsFromDir()` suite (fails closed on empty/malformed
+    registries, on schema violations, on an invalid status enum value,
+    and on duplicate IDs both within and across files — including against
+    the REAL registry, this file), which `scripts/validate-requirements.mjs`
+    itself delegates to. The status was stale, not the evidence; raised
+    to UNIT_TESTED by adding the missing test_ref, no implementation
+    change required.
 
 - id: UASF-REQ-0005
   title: Strict schemas, fail closed
@@ -266,7 +313,7 @@
   source_baseline: "BASELINE-V1 section 280"
   category: P0
   priority: HIGH
-  status: IMPLEMENTATION_IN_PROGRESS
+  status: UNIT_TESTED
   implementation_refs:
     - "schemas/requirement.schema.json"
     - "schemas/model.schema.json"
@@ -274,11 +321,33 @@
     - "runtime/project-genome/genome.ts"
   test_refs:
     - "scripts/validate-requirements.mjs"
-    - "runtime/models/__tests__/registry.test.ts"
-    - "runtime/project-genome/__tests__/genome.test.ts"
+    - path: "runtime/models/__tests__/registry.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
+    - path: "runtime/project-genome/__tests__/genome.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
+    - path: "runtime/cli/__tests__/baseline-status.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   proof_refs: []
   security_refs: []
-  notes: "Three schemas now demonstrate fail-closed validation (requirement, model, project-genome); still not every core entity listed in section 280 has one."
+  notes: >
+    Three schemas now demonstrate fail-closed validation (requirement,
+    model, project-genome); still not every core entity listed in
+    section 280 has one. P1 fix (P0 final closure remediation, finding
+    1): this was a stale-status case, not a missing-evidence one —
+    `registry.test.ts` already proves NaN/Infinity/negative model prices
+    are rejected before ever reaching the registry, `genome.test.ts`
+    already proves an invalid genome fails closed before any detachment
+    side effect leaks, and `baseline-status.test.ts` already proves an
+    empty/malformed/schema-invalid requirement registry is rejected.
+    Raised to UNIT_TESTED for what these schemas and tests actually,
+    already cover; the "not every core entity" gap remains honestly
+    disclosed above.
 
 - id: UASF-REQ-0006
   title: Factory CLI
@@ -288,14 +357,30 @@
   source_baseline: "BASELINE-V1 section 286"
   category: P0
   priority: HIGH
-  status: IMPLEMENTATION_IN_PROGRESS
+  status: UNIT_TESTED
   implementation_refs:
     - "runtime/cli"
   test_refs:
-    - "runtime/cli/__tests__"
+    - path: "runtime/cli/__tests__/doctor.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
+    - path: "runtime/cli/__tests__/baseline-status.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   proof_refs: []
   security_refs: []
-  notes: "Only a subset of the full command list in section 286 is implemented; remaining commands are future work."
+  notes: >
+    Only a subset of the full command list in section 286 is implemented
+    (`factory doctor` and `factory baseline status`); `factory status`,
+    `factory routing explain`, and `factory costs show` remain future
+    work — this gap is real and stays honestly disclosed, not upgraded.
+    P1 fix (P0 final closure remediation, finding 1): the two commands
+    that DO exist are genuinely, extensively tested (`doctor.test.ts`,
+    `baseline-status.test.ts`) — this was a stale-status case for the
+    implemented subset, not a missing-evidence one. Raised to UNIT_TESTED
+    for what is actually implemented and tested today.
 
 - id: UASF-REQ-0007
   title: Project Factory / Project OS foundation
@@ -895,7 +980,21 @@
   test_refs: []
   proof_refs: []
   security_refs: []
-  notes: "The Baseline Requirement Registry itself is the first instance of this engine's data model."
+  notes: >
+    The Baseline Requirement Registry itself is the first instance of
+    this engine's data model. P1 finding (P0 final closure remediation,
+    finding 1, "authoritative P0 registry is not closure-ready"):
+    genuinely investigated rather than status-upgraded on request —
+    `schemas/requirement.schema.json`'s `category` field is the
+    IMPLEMENTATION PHASE (P0/P1/P2/P3, baseline section 304), never the
+    BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL requirement-TYPE taxonomy
+    this requirement actually promises — no field for that taxonomy
+    exists anywhere in this registry today. This is a genuine
+    implementation gap, not a stale-status/missing-test case like the
+    other seven requirements in this same finding. Left at
+    IMPLEMENTATION_IN_PROGRESS rather than force-closed; remains a
+    legitimate P0 blocker until the type taxonomy is actually added to
+    the schema and a real record uses it.
 
 - id: UASF-REQ-0013
   title: Requirements traceability
@@ -1090,13 +1189,27 @@
   source_baseline: "BASELINE-V1 section 75"
   category: P0
   priority: MEDIUM
-  status: IMPLEMENTATION_IN_PROGRESS
+  status: PROOF_VERIFIED
   implementation_refs:
     - "runtime/event-bus"
   test_refs:
     - "runtime/event-bus/__tests__"
-  proof_refs: []
+  proof_refs:
+    - path: "proofs/event-driven-activation/proof.test.ts"
+      type: PROOF_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — re-verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   security_refs: []
+  notes: >
+    P1 fix (P0 final closure remediation, finding 1, "authoritative P0
+    registry is not closure-ready"): this requirement already had a real
+    P0 proof it was never credited for — `proofs/event-driven-activation/
+    proof.test.ts` (baseline section 306, Proof F+I) demonstrates exactly
+    this requirement's promise: an event-driven agent spends nothing while
+    idle and activates only for its own registered event type. Raised
+    from IMPLEMENTATION_IN_PROGRESS to PROOF_VERIFIED on that genuine,
+    pre-existing, already-passing evidence — no code change was needed,
+    only crediting the evidence that already existed.
 
 - id: UASF-REQ-0018
   title: Policy engine — ALLOW/DENY/APPROVAL_REQUIRED
@@ -1715,6 +1828,32 @@
     (double billing) that the earlier "no current reader of these files"
     reasoning had missed.
 
+    P1 fix (P0 FINAL CLOSURE REMEDIATION — ELEVEN REPRODUCED EXISTING-P0
+    FINDINGS, finding 9, "recovery/checkpoint identity omitting materially
+    relevant invocation identity"): the bootstrap-transaction checkpoint
+    finding 8 above added was keyed by `genome.project.id` ALONE. A retry
+    for the SAME project that had routed to a DIFFERENT model (a live
+    routing/registry change between attempts) still landed on the SAME
+    checkpoint entry as the first attempt, silently reusing the FIRST
+    model's already-billed response while the caller's own durable
+    bootstrap record went on to name the SECOND (never actually invoked)
+    model — an accounting/evidence mismatch between "which model produced
+    this result" and "which model this checkpoint claims was used," a
+    direct violation of the same "kalıcı durum" durability guarantee this
+    requirement tracks. Fixed: the checkpoint key now binds every
+    materially relevant part of the invocation
+    (`${projectId}:${provider}:${modelId}`), so a retry that changes
+    routing is correctly treated as a NEW governed transaction. New
+    regression tests in `orchestrator.test.ts` reproduce the exact
+    scenario (same project, first attempt routes to model A and completes,
+    a live registry change retires model A and adds model B, second
+    attempt for the SAME project routes to model B) and confirm model B is
+    genuinely invoked (not silently short-circuited by model A's stale
+    checkpoint), plus a no-regression same-project-same-model reuse case.
+    Bypass-verified: with the composite key reverted to the bare project
+    id, the exact predicted failure reproduced (model B's provider was
+    never invoked); restored and the full 75-test suite reconfirmed green.
+
 - id: UASF-REQ-0022
   title: Audit (foundation)
   description: Append-only audit log for policy/approval/budget decisions.
@@ -1816,6 +1955,36 @@
     element throws, and nested undefined values are stripped at any depth. Verified via a temporary bypass
     (disabling both the property-strip and the array-element rejection) — confirmed exactly the 2 predicted
     BLOCKER tests failed, then reverted and re-confirmed all 38 tests passing.
+
+    P1 fix (P0 FINAL CLOSURE REMEDIATION — ELEVEN REPRODUCED EXISTING-P0
+    FINDINGS, finding 10, "authoritative state mutation surviving when
+    mandatory audit publication fails"): `BudgetGuard.reserve()`
+    (runtime/budget/budget.ts) durably commits a reservation to the
+    CostEngine ledger BEFORE appending the corresponding
+    `BUDGET_RESERVATION_CREATED` audit event. Reproduced: if `auditLog.append()`
+    itself throws (a corrupted/durable-storage-backed `AuditLog`
+    implementation failing to write), the exception propagated straight out
+    of `reserve()` — the caller never received the `Reservation` handle and
+    therefore had no way to ever release it — yet the reservation remained
+    live in the ledger, permanently counted against every future ceiling
+    check via `reservedTotal()`: budget capacity reserved for work that,
+    from every caller's perspective, never started. Same root class this
+    codebase already closed for provider replacement (30th independent
+    review round, "provider replacement must rollback if audit fails") and
+    approval state (35th round, finding 2), applied here to budget
+    reservations. Fixed: if publishing the audit event throws, the
+    just-created reservation is immediately rolled back via
+    `releaseReservation()` (inside the SAME `withLedgerLock()` transaction,
+    so no sibling `reserve()`/ceiling check can observe the orphaned
+    reservation), and the original audit error is re-thrown. New regression
+    tests in `budget.test.ts` (using a `ThrowingAuditLog` subclass that
+    throws only on `BUDGET_RESERVATION_CREATED`) confirm `reserve()`
+    rejects, `reservedTotal()` returns to zero, and a fresh reservation for
+    the full ceiling then succeeds via a healthy-audit-log guard sharing the
+    same CostEngine — proof nothing was left behind. Bypass-verified: with
+    the rollback removed, the exact predicted failure reproduced (0.6
+    stranded instead of 0); restored and the full 148-test suite
+    reconfirmed green.
 
 - id: UASF-REQ-0023
   title: Artifact foundation
@@ -3962,7 +4131,7 @@
     - path: "runtime/cache/__tests__/file-cache.test.ts"
       type: TEST_RESULT
       outcome: PASS
-      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 CLOSURE REMEDIATION, 8-finding batch: findings 3/4, compute-lease renewal-during-async-work and stale-owner-release fencing via new compareAndSwapComputeLease())"
+      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 FINAL CLOSURE REMEDIATION, 11-finding batch: finding 11, compute lease TTL validation at construction; findings 2/5, durable completion checkpoint and stale-owner fencing)"
     - path: "runtime/cache/__tests__/file-cache.cross-process.test.ts"
       type: TEST_RESULT
       outcome: PASS
@@ -4623,6 +4792,40 @@
     their old `!== undefined` form) and of `assertValidTtl()`'s call sites — confirmed exactly the predicted sets
     of new tests failed in each case (no others), then reverted and reconfirmed all tests passing.
 
+    P1 fix (P0 FINAL CLOSURE REMEDIATION — ELEVEN REPRODUCED EXISTING-P0
+    FINDINGS, finding 11, "invalid lease timing configuration"):
+    `FileCache`'s `computeLeaseTtlMs` constructor parameter (distinct from
+    the ordinary per-entry `ttlMs` `assertValidTtl()` above governs) was
+    accepted completely unvalidated. Reproduced: `computeLeaseTtlMs: 0`
+    grants a compute lease that is already expired the instant it is
+    written (`Date.now() + 0`) — every concurrent contender's
+    `negotiateComputeOwnership()` sees it as immediately reclaimable and
+    proceeds to compute too, so two `FileCache` instances sharing one path
+    with `computeLeaseTtlMs: 0` both concurrently compute the same key,
+    defeating the exact mutual-exclusion guarantee findings 2/5 of this
+    same closure round depend on. NaN/Infinity/negative values are equally
+    nonsensical for a real wall-clock deadline; separately, an extreme but
+    finite positive value (e.g. `1`) derives a renewal interval
+    (`Math.max(1, Math.floor(ttlMs / 3))`) that lands at the SAME instant
+    as the lease's own expiry, a genuine race between "renew in time" and
+    "a waiting follower reclaims as stale." Fixed: a new
+    `assertValidComputeLeaseTtl()` (distinct from, and stricter than,
+    `assertValidTtl()` — 0 is destructive for a LEASE though valid for an
+    ordinary entry) runs once in the constructor, rejecting non-finite,
+    non-positive values and any value whose derived renewal interval would
+    not run strictly before its own expiry; `computeRenewalIntervalMs()` is
+    shared between this validator and `#computeCrossProcess()`'s own
+    renewal timer so the check is authoritative for what actually runs at
+    runtime. New regression tests in `file-cache.test.ts` prove
+    `computeLeaseTtlMs: 0` is rejected at construction (the BLOCKER
+    reproduction), NaN/Infinity/negative are rejected, a TTL of `1` is
+    rejected for its degenerate renewal interval, and the default plus
+    other genuinely valid custom TTLs still construct fine. Bypass-verified:
+    with the constructor validation call removed, the exact predicted 3
+    tests failed (the 4th, valid-TTL non-regression test was unaffected);
+    restored and the full 50-test `file-cache.test.ts` suite plus the
+    23-test cross-process suite reconfirmed green.
+
 - id: UASF-REQ-0037
   title: Service / integration catalog foundation
   description: Minimal catalog record shape for services/integrations (provider, purpose, owner, status).
@@ -4770,15 +4973,29 @@
   source_baseline: "BASELINE-V1 section 281, 285"
   category: P0
   priority: HIGH
-  status: IMPLEMENTATION_IN_PROGRESS
+  status: UNIT_TESTED
   implementation_refs:
     - "runtime/policy-engine/policy-engine.ts"
     - "runtime/models/router.ts"
     - "runtime/budget/budget.ts"
-  test_refs: []
+  test_refs:
+    - path: "runtime/policy-engine/__tests__/turkish-comment-standard.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest), full repository suite — added and verified in P0 FINAL CLOSURE REMEDIATION, 11-finding batch, finding 1"
   proof_refs: []
   security_refs: []
-  notes: "Applied to P0 kernel modules implemented this session; broader repo-wide coverage is ongoing."
+  notes: >
+    Applied to P0 kernel modules implemented this session; broader
+    repo-wide coverage is ongoing (33 of 42 non-test runtime/*.ts files
+    now carry Turkish-language comments, not yet all). P1 fix (P0 final
+    closure remediation, finding 1): the narrow claim this requirement's
+    own `implementation_refs` actually makes — that these three specific
+    files carry the required comments — is now genuinely, automatically
+    re-verified by `turkish-comment-standard.test.ts` rather than resting
+    on an unchecked prose note. Raised to UNIT_TESTED for that exact
+    claim; the broader repo-wide rollout remains honestly disclosed as
+    ongoing, not upgraded.
 
 - id: UASF-REQ-0040
   title: Factory Doctor

@@ -98,13 +98,33 @@ export class InvariantGuard {
    * if the checker legitimately reads its own `this` state.
    */
   register(def: InvariantDefinition): void {
-    if (this.#invariants.has(def.id)) {
-      throw new DuplicateInvariantIdError(def.id);
+    // P1 fix (P0 final closure remediation, finding 3, "invariant
+    // registration identity must be immutable"): reproduced — `def.id`
+    // used to be read THREE separate times (`.has(def.id)`, the object
+    // literal's `id: def.id`, and `.set(def.id, ...)`). `InvariantDefinition.id`
+    // is a plain interface property, not required to be an own data
+    // field — a caller-supplied `def` whose `id` is a GETTER can legally
+    // return a DIFFERENT value on each read (e.g. `"unused"` for the
+    // duplicate check, then `"protected"` for storage), so a malicious or
+    // buggy registration could pass the `.has()` guard under one identity
+    // and silently REPLACE an already-registered, security-relevant
+    // invariant under another — exactly the "reread a caller-controlled
+    // accessor between validation and storage" class this codebase has
+    // already closed elsewhere (bkz. `policy-engine.ts`'in risk-snapshot
+    // fix notu, `gateway.ts`'in çeşitli execution-scope fix notları).
+    // Fixed: `id` is captured ONCE into a local, immutable binding before
+    // any check or storage happens, and every subsequent use (the
+    // duplicate check, the frozen record's own `id` field, and the map
+    // key) reads that SAME captured value — a getter can no longer answer
+    // differently across the two steps.
+    const id = def.id;
+    if (this.#invariants.has(id)) {
+      throw new DuplicateInvariantIdError(id);
     }
     this.#invariants.set(
-      def.id,
+      id,
       freezeRecord({
-        id: def.id,
+        id,
         description: def.description,
         severity: def.severity,
         check: def.check.bind(def)

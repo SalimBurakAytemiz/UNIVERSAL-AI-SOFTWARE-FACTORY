@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { FileStateStore } from "../../state/file-store.js";
-import { FileCache, computeWithFileCache } from "../file-cache.js";
+import { FileCache, computeWithFileCache, InvalidComputeLeaseTtlError } from "../file-cache.js";
 import { InvalidTtlError } from "../cache.js";
 
 /** Mirrors FileCache's own private computeLeasePath() exactly, so a test can inspect/fabricate the durable lease record directly. */
@@ -663,6 +663,223 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
         // never blocked waiting out the original 10s TTL.
         const result = await cache.computeAndSet("retry-key", () => "recovered-value");
         expect(result).toEqual({ value: "recovered-value", cached: false });
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 2, 'paid bootstrap checkpoint must be atomic with provider " +
+      "completion'): a persistence failure on the main cache write must never let a retry invoke compute() " +
+      "(the real, billable provider) a second time for work already paid for",
+    () => {
+      it("BLOCKER regression, exact reproduction: the main cache's durable write fails once after compute() succeeds; a subsequent retry recovers the already-computed value without calling compute() again", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-atomic-checkpoint-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const realStore = new FileStateStore();
+        let failNextWriteToMainFile = true;
+        const flakyStore = {
+          read: realStore.read.bind(realStore),
+          exists: realStore.exists.bind(realStore),
+          write: (path: string, data: unknown) => {
+            if (path === cachePath && failNextWriteToMainFile) {
+              failNextWriteToMainFile = false;
+              throw new Error("simulated transient store failure on the main cache file");
+            }
+            realStore.write(path, data);
+          }
+        };
+        const cache = new FileCache<{ readonly costUsd: number }>(flakyStore, cachePath, undefined, 10_000);
+
+        let providerCalls = 0;
+        const compute = () => {
+          providerCalls++;
+          return { costUsd: 0.25 };
+        };
+
+        // First attempt: compute() succeeds (the provider is genuinely
+        // billed), but the main cache write fails — this attempt is
+        // expected to surface that failure rather than silently succeed,
+        // exactly like the original unfixed behavior did for THIS attempt.
+        await expect(cache.computeAndSet("project-x", compute)).rejects.toThrow(
+          "simulated transient store failure on the main cache file"
+        );
+        expect(providerCalls).toBe(1);
+
+        // Second attempt (the caller's retry, exactly as bootstrapProject()
+        // would be retried): must recover the SAME already-billed result
+        // from the durable lease checkpoint — never invoke compute() again.
+        const retryResult = await cache.computeAndSet("project-x", compute);
+        expect(providerCalls).toBe(1);
+        expect(retryResult.value).toEqual({ costUsd: 0.25 });
+
+        let totalCostUsd = 0;
+        for (let i = 0; i < providerCalls; i++) totalCostUsd += 0.25;
+        expect(totalCostUsd).toBe(0.25);
+      });
+
+      it("no-regression: when the main cache write succeeds normally, the completed value is reflected in the main cache file (not just the lease) and a later lookup finds it without touching compute() at all", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-atomic-checkpoint-heal-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const stateStore = new FileStateStore();
+        const cache = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+
+        let calls = 0;
+        await cache.computeAndSet("k", () => {
+          calls++;
+          return "v";
+        });
+        expect(calls).toBe(1);
+        expect(cache.get("k")).toBe("v");
+
+        // A fresh instance sharing the same durable path (simulating a
+        // new process) must see the healed main-cache entry directly,
+        // never needing to consult the lease file at all.
+        const otherInstance = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+        expect(otherInstance.get("k")).toBe("v");
+      });
+
+      it("no-regression: the completed-lease recovery path also heals a still-missing main cache entry once it eventually succeeds", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-atomic-checkpoint-heal2-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const realStore = new FileStateStore();
+        let failMainWrites = true;
+        const flakyStore = {
+          read: realStore.read.bind(realStore),
+          exists: realStore.exists.bind(realStore),
+          write: (path: string, data: unknown) => {
+            if (path === cachePath && failMainWrites) {
+              throw new Error("main cache file still unwritable");
+            }
+            realStore.write(path, data);
+          }
+        };
+        const cache = new FileCache<string>(flakyStore, cachePath, undefined, 10_000);
+
+        await expect(cache.computeAndSet("k", () => "v")).rejects.toThrow();
+        // The main cache file genuinely has no entry yet.
+        expect(realStore.read(cachePath)).toBeUndefined();
+
+        // Now the store recovers — the retry heals the main cache from
+        // the durable lease record, without recomputing.
+        failMainWrites = false;
+        let calls = 0;
+        const result = await cache.computeAndSet("k", () => {
+          calls++;
+          return "should-never-run";
+        });
+        expect(calls).toBe(0);
+        expect(result.value).toBe("v");
+        expect(cache.get("k")).toBe("v");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 5, 'successful stale compute-lease owners must not " +
+      "commit'): a compute() call whose lease was reclaimed by a successor WHILE it was still running must " +
+      "never overwrite the successor's already-committed result",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: owner A's lease is replaced by successor B's lease (with B's " +
+          "own already-completed result) while A's compute() is still in flight; A's own stale result must " +
+          "never be committed over B's",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-stale-owner-commit-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const stateStore = new FileStateStore();
+          const cache = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+          const leasePath = computeLeasePathFor(cachePath, "shared-key");
+
+          const result = await cache.computeAndSet("shared-key", () => {
+            // At this point A has already claimed ownership and persisted
+            // its own lease. Simulate a successor B having reclaimed the
+            // key (this lease was legitimately treated as abandoned) AND
+            // already completed and committed its own genuine result —
+            // exactly the race finding 5 describes, without needing a
+            // real timing race.
+            const ownersLease = stateStore.read<{ ownerId: string }>(leasePath);
+            expect(ownersLease).toBeDefined();
+            stateStore.write(leasePath, {
+              ownerId: "successor-B",
+              expiresAt: Date.now() + 60_000,
+              completed: true,
+              value: "B-value"
+            });
+            return "A-stale-value";
+          });
+
+          // A's own (stale) result must never win — B's already-committed
+          // result must be what both the return value AND the main cache
+          // reflect.
+          expect(result.value).toBe("B-value");
+          expect(cache.get("shared-key")).toBe("B-value");
+        }
+      );
+
+      it("no-regression: an owner that genuinely still holds its lease when compute() finishes commits normally", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-stale-owner-commit-noregression-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const cache = new FileCache<string>(new FileStateStore(), cachePath, undefined, 10_000);
+        const result = await cache.computeAndSet("k", () => "genuine-value");
+        expect(result).toEqual({ value: "genuine-value", cached: false });
+        expect(cache.get("k")).toBe("genuine-value");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 11, 'invalid lease timing configuration'): a compute lease " +
+      "TTL of 0 (or NaN/Infinity/negative, or one too short for its own derived renewal interval to precede " +
+      "expiry) must be rejected at construction, not silently destroy mutual exclusion at runtime",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: two FileCache instances sharing ONE path with " +
+          "computeLeaseTtlMs = 0 both concurrently compute the same key, since a lease that expires the " +
+          "instant it is granted excludes no one",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-zero-lease-ttl-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const store = new FileStateStore();
+
+          expect(() => new FileCache<string>(store, cachePath, undefined, 0)).toThrow(InvalidComputeLeaseTtlError);
+        }
+      );
+
+      it("rejects NaN, Infinity, and negative compute lease TTLs at construction", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-invalid-lease-ttl-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const store = new FileStateStore();
+
+        expect(() => new FileCache<string>(store, cachePath, undefined, NaN)).toThrow(InvalidComputeLeaseTtlError);
+        expect(() => new FileCache<string>(store, cachePath, undefined, Infinity)).toThrow(
+          InvalidComputeLeaseTtlError
+        );
+        expect(() => new FileCache<string>(store, cachePath, undefined, -1)).toThrow(InvalidComputeLeaseTtlError);
+      });
+
+      it(
+        "rejects a compute lease TTL so short its derived renewal interval would not run strictly before the " +
+          "lease's own expiry",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-thrashing-lease-ttl-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const store = new FileStateStore();
+
+          // renewalIntervalMs = max(1, floor(1/3)) = 1, which does NOT run
+          // strictly before a 1ms expiry — the renewal and the expiry land
+          // at the exact same instant.
+          expect(() => new FileCache<string>(store, cachePath, undefined, 1)).toThrow(InvalidComputeLeaseTtlError);
+        }
+      );
+
+      it("no regression: the default compute lease TTL, and other genuinely valid custom TTLs, still construct fine", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-valid-lease-ttl-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const store = new FileStateStore();
+
+        expect(() => new FileCache<string>(store, cachePath)).not.toThrow();
+        expect(() => new FileCache<string>(store, cachePath, undefined, 10_000)).not.toThrow();
+        expect(() => new FileCache<string>(store, cachePath, undefined, 3)).not.toThrow();
       });
     }
   );

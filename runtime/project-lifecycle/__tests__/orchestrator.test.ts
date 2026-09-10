@@ -2578,7 +2578,11 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           const transactionsPath = join(tempRoot, "bootstrap-transactions.json");
           expect(existsSync(transactionsPath)).toBe(true);
           const transactionCache = new FileCache<{ costUsd: number }>(new FileStateStore(), transactionsPath);
-          const persistedInvocation = transactionCache.get(projectId);
+          // P1 fix (P0 final closure remediation, finding 9): the checkpoint
+          // key is now `${projectId}:${provider}:${modelId}`, not the bare
+          // projectId — bkz. orchestrator.ts'in bootstrapTransactionKey fix
+          // notu.
+          const persistedInvocation = transactionCache.get(`${projectId}:counting:counting-summarizer`);
           expect(persistedInvocation).toBeDefined();
           expect(persistedInvocation?.costUsd).toBe(0.6);
 
@@ -2679,6 +2683,164 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           // transaction record is keyed separately by its own projectId.
           expect(invocationCount()).toBe(2);
           expect(resultB.totalCostUsd).toBe(0.6);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 9, 'bootstrap checkpoint must be bound to invocation " +
+      "identity'): a retry for the SAME project that routes to a DIFFERENT model must never reuse the first " +
+      "model's cached response while the durable record claims the second model was used",
+    () => {
+      function gatewayWithCountingProviders(): {
+        gateway: ModelGateway;
+        callsA: () => number;
+        callsB: () => number;
+      } {
+        let countA = 0;
+        let countB = 0;
+        const providerA: ModelProvider = {
+          id: "provider-a",
+          async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+            countA++;
+            return { modelId: model.modelId, provider: "provider-a", costUsd: 0.4, output: `A:${request.prompt}` };
+          }
+        };
+        const providerB: ModelProvider = {
+          id: "provider-b",
+          async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+            countB++;
+            return { modelId: model.modelId, provider: "provider-b", costUsd: 0.4, output: `B:${request.prompt}` };
+          }
+        };
+        const gateway = new ModelGateway();
+        gateway.registerProvider(providerA);
+        gateway.registerProvider(providerB);
+        return { gateway, callsA: () => countA, callsB: () => countB };
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: bootstrap for a project first routes to model A and completes; " +
+          "a second bootstrap for the SAME project (simulating a live routing change) that routes to model B " +
+          "must genuinely invoke model B — never silently reuse model A's already-cached response",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-model-switch-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "provider-a",
+            modelId: "model-a",
+            tier: "MOCK",
+            costPerCall: 0.4,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const { gateway: modelGateway, callsA, callsB } = gatewayWithCountingProviders();
+          const projectId = "proj-bootstrap-model-switch";
+
+          const resultA = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+          expect(callsA()).toBe(1);
+          expect(callsB()).toBe(0);
+          expect(resultA.totalCostUsd).toBe(0.4);
+
+          // Simulate a live routing/registry change between attempts: the
+          // SAME project now routes to a DIFFERENT model (provider-b).
+          registry.register({
+            provider: "provider-b",
+            modelId: "model-b",
+            tier: "MOCK",
+            costPerCall: 0.4,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          registry.updateStatus("model-a", "RETIRED");
+
+          const resultB = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          // Model B must have been genuinely invoked — not silently
+          // short-circuited by model A's stale checkpoint entry. totalCostUsd
+          // is the project's CUMULATIVE cost (costEngine.totalFor()), so it
+          // reflects BOTH genuine, distinct charges — 0.4 (model A) + 0.4
+          // (model B) — never the single stale charge the defect reproduced.
+          expect(callsA()).toBe(1);
+          expect(callsB()).toBe(1);
+          expect(resultB.totalCostUsd).toBe(0.8);
+
+          const transactionsPath = join(tempRoot, "bootstrap-transactions.json");
+          const transactionCache = new FileCache<{ provider: string; modelId: string; costUsd: number }>(
+            new FileStateStore(),
+            transactionsPath
+          );
+          const persistedA = transactionCache.get(`${projectId}:provider-a:model-a`);
+          const persistedB = transactionCache.get(`${projectId}:provider-b:model-b`);
+          expect(persistedA?.provider).toBe("provider-a");
+          expect(persistedB?.provider).toBe("provider-b");
+        }
+      );
+
+      it(
+        "no regression: a retry for the SAME project that routes to the SAME model reuses the existing " +
+          "checkpoint and does not invoke the model a second time",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-same-model-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "provider-a",
+            modelId: "model-a",
+            tier: "MOCK",
+            costPerCall: 0.4,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const { gateway: modelGateway, callsA } = gatewayWithCountingProviders();
+          const projectId = "proj-bootstrap-same-model";
+
+          mkdirSync(join(tempRoot, projectId), { recursive: true });
+          writeFileSync(join(tempRoot, projectId, "state"), "not a directory");
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome(projectId),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: registry,
+              modelGateway,
+              budgetLimits: { perTaskUsd: 10 }
+            })
+          ).rejects.toThrow();
+          expect(callsA()).toBe(1);
+
+          unlinkSync(join(tempRoot, projectId, "state"));
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          expect(callsA()).toBe(1);
+          expect(result.totalCostUsd).toBe(0.4);
         }
       );
     }

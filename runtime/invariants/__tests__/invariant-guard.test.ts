@@ -255,3 +255,70 @@ describe(
     });
   }
 );
+
+describe(
+  "P1 fix (P0 final closure remediation, finding 3, 'invariant registration identity must be immutable'): " +
+    "register() must never reread a caller-controlled id accessor between its duplicate check and its storage",
+  () => {
+    it("BLOCKER regression, exact reproduction: a getter-backed id returning a different value on each read cannot replace an already-registered invariant", () => {
+      const guard = new InvariantGuard();
+      guard.register({
+        id: "protected",
+        description: "the real, protected invariant",
+        severity: "BLOCKING",
+        check: (): InvariantCheckResult => ({ satisfied: false, detail: "genuinely violated" })
+      });
+
+      let reads = 0;
+      const maliciousDef: InvariantDefinition = {
+        get id() {
+          reads++;
+          // First read (the duplicate `.has()` check) claims an unused
+          // id; every subsequent read (storage) claims the ALREADY-
+          // registered "protected" id — exactly the reproduction.
+          return reads === 1 ? "unused" : "protected";
+        },
+        description: "a forged replacement",
+        severity: "WARNING",
+        check: (): InvariantCheckResult => ({ satisfied: true, detail: "forged: always satisfied" })
+      };
+
+      // Must fail closed: the duplicate check must see the SAME id that
+      // ends up stored, so this either throws DuplicateInvariantIdError
+      // (correct, fail-closed behavior) or genuinely registers under
+      // "unused" — but it must NEVER silently replace "protected".
+      try {
+        guard.register(maliciousDef);
+      } catch (err) {
+        expect(err).toBeInstanceOf(DuplicateInvariantIdError);
+      }
+
+      const report = guard.runAll();
+      // The REAL "protected" invariant must still be the one that runs —
+      // its genuine BLOCKING violation must still be reported, never
+      // silently satisfied by the forged replacement.
+      expect(report.allBlockingSatisfied).toBe(false);
+      const protectedViolation = report.violations.find((v) => v.invariantId === "protected");
+      expect(protectedViolation?.detail).toBe("genuinely violated");
+    });
+
+    it("no-regression: a well-behaved, ordinary-property id still registers and duplicate-checks normally", () => {
+      const guard = new InvariantGuard();
+      guard.register({
+        id: "ordinary",
+        description: "d",
+        severity: "WARNING",
+        check: (): InvariantCheckResult => ({ satisfied: true, detail: "ok" })
+      });
+      expect(() =>
+        guard.register({
+          id: "ordinary",
+          description: "d2",
+          severity: "WARNING",
+          check: (): InvariantCheckResult => ({ satisfied: true, detail: "ok2" })
+        })
+      ).toThrow(DuplicateInvariantIdError);
+      expect(guard.list()).toHaveLength(1);
+    });
+  }
+);

@@ -712,12 +712,46 @@ export class BudgetGuard {
       // independent review round fix notu).
       const reservation = this.#costEngine.createReservation(snapshot, amountUsd);
 
-      this.#auditLog?.append({
-        type: "BUDGET_RESERVATION_CREATED",
-        actor: "budget-guard",
-        payload: { reservationId: reservation.id, scope: snapshot, amountUsd, checks },
-        timestamp: this.#now().toISOString()
-      });
+      // P1 fix (P0 final closure remediation, finding 10, "authoritative
+      // state mutation surviving when mandatory audit publication fails"):
+      // reproduced — `createReservation()` above durably commits the
+      // reservation to `this.#costEngine`'s ledger (counted from then on by
+      // `reservedTotal()`) BEFORE this `BUDGET_RESERVATION_CREATED` audit
+      // event is ever appended. If `this.#auditLog.append()` itself throws
+      // (a corrupted/durable-storage-backed `AuditLog` implementation
+      // failing to write), the exception propagated straight out of
+      // `reserve()` — the caller never received the `Reservation` handle
+      // `freezeRecord(...)` below would have returned, and therefore has no
+      // way to ever call `release()`/`commit()` on it — yet the reservation
+      // itself remained live in the ledger, permanently (until process
+      // restart) counted against every future ceiling check via
+      // `reservedTotal()`: budget capacity reserved for work that, from
+      // every caller's perspective, never started. Same root class this
+      // codebase already closed for provider replacement (bkz.
+      // `models/gateway.ts`'in 30th independent review round fix notu,
+      // "provider replacement must rollback if audit fails") and for
+      // approval state (bkz. `policy-engine/approval-workflow.ts`'in 35th
+      // round fix notu, finding 2) — a mandatory audit record and an
+      // authoritative state mutation must succeed or fail TOGETHER. Fixed:
+      // if publishing the audit event throws, the just-created reservation
+      // is immediately rolled back via `releaseReservation()` (still inside
+      // this SAME `withLedgerLock()` transaction, so no sibling `reserve()`/
+      // ceiling check can observe the now-orphaned reservation in the gap),
+      // and the ORIGINAL audit error is re-thrown — `reserve()` then fails
+      // exactly as before, but with zero durable trace left behind, so a
+      // caller who legitimately received no handle also owns no stranded
+      // capacity.
+      try {
+        this.#auditLog?.append({
+          type: "BUDGET_RESERVATION_CREATED",
+          actor: "budget-guard",
+          payload: { reservationId: reservation.id, scope: snapshot, amountUsd, checks },
+          timestamp: this.#now().toISOString()
+        });
+      } catch (auditErr) {
+        this.#costEngine.releaseReservation(reservation.id, snapshot);
+        throw auditErr;
+      }
 
       return reservation;
     });

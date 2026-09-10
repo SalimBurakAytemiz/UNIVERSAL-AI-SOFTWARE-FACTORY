@@ -1619,6 +1619,68 @@ factory:
     to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work
     stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    A subsequent, FINAL independent closure review reproduced ELEVEN more CURRENT-P0 findings (8 P1, 3 P2)
+    despite the prior round's full verification suite passing — all now fixed, regression-tested, and
+    bypass-verified in one consolidated batch. Finding 1 was a requirement-reality reconciliation across 8
+    tracked UASF-REQ items (0001/0003/0004/0005/0006/0012/0017/0039): honest per-requirement investigation (not
+    blind status edits) found 7 genuinely supported by either newly-written re-verification tests (a new
+    git-history-based `repository-provenance.test.ts` for the frozen-baseline/root-commit claims UASF-REQ-0001/
+    0003 make, and a new `turkish-comment-standard.test.ts` verifying UASF-REQ-0039's own named files genuinely
+    contain Turkish comments) or pre-existing evidence that was never credited (UASF-REQ-0004/0005/0006/0017) —
+    raised accordingly; UASF-REQ-0012 was left honestly at its existing status, since its schema's `category`
+    field is a phase enum, not the BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL type taxonomy the requirement
+    text promises — a genuine implementation gap, not a stale-status case. Findings 2/5 (file-cache.ts): a
+    completed, paid `compute()` result could be lost to a persistence failure (finding 2) or overwritten by a
+    stale lease owner's own late write racing a successor's already-committed result (finding 5) — fixed with a
+    two-phase durable-completion record (`recordComputeCompletion()`, CAS-fenced by lease ownership) written
+    BEFORE the main cache, checked by `negotiateComputeOwnership()` ahead of the ordinary busy/expiry path, with
+    a best-effort main-cache heal on read. Finding 3 (invariant-guard.ts): `register()` re-read a caller-supplied
+    `InvariantDefinition`'s `id` three separate times — a getter answering differently across those reads could
+    silently replace an already-registered BLOCKING invariant; fixed by capturing `id` once into a local const.
+    Finding 4 (models/gateway.ts): `canonicalizeConfigValueForFingerprint()`'s array branch used `.map()`, which
+    silently reproduces sparse-array holes rather than rejecting them — the exact class multiple prior rounds
+    already closed elsewhere (audit-log.ts, file-store.ts) — fixed with the same explicit hole-rejecting loop.
+    Findings 6/7/8 (governance/phase-closure.ts): a recovered pending-closure manifest was trusted without
+    checking its OWN recorded phaseId/manifestId matched the requested ones (finding 6, a path-collision-driven
+    identity confusion); `attemptPhaseClosure()` read its caller-supplied `attempt` object's fields at multiple
+    points across its own execution rather than one upfront snapshot (finding 7, the same getter-multi-read
+    class as finding 3); and the function's entire check-then-write manifest sequence ran with no lock at all,
+    a genuine cross-process TOCTOU race (finding 8) — fixed with `MismatchedClosureIntentError` validation,
+    `deepFreezeClone()` snapshotting the whole caller object graph once at entry, and wrapping the function body
+    in `acquireFileLock()` (the same primitive file-cache.ts already uses for the identical purpose) respectively.
+    Finding 9 (project-lifecycle/orchestrator.ts): the bootstrap-transaction durable checkpoint finding 8 of the
+    PRIOR round introduced was keyed by `genome.project.id` alone — a retry that routed to a DIFFERENT model
+    (a live routing/registry change between attempts) silently reused the FIRST model's already-billed response
+    while the durable record went on to name the SECOND, never-invoked model; fixed by binding the checkpoint
+    key to every materially relevant part of the invocation (`${projectId}:${provider}:${modelId}`). Finding 10
+    (budget.ts): `BudgetGuard.reserve()` durably committed a reservation to the CostEngine ledger BEFORE
+    appending its `BUDGET_RESERVATION_CREATED` audit event — if that audit append itself threw, the reservation
+    survived (permanently counted against every future ceiling check via `reservedTotal()`) even though the
+    caller, whose `reserve()` call rejected, never received a handle to ever release it; fixed with the same
+    "prepare/audit/mutate atomically" rollback-on-audit-failure pattern this codebase already established for
+    provider replacement (30th round) and approval state (35th round) — an audit-append failure now rolls back
+    the just-created reservation via `releaseReservation()` inside the SAME lock transaction before re-throwing.
+    Finding 11 (file-cache.ts): the `computeLeaseTtlMs` constructor parameter was accepted completely
+    unvalidated — a value of `0` grants a lease that is already expired the instant it is written, destroying
+    the mutual-exclusion guarantee findings 2/5 above depend on (two `FileCache` instances sharing one path
+    with `computeLeaseTtlMs: 0` would both concurrently compute the same key); fixed with a new
+    `assertValidComputeLeaseTtl()` (distinct from, and stricter than, the ordinary per-entry `assertValidTtl()`,
+    since 0 is destructive for a lease though valid for an ordinary cache entry) run once at construction,
+    rejecting non-finite/non-positive values and any TTL whose derived renewal interval would not run strictly
+    before its own expiry. A narrow root-cause audit strictly scoped to these 11 exact classes (no general
+    hardening sweep) found NO additional genuine sibling instances elsewhere in `runtime/` — every other
+    `register()`-style method, `.map()`-based array canonicalization, and lease/checkpoint mechanism already
+    carries the corresponding fix from a prior round. Full required verification sequence green on the
+    resulting commit: lint (clean), typecheck (clean), build (clean), 1625/1625 tests across 53 files (up from
+    1592 before this round's work began; zero skipped), validate:requirements (46 schema-valid records,
+    unchanged), history-and-current-tree-aware secret-scan (PASS), production install verification (PASS —
+    `npm ci --omit=dev` genuinely runnable), Factory Doctor (READY — Node.js, npm, Python, Git, Docker), all 9
+    P0 proofs green (13 assertions). No requirement's status was raised beyond what this round's actual change
+    supports. With all 11 findings closed and every mandatory check green, this round sets the phase status to
+    READY_FOR_INDEPENDENT_REVIEW (not CLOSED — independent closure remains Codex's own job). Per explicit
+    instruction, this round does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke
+    Codex itself, and did NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -7280,3 +7342,32 @@ exact_next_action: >
   is an independent review of this exact commit. Per explicit instruction, this round does NOT merge, does NOT
   move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work
   stayed on claude/ai-factory-baseline-v1-seawq7.
+
+  UPDATE (P0 FINAL CLOSURE REMEDIATION — ELEVEN REPRODUCED EXISTING-P0 FINDINGS round; see `p0_status`'s own
+  final paragraph for the complete narrative): a FINAL independent closure review reproduced ELEVEN CURRENT-P0
+  findings (8 P1, 3 P2) despite the prior round's full verification suite passing. All eleven are fixed,
+  individually regression-tested, and individually bypass-verified: (1) a requirement-reality reconciliation
+  across 8 tracked UASF-REQ items (7 honestly raised on real new/existing evidence, 1 correctly left
+  incomplete — UASF-REQ-0012's type-taxonomy gap); (2) file-cache.ts's compute-completion checkpoint written
+  only after the main-cache write, not before it; (3) invariant-guard.ts's register() re-reading a
+  caller-supplied definition's id from multiple points; (4) models/gateway.ts's config-fingerprint
+  canonicalization silently reproducing sparse-array holes via `.map()`; (5) file-cache.ts allowing a stale
+  lease owner's late write to overwrite a successor's already-committed result; (6) phase-closure.ts's crash
+  recovery trusting a recovered manifest's identity without validating it against the requested identity; (7)
+  phase-closure.ts's attemptPhaseClosure() validating and persisting from separate reads of a caller-supplied
+  object instead of one upfront snapshot; (8) phase-closure.ts's entire check-then-write manifest sequence
+  running with no lock at all; (9) orchestrator.ts's bootstrap checkpoint being keyed by project id alone,
+  omitting the provider/model actually invoked; (10) budget.ts's reserve() durably committing a reservation
+  before its mandatory audit event, stranding capacity when the audit append itself failed; (11) file-cache.ts
+  accepting an unvalidated compute-lease TTL, where 0 (or a value too small for its own renewal interval)
+  destroys the lease's mutual-exclusion guarantee entirely. The narrow root-cause audit, strictly limited to
+  these eleven exact classes, found no further genuine direct instances of any of them elsewhere in runtime/.
+  Full required verification sequence green: lint, typecheck, build, 1625/1625 tests across 53 files (zero
+  skipped), validate:requirements (46 schema-valid records, unchanged), history-and-current-tree-aware
+  secret-scan (PASS), production install verification (PASS), Factory Doctor (READY), all 9 P0 proofs (13
+  assertions). No requirement status was raised beyond what this round's real evidence supports. With all
+  eleven findings closed and every mandatory check green, this round sets P0's phase status to
+  READY_FOR_INDEPENDENT_REVIEW — P0 remains explicitly NOT CLOSED; the next step is an independent review of
+  this exact commit. Per explicit instruction, this round does NOT merge, does NOT move to P1, does NOT declare
+  P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work stayed on
+  claude/ai-factory-baseline-v1-seawq7.

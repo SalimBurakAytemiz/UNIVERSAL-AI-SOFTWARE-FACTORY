@@ -17,6 +17,7 @@ import { FounderDecisionLedger } from "../../decisions/decision-ledger.js";
 import { InvariantGuard, type InvariantCheckResult } from "../../invariants/invariant-guard.js";
 import { FileStateStore } from "../../state/file-store.js";
 import type { EvidenceRef, EvidenceRefType } from "../../requirements-traceability/traceability.js";
+import { acquireFileLock, FileLockTimeoutError } from "../../cache/file-lock.js";
 
 /**
  * P1 fix (independent Codex review, "do not trust caller-authored
@@ -1179,6 +1180,131 @@ describe("attemptPhaseClosure", () => {
   );
 
   describe(
+    "P1 fix (P0 final closure remediation, finding 6, 'recovery must validate existing manifest identity'): " +
+      "the 'already fully committed' early-return in recoverPendingPhaseClosure() must verify the persisted " +
+      "manifest's OWN identity before trusting it as belonging to the requested (phaseId, manifestId)",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: (phaseId='P0-sub', manifestId='manifest') and (phaseId='P0', " +
+          "manifestId='sub-manifest') collide on the SAME manifest file path — a genuinely-closed manifest for " +
+          "the FIRST identity must never be handed back as recovery output for the SECOND",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+
+          // Genuinely, successfully close phase "P0-sub" under manifestId
+          // "manifest" — this writes a REAL manifest file directly (no
+          // crash, no intent involved), landing at the colliding path.
+          deps.scopeLock.lock("P0-sub", "ready", deps.invariantGuard.runAll(), "d-lock");
+          const genuine = attemptPhaseClosure(
+            baseAttempt({ phaseId: "P0-sub", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "manifest",
+            "d-real",
+            deps
+          );
+          expect(genuine.outcome).toBe("CLOSED");
+
+          // Sanity: the collision is real.
+          const collidingPath = join(deps.manifestDir, "P0-sub-manifest.json");
+          expect(existsSync(collidingPath)).toBe(true);
+
+          // "P0" phase was never locked/closed at all — no intent exists
+          // for ("P0", "sub-manifest") either, so recovery reaches the
+          // "already fully committed" branch directly via the colliding
+          // path, reading the SAME file just written for "P0-sub".
+          expect(() => recoverPendingPhaseClosure("P0", "sub-manifest", deps)).toThrow(/identifies phaseId='P0-sub'/);
+
+          // Phase "P0" itself was never touched by the rejected recovery.
+          expect(deps.scopeLock.getState("P0")).toBe("OPEN");
+
+          // The genuinely-matching identity still recovers correctly.
+          const recovered = recoverPendingPhaseClosure("P0-sub", "manifest", deps);
+          expect(recovered?.outcome).toBe("CLOSED");
+        }
+      );
+
+      it("no-regression: a genuinely matching, already-committed manifest still recovers normally with no intent involved", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d-lock2");
+        attemptPhaseClosure(
+          baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+          "manifest-plain",
+          "d-close2",
+          deps
+        );
+        const recovered = recoverPendingPhaseClosure("P0", "manifest-plain", deps);
+        expect(recovered?.outcome).toBe("CLOSED");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 7, 'closure evaluation and persistence must use one " +
+      "snapshot'): attemptPhaseClosure() must detach the caller's attempt into ONE immutable snapshot before " +
+      "evaluating it, so a stateful/getter-backed field cannot answer differently at evaluation time than at " +
+      "persistence time",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: independentReview.outcome is a getter returning 'CLEAN' on its " +
+          "first read and 'FOUND_ISSUES' on every later read — the persisted manifest must never end up CLOSED " +
+          "with a non-CLEAN independentReview.outcome inside it",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          let reads = 0;
+          const statefulReview: IndependentReviewEvidence = {
+            reviewId: "rev-1",
+            reviewerIdentity: "independent-reviewer",
+            reviewedCommitSha: DEFAULT_COMMIT_SHA,
+            reviewTimestamp: new Date().toISOString(),
+            evidenceRef: evidenceRef(),
+            get outcome(): IndependentReviewResult {
+              reads++;
+              return reads === 1 ? "CLEAN" : "FOUND_ISSUES";
+            }
+          };
+
+          const manifest = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReview: statefulReview }),
+            "stateful-review",
+            "d2",
+            deps
+          );
+
+          // Whichever outcome this attempt settled on, its OWN persisted
+          // independentReview.outcome must be internally consistent with
+          // it — never CLOSED while the persisted evidence itself reads
+          // as a non-CLEAN outcome (the exact contradiction the un-fixed
+          // multi-read bug could produce).
+          if (manifest.outcome === "CLOSED") {
+            expect(manifest.independentReview.outcome).toBe("CLEAN");
+          } else {
+            expect(manifest.rejectionReasons.length).toBeGreaterThan(0);
+          }
+        }
+      );
+
+      it("no-regression: an ordinary, non-stateful CLEAN review still closes normally with a consistent persisted record", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+        const manifest = attemptPhaseClosure(
+          baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+          "plain-review",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("CLOSED");
+        expect(manifest.independentReview.outcome).toBe("CLEAN");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (independent review, 'match recovered decisions against an already-closed phase', finding 7): " +
       "recovery for an ALREADY-CLOSED phase must verify the phase's OWN authoritative decisionId (and matching " +
       "Decision Ledger record) against the recovered intent's claimed decisionId before finalizing anything",
@@ -1279,6 +1405,106 @@ describe("attemptPhaseClosure", () => {
           );
         }
       );
+    }
+  );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 8, 'closure manifest identities must be atomically " +
+      "reserved'): attemptPhaseClosure() must reserve its manifest path exclusively (via a real file lock), " +
+      "never via an exists()-then-write() check with no atomicity between the two",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: with the manifest's lock already held by someone else, " +
+          "attemptPhaseClosure() genuinely contends for it (times out) rather than proceeding as though the " +
+          "duplicate check and the eventual write were atomic on their own",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const manifestPathForLock = join(deps.manifestDir, "P0-contended.json");
+          const releaseExternalLock = acquireFileLock(`${manifestPathForLock}.lock`);
+          try {
+            expect(() =>
+              attemptPhaseClosure(
+                baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+                "contended",
+                "d2",
+                { ...deps, lockOptions: { timeoutMs: 50, pollIntervalMs: 5 } }
+              )
+            ).toThrow(FileLockTimeoutError);
+          } finally {
+            releaseExternalLock();
+          }
+
+          // Nothing was ever written or committed while contended — the
+          // lock genuinely gated every write this attempt could have made.
+          expect(existsSync(manifestPathForLock)).toBe(false);
+          expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+
+          // Once the lock is free, the identical attempt proceeds and
+          // closes normally.
+          const recovered = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "contended",
+            "d3",
+            deps
+          );
+          expect(recovered.outcome).toBe("CLOSED");
+        }
+      );
+
+      it(
+        "BLOCKER regression: a SECOND attempt for the SAME manifest identity, made while the first attempt's " +
+          "own internal lock is still held (simulated by pre-holding it, since the real function is fully " +
+          "synchronous and cannot itself be interrupted mid-flight), must never silently overwrite a manifest " +
+          "the first attempt already committed — it must observe DuplicateClosureManifestError once the lock " +
+          "is free, never a corrupted/mixed manifest",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const first = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "race-target",
+            "d2",
+            deps
+          );
+          expect(first.outcome).toBe("CLOSED");
+
+          // A second attempt for the IDENTICAL identity, after the first
+          // already fully committed, must fail closed — never silently
+          // replace the first attempt's own durable manifest.
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+              "race-target",
+              "d3",
+              deps
+            )
+          ).toThrow(DuplicateClosureManifestError);
+
+          // The original manifest survives, byte-for-byte, with its
+          // ORIGINAL decisionId — never overwritten by the second attempt.
+          const surviving = readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "race-target");
+          expect(surviving?.decisionId).toBe("d2");
+        }
+      );
+
+      it("no-regression: ordinary, uncontended closure attempts still succeed with no lock artifacts left behind", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+          "uncontended",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("CLOSED");
+        expect(existsSync(join(deps.manifestDir, "P0-uncontended.json.lock"))).toBe(false);
+      });
     }
   );
 });

@@ -42,6 +42,7 @@ import type { FounderDecisionLedger } from "../decisions/decision-ledger.js";
 import { computeRealityMatrix, type RealityMatrixSummary } from "./reality-matrix.js";
 import type { StateStore } from "../state/file-store.js";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
+import { acquireFileLock, type FileLockOptions } from "../cache/file-lock.js";
 import { deepFreezeClone } from "../util/immutable.js";
 import { isNonBlankIdentity } from "../util/identity.js";
 import { isCanonicalIsoTimestamp } from "../cost/cost-engine.js";
@@ -313,6 +314,17 @@ export interface AttemptPhaseClosureDeps {
    * genuine call site should rely on the real default.
    */
   readonly resolveHeadCommitSha?: (rootDir: string) => string;
+  /**
+   * P1 fix (P0 final closure remediation, finding 8, "closure manifest
+   * identities must be atomically reserved"): forwarded to the
+   * per-manifest `acquireFileLock()` call this function's own duplicate
+   * check now runs inside — bkz. `attemptPhaseClosure()`'ın fix notu.
+   * Mirrors `FileCache`'s own identical `lockOptions` constructor
+   * parameter; overridable ONLY so tests can exercise lock contention
+   * deterministically (a short `timeoutMs`) without waiting out the real
+   * default — every genuine call site should leave this unset.
+   */
+  readonly lockOptions?: FileLockOptions;
 }
 
 const SAFE_GOVERNANCE_IDENTIFIER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
@@ -672,86 +684,142 @@ export class DuplicateClosureManifestError extends Error {
  * transaction that crashed between steps (1) and (6).
  */
 export function attemptPhaseClosure(
-  attempt: PhaseClosureAttempt,
+  callerAttempt: PhaseClosureAttempt,
   manifestId: string,
   decisionId: string,
   deps: AttemptPhaseClosureDeps
 ): PhaseClosureManifestRecord {
+  // P1 fix (P0 final closure remediation, finding 7, "closure evaluation
+  // and persistence must use one snapshot"): reproduced — every field
+  // this function reads from the caller-supplied `attempt` (most
+  // dangerously `attempt.independentReview.outcome`, but the SAME class
+  // applies to any other field) used to be read MULTIPLE times across
+  // this function's body: once by `evaluateClosureAttempt()` to DECIDE
+  // `willClose`, and again — separately — by `buildManifest()` when
+  // constructing the record that eventually gets persisted (itself only
+  // detached from the caller by `deepFreezeClone()`'s `structuredClone()`
+  // AFTER `buildManifest()` already ran). A caller whose `independentReview`
+  // exposes `outcome` as a STATEFUL GETTER (first read: "CLEAN", every
+  // later read: "FOUND_ISSUES") could therefore pass the evaluation gate
+  // on the FIRST read, then have the SECOND read (captured into the
+  // persisted manifest, and read AGAIN by `structuredClone()` inside
+  // `deepFreezeClone()`) show a completely different, non-CLEAN outcome —
+  // a durably persisted "CLOSED" manifest whose own `independentReview`
+  // field contradicts the very evidence that supposedly justified
+  // closing. Fixed the same way this codebase already snapshots any
+  // caller-controlled input read across more than one step (bkz.
+  // `policy-engine.ts`'in risk-snapshot, `gateway.ts`'in execution-scope
+  // fix notları): `attempt` is detached into a single, fully immutable
+  // snapshot via `deepFreezeClone()` (one `structuredClone()` call — every
+  // getter anywhere in the object graph is evaluated EXACTLY ONCE, right
+  // here, before anything else happens) and EVERY subsequent read in this
+  // function — evaluation, manifest construction, the intent record,
+  // persistence — uses that SAME frozen `attempt`, never the caller's
+  // original, still-live object again.
+  const attempt = deepFreezeClone(callerAttempt);
   const path = manifestPath(deps.manifestDir, attempt.phaseId, manifestId);
-  if (deps.store.exists(path)) {
-    throw new DuplicateClosureManifestError(attempt.phaseId, manifestId);
-  }
 
-  const { rejectionReasons, guardReport, realityMatrix } = evaluateClosureAttempt(attempt, deps);
+  // P1 fix (P0 final closure remediation, finding 8, "closure manifest
+  // identities must be atomically reserved"): reproduced — the duplicate
+  // check above used to be `deps.store.exists(path)` immediately followed
+  // (many synchronous statements, but no ATOMICITY between the two) by
+  // this function's own eventual `deps.store.write(path, frozen)` — a
+  // classic check-then-write TOCTOU race. Two concurrent closure attempts
+  // for the SAME (phaseId, manifestId) could each observe `exists() ===
+  // false` before either had written anything, then both proceed to
+  // evaluate and (eventually) write — the second write silently
+  // OVERWRITING the first's manifest, destroying it as durable evidence
+  // (exactly what `DuplicateClosureManifestError`'s own contract promises
+  // never happens). `attemptPhaseClosure()` is entirely synchronous (no
+  // `await` anywhere in its body), so the fix reuses the EXACT same
+  // synchronous, non-`await`-spanning `acquireFileLock()` critical-section
+  // pattern this codebase already established for `file-cache.ts`'s own
+  // check-then-claim races — never a bespoke locking mechanism. The lock
+  // is held for this function's ENTIRE remaining body: the (now genuinely
+  // exclusive) duplicate check, evaluation, and every write this attempt
+  // could make — so a concurrent second attempt for the identical
+  // identity blocks until the first one has completely finished, then
+  // itself observes the first attempt's manifest via `exists()` and fails
+  // closed with `DuplicateClosureManifestError`, exactly as intended.
+  const releaseManifestLock = acquireFileLock(`${path}.lock`, deps.lockOptions);
+  try {
+    if (deps.store.exists(path)) {
+      throw new DuplicateClosureManifestError(attempt.phaseId, manifestId);
+    }
 
-  const currentState = deps.scopeLock.getState(attempt.phaseId);
-  if (currentState !== "LOCKED_FOR_CLOSURE") {
-    rejectionReasons.push(
-      `phase '${attempt.phaseId}' is not currently LOCKED_FOR_CLOSURE (current state: ${currentState}) — ` +
-        `closure may only be attempted after ScopeLock.lock() has already run`
+    const { rejectionReasons, guardReport, realityMatrix } = evaluateClosureAttempt(attempt, deps);
+
+    const currentState = deps.scopeLock.getState(attempt.phaseId);
+    if (currentState !== "LOCKED_FOR_CLOSURE") {
+      rejectionReasons.push(
+        `phase '${attempt.phaseId}' is not currently LOCKED_FOR_CLOSURE (current state: ${currentState}) — ` +
+          `closure may only be attempted after ScopeLock.lock() has already run`
+      );
+    }
+
+    // decisionId must be fresh — checked read-only, BEFORE anything is
+    // persisted, so a colliding decisionId is an ordinary REJECTED outcome,
+    // never a durable "CLOSED" claim for a transition that then fails.
+    if (rejectionReasons.length === 0 && deps.scopeLock.hasDecision(decisionId)) {
+      rejectionReasons.push(
+        `decisionId '${decisionId}' already names an existing Decision Ledger entry — closure requires a fresh, ` +
+          `never-before-used decisionId (this is exactly the one precondition ScopeLock.close() itself would ` +
+          `otherwise fail on, after durable closure evidence had already been persisted)`
+      );
+    }
+
+    // Whether this attempt WOULD close the phase, pending only the final
+    // commit steps below — no side effect has happened yet at this point.
+    const willClose = rejectionReasons.length === 0;
+    const outcome: PhaseClosureOutcome = willClose ? "CLOSED" : "REJECTED";
+    const frozen = deepFreezeClone(
+      buildManifest(attempt, manifestId, outcome, rejectionReasons, guardReport, realityMatrix, willClose ? decisionId : undefined)
     );
-  }
 
-  // decisionId must be fresh — checked read-only, BEFORE anything is
-  // persisted, so a colliding decisionId is an ordinary REJECTED outcome,
-  // never a durable "CLOSED" claim for a transition that then fails.
-  if (rejectionReasons.length === 0 && deps.scopeLock.hasDecision(decisionId)) {
-    rejectionReasons.push(
-      `decisionId '${decisionId}' already names an existing Decision Ledger entry — closure requires a fresh, ` +
-        `never-before-used decisionId (this is exactly the one precondition ScopeLock.close() itself would ` +
-        `otherwise fail on, after durable closure evidence had already been persisted)`
-    );
-  }
+    if (!willClose) {
+      // A rejection makes no authoritative-state claim at all — a single
+      // durable write is already atomic (no partial-commit window exists).
+      deps.store.write(path, frozen);
+      return frozen;
+    }
 
-  // Whether this attempt WOULD close the phase, pending only the final
-  // commit steps below — no side effect has happened yet at this point.
-  const willClose = rejectionReasons.length === 0;
-  const outcome: PhaseClosureOutcome = willClose ? "CLOSED" : "REJECTED";
-  const frozen = deepFreezeClone(
-    buildManifest(attempt, manifestId, outcome, rejectionReasons, guardReport, realityMatrix, willClose ? decisionId : undefined)
-  );
+    // --- Staged, crash-recoverable commit protocol (willClose === true) ---
+    const iPath = intentPath(deps.manifestDir, attempt.phaseId, manifestId);
+    // P1 fix (independent Codex review, "recovery must revalidate persisted
+    // phase-closure intents", finding 6): persists ONLY the original
+    // request (`attempt`) — bkz. `PendingClosureIntent`'in üstündeki fix
+    // notu — never this function's own computed `guardReport`/`manifest`
+    // conclusion, which `recoverPendingPhaseClosure()` must independently
+    // re-derive, never trust.
+    const intent: PendingClosureIntent = {
+      status: "PREPARED",
+      phaseId: attempt.phaseId,
+      manifestId,
+      decisionId,
+      attempt,
+      createdAt: new Date().toISOString()
+    };
+    // (1) PREPARE. If this throws, nothing else has happened — scenario A.
+    deps.store.write(iPath, deepFreezeClone(intent));
 
-  if (!willClose) {
-    // A rejection makes no authoritative-state claim at all — a single
-    // durable write is already atomic (no partial-commit window exists).
+    // (2) TRANSITION. Guaranteed not to throw: currentState/guardReport were
+    // just re-verified above with no intervening yield point, and the fresh-
+    // decisionId precondition was proven moments ago.
+    deps.scopeLock.close(attempt.phaseId, attempt.reason, guardReport, decisionId);
+    // (3) PERSIST LEDGER, then (4) PERSIST SCOPE LOCK — see this function's
+    // own doc comment for why the ledger must be persisted first.
+    deps.ledger.saveTo(deps.store, deps.ledgerPath);
+    deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
+    // (5) FINALIZE.
     deps.store.write(path, frozen);
+    // (6) COMMIT (cleanup only — the manifest at `path` is already
+    // sufficient proof of full commit even if this final write is lost).
+    deps.store.write(iPath, deepFreezeClone({ ...intent, status: "COMMITTED" as PendingClosureIntentStatus }));
+
     return frozen;
+  } finally {
+    releaseManifestLock();
   }
-
-  // --- Staged, crash-recoverable commit protocol (willClose === true) ---
-  const iPath = intentPath(deps.manifestDir, attempt.phaseId, manifestId);
-  // P1 fix (independent Codex review, "recovery must revalidate persisted
-  // phase-closure intents", finding 6): persists ONLY the original
-  // request (`attempt`) — bkz. `PendingClosureIntent`'in üstündeki fix
-  // notu — never this function's own computed `guardReport`/`manifest`
-  // conclusion, which `recoverPendingPhaseClosure()` must independently
-  // re-derive, never trust.
-  const intent: PendingClosureIntent = {
-    status: "PREPARED",
-    phaseId: attempt.phaseId,
-    manifestId,
-    decisionId,
-    attempt,
-    createdAt: new Date().toISOString()
-  };
-  // (1) PREPARE. If this throws, nothing else has happened — scenario A.
-  deps.store.write(iPath, deepFreezeClone(intent));
-
-  // (2) TRANSITION. Guaranteed not to throw: currentState/guardReport were
-  // just re-verified above with no intervening yield point, and the fresh-
-  // decisionId precondition was proven moments ago.
-  deps.scopeLock.close(attempt.phaseId, attempt.reason, guardReport, decisionId);
-  // (3) PERSIST LEDGER, then (4) PERSIST SCOPE LOCK — see this function's
-  // own doc comment for why the ledger must be persisted first.
-  deps.ledger.saveTo(deps.store, deps.ledgerPath);
-  deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
-  // (5) FINALIZE.
-  deps.store.write(path, frozen);
-  // (6) COMMIT (cleanup only — the manifest at `path` is already
-  // sufficient proof of full commit even if this final write is lost).
-  deps.store.write(iPath, deepFreezeClone({ ...intent, status: "COMMITTED" as PendingClosureIntentStatus }));
-
-  return frozen;
 }
 
 /**
@@ -817,6 +885,31 @@ export function recoverPendingPhaseClosure(
 
   const existingManifest = deps.store.read<PhaseClosureManifestRecord>(path);
   if (existingManifest) {
+    // P1 fix (P0 final closure remediation, finding 6, "recovery must
+    // validate existing manifest identity"): reproduced — this
+    // "already fully committed" early-return trusted WHATEVER manifest
+    // record `manifestPath()` happened to resolve to as genuinely
+    // belonging to the REQUESTED (phaseId, manifestId), with no identity
+    // check at all. `manifestPath()`/`intentPath()` join phaseId/
+    // manifestId with a plain `-`, which `-` is itself a permitted
+    // identifier character — `("P0-sub", "manifest")` and `("P0",
+    // "sub-manifest")` collide onto the exact same file path. A caller
+    // recovering `("P0", "sub-manifest")` could therefore be handed back
+    // an unrelated phase's genuinely-CLOSED manifest and treat that
+    // phase as closed too. This is the SAME class of bug this function's
+    // own PREPARED-intent branch below already guards against (bkz.
+    // MismatchedClosureIntentError'ın fix notu, finding 6 in the prior
+    // batch) — fixed identically here: the manifest's OWN recorded
+    // identity is verified against what was actually requested BEFORE it
+    // is trusted as authoritative.
+    if (existingManifest.phaseId !== phaseId || existingManifest.manifestId !== manifestId) {
+      throw new MismatchedClosureIntentError(
+        `the persisted manifest at '${path}' identifies phaseId='${existingManifest.phaseId}'/` +
+          `manifestId='${existingManifest.manifestId}', but recovery was requested for phaseId='${phaseId}'/` +
+          `manifestId='${manifestId}' — this is either a colliding governance-identifier path or a forged/corrupt ` +
+          `manifest record`
+      );
+    }
     // Already fully committed (scenario B) — clean up a lingering PREPARED
     // marker if one somehow survived, but the outcome itself needs nothing.
     const intent = deps.store.read<PendingClosureIntent>(iPath);

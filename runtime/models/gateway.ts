@@ -294,9 +294,43 @@ function canonicalizeConfigValueForFingerprint(
     );
   }
   if (Array.isArray(value)) {
+    // P1 fix (P0 final closure remediation, finding 4, "sparse provider
+    // arrays must not collide with explicit null"): reproduced — `.map()`
+    // never invokes its callback for a genuine HOLE (`Array(1)` has no
+    // own element at index 0) and silently reproduces the hole in the
+    // result array instead of rejecting it. Whatever eventually
+    // serializes this canonicalized value for hashing (`JSON.stringify`)
+    // turns BOTH a surviving hole and a genuine `null` into the identical
+    // text `"null"` — so `Array(1)` (a hole) and `[null]` (an explicit
+    // value), two materially DIFFERENT provider configurations, would
+    // fingerprint IDENTICALLY, letting a provider replacement reuse an
+    // approval that was never actually granted for its real
+    // configuration. Reusing the same explicit, hole-rejecting loop
+    // already established for the identical root cause in
+    // `file-store.ts`'s `captureSnapshot()` and `audit-log.ts`'s
+    // `canonicalizeAuditValue()` — a hole fails closed here too, per this
+    // finding's own explicit "fail closed rather than lossily normalize"
+    // instruction, since no lossless canonical representation of "this
+    // index has no value at all" exists that could not itself collide
+    // with a legitimate value.
     seen.add(value);
     try {
-      return value.map((item) => canonicalizeConfigValueForFingerprint(item, id, key, seen));
+      const length = value.length;
+      const result: CanonicalFingerprintValue[] = new Array(length);
+      for (let index = 0; index < length; index += 1) {
+        if (!Object.prototype.hasOwnProperty.call(value, index)) {
+          throw new UnsupportedProviderConfigurationError(
+            id,
+            key,
+            new Error(
+              `a hole in a sparse array (no own element at index ${index}) cannot be canonically fingerprinted — ` +
+                "it would collide with an explicit null under JSON-based hashing"
+            )
+          );
+        }
+        result[index] = canonicalizeConfigValueForFingerprint(value[index], id, key, seen);
+      }
+      return result;
     } finally {
       seen.delete(value);
     }

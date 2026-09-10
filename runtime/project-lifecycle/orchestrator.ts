@@ -743,8 +743,27 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     // project (finding 5's own exact reproduction) observes and waits on
     // this in-flight lease instead of independently deciding "nobody has
     // claimed this yet" and invoking a second, duplicate, real charge.
+    //
+    // P1 fix (P0 final closure remediation, finding 9, "bootstrap
+    // checkpoint must be bound to invocation identity"): reproduced — the
+    // checkpoint key used to be `genome.project.id` ALONE. A retry for
+    // the SAME project that had ROUTED to a DIFFERENT model (a live
+    // routing/pricing change between attempts, or a caller-forced model
+    // override) would still land on the SAME cache entry as the FIRST
+    // attempt — `computeAndSet()` would then silently return the FIRST
+    // model's already-cached response while the caller's own durable
+    // bootstrap record went on to name the SECOND (never actually
+    // invoked) model, an accounting/evidence mismatch between "which
+    // model produced this result" and "which model this checkpoint
+    // claims was used." Fixed: the checkpoint identity now binds every
+    // materially relevant part of the invocation this codebase's own
+    // `ModelRecord` exposes — project, provider, and model id — so a
+    // retry that changes any of them is, correctly, a NEW governed
+    // transaction (this finding's own explicit option A) rather than a
+    // stale reuse of an unrelated prior computation.
+    const bootstrapTransactionKey = `${genome.project.id}:${modelDecision.model.provider}:${modelDecision.model.modelId}`;
     invocationResponse = (
-      await bootstrapTransactionCache.computeAndSet(genome.project.id, () =>
+      await bootstrapTransactionCache.computeAndSet(bootstrapTransactionKey, () =>
         modelGateway.invoke(
           modelDecision.model,
           {

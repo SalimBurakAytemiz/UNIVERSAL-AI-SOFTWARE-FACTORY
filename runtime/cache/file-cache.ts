@@ -41,6 +41,71 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * P1 fix (P0 final closure remediation, finding 11, "invalid lease timing
+ * configuration"): reproduced — `computeLeaseTtlMs` (constructor parameter
+ * below) was accepted completely unvalidated. `assertValidTtl()`
+ * (cache.ts) exists for ORDINARY cache-entry TTLs, where 0 is a legitimate
+ * ("immediately-expiring entry") value — but a compute LEASE is not an
+ * ordinary entry: its entire purpose is mutual exclusion between
+ * concurrent `computeAndSet()` callers (bkz.
+ * `negotiateComputeOwnership()`'in fix notu), and `Date.now() + 0` grants a
+ * lease that is already expired the instant it is written — every
+ * concurrent contender's `negotiateComputeOwnership()` would see it as
+ * immediately reclaimable and proceed to compute too, exactly the
+ * duplicate-real-charge race this whole lease mechanism exists to prevent.
+ * Two `FileCache` instances sharing one path with `computeLeaseTtlMs: 0`
+ * therefore both concurrently compute the same key. NaN/Infinity/negative
+ * values are equally nonsensical for a real wall-clock deadline (bkz.
+ * `assertValidTtl()`'in kendi InvalidTtlError notu — the same class of bug,
+ * a stricter threshold for a different field). Separately, the *renewal*
+ * interval `#computeCrossProcess()` derives from this TTL
+ * (`Math.max(1, Math.floor(ttlMs / 3))`, bkz. aşağısı) must fire strictly
+ * BEFORE the lease it renews would otherwise expire — an extreme (but
+ * finite, positive) TTL like `1` derives a renewal interval of `1` too,
+ * meaning the renewal timer and the lease's own expiry land at the exact
+ * same instant: a genuine race between "renew in time" and "a waiting
+ * follower reclaims as stale." `computeRenewalIntervalMs()` and this
+ * validator share the EXACT SAME formula (never two independently
+ * hand-duplicated ones that could silently drift), so this check is
+ * authoritative for whatever `#computeCrossProcess()` will actually do at
+ * runtime. Both checks run once, in the constructor, at construction time
+ * — before any real lease is ever negotiated — so a misconfigured
+ * `FileCache` fails fast and loud rather than silently destroying its own
+ * mutual-exclusion guarantee.
+ */
+export class InvalidComputeLeaseTtlError extends Error {
+  constructor(ttlMs: number, reason: string) {
+    super(`Invalid FileCache compute lease TTL '${String(ttlMs)}': ${reason}`);
+    this.name = "InvalidComputeLeaseTtlError";
+  }
+}
+
+function computeRenewalIntervalMs(computeLeaseTtlMs: number): number {
+  return Math.max(1, Math.floor(computeLeaseTtlMs / 3));
+}
+
+function assertValidComputeLeaseTtl(ttlMs: number): void {
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+    throw new InvalidComputeLeaseTtlError(
+      ttlMs,
+      "must be a finite, POSITIVE number of milliseconds. Unlike an ordinary cache-entry TTL, 0 destroys lease " +
+        "semantics entirely (a lease that expires the instant it is granted excludes no one); NaN/Infinity/" +
+        "negative values are equally nonsensical for a real wall-clock deadline."
+    );
+  }
+  const renewalIntervalMs = computeRenewalIntervalMs(ttlMs);
+  if (renewalIntervalMs >= ttlMs) {
+    throw new InvalidComputeLeaseTtlError(
+      ttlMs,
+      `the derived renewal interval (${renewalIntervalMs}ms) would not run strictly before the lease's own ` +
+        `expiry — a lease this short can expire (and be reclaimed by a waiting follower) at the same instant ` +
+        `its own owner's renewal timer fires, defeating the "renew for as long as compute() is genuinely in ` +
+        `flight" guarantee.`
+    );
+  }
+}
+
 export class FileCache<T = unknown> {
   /**
    * P1 fix (independent Codex review, "do not hold the synchronous cache
@@ -61,7 +126,9 @@ export class FileCache<T = unknown> {
     private readonly path: string,
     private readonly lockOptions?: FileLockOptions,
     private readonly computeLeaseTtlMs: number = DEFAULT_COMPUTE_LEASE_TTL_MS
-  ) {}
+  ) {
+    assertValidComputeLeaseTtl(computeLeaseTtlMs);
+  }
 
   /**
    * P2 fix (16th independent review round, "durable cache read-modify-
@@ -248,16 +315,69 @@ export class FileCache<T = unknown> {
     return `${this.path}.compute.${createHash("sha256").update(key).digest("hex")}.lease`;
   }
 
-  private readComputeLease(key: string): { readonly ownerId: string; readonly expiresAt: number } | undefined {
-    const raw = this.stateStore.read<{ ownerId?: unknown; expiresAt?: unknown }>(this.computeLeasePath(key));
+  /**
+   * P1 fix (P0 final closure remediation, finding 2, "paid bootstrap
+   * checkpoint must be atomic with provider completion"): the lease
+   * record can now ALSO carry the completed compute's own result
+   * (`completed: true, value`) — bkz. `recordComputeCompletion()`'ın fix
+   * notu for why this is written durably BEFORE the main cache's own
+   * `set()` is even attempted, so a failure of THAT later write can never
+   * lose the already-paid-for result.
+   */
+  private readComputeLease(
+    key: string
+  ): { readonly ownerId: string; readonly expiresAt: number; readonly completed: boolean; readonly value?: T } | undefined {
+    const raw = this.stateStore.read<{ ownerId?: unknown; expiresAt?: unknown; completed?: unknown; value?: unknown }>(
+      this.computeLeasePath(key)
+    );
     if (!raw || typeof raw.ownerId !== "string" || typeof raw.expiresAt !== "number" || !Number.isFinite(raw.expiresAt)) {
       return undefined;
     }
-    return { ownerId: raw.ownerId, expiresAt: raw.expiresAt };
+    const completed = raw.completed === true;
+    return { ownerId: raw.ownerId, expiresAt: raw.expiresAt, completed, value: completed ? (raw.value as T) : undefined };
   }
 
   private writeComputeLease(key: string, ownerId: string, expiresAt: number): void {
     this.stateStore.write(this.computeLeasePath(key), { ownerId, expiresAt });
+  }
+
+  /**
+   * P1 fix (P0 final closure remediation, finding 2, "paid bootstrap
+   * checkpoint must be atomic with provider completion"): reproduced —
+   * `compute()` succeeds (the provider is genuinely invoked and billed),
+   * but the SEPARATE main-cache write (`set()`, targeting THIS FileCache's
+   * own `this.path`) then fails once (e.g. a transient store error). The
+   * old code propagated that failure straight out of
+   * `#computeCrossProcess()`, which is fine on its own — but a caller
+   * that RETRIES the whole operation (exactly how `bootstrapProject()`'s
+   * own caller is expected to recover from a failed attempt) would find
+   * NO recorded value (the main cache write never landed) and NO live
+   * lease (the failure path released it), so `negotiateComputeOwnership()`
+   * would honestly see "nobody has ever computed this" and invoke
+   * `compute()` — and therefore the real, billable provider — a SECOND
+   * time for work already paid for once. Fixed: the lease record (a
+   * DIFFERENT file than the main cache's own `this.path`, so a failure
+   * localized to writing the main file does not also prevent this write)
+   * durably records the completed value FIRST, fenced by ownership via
+   * the same short, synchronous, non-`await`-spanning critical section
+   * every other lease mutation in this file already uses — so even if
+   * every subsequent attempt to write it into the main cache fails,
+   * `negotiateComputeOwnership()`'s own lease check (bkz. aşağısı) finds
+   * this completed record and returns the ALREADY-PAID-FOR value instead
+   * of ever calling `compute()` again for this key.
+   */
+  private recordComputeCompletion(key: string, ownerId: string, value: T): boolean {
+    const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
+    try {
+      const current = this.readComputeLease(key);
+      if (!current || current.ownerId !== ownerId) {
+        return false;
+      }
+      this.stateStore.write(this.computeLeasePath(key), { ownerId, expiresAt: current.expiresAt, completed: true, value });
+      return true;
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -392,6 +512,19 @@ export class FileCache<T = unknown> {
       }
       const now = Date.now();
       const existingLease = this.readComputeLease(key);
+      // P1 fix (P0 final closure remediation, finding 2): a `completed`
+      // lease (bkz. `recordComputeCompletion()`'ın fix notu) means the
+      // paid work genuinely finished — checked and returned BEFORE the
+      // ordinary liveness check below, and regardless of whether
+      // `expiresAt` has since passed, since "completed" is a stronger,
+      // permanent fact than "still within its original TTL window."
+      // Returning it here is exactly what stops a retrying caller from
+      // ever invoking `compute()` (and the real, billable provider) a
+      // second time merely because the main cache's own write of this
+      // same value failed on a previous attempt.
+      if (existingLease?.completed) {
+        return { kind: "value", value: existingLease.value as T };
+      }
       if (existingLease && existingLease.expiresAt > now) {
         return { kind: "busy" };
       }
@@ -436,6 +569,20 @@ export class FileCache<T = unknown> {
         // (this process or another) already won ownership and persisted a
         // result before this negotiation ran. Reported as a genuine cache
         // hit, exactly like `computeWithFileCache()`'s own initial lookup.
+        //
+        // P1 fix (P0 final closure remediation, finding 2): `outcome.value`
+        // may have come from a `completed` LEASE record rather than the
+        // main cache (bkz. `negotiateComputeOwnership()`'in fix notu) — a
+        // prior attempt's paid result that never made it into the main
+        // cache file. Opportunistically heal that here so future lookups
+        // are fast and do not depend on the lease file forever; a failure
+        // here is never fatal (the lease record remains the durable source
+        // of truth until this eventually succeeds on some later call).
+        try {
+          this.set(key, outcome.value, ttlMs);
+        } catch {
+          // Best-effort heal only — see fix note above.
+        }
         return { value: outcome.value, cached: true };
       }
       if (outcome.kind === "owner") {
@@ -458,7 +605,7 @@ export class FileCache<T = unknown> {
         // eventually stop renewing, successors recover only once genuinely
         // stale" recovery shape this file's lease design already
         // documents for the ORIGINAL, one-shot claim.
-        const renewalIntervalMs = Math.max(1, Math.floor(this.computeLeaseTtlMs / 3));
+        const renewalIntervalMs = computeRenewalIntervalMs(this.computeLeaseTtlMs);
         const renewalTimer = setInterval(() => {
           this.renewComputeLease(key, ownerId);
         }, renewalIntervalMs);
@@ -467,12 +614,57 @@ export class FileCache<T = unknown> {
           // No lock held here at all — an `await`-bound computation never
           // blocks the event loop, and never blocks another contender's own
           // brief `negotiateComputeOwnership()` critical section.
-          const value = await compute();
+          let value: T;
+          try {
+            value = await compute();
+          } catch (err) {
+            // `compute()` itself never ran to completion — no billable
+            // work was ever actually finished, so releasing the lease
+            // (letting a fresh contender try again) is exactly correct.
+            this.releaseComputeLease(key, ownerId);
+            throw err;
+          }
+          // P1 fix (P0 final closure remediation, finding 2, "paid
+          // bootstrap checkpoint must be atomic with provider
+          // completion"): from THIS point on, `value` is a genuine,
+          // already-billed result — bkz. `recordComputeCompletion()`'ın
+          // fix notu. That durable record is written FIRST, and on ANY
+          // failure from here on (including this line itself, or the
+          // main-cache `set()` below), the lease is deliberately NEVER
+          // released: releasing it would tell the next contender "nobody
+          // has computed this yet," and `negotiateComputeOwnership()`
+          // would then invoke `compute()` — the real, billable provider —
+          // a second time for work already paid for once. Whether or not
+          // this specific call successfully reflects the result into the
+          // main cache, `negotiateComputeOwnership()`'s own completed-
+          // lease check guarantees every future caller (this one retried,
+          // or any other) recovers the SAME value without recomputing.
+          //
+          // P1 fix (P0 final closure remediation, finding 5, "successful
+          // stale compute-lease owners must not commit"): reproduced —
+          // `recordComputeCompletion()`'s own CAS return value used to be
+          // discarded entirely, so even when it returned `false` (this
+          // owner's lease had ALREADY been reclaimed by a successor —
+          // e.g. this owner was wrongly presumed abandoned while
+          // genuinely still computing, a legitimate race the lease
+          // protocol's own TTL/reclaim design accepts as possible) the
+          // code below still called `this.set(key, value, ttlMs)`
+          // UNCONDITIONALLY — clobbering the main cache with THIS now-
+          // stale owner's result even after a successor had already
+          // legitimately claimed the key and may have already persisted
+          // its OWN, authoritative result. Lease release/renewal were
+          // already owner-fenced (findings 3/4 of this same batch); the
+          // final COMMIT step was not. Fixed: `committed` is checked, and
+          // a losing/stale owner falls through to renegotiate — exactly
+          // the same path an ordinary losing contender takes — so it
+          // recovers the SUCCESSOR's real, already-committed value on the
+          // next iteration instead of ever overwriting it with its own.
+          const committed = this.recordComputeCompletion(key, ownerId, value);
+          if (!committed) {
+            continue;
+          }
           this.set(key, value, ttlMs);
           return { value, cached: false };
-        } catch (err) {
-          this.releaseComputeLease(key, ownerId);
-          throw err;
         } finally {
           clearInterval(renewalTimer);
         }

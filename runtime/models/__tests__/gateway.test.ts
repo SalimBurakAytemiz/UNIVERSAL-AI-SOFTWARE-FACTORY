@@ -3290,4 +3290,49 @@ describe("ModelGateway + MockProvider", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 4, 'sparse provider arrays must not collide with explicit " +
+      "null'): canonicalizeConfigValueForFingerprint() must fail closed on a sparse array hole rather than " +
+      "letting it collapse onto the same fingerprint as an explicit null",
+    () => {
+      it("BLOCKER regression, exact reproduction: Array(1) (a hole) and [null] (an explicit value) must NOT produce the same identity digest", () => {
+        class SparseArrayConfigProvider implements ModelProvider {
+          readonly id = "mock";
+          config: unknown[];
+          constructor(items: unknown[]) {
+            this.config = items;
+          }
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const sparse = new SparseArrayConfigProvider(Array(1));
+        const explicitNull = new SparseArrayConfigProvider([null]);
+
+        // The finding's own instruction: fail closed on a sparse hole
+        // rather than lossily normalize it — so the sparse candidate must
+        // throw, and specifically must never produce a digest indistinguishable from `[null]`'s.
+        expect(() => computeProviderReplacementIdentityDigest(sparse, "mock")).toThrow(
+          UnsupportedProviderConfigurationError
+        );
+        expect(() => computeProviderReplacementIdentityDigest(explicitNull, "mock")).not.toThrow();
+      });
+
+      it("no-regression: a genuinely dense array of nulls still fingerprints normally and deterministically", () => {
+        class DenseArrayConfigProvider implements ModelProvider {
+          readonly id = "mock";
+          config = [null, null, "x"];
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const provider = new DenseArrayConfigProvider();
+        expect(() => computeProviderReplacementIdentityDigest(provider, "mock")).not.toThrow();
+        expect(computeProviderReplacementIdentityDigest(provider, "mock")).toBe(
+          computeProviderReplacementIdentityDigest(provider, "mock")
+        );
+      });
+    }
+  );
 });

@@ -2389,4 +2389,56 @@ describe("BudgetGuard", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (P0 final closure remediation, finding 10, 'authoritative state mutation surviving when mandatory " +
+      "audit publication fails'): a reservation must not remain live in the ledger when the mandatory " +
+      "BUDGET_RESERVATION_CREATED audit event fails to publish",
+    () => {
+      class ThrowingAuditLog extends AuditLog {
+        override append(event: Parameters<AuditLog["append"]>[0]): ReturnType<AuditLog["append"]> {
+          if (event.type === "BUDGET_RESERVATION_CREATED") {
+            throw new Error("simulated durable audit-log write failure");
+          }
+          return super.append(event);
+        }
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: reserve() rejects when BUDGET_RESERVATION_CREATED audit " +
+          "publication fails, and the just-created reservation is rolled back — reservedTotal() returns to " +
+          "zero and a fresh reservation for the full ceiling succeeds",
+        () => {
+          const costEngine = new CostEngine();
+          const auditLog = new ThrowingAuditLog();
+          const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 }, () => new Date(), auditLog);
+
+          expect(() => guard.reserve({ taskId: "t1" }, 0.6)).toThrow("simulated durable audit-log write failure");
+
+          // The reservation must NOT have survived the failed audit publish —
+          // no stranded capacity counted against future ceiling checks.
+          expect(costEngine.reservedTotal({ taskId: "t1" })).toBe(0);
+
+          // A caller that never received a handle must still be able to
+          // reserve the FULL ceiling afterward (via a guard whose audit log
+          // is healthy again) — proof that nothing was left behind on the
+          // SHARED costEngine ledger.
+          const healthyGuard = new BudgetGuard(costEngine, { perTaskUsd: 1 }, () => new Date(), new AuditLog());
+          expect(() => healthyGuard.reserve({ taskId: "t1" }, 1)).not.toThrow();
+        }
+      );
+
+      it("no regression: reserve() with a healthy audit log still creates and counts the reservation normally", () => {
+        const costEngine = new CostEngine();
+        const auditLog = new AuditLog();
+        const guard = new BudgetGuard(costEngine, { perTaskUsd: 1 }, () => new Date(), auditLog);
+
+        const reservation = guard.reserve({ taskId: "t1" }, 0.6);
+
+        expect(costEngine.reservedTotal({ taskId: "t1" })).toBe(0.6);
+        expect(auditLog.all().some((r) => r.type === "BUDGET_RESERVATION_CREATED")).toBe(true);
+        expect(() => guard.release(reservation.id, reservation.scope)).not.toThrow();
+      });
+    }
+  );
 });
