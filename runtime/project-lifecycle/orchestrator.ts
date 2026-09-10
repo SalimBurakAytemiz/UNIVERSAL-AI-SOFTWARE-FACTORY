@@ -256,6 +256,37 @@ export interface BootstrapProjectResult {
 }
 
 /**
+ * P1 fix (independent review, finding 8, "completed paid work lacking a
+ * durable checkpoint"): a crash between the paid `modelGateway.invoke()`
+ * call below actually completing and this function's own three
+ * `stateStore.write()` calls finishing left NOTHING durable recording
+ * that the invocation already happened — a retried `bootstrapProject()`
+ * call for the SAME `genome.project.id` had no way to tell "the model
+ * already ran and was billed" from "the model has never run," so it
+ * called `modelGateway.invoke()` a SECOND time, incurring a SECOND real
+ * charge for a single logical bootstrap (`baseline bölüm 277`, "kalıcı
+ * durum: süreç yeniden başlasa bile kaybolmaz" ihlali). This record is
+ * the minimal durable checkpoint needed to close that window: written
+ * via the SAME `stateStore` this function already uses for its other
+ * durable state (no new persistence mechanism), keyed by
+ * `genome.project.id` (bkz. `resolveTransactionPath()`), and consulted
+ * FIRST, inside `gateway.authorize()`'s own `execute` callback, before
+ * `modelGateway.invoke()` is ever called again for the same project.
+ * `scaffoldProjectOs()` and the three `stateStore.write()` calls that
+ * follow are already idempotent (recursive `mkdirSync`, deterministic
+ * overwrites) and therefore need no equivalent staged-transaction
+ * machinery of their own — this checkpoint exists ONLY to make the one
+ * genuinely non-idempotent, billable step in this function safe to
+ * retry.
+ */
+interface BootstrapTransactionRecord {
+  readonly projectId: string;
+  readonly status: "MODEL_COMPLETED";
+  readonly modelInvocation: ModelInvocationResponse;
+  readonly completedAt: string;
+}
+
+/**
  * P1 fix (11th independent review round targeted audit, same class as
  * "caller context mutation can change cost ownership during invocation" —
  * runtime/models/gateway.ts): `bootstrapProject()` awaits
@@ -415,6 +446,20 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   assertFilesystemConfinement(projectRoot, join("project-genome", "genome.json"));
   assertFilesystemConfinement(projectRoot, join("organization", "organization.json"));
   assertFilesystemConfinement(projectRoot, join("state", "bootstrap.json"));
+  // P1 fix (independent review, finding 8, "completed paid work lacking a
+  // durable checkpoint"): validated in this SAME synchronous, pre-paid-work
+  // prefix as the three destinations above, for the same reason — a
+  // symlink-escape at this path must be rejected before any billed
+  // invocation, not discovered afterward. Deliberately anchored under
+  // `baseDir` (bkz. üstündeki `BootstrapTransactionRecord`'ın fix notu),
+  // NOT `projectRoot`: `projectRoot`'s own directory tree does not exist
+  // yet at this point (`scaffoldProjectOs()` has not run), so a retry that
+  // crashed before scaffolding ever started still needs a stable location
+  // to find this project's transaction record.
+  const transactionPath = assertFilesystemConfinement(
+    baseDir,
+    join("bootstrap-transactions", `${genome.project.id}.json`)
+  );
   const organization = composeOrganizationFromGenome(genome, risk);
 
   // P2 fix (13th independent review round targeted audit, same class as
@@ -653,21 +698,51 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   const scaffold = await gateway.authorize(
     scaffoldAction,
     async () => {
-    invocationResponse = await modelGateway.invoke(
-      modelDecision.model,
-      {
-        prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
-        taskType: "bootstrap-summary"
-      },
-      {
-        policy,
-        budget,
-        risk: 0,
-        taskId: `bootstrap:${genome.project.id}`,
+    // P1 fix (independent review, finding 8, "completed paid work lacking
+    // a durable checkpoint"): consult the durable transaction record
+    // BEFORE invoking the paid model a second time. A retry after a crash
+    // that happened AFTER the invocation below already completed (but
+    // before this whole bootstrap finished) reuses the ALREADY-BILLED,
+    // ALREADY-COMMITTED `modelInvocation` this record captured on the
+    // attempt that actually paid for it — never a fresh `invoke()` call —
+    // so provider-invocation-count and total cost for this project stay
+    // exactly what the first, genuinely successful invocation produced,
+    // no matter how many times bootstrap is retried afterward.
+    const existingTransaction = stateStore.read<BootstrapTransactionRecord>(transactionPath);
+    if (existingTransaction && existingTransaction.status === "MODEL_COMPLETED") {
+      invocationResponse = existingTransaction.modelInvocation;
+    } else {
+      invocationResponse = await modelGateway.invoke(
+        modelDecision.model,
+        {
+          prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
+          taskType: "bootstrap-summary"
+        },
+        {
+          policy,
+          budget,
+          risk: 0,
+          taskId: `bootstrap:${genome.project.id}`,
+          projectId: genome.project.id,
+          description: `Bootstrap summary for project '${genome.project.id}'`
+        }
+      );
+      // Persisted immediately after the paid call succeeds, and BEFORE
+      // `scaffoldProjectOs()` runs — the residual crash window between the
+      // provider genuinely completing and this local write landing is
+      // real and unavoidable (no distributed transaction spans an
+      // external provider call), but every crash on either side of THIS
+      // line is now covered: before it, no charge was ever recorded as
+      // having happened and `invoke()` retries in full; after it, this
+      // exact record is what the next retry above reuses instead of
+      // paying again.
+      stateStore.write(transactionPath, {
         projectId: genome.project.id,
-        description: `Bootstrap summary for project '${genome.project.id}'`
-      }
-    );
+        status: "MODEL_COMPLETED",
+        modelInvocation: invocationResponse,
+        completedAt: new Date().toISOString()
+      } satisfies BootstrapTransactionRecord);
+    }
     const scaffoldResult = scaffoldProjectOs(baseDir, genome.project.id);
 
     // P1 fix (5th independent review round, "final-destination / dangling

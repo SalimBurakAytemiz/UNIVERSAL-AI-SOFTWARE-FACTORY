@@ -1472,6 +1472,93 @@ factory:
     does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT
     create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    UPDATE (P0 FINAL CLOSURE REMEDIATION — NINE REPRODUCED EXISTING-P0 BLOCKERS round; see the `blockers` list's
+    own final entry for the condensed pointer): an independent reviewer examined a prior commit on this branch
+    against origin/main and reproduced NINE EXISTING P0 blockers (8 P1, 1 P2), required to be fixed as ONE
+    consolidated corrective batch, never routed to backlog/P1. All nine are fixed, individually
+    regression-tested, and individually bypass-verified (each fix was temporarily reverted in place — via a
+    backed-up file edit, never a git operation — and the exact predicted new test(s), never more, never fewer,
+    were confirmed to fail before the fix was restored and the full suite reconfirmed green): (1) same-process
+    async cache concurrency: `cache/file-cache.ts`'s `computeAndSet()` now negotiates a durable, TTL-bounded
+    cross-process "compute lease" via a SHORT synchronous `acquireFileLock()` critical section that never spans an
+    `await` (the actual `compute()` call runs with no lock held), plus a same-process `Map<string,
+    Promise<...>>` in-flight dedup — a tight-timeout follower can no longer observe `FileLockTimeoutError` while
+    a slower same-key computation is legitimately in flight, and a fabricated never-released lease is reclaimed
+    once its `expiresAt` passes. (2) incomplete-status accepted by closure: `governance/phase-closure.ts` gained
+    `CLOSURE_READY_EFFECTIVE_STATUSES` (`UNIT_TESTED`/`INTEGRATION_TESTED`/`PROOF_VERIFIED`/
+    `PRODUCTION_VERIFIED`/`DEPRECATED`/`SUPERSEDED` only) as the closure gate's requirement-readiness check — a
+    strict superset of the old BLOCKED-only check, so `DEFINED`/`PLANNED`/`IMPLEMENTATION_IN_PROGRESS`/
+    `IMPLEMENTED`/`UNSUPPORTED_CLAIM` requirements can no longer pass closure. (3) caller-authored evidence
+    outcome trusted: `phase-closure.ts`'s `IndependentReviewEvidence.evidenceRef` is now authenticated via a new,
+    exported `isAuthenticatedVerificationArtifact()` (existence + recognized-artifact path shape + a trusted
+    `verificationSource` prefix, deliberately WITHOUT requiring a specific outcome value, since a review's true
+    verdict is tracked separately via its own `outcome` field) factored out of
+    `requirements-traceability/traceability.ts`'s existing `isOutcomeVerifiedEvidenceRef()` — a caller can no
+    longer fabricate a review's evidence outcome merely by asserting `outcome: "CLEAN"` against an arbitrary
+    real file. (4) existence-only evidence: the same `isAuthenticatedVerificationArtifact()`/
+    `isOutcomeVerifiedEvidenceRef()` split adds a closed-allowlist `OUTCOME_EVIDENCE_ARTIFACT_PATH_PATTERN`
+    (this Factory's own genuine verification-artifact shapes only — `proofs/**`, `__tests__/**`,
+    `*.test.{ts,js,mjs,cjs}`, `*.spec.*`, CI workflow files, phase-closure manifests) and an exported
+    `TRUSTED_VERIFICATION_SOURCE_PREFIXES` allowlist, so `phase-closure.ts`'s `verificationEvidenceRefs` can no
+    longer be satisfied by an arbitrary existing file (e.g. `package.json`) asserting a PASS outcome. (5)
+    caller-supplied repository identity trusted as HEAD: `phase-closure.ts` gained
+    `resolveTrustedRepositoryHeadSha()` — the one trusted source of "what commit is actually checked out" (real
+    `git rev-parse HEAD`, validated as a 40-hex-char SHA, fail-closed via `UntrustedRepositoryIdentityError`),
+    injectable only for test determinism — a closing attempt's `closingCommitSha` can no longer be a
+    caller-asserted value never cross-checked against the real repository state. (6) recovery trusting staged
+    claims: `phase-closure.ts`'s closure gate logic was extracted into one shared `evaluateClosureAttempt()`
+    function called BOTH by a fresh `attemptPhaseClosure()` call AND by `recoverPendingPhaseClosure()` — recovery
+    now re-evaluates the ORIGINAL, untrusted `PendingClosureIntent.attempt` fresh against LIVE authoritative
+    state every time, rather than trusting a persisted `guardReport`/manifest/conclusion; a malformed or
+    tampered recovery intent now fails recovery instead of completing a closure the live state no longer
+    supports. (7) live-persistence accepting what identity-restore rejects: `cost/cost-engine.ts` gained a
+    shared `reservationOwnershipShapeError()` that both the existing restore-time
+    `assertValidPersistedScope()` and a new live-write-time `assertValidLiveReservationScope()` (thrown as a new
+    `InvalidReservationScopeError`, called from `createReservation()`) funnel through — a malformed
+    `ReservationOwnership` can no longer be written live only to be rejected on the next restart's restore.
+    (8) completed paid work lacking a durable checkpoint: `project-lifecycle/orchestrator.ts`'s
+    `bootstrapProject()` now writes a durable `bootstrap-transactions/<projectId>.json` checkpoint (via the
+    SAME `stateStore` this function already uses — no new persistence mechanism) immediately after its paid
+    `modelGateway.invoke()` call succeeds and BEFORE `scaffoldProjectOs()` runs; the SAME `execute` callback now
+    checks that checkpoint FIRST and reuses its already-billed `modelInvocation` instead of invoking the model
+    again on retry. This EXPLICITLY CORRECTS the "known_limitations" entry this file previously recorded for
+    this exact defect (routed to backlog on the reasoning that no code yet reads these files back to misinterpret
+    partial state) — a fresh independent review, and this round's own re-examination, established that "no
+    current reader" was never the relevant harm: a crash-and-retry after a real, billed model invocation but
+    before bootstrap finished caused a SECOND real charge for one logical bootstrap, a direct violation of
+    baseline section 147 ("no silent spending") and UASF-REQ-0021/section 277 ("kalıcı durum: süreç yeniden
+    başlasa bile kaybolmaz"), independent of whether anything downstream ever reads the resulting files. That
+    known_limitations entry is corrected below to reflect this fix. (9) validation/serialization reading input
+    separately: `state/file-store.ts`'s `write()` now calls a single `captureSnapshot()` that validates
+    (rejecting non-finite numbers, unsafe `undefined` positions, functions/symbols/bigint, non-plain-object
+    instances, genuine circular references) AND builds a detached plain-data copy in ONE pass over each
+    property/getter — replacing the old two-pass `assertNoLossySerialization()` (validate) followed by a
+    separate `JSON.stringify(data, ...)` (serialize) that could observe DIFFERENT values from an unstable
+    getter/Proxy on its second read; `write()` now serializes and persists ONLY that one captured snapshot,
+    never re-reading the caller-owned `data` again.
+
+    A narrow root-cause audit, strictly limited to these nine exact root classes (no open-ended hardening, no
+    P0 scope expansion), found NO further genuine direct instances of any of them elsewhere in `runtime/`:
+    `cost-engine.ts`'s own `acquireFileLock()` usage never spans an `await` (mutator is fully synchronous, so
+    class 1 does not recur there); `reality-matrix.ts`/`invariant-guard.ts` both delegate evidence checking to
+    the SAME hardened `detectTraceabilityIssues()` (classes 3/4 do not recur as separate weaker checks);
+    `phase-closure.ts` is the only module anywhere in `runtime/` that resolves a repository HEAD identity
+    (class 5 has no other instance); `router.ts`'s only paid-invocation call site returns `gateway.invoke()`'s
+    result directly with no further non-idempotent step afterward, unlike `bootstrapProject()`'s three
+    sequential writes (class 8 has no other instance); `audit-log.ts`'s `append()` already single-detaches via
+    `structuredClone()` before validating/canonicalizing, storing only that already-detached, already-validated
+    result (class 9's pattern is already correctly applied there, not a second genuine violation). Full required
+    verification sequence green on the resulting commit: lint (clean), typecheck (clean), build (clean),
+    1565/1565 tests across 51 files (up from 1562 immediately pre-finding-8, +3 new finding-8 regression tests),
+    validate:requirements (46 schema-valid records, unchanged), history-and-current-tree-aware secret-scan (PASS
+    — 126 current-tree files, 721 unique historical blobs, zero unreadable), production install verification
+    (PASS — `npm ci --omit=dev` genuinely runnable, compiled CLI + js-yaml + ajv all functional with zero
+    devDependencies present), Factory Doctor (READY — Node.js, npm, Python, Git, Docker), all 9 P0 proofs green
+    (13 assertions). Per explicit instruction, this round used `READY_FOR_INDEPENDENT_REVIEW` (never `CLOSED`),
+    made no unsupported requirement-status upgrades, did not merge, did not move to P1, did not invoke Codex
+    itself, and did not create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7. The next
+    step remains an independent review of this exact commit; P0 is explicitly NOT CLOSED.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -4441,15 +4528,27 @@ known_limitations:
     invocation end-to-end is a feature addition, not a bug fix within
     existing plumbing.
   - >-
-    `project-lifecycle/orchestrator.ts`'s `bootstrapProject()` performs three sequential durable writes
+    CORRECTED by the P0 FINAL CLOSURE REMEDIATION — NINE REPRODUCED EXISTING-P0 BLOCKERS round (see
+    `p0_status`'s own finding-8 paragraph for the full narrative): this entry previously read
+    "`project-lifecycle/orchestrator.ts`'s `bootstrapProject()` performs three sequential durable writes
     (project-genome/genome.json, organization/organization.json, state/bootstrap.json) with no staged
-    intent/recovery record — a crash between any two writes leaves a partial project directory. Found during the
-    P0 CLOSURE REMEDIATION (9-finding batch) round's own narrow root-cause audit (same shape as that round's
-    finding 3, "multi-file governance closure without recoverable transaction semantics") but deliberately NOT
-    fixed: no code anywhere in `runtime/` currently reads these three files back to decide "is this project
-    bootstrapped", so a crash-induced partial write is inert today, not a reproducible violation of any live
-    invariant — building a full staged-transaction+recovery mechanism for it now would be new architecture, not a
-    narrow fix. Route to backlog for whenever a real consumer of these files is introduced.
+    intent/recovery record ... deliberately NOT fixed: no code anywhere in `runtime/` currently reads these
+    three files back to decide 'is this project bootstrapped', so a crash-induced partial write is inert
+    today ... Route to backlog for whenever a real consumer of these files is introduced." A fresh independent
+    review, and this round's own re-examination, established that this classification was wrong: the real harm
+    was never "a reader misinterprets partial state" but "a crash-and-retry after the paid `modelGateway.invoke()`
+    call already succeeded, but before bootstrap finished, incurs a SECOND real charge for one logical
+    bootstrap" — a direct "no silent spending" (baseline section 147) / UASF-REQ-0021 (baseline section 277,
+    durable state that survives a restart) violation, independent of whether any downstream reader exists yet.
+    This is now FIXED, not deferred: `bootstrapProject()` writes a durable `bootstrap-transactions/<projectId>.json`
+    checkpoint (reusing the existing `stateStore`, no new persistence mechanism) immediately after the paid
+    invocation succeeds and before `scaffoldProjectOs()` runs, and checks it first on every call — a retry
+    reuses the already-billed invocation instead of paying/invoking again. The narrower, still-true residual
+    fact — `scaffoldProjectOs()`'s directory creation and the three `stateStore.write()` calls themselves have
+    no staged multi-file atomicity beyond each call's own idempotency — remains accurate and is NOT itself a
+    live violation (each write is independently idempotent/overwrite-safe, and this round's regression suite
+    proves a crash between them and a retry still converges to the correct end state); it is not restated as a
+    separate limitation here to avoid re-implying the withdrawn "route to backlog" framing.
 
 blockers:
   - >-
@@ -7074,3 +7173,31 @@ exact_next_action: >
   explicitly NOT CLOSED; the next step is an independent FINAL P0 CLOSURE REVIEW. Per explicit instruction, this
   round does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT
   create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
+
+  UPDATE (P0 FINAL CLOSURE REMEDIATION — NINE REPRODUCED EXISTING-P0 BLOCKERS round; see `p0_status`'s own final
+  paragraph for the complete narrative): P0 REMAINS READY_FOR_INDEPENDENT_REVIEW (LOCKED_FOR_CLOSURE) — still NOT
+  CLOSED. An independent reviewer examined a prior commit on this branch against origin/main and reproduced NINE
+  EXISTING P0 blockers (8 P1, 1 P2); this round's task was explicitly scope-locked to fix all nine as ONE
+  consolidated corrective batch, never routed to backlog/P1, plus a narrow same-root-cause audit against the
+  round's own 9 named classes — no new P1/feature work, no new governance subsystem, no new branch, no merge, no
+  Codex invocation, no CLOSED declaration. All nine findings are fixed, individually regression-tested, and
+  individually bypass-verified: (1) same-process async cache concurrency in file-cache.ts, (2) incomplete
+  requirement statuses accepted by phase-closure.ts's closure gate, (3) caller-authored evidence outcomes trusted
+  by phase-closure.ts's independent-review evidence, (4) existence-only evidence satisfying outcome-bearing
+  verification claims, (5) a caller-supplied repository identity trusted as HEAD in phase-closure.ts, (6)
+  phase-closure.ts's crash recovery trusting a persisted intent's staged claims instead of re-evaluating live
+  state, (7) cost-engine.ts's live reservation-write path accepting shapes its own restore path would reject, (8)
+  orchestrator.ts's bootstrapProject() lacking a durable checkpoint for its one paid, non-idempotent step (this
+  EXPLICITLY CORRECTS the "route to backlog" classification this file previously recorded for the same defect —
+  see the corrected `known_limitations` entry), and (9) file-store.ts's write() validating and serializing an
+  unstable getter/Proxy input via two separate reads instead of one. The narrow root-cause audit, strictly
+  limited to these nine exact classes, found no further genuine direct instances of any of them elsewhere in
+  runtime/. Full required verification sequence green: lint, typecheck, build, 1565/1565 tests across 51 files,
+  validate:requirements (46 schema-valid records, unchanged), history-and-current-tree-aware secret-scan (PASS),
+  production install verification (PASS), Factory Doctor (READY), all 9 P0 proofs (13 assertions). No requirement
+  status was raised beyond what this round's real evidence supports; P0's persisted Scope Lock state is UNCHANGED
+  by this round (still LOCKED_FOR_CLOSURE from round 35) — this round ran no phase-transition API call, since it
+  supplied no new independent review result of its own to act on. P0 remains explicitly NOT CLOSED; the next step
+  is an independent review of this exact commit. Per explicit instruction, this round does NOT merge, does NOT
+  move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work
+  stayed on claude/ai-factory-baseline-v1-seawq7.

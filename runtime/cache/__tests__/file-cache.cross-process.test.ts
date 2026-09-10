@@ -13,6 +13,17 @@ function computeLockPathFor(cachePath: string, key: string): string {
   return `${cachePath}.compute.${createHash("sha256").update(key).digest("hex")}.lock`;
 }
 
+/**
+ * Mirrors FileCache's own private computeLeasePath() exactly (independent
+ * Codex review, "do not hold the synchronous cache lock across await") —
+ * lets a test fabricate a durable "someone is already computing this key"
+ * lease record directly on disk, simulating an owner that crashed mid-
+ * compute without ever reaching the code that would normally clear it.
+ */
+function computeLeasePathFor(cachePath: string, key: string): string {
+  return `${cachePath}.compute.${createHash("sha256").update(key).digest("hex")}.lease`;
+}
+
 // P2 fix (16th independent review round, "durable cache read-modify-write
 // is not safe across processes"): Codex reproduced the classic
 // cross-process lost-update race — two independent OS processes both
@@ -882,6 +893,86 @@ describe(
 
             const cache = new FileCache<string>(new FileStateStore(), cachePath);
             expect(cache.get("crash-key")).toBe("value-after-crash");
+          },
+          20_000
+        );
+
+        it(
+          "P1 fix (independent Codex review, 'do not hold the synchronous cache lock across await'): a REAL " +
+            "cross-process compute() taking longer than another contender's short lock timeoutMs never throws " +
+            "FileLockTimeoutError — the lock is only ever held for the brief negotiation, never across the " +
+            "await itself",
+          async () => {
+            tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-no-lock-across-await-"));
+            const cachePath = join(tempRoot, "cache.json");
+            const logPath = join(tempRoot, "compute-log.txt");
+            writeFileSync(logPath, "");
+            // A deliberately TIGHT lock timeoutMs (governs only the brief
+            // negotiation critical section, never the compute itself) —
+            // paired with a compute delay far longer than it. Under the old
+            // "hold the lock across await" implementation this would have
+            // made the second contender's `acquireFileLock()` spin-wait
+            // time out and throw; it must not under the fixed protocol.
+            const tightLockOptions = JSON.stringify({ timeoutMs: 50, staleMs: 5_000, pollIntervalMs: 5 });
+
+            const [resultA, resultB] = await Promise.all([
+              runWorker(["compute", cachePath, "shared-key", "computed-value", logPath, "300", tightLockOptions]),
+              runWorker(["compute", cachePath, "shared-key", "computed-value", logPath, "300", tightLockOptions])
+            ]);
+            expect(resultA.code, resultA.stderr).toBe(0);
+            expect(resultB.code, resultB.stderr).toBe(0);
+            expect(resultA.stderr).not.toContain("FileLockTimeoutError");
+            expect(resultB.stderr).not.toContain("FileLockTimeoutError");
+
+            const parsedA = JSON.parse(resultA.stdout) as { value: string; cached: boolean };
+            const parsedB = JSON.parse(resultB.stdout) as { value: string; cached: boolean };
+            expect(parsedA.value).toBe("computed-value");
+            expect(parsedB.value).toBe("computed-value");
+            expect([parsedA.cached, parsedB.cached].sort()).toEqual([false, true]);
+
+            const logLines = readFileSync(logPath, "utf8").split("\n").filter((l) => l.length > 0);
+            expect(logLines).toHaveLength(1);
+          },
+          20_000
+        );
+
+        it(
+          "a fabricated, never-released compute LEASE (simulating an owner that crashed mid-compute, after " +
+            "winning ownership but before persisting anything) is reclaimed once its own recorded expiresAt " +
+            "passes — bounded, deterministic recovery rather than a permanent deadlock",
+          async () => {
+            tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-xproc-dead-lease-"));
+            const cachePath = join(tempRoot, "cache.json");
+            const logPath = join(tempRoot, "compute-log.txt");
+            writeFileSync(logPath, "");
+            const leasePath = computeLeasePathFor(cachePath, "abandoned-key");
+
+            // Fabricate a lease whose `expiresAt` is already in the past —
+            // exactly what a genuinely crashed owner's lease looks like
+            // once its own bounded TTL has elapsed.
+            const staleLease = JSON.stringify({ ownerId: "crashed-owner", expiresAt: Date.now() - 1_000 });
+            const writeResult = await runWorker(["write-json", leasePath, staleLease]);
+            expect(writeResult.code, writeResult.stderr).toBe(0);
+
+            const start = Date.now();
+            const computeResult = await runWorker([
+              "compute",
+              cachePath,
+              "abandoned-key",
+              "value-after-crash",
+              logPath,
+              "0"
+            ]);
+            const elapsedMs = Date.now() - start;
+
+            expect(computeResult.code, computeResult.stderr).toBe(0);
+            expect(elapsedMs).toBeLessThan(5_000);
+            const parsed = JSON.parse(computeResult.stdout) as { value: string; cached: boolean };
+            expect(parsed.value).toBe("value-after-crash");
+            expect(parsed.cached).toBe(false);
+
+            const cache = new FileCache<string>(new FileStateStore(), cachePath);
+            expect(cache.get("abandoned-key")).toBe("value-after-crash");
           },
           20_000
         );

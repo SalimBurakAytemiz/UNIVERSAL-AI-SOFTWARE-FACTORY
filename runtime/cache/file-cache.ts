@@ -6,7 +6,7 @@
 // ayrı bir process/instance önceden hesaplanmış bir sonucu yeniden kullanabilir
 // (Proof G'nin "restart sonrası da geçerli" kanıtı, bölüm 306).
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { StateStore } from "../state/file-store.js";
 import type { CacheEntry, CacheLookupResult } from "./cache.js";
 import { assertValidTtl } from "./cache.js";
@@ -34,11 +34,33 @@ import { acquireFileLock, type FileLockOptions } from "./file-lock.js";
 type PersistedEntry<T> = readonly [key: string, entry: CacheEntry<T>];
 type PersistedEntries<T> = readonly PersistedEntry<T>[];
 
+const DEFAULT_COMPUTE_LEASE_TTL_MS = 30_000;
+const COMPUTE_LEASE_POLL_INTERVAL_MS = 20;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class FileCache<T = unknown> {
+  /**
+   * P1 fix (independent Codex review, "do not hold the synchronous cache
+   * lock across await"): same-process rationale as `cache.ts`'in
+   * `inFlight`'inin fix notu — two callers in THIS process racing the SAME
+   * missing key must never both reach `#computeCrossProcess()` (bkz.
+   * aşağısı) at all; the second one simply awaits the first's own Promise.
+   * This is a PURE in-process optimization layered on top of the
+   * cross-process lease protocol below — it never touches the filesystem,
+   * so it adds no new failure mode, and removing it would only cost extra
+   * (still-correct) cross-process lease round-trips for same-process
+   * callers, never a correctness regression.
+   */
+  private readonly inFlight = new Map<string, Promise<ComputeWithFileCacheResult<T>>>();
+
   constructor(
     private readonly stateStore: StateStore,
     private readonly path: string,
-    private readonly lockOptions?: FileLockOptions
+    private readonly lockOptions?: FileLockOptions,
+    private readonly computeLeaseTtlMs: number = DEFAULT_COMPUTE_LEASE_TTL_MS
   ) {}
 
   /**
@@ -197,48 +219,183 @@ export class FileCache<T = unknown> {
    * documents for OTHER reasons) never need to be filesystem-safe
    * themselves.
    */
+  /**
+   * A SHORT-LIVED, per-key file lock used ONLY to guard the brief,
+   * synchronous "check the cache, then read-or-write the durable lease
+   * record" critical section below — never held across an `await`. Kept
+   * distinct from the whole-cache `lockPath()` `set()`/`lookup()` use for
+   * their own mutation critical sections (bkz. o alanların üstündeki fix
+   * notları), so a compute lease negotiation for one key never serializes
+   * against an unrelated key's ordinary `set()`/`get()`.
+   */
   private computeLockPath(key: string): string {
     return `${this.path}.compute.${createHash("sha256").update(key).digest("hex")}.lock`;
   }
 
   /**
-   * P2 fix (independent Codex review, "deduplicate concurrent durable
-   * cache computations"): `computeWithFileCache()` below used to
-   * `lookup()` (a MISS), then call `compute()` completely OUTSIDE any
-   * lock, then `set()` — two callers (in this process, or in two SEPARATE
-   * processes sharing this same durable cache file) racing the SAME
-   * cache-miss key could both observe the miss and both run `compute()`,
-   * defeating this cache's own documented reuse guarantee and, for a
-   * caller wrapping a paid model invocation, duplicating real spend.
-   * Fixed with a single-flight/lease protocol built on the ALREADY-
-   * HARDENED `acquireFileLock()` primitive (never a new, unrelated locking
-   * mechanism — this round's own explicit instruction): acquire a PER-KEY
-   * compute lease -> RE-CHECK the cache (another caller may have already
-   * computed and persisted this exact key while this one waited for the
-   * lease — reusing it here is what makes this "single-flight", not just
-   * "single-writer") -> only the lease WINNER actually calls `compute()`
-   * -> persist via the ordinary, already-locked `set()` -> release. If
-   * `compute()` throws, `set()` is never reached and the lease is still
-   * released in `finally` — a failure never gets silently cached as a
-   * success, and the next caller (or a retry) can immediately attempt its
-   * own fresh compute rather than deadlocking on a lease no one will ever
-   * release. Crash recovery (a process dying while holding this lease) is
-   * inherited for free from `acquireFileLock()`'s own already-hardened
-   * stale-lock reclamation (established across the 18th/20th/21st/22nd
-   * independent review rounds) — no new recovery logic is needed here.
+   * P1 fix (independent Codex review, "do not hold the synchronous cache
+   * lock across await"): the durable "someone is already computing this
+   * key" marker — `{ ownerId, expiresAt }`, written and read ONLY inside
+   * `#negotiateComputeOwnership()`'s short, lock-protected critical
+   * section (bkz. aşağısı), NEVER while an `await compute()` is pending.
+   * Path derived the same hashed way `computeLockPath()` already is, kept
+   * as a SEPARATE file (`.lease`, not `.lock`) so the DATA (who owns this
+   * compute, until when) is never confused with the brief MUTUAL-EXCLUSION
+   * primitive (`acquireFileLock()`'s own directory-based lock) used only
+   * to serialize reads/writes of that data.
+   */
+  private computeLeasePath(key: string): string {
+    return `${this.path}.compute.${createHash("sha256").update(key).digest("hex")}.lease`;
+  }
+
+  private readComputeLease(key: string): { readonly ownerId: string; readonly expiresAt: number } | undefined {
+    const raw = this.stateStore.read<{ ownerId?: unknown; expiresAt?: unknown }>(this.computeLeasePath(key));
+    if (!raw || typeof raw.ownerId !== "string" || typeof raw.expiresAt !== "number" || !Number.isFinite(raw.expiresAt)) {
+      return undefined;
+    }
+    return { ownerId: raw.ownerId, expiresAt: raw.expiresAt };
+  }
+
+  private writeComputeLease(key: string, ownerId: string, expiresAt: number): void {
+    this.stateStore.write(this.computeLeasePath(key), { ownerId, expiresAt });
+  }
+
+  /**
+   * P1 fix (independent Codex review, "do not hold the synchronous cache
+   * lock across await" — reproduced: a caller holding `computeLockPath()`'s
+   * synchronous, directory-based file lock across `await compute()` forces
+   * every OTHER same-process/cross-process contender for the SAME key to
+   * block the Node.js EVENT LOOP inside `acquireFileLock()`'s own
+   * synchronous `Atomics.wait()` spin-wait for up to their configured
+   * `timeoutMs`, throwing `FileLockTimeoutError` the instant that elapses —
+   * even though the actual computation was still legitimately in flight and
+   * would have finished shortly after. A synchronous mutual-exclusion
+   * primitive must NEVER be held across an asynchronous gap): this method
+   * used to hold `computeLockPath(key)`'s lock for the ENTIRE duration of
+   * `await compute()`. Fixed with a two-level protocol — bkz. `#negotiateComputeOwnership()`'s
+   * own fix notu for the short, synchronous critical section this now
+   * uses instead:
+   *   (1) SAME-PROCESS callers dedupe via `inFlight` (bkz. onun üstündeki
+   *       fix notu) — a genuine JS `Promise`, no lock, no polling, no
+   *       event-loop blocking at all.
+   *   (2) CROSS-PROCESS callers negotiate a durable, TTL-bounded compute
+   *       LEASE via a SHORT (microseconds-scale) critical section —
+   *       acquire the per-key file lock, check whether the value already
+   *       landed (another process finished while this one was contending),
+   *       check/claim the lease, RELEASE the lock — all BEFORE `compute()`
+   *       ever runs. The winner then runs `compute()` with NO lock held at
+   *       all (the event loop is never blocked by a pending computation),
+   *       persists via the ordinary, independently-locked `set()`, and — on
+   *       failure — immediately expires its own lease (never waits out the
+   *       full TTL) so a retry can proceed at once. A loser (lease already
+   *       held and not yet expired) sleeps `COMPUTE_LEASE_POLL_INTERVAL_MS`
+   *       (an ordinary `await`-based sleep — never a synchronous, event-
+   *       loop-blocking wait) and renegotiates; if the ORIGINAL owner
+   *       crashes mid-compute, the lease's own `expiresAt` bounds how long
+   *       any follower ever waits before reclaiming it — the same
+   *       TTL/mtime-bounded "owner identity cannot be perfectly proven, so
+   *       bound the wait instead" recovery shape `runtime/cache/file-lock.ts`'s
+   *       own documented UNKNOWN-owner path already establishes, not a
+   *       novel mechanism.
    */
   async computeAndSet(key: string, compute: () => Promise<T> | T, ttlMs?: number): Promise<ComputeWithFileCacheResult<T>> {
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      // A same-process follower always reports a cache HIT regardless of
+      // what the shared in-flight call itself observed (bkz. `inFlight`'in
+      // üstündeki fix notu) — it never independently negotiated ownership.
+      return { value: (await existing).value, cached: true };
+    }
+    const promise = this.#computeCrossProcess(key, compute, ttlMs);
+    this.inFlight.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  /**
+   * The SHORT, synchronous critical section: acquire `computeLockPath(key)`
+   * (never held past this function's own synchronous body — no `await`
+   * anywhere inside it), re-check the cache for a value another contender
+   * may have already committed, and otherwise atomically read-or-claim the
+   * durable compute lease. Returns immediately in every case — the caller
+   * (`#computeCrossProcess()`) decides what to do (run `compute()`, reuse a
+   * value, or sleep-and-retry) OUTSIDE this lock.
+   */
+  private negotiateComputeOwnership(
+    key: string,
+    ownerId: string
+  ): { readonly kind: "value"; readonly value: T } | { readonly kind: "owner" } | { readonly kind: "busy" } {
     const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
     try {
       const recheck = this.lookup(key);
       if (recheck.found) {
-        return { value: recheck.value as T, cached: true };
+        return { kind: "value", value: recheck.value as T };
       }
-      const value = await compute();
-      this.set(key, value, ttlMs);
-      return { value, cached: false };
+      const now = Date.now();
+      const existingLease = this.readComputeLease(key);
+      if (existingLease && existingLease.expiresAt > now) {
+        return { kind: "busy" };
+      }
+      this.writeComputeLease(key, ownerId, now + this.computeLeaseTtlMs);
+      return { kind: "owner" };
     } finally {
       release();
+    }
+  }
+
+  /**
+   * Immediately expires this key's compute lease — called ONLY when the
+   * lease OWNER's own `compute()` call fails, so a genuine failure never
+   * forces a waiting follower to sit out the full `computeLeaseTtlMs`
+   * before it can attempt its own fresh compute. A best-effort write: if
+   * it itself fails, the lease still naturally expires at its own
+   * `expiresAt` — bounded recovery, never a permanent deadlock.
+   */
+  private releaseComputeLease(key: string, ownerId: string): void {
+    const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
+    try {
+      this.writeComputeLease(key, ownerId, 0);
+    } finally {
+      release();
+    }
+  }
+
+  async #computeCrossProcess(
+    key: string,
+    compute: () => Promise<T> | T,
+    ttlMs?: number
+  ): Promise<ComputeWithFileCacheResult<T>> {
+    const ownerId = `${process.pid}-${randomBytes(8).toString("hex")}`;
+    for (;;) {
+      const outcome = this.negotiateComputeOwnership(key, ownerId);
+      if (outcome.kind === "value") {
+        // This call never actually computed anything — another contender
+        // (this process or another) already won ownership and persisted a
+        // result before this negotiation ran. Reported as a genuine cache
+        // hit, exactly like `computeWithFileCache()`'s own initial lookup.
+        return { value: outcome.value, cached: true };
+      }
+      if (outcome.kind === "owner") {
+        try {
+          // No lock held here at all — an `await`-bound computation never
+          // blocks the event loop, and never blocks another contender's own
+          // brief `negotiateComputeOwnership()` critical section.
+          const value = await compute();
+          this.set(key, value, ttlMs);
+          return { value, cached: false };
+        } catch (err) {
+          this.releaseComputeLease(key, ownerId);
+          throw err;
+        }
+      }
+      // "busy": another contender holds a live lease. Sleep via an
+      // ordinary `await` (never a synchronous, event-loop-blocking wait)
+      // and renegotiate — either the winner's value has landed by then, or
+      // the lease has meanwhile expired (bounding a crashed owner's impact).
+      await sleep(COMPUTE_LEASE_POLL_INTERVAL_MS);
     }
   }
 }

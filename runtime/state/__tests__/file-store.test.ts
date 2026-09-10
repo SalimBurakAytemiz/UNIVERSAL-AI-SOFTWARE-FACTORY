@@ -375,4 +375,97 @@ describe("FileStateStore", () => {
       });
     }
   );
+
+  describe(
+    "P2 fix (independent Codex review, 'FileStateStore must validate and serialize ONE captured snapshot', " +
+      "finding 9): validation and the bytes actually persisted must always agree, even when a caller-owned " +
+      "getter answers differently on repeated reads",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a getter whose FIRST observation is NaN and whose SECOND " +
+          "observation would be a valid 1 -> write() FAILS closed (rejects the FIRST, invalid observation) " +
+          "and persists NOTHING, rather than validating one observation and serializing a different one",
+        () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-single-observation-"));
+          const path = join(tempRoot, "state.json");
+          const store = new FileStateStore();
+
+          let reads = 0;
+          const value = {
+            get amount() {
+              reads++;
+              return reads === 1 ? NaN : 1;
+            }
+          };
+
+          expect(() => store.write(path, value)).toThrow(UnserializableStateError);
+          // The getter must have been read EXACTLY ONCE — proving there is
+          // no longer a separate validation pass and a separate
+          // serialization pass that could observe two different values.
+          expect(reads).toBe(1);
+          expect(store.exists(path)).toBe(false);
+        }
+      );
+
+      it("no-regression (inverse): a getter whose single observation is a valid, finite value is captured and persisted correctly, and is read only once", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-single-observation-valid-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        let reads = 0;
+        const value = {
+          get amount() {
+            reads++;
+            return 42;
+          }
+        };
+
+        store.write(path, value);
+        expect(reads).toBe(1);
+        expect(store.read<{ amount: number }>(path)?.amount).toBe(42);
+      });
+
+      it("no-regression: a caller mutating the source object AFTER write() returns never affects the already-persisted snapshot", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-single-observation-mutation-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const value: { amount: number } = { amount: 5 };
+        store.write(path, value);
+        value.amount = 999; // mutate the caller's own object after the write
+
+        expect(store.read<{ amount: number }>(path)?.amount).toBe(5);
+      });
+
+      it("no-regression: a value legitimately referenced from two different, non-cyclic places (shared sub-object, not a cycle) is still captured correctly", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-shared-subobject-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const shared = { id: "shared" };
+        const value = { a: shared, b: shared };
+
+        expect(() => store.write(path, value)).not.toThrow();
+        expect(store.read(path)).toEqual({ a: { id: "shared" }, b: { id: "shared" } });
+      });
+
+      it("BLOCKER regression: a genuine circular reference is still rejected, and the thrown error preserves an underlying cause", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-circular-2-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const circular: Record<string, unknown> = { nested: {} };
+        (circular.nested as Record<string, unknown>).parent = circular;
+
+        try {
+          store.write(path, circular);
+          expect.unreachable("write() should have thrown");
+        } catch (err) {
+          expect(err).toBeInstanceOf(UnserializableStateError);
+          expect((err as UnserializableStateError).cause).toBeDefined();
+        }
+        expect(store.exists(path)).toBe(false);
+      });
+    }
+  );
 });

@@ -7,6 +7,7 @@ import {
   CostEngine,
   InvalidCostEntryIdentityError,
   InvalidMonetaryAmountError,
+  InvalidReservationScopeError,
   MAX_SUPPORTED_MONETARY_AMOUNT_USD,
   ReservationOwnershipMismatchError,
   UnknownReservationError,
@@ -1929,6 +1930,67 @@ describe("CostEngine", () => {
         } finally {
           rmSync(tempRoot, { recursive: true, force: true });
         }
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (independent Codex review, 'validate reservation ownership before live persistence'): " +
+      "createReservation() must reject a scope restore() would ALSO reject, before any state mutation",
+    () => {
+      it("BLOCKER regression, exact reproduction: createReservation({ taskId: 123 } as any, ...) is rejected before it ever reaches memory or disk", () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-reservation-scope-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const engine = new CostEngine(() => new Date(), { store, path: statePath });
+
+          expect(() => engine.createReservation({ taskId: 123 } as unknown as never, 0.6)).toThrow(
+            InvalidReservationScopeError
+          );
+
+          // Never inserted into memory...
+          expect(engine.reservedTotal({})).toBe(0);
+          // ...and never durably persisted — a fresh engine over the same
+          // ledger sees nothing, and does NOT throw CorruptCostStateError
+          // (which it WOULD have, had the invalid scope reached disk).
+          expect(() => new CostEngine(() => new Date(), { store, path: statePath })).not.toThrow();
+          const reloaded = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(reloaded.reservedTotal({})).toBe(0);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("BLOCKER regression: an in-memory-only engine (no persistence configured) rejects the identical invalid scope the same way", () => {
+        const engine = new CostEngine();
+        expect(() => engine.createReservation({ provider: 42 } as unknown as never, 0.1)).toThrow(
+          InvalidReservationScopeError
+        );
+        expect(engine.reservedTotal({})).toBe(0);
+      });
+
+      it("no-regression: a genuinely valid reservation scope is accepted, live, and reloadable by a new CostEngine after restart", () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), "uasf-cost-engine-reservation-scope-valid-"));
+        try {
+          const store = new FileStateStore();
+          const statePath = join(tempRoot, "cost-state.json");
+          const engine = new CostEngine(() => new Date(), { store, path: statePath });
+
+          const reservation = engine.createReservation({ taskId: "t1", provider: "mock", modelId: "m1" }, 0.6);
+          expect(reservation.amountUsd).toBeCloseTo(0.6);
+          expect(engine.reservedTotal({ taskId: "t1" })).toBeCloseTo(0.6);
+
+          const reloaded = new CostEngine(() => new Date(), { store, path: statePath });
+          expect(reloaded.reservedTotal({ taskId: "t1" })).toBeCloseTo(0.6);
+        } finally {
+          rmSync(tempRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("no-regression: omitting optional scope fields entirely remains valid (matches assertValidPersistedScope's own contract)", () => {
+        const engine = new CostEngine();
+        expect(() => engine.createReservation({}, 0.1)).not.toThrow();
       });
     }
   );

@@ -29,7 +29,12 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
     tempRoot = mkdtempSync(join(tmpdir(), "uasf-governance-e2e-"));
     const requirementsDir = join(tempRoot, "specification", "requirements");
     mkdirSync(requirementsDir, { recursive: true });
-    const evidenceFile = join(tempRoot, "proof.log");
+    // P1 fix (independent Codex review, "do not trust caller-authored
+    // evidence outcomes" / "phase verification and independent review
+    // must use verified outcome artifacts"): the evidence artifact must
+    // now be shaped like a genuine recognized verification artifact (bkz.
+    // traceability.ts'in fix notu) — `proof.log` no longer qualifies.
+    const evidenceFile = join(tempRoot, "proof.test.ts");
     writeFileSync(evidenceFile, "verification suite output");
     writeFileSync(
       join(requirementsDir, "clean.yml"),
@@ -43,7 +48,7 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
         "  status: UNIT_TESTED",
         "  implementation_refs: []",
         "  test_refs:",
-        "    - path: proof.log",
+        "    - path: proof.test.ts",
         "      type: TEST_RESULT",
         "      outcome: PASS",
         "      verificationSource: 'npm test (vitest)'",
@@ -86,25 +91,50 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
     const scopeLockPath = join(tempRoot, "scope-lock.json");
     const ledgerPath = join(tempRoot, "decision-ledger.json");
     const closingCommitSha = "abc123def456";
+    // P1 fix (independent Codex review, "bind the closing SHA to trusted
+    // repository state", finding 5): this temp root has no real git
+    // checkout, so `resolveHeadCommitSha` is overridden to the SAME fixed
+    // SHA every attempt below claims to be closing.
+    const closureDeps = {
+      scopeLock,
+      invariantGuard,
+      rootDir: tempRoot,
+      requirementsDir,
+      store,
+      manifestDir,
+      ledger,
+      scopeLockPath,
+      ledgerPath,
+      resolveHeadCommitSha: () => closingCommitSha
+    };
+    // P1 fix (independent Codex review, "phase verification and
+    // independent review must use verified outcome artifacts", finding
+    // 4): outcome-bearing evidence refs must now be structured and
+    // authenticated (bkz. traceability.ts'in fix notu) — bare strings no
+    // longer qualify.
+    const verificationEvidenceRefs = [
+      { path: "proof.test.ts", type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest)" }
+    ];
+    const reviewEvidenceRef = { path: "proof.test.ts", type: "REVIEW_RESULT" as const, outcome: "CLEAN", verificationSource: "npm test (vitest)" };
     const pendingAttempt = attemptPhaseClosure(
       {
         phaseId: "P0",
         requestedBy: "integration-test",
         reason: "attempting closure before independent review",
-        verificationEvidenceRefs: ["proof.log"],
+        verificationEvidenceRefs,
         independentReview: {
           reviewId: "rev-1",
           reviewerIdentity: "independent-reviewer",
           reviewedCommitSha: closingCommitSha,
           reviewTimestamp: new Date().toISOString(),
           outcome: "PENDING",
-          evidenceRef: "proof.log"
+          evidenceRef: reviewEvidenceRef
         },
         closingCommitSha
       },
       "manifest-pending",
       "d-close-pending",
-      { scopeLock, invariantGuard, rootDir: tempRoot, requirementsDir, store, manifestDir, ledger, scopeLockPath, ledgerPath }
+      closureDeps
     );
     expect(pendingAttempt.outcome).toBe("REJECTED");
     expect(scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
@@ -117,20 +147,20 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
         phaseId: "P0",
         requestedBy: "integration-test",
         reason: "independent review returned CLEAN",
-        verificationEvidenceRefs: ["proof.log"],
+        verificationEvidenceRefs,
         independentReview: {
           reviewId: "rev-2",
           reviewerIdentity: "independent-reviewer",
           reviewedCommitSha: closingCommitSha,
           reviewTimestamp: new Date().toISOString(),
           outcome: "CLEAN",
-          evidenceRef: "proof.log"
+          evidenceRef: reviewEvidenceRef
         },
         closingCommitSha
       },
       "manifest-closed",
       "d-close-final",
-      { scopeLock, invariantGuard, rootDir: tempRoot, requirementsDir, store, manifestDir, ledger, scopeLockPath, ledgerPath }
+      closureDeps
     );
     expect(closedAttempt.outcome).toBe("CLOSED");
     expect(scopeLock.getState("P0")).toBe("CLOSED");

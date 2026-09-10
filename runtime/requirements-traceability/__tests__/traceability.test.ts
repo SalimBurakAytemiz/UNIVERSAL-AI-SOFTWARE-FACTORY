@@ -9,6 +9,16 @@ import { traceRequirements } from "../../cli/commands/trace-requirement.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
 const requirementsDir = join(repoRoot, "specification", "requirements");
+/**
+ * P1 fix (independent Codex review, "do not trust caller-authored evidence
+ * outcomes"): a REAL, `.test.ts`-shaped path already on disk — the pattern
+ * `isOutcomeVerifiedEvidenceRef()` now requires an outcome-bearing ref's
+ * OWN path to match (bkz. traceability.ts'in fix notu), so fixtures that
+ * want a genuinely-VERIFIED outcome ref can no longer use `package.json`
+ * (a plain manifest, the finding's own reproduction) — this file itself is
+ * a stable, always-present stand-in.
+ */
+const VERIFIED_ARTIFACT_PATH = "runtime/requirements-traceability/__tests__/traceability.test.ts";
 
 describe(
   "detectTraceabilityIssues (pure logic, refs are REAL resolvable repo paths — bkz. 30th independent review " +
@@ -39,7 +49,7 @@ describe(
             id: "R3",
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
-            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            testRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
             proofRefs: []
           }
         ],
@@ -55,8 +65,8 @@ describe(
             id: "R4",
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
-            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
-            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
+            testRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
           }
         ],
         repoRoot
@@ -156,8 +166,8 @@ describe(
             id: "R-PASS",
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
-            testRefs: [{ path: "package.json", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
-            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "CLEAN", verificationSource: "npm test (vitest)" }]
+            testRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "PROOF_RESULT", outcome: "CLEAN", verificationSource: "npm test (vitest)" }]
           }
         ],
         repoRoot
@@ -185,17 +195,26 @@ describe(
       expect(issues).toHaveLength(0);
     });
 
-    it("no-regression: a genuinely-scoped, previously-accepted module directory (not the confinement root itself) still counts as evidence", () => {
+    it("no-regression: a genuinely-scoped, previously-accepted module directory still counts for the weaker implementation-level existence claim; the outcome-bearing test claim needs a genuine result artifact, not the bare module directory", () => {
       // P1 fix (independent Codex review, outcome-backed evidence): testRefs
       // must now carry an outcome-bearing structured ref to satisfy UNIT_TESTED;
       // a bare-string ref makes no outcome claim at all (see isOutcomeVerifiedEvidenceRef).
+      //
+      // P1 fix (independent Codex review, "do not trust caller-authored
+      // evidence outcomes"): a bare module DIRECTORY is exactly the "arbitrary
+      // directory... must not prove PROOF_VERIFIED" shape this finding
+      // targets — it is no longer sufficient as an OUTCOME-bearing ref (the
+      // weaker, existence-only implementationRefs check is unaffected, since
+      // "this module exists" is a legitimate, narrower claim than "this
+      // module's tests passed"). The test claim now needs a genuine
+      // recognized-artifact path.
       const issues = detectTraceabilityIssues(
         [
           {
             id: "R-MODULE-DIR",
             status: "UNIT_TESTED",
             implementationRefs: ["runtime/audit"],
-            testRefs: [{ path: "runtime/audit", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            testRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
             proofRefs: []
           }
         ],
@@ -348,7 +367,12 @@ describe(
     it("only ONE genuinely-verified ref among several is sufficient (mirrors the pre-existing 'any ref counts' semantics)", () => {
       const root = makeRoot();
       mkdirSync(join(root, "runtime"), { recursive: true });
-      writeFileSync(join(root, "runtime", "real.ts"), "// real");
+      // P1 fix (independent Codex review, "do not trust caller-authored
+      // evidence outcomes"): an outcome-bearing ref's own path must be
+      // shaped like a genuine recognized verification artifact (bkz.
+      // traceability.ts'in fix notu) — a plain `real.ts` source file no
+      // longer qualifies, so this fixture is a `.test.ts`-named file instead.
+      writeFileSync(join(root, "runtime", "real.test.ts"), "// real");
 
       // P1 fix (independent Codex review, outcome-backed evidence): the genuine
       // ref must be outcome-bearing to satisfy PROOF_VERIFIED's test/proof claims.
@@ -357,9 +381,9 @@ describe(
           {
             id: "R15",
             status: "PROOF_VERIFIED",
-            implementationRefs: ["runtime/real.ts"],
-            testRefs: ["does/not/exist", { path: "runtime/real.ts", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
-            proofRefs: ["also/does/not/exist", { path: "runtime/real.ts", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
+            implementationRefs: ["runtime/real.test.ts"],
+            testRefs: ["does/not/exist", { path: "runtime/real.test.ts", type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: ["also/does/not/exist", { path: "runtime/real.test.ts", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }]
           }
         ],
         root
@@ -549,7 +573,7 @@ describe(
     });
 
     it("no-regression: a valid, signed/authoritative PASS artifact WITH a named verificationSource satisfies the corresponding evidence gate", () => {
-      const ref = { path: "package.json", type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest), full repository suite" };
+      const ref = { path: VERIFIED_ARTIFACT_PATH, type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest), full repository suite" };
       expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(true);
 
       const issues = detectTraceabilityIssues(
@@ -559,7 +583,7 @@ describe(
             status: "PROOF_VERIFIED",
             implementationRefs: ["package.json"],
             testRefs: [ref],
-            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest), full repository suite" }]
+            proofRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "PROOF_RESULT", outcome: "PASS", verificationSource: "npm test (vitest), full repository suite" }]
           }
         ],
         repoRoot
@@ -570,6 +594,73 @@ describe(
     it("a bare directory reference is rejected as proof — it never carries an outcome-bearing type", () => {
       const ref = "runtime/audit";
       expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(false);
+    });
+  }
+);
+
+describe(
+  "P1 fix (independent Codex review, 'do not trust caller-authored evidence outcomes'): a caller's own " +
+    "typed type/outcome/verificationSource claim must never, by itself, make an arbitrary file count as " +
+    "PROOF_VERIFIED-grade evidence",
+  () => {
+    it(
+      "BLOCKER regression, exact reproduction: {path: 'package.json', type: 'PROOF_RESULT', outcome: 'PASS', " +
+        "verificationSource: 'anything'} is REJECTED — package.json is a manifest, not a verification artifact",
+      () => {
+        const ref = { path: "package.json", type: "PROOF_RESULT" as const, outcome: "PASS", verificationSource: "anything" };
+        expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(false);
+      }
+    );
+
+    it("BLOCKER regression: an otherwise-valid, recognized-artifact ref with verificationSource: 'anything' is still rejected — a caller-invented source name is never authoritative", () => {
+      const ref = { path: VERIFIED_ARTIFACT_PATH, type: "PROOF_RESULT" as const, outcome: "PASS", verificationSource: "anything" };
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(false);
+    });
+
+    it("BLOCKER regression: a generic source file (not a manifest, not package.json, just an ordinary module) claiming PROOF_RESULT is also rejected", () => {
+      const ref = {
+        path: "runtime/requirements-traceability/traceability.ts",
+        type: "PROOF_RESULT" as const,
+        outcome: "PASS",
+        verificationSource: "npm test (vitest)"
+      };
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(false);
+    });
+
+    it("no-regression: a real proof result generated by this repository's own approved proof flow (proofs/**/*.test.ts) with a recognized verificationSource IS accepted", () => {
+      const ref = {
+        path: "proofs/cache-reuse/proof.test.ts",
+        type: "PROOF_RESULT" as const,
+        outcome: "PASS",
+        verificationSource: "npm test (vitest), full repository suite"
+      };
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(true);
+    });
+
+    it("no-regression: the real, existing CI workflow that runs this Factory's own verification suite remains a recognized PROOF_RESULT artifact location", () => {
+      const ref = {
+        path: ".github/workflows/ci.yml",
+        type: "PROOF_RESULT" as const,
+        outcome: "PASS",
+        verificationSource: "npm test (vitest), full repository suite"
+      };
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot)).toBe(true);
+    });
+
+    it("end-to-end: a requirement citing the fabricated package.json PROOF_RESULT is flagged MISSING_PROOF_REFS, not silently accepted as PROOF_VERIFIED", () => {
+      const issues = detectTraceabilityIssues(
+        [
+          {
+            id: "R-FAKE-PROOF",
+            status: "PROOF_VERIFIED",
+            implementationRefs: ["package.json"],
+            testRefs: [{ path: VERIFIED_ARTIFACT_PATH, type: "TEST_RESULT", outcome: "PASS", verificationSource: "npm test (vitest)" }],
+            proofRefs: [{ path: "package.json", type: "PROOF_RESULT", outcome: "PASS", verificationSource: "anything" }]
+          }
+        ],
+        repoRoot
+      );
+      expect(issues.map((i) => i.issue)).toEqual(["MISSING_PROOF_REFS"]);
     });
   }
 );

@@ -418,6 +418,68 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
     });
   });
 
+  describe(
+    "P1 fix (independent Codex review, 'do not hold the synchronous cache lock across await'): a compute() " +
+      "call in flight must never hold the underlying synchronous file lock — a second, same-process caller " +
+      "racing the SAME missing key must never observe a FileLockTimeoutError merely because compute() takes " +
+      "longer than the configured lock timeoutMs",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: two same-process concurrent misses for the SAME key, with a " +
+          "compute() delay LONGER than the configured lock timeoutMs -> compute() runs exactly once, no " +
+          "FileLockTimeoutError is thrown, and both callers receive the identical value",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-no-lock-across-await-"));
+          const cache = new FileCache<string>(
+            new FileStateStore(),
+            join(tempRoot, "cache.json"),
+            { timeoutMs: 30, staleMs: 1_000, pollIntervalMs: 5 } // deliberately shorter than the compute delay below
+          );
+          let computeCalls = 0;
+          const compute = async () => {
+            computeCalls++;
+            await new Promise((resolve) => setTimeout(resolve, 80)); // longer than timeoutMs
+            return "computed-value";
+          };
+
+          const [first, second] = await Promise.all([
+            computeWithFileCache(cache, "shared-key", compute),
+            computeWithFileCache(cache, "shared-key", compute)
+          ]);
+
+          expect(computeCalls).toBe(1);
+          expect(first.value).toBe("computed-value");
+          expect(second.value).toBe("computed-value");
+          expect([first.cached, second.cached].sort()).toEqual([false, true]);
+          expect(cache.get("shared-key")).toBe("computed-value");
+        }
+      );
+
+      it("high-contention: 5 same-process concurrent calls for the same missing key still run compute() exactly once, with a tight lock timeout", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-no-lock-across-await-contend-"));
+        const cache = new FileCache<string>(
+          new FileStateStore(),
+          join(tempRoot, "cache.json"),
+          { timeoutMs: 25, staleMs: 1_000, pollIntervalMs: 5 }
+        );
+        let computeCalls = 0;
+        const compute = async () => {
+          computeCalls++;
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          return "the-one-true-value";
+        };
+
+        const results = await Promise.all(
+          Array.from({ length: 5 }, () => computeWithFileCache(cache, "hot-key", compute))
+        );
+
+        expect(computeCalls).toBe(1);
+        for (const r of results) expect(r.value).toBe("the-one-true-value");
+        expect(results.filter((r) => !r.cached)).toHaveLength(1);
+      });
+    }
+  );
+
   describe("P2 fix (34th independent review round, finding 11, 'validate TTL values before persisting')", () => {
     it.each([NaN, Infinity, -Infinity, -1, -100])(
       "BLOCKER regression, exact reproduction: set() rejects a non-finite/negative ttlMs (%s) before it ever reaches disk",

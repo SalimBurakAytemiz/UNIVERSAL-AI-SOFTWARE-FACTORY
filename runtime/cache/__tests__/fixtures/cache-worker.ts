@@ -8,6 +8,7 @@
 // OS-level race timing at all. This file is only ever invoked by `tsx`
 // directly, never imported.
 import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { FileStateStore } from "../../../state/file-store.js";
 import { FileCache, computeWithFileCache } from "../../file-cache.js";
 import { acquireFileLock, type FileLockOptions } from "../../file-lock.js";
@@ -103,6 +104,19 @@ switch (mode) {
     process.exit(0);
     break;
   }
+  case "write-json": {
+    // Generic fixture primitive (independent Codex review, "do not hold
+    // the synchronous cache lock across await"): writes an arbitrary JSON
+    // payload verbatim to `path` — used by the cross-process test to
+    // fabricate a durable compute-lease record directly on disk (a
+    // "crashed owner never released this lease" precondition), without
+    // needing a dedicated, lease-specific worker mode.
+    const [path, json] = rest;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, json, "utf8");
+    process.exit(0);
+    break;
+  }
   case "compute": {
     // P2 fix (independent Codex review, "deduplicate concurrent durable
     // cache computations"): calls the REAL `computeWithFileCache()` on a
@@ -110,9 +124,14 @@ switch (mode) {
     // `compute()` invocation — the parent test counts lines in that file
     // across MULTIPLE real processes racing the SAME key to prove the
     // callback ran exactly once, not once per process.
-    const [cachePath, key, value, logPath, delayMsArg, lockOptionsArg] = rest;
+    const [cachePath, key, value, logPath, delayMsArg, lockOptionsArg, leaseTtlMsArg] = rest;
     const delayMs = delayMsArg ? Number(delayMsArg) : 0;
-    const cache = new FileCache<string>(new FileStateStore(), cachePath, parseLockOptions(lockOptionsArg));
+    const cache = new FileCache<string>(
+      new FileStateStore(),
+      cachePath,
+      parseLockOptions(lockOptionsArg),
+      leaseTtlMsArg ? Number(leaseTtlMsArg) : undefined
+    );
     computeWithFileCache(cache, key, () => {
       appendFileSync(logPath, "1\n");
       if (delayMs > 0) sleepSync(delayMs);

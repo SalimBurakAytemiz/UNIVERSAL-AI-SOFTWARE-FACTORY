@@ -309,15 +309,111 @@ function hasVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boo
  * an existence claim, not an outcome claim, so a plain source-file
  * reference remains completely legitimate evidence for it.
  */
-export function isOutcomeVerifiedEvidenceRef(ref: EvidenceRef, rootDir: string): boolean {
+/**
+ * P1 fix (independent Codex review, "phase verification and independent
+ * review must use verified outcome artifacts", finding 4): factored out of
+ * `isOutcomeVerifiedEvidenceRef()` below so `phase-closure.ts`'s own
+ * independent-review evidence gate can reuse the SAME authentication
+ * (existence + path-shape + trusted source) WITHOUT also requiring the
+ * ref's own `outcome` field to be a success value — a review's genuine
+ * verdict (CLEAN/PENDING/FOUND_ISSUES) is tracked separately on
+ * `IndependentReviewEvidence.outcome`, which `attemptPhaseClosure()`
+ * already checks for exactly `"CLEAN"`; conflating that with THIS
+ * function's own success-outcome check would incorrectly require a
+ * PENDING or FOUND_ISSUES review's evidence artifact to itself claim
+ * "PASS" merely to be recognized as authentic evidence AT ALL. This
+ * function answers "is this a genuine, type-appropriate, trustworthy-
+ * sourced artifact?" — never "did it succeed?".
+ */
+export function isAuthenticatedVerificationArtifact(ref: EvidenceRef, rootDir: string): boolean {
   if (!isVerifiedEvidenceRef(ref, rootDir)) return false;
   if (typeof ref === "string") return false;
   if (ref.type === "ARTIFACT_REFERENCE") return false;
-  return typeof ref.verificationSource === "string" && ref.verificationSource.length > 0;
+  if (typeof ref.verificationSource !== "string" || ref.verificationSource.length === 0) return false;
+  // P1 fix (independent Codex review, "do not trust caller-authored
+  // evidence outcomes"): bkz. `looksLikeRecognizedVerificationArtifact()`/
+  // `isTrustedVerificationSource()`'un üstündeki fix notu — a caller's own
+  // typed `type`/`outcome`/`verificationSource` claim is no longer
+  // sufficient on its own; the artifact's PATH must also be shaped like a
+  // genuine verification-flow output, and `verificationSource` must name a
+  // mechanism this Factory actually recognizes as one of its own.
+  if (!looksLikeRecognizedVerificationArtifact(ref.path)) return false;
+  return isTrustedVerificationSource(ref.verificationSource);
+}
+
+export function isOutcomeVerifiedEvidenceRef(ref: EvidenceRef, rootDir: string): boolean {
+  if (!isAuthenticatedVerificationArtifact(ref, rootDir)) return false;
+  const outcome = (ref as StructuredEvidenceRef).outcome;
+  return outcome !== undefined && EVIDENCE_SUCCESS_OUTCOMES.has(outcome);
 }
 
 function hasOutcomeVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boolean {
   return refs.some((ref) => isOutcomeVerifiedEvidenceRef(ref, rootDir));
+}
+
+/**
+ * P1 fix (independent Codex review, "do not trust caller-authored evidence
+ * outcomes"): reproduced — `{path: "package.json", type: "PROOF_RESULT",
+ * outcome: "PASS", verificationSource: "anything"}` used to satisfy
+ * `isOutcomeVerifiedEvidenceRef()` in full: the path exists (every
+ * repository has a package.json), the outcome is a recognized success
+ * value, and `verificationSource` was accepted for being merely a non-
+ * empty string. Nothing about this actually verified an outcome — a
+ * caller's own typed claim was the ENTIRE proof, indistinguishable from a
+ * fabricated one (AGENTS.md "evidence-not-claims"; baseline section 294).
+ *
+ * A path alone cannot prove WHAT an artifact is, and this repository has
+ * no independent, machine-checkable proof-artifact format to parse (adding
+ * one — a signed/structured evidence-record schema every verification flow
+ * would need to emit — is real new architecture, out of this round's
+ * narrow-fix scope). The two things that CAN be checked without inventing
+ * one: (1) the path must be SHAPED like a genuine artifact this Factory's
+ * own established verification flow actually produces (a proof/test file
+ * this repo runs, the CI workflow that runs it, or durable governance
+ * state this repo itself writes) — never an arbitrary source file or
+ * manifest a caller merely points at; and (2) `verificationSource` must
+ * name one of this Factory's own recognized verification mechanisms, not
+ * an arbitrary caller-invented label (bkz. `isTrustedVerificationSource()`
+ * altında). Neither check makes the claim cryptographically unforgeable —
+ * this remains a HEURISTIC gate, not a signed proof chain — but together
+ * they close the exact demonstrated bypass: `package.json` matches neither
+ * pattern (it is not itself run/executed as a proof, and it lives outside
+ * every recognized verification-artifact location), and `"anything"`
+ * matches no recognized source, so both are rejected fail-closed, while a
+ * genuine reference into `proofs/**`/a real `*.test.ts` file/the CI
+ * workflow that runs it, carrying the SAME `verificationSource` string
+ * every real closure round in this registry already uses, continues to
+ * verify exactly as before.
+ */
+const OUTCOME_EVIDENCE_ARTIFACT_PATH_PATTERN =
+  /(^|\/)proofs\/|(^|\/)__tests__\/|\.(test|spec)\.(ts|js|mjs|cjs)$|(^|\/)\.github\/workflows\/[^/]+\.ya?ml$|(^|\/)project-state\/phase-closures\/[^/]+\.json$/;
+
+function looksLikeRecognizedVerificationArtifact(path: string): boolean {
+  return OUTCOME_EVIDENCE_ARTIFACT_PATH_PATTERN.test(path);
+}
+
+/**
+ * A small, closed allow-list of PREFIXES this Factory's own established
+ * verification mechanisms actually produce (case-insensitive) — bkz.
+ * `looksLikeRecognizedVerificationArtifact()`'in üstündeki fix notu for the
+ * full rationale. Exported so `phase-closure.ts` (finding 4, which reuses
+ * this SAME evidence gate for its own verification/review evidence, per
+ * "consume the existing authoritative evidence path, do not create a
+ * duplicate evidence subsystem") never needs a second, independently
+ * drifting copy of this list.
+ */
+export const TRUSTED_VERIFICATION_SOURCE_PREFIXES: readonly string[] = [
+  "npm test (vitest)",
+  "npm run ",
+  "independent codex review",
+  "independent review",
+  "factory doctor",
+  "ci pipeline"
+];
+
+export function isTrustedVerificationSource(source: string): boolean {
+  const normalized = source.trim().toLowerCase();
+  return TRUSTED_VERIFICATION_SOURCE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 /**

@@ -104,51 +104,132 @@ export class UnserializableStateError extends Error {
  * reasoning `audit-log.ts`'s own 33rd-round fix note documents for its
  * identical design choice).
  */
-function assertNoLossySerialization(value: unknown, jsonPath: string, statePath: string, canOmit: boolean): void {
-  if (value === null) return;
+/**
+ * P2 fix (independent Codex review, "FileStateStore must validate and
+ * serialize ONE captured snapshot", finding 9): the PREVIOUS design
+ * (`assertNoLossySerialization()`, superseded, kept only in history/
+ * comments above) validated the CALLER-OWNED `data` argument by reading
+ * its properties directly — a SEPARATE, LATER read from the ALSO-separate
+ * `JSON.stringify(data, ...)` call `write()` used to serialize it.
+ * Codex reproduced the resulting defect directly: a getter that returns a
+ * DIFFERENT value on each access (`first read → NaN, second read → 1`)
+ * lets `JSON.stringify()` observe the FIRST (invalid, non-finite) read
+ * while `assertNoLossySerialization()`'s later, independent walk observes
+ * the SECOND (valid) read — validation and the bytes actually persisted
+ * disagreed about which value was ever written: `write()` "succeeded",
+ * but the durable file silently contained `null` (JSON's coercion of the
+ * NaN `JSON.stringify()` actually saw) for a value validation itself
+ * judged perfectly fine. This is a durable-state-integrity violation
+ * (baseline section 277, "no claim without evidence" extended to what
+ * validation actually proves) even though NEITHER individual check was
+ * wrong in isolation — the defect is TWO READS of a value that need not
+ * agree, not a bug in either read itself.
+ *
+ * Fixed by making this the ONE AND ONLY place `data`'s properties/
+ * getters are ever read: it walks `value` EXACTLY ONCE, per property,
+ * REJECTING (fail closed) anything that cannot be safely captured
+ * (non-finite numbers, `undefined` with no safe 'omit' equivalent,
+ * functions/symbols/bigint, a non-plain-object instance, a genuine
+ * circular reference — bkz. `ancestors` aşağıda) WHILE building a
+ * detached, plain-data COPY from those SAME single reads. `write()` below
+ * then both "validates" and "serializes" by operating ENTIRELY on this
+ * returned snapshot — never on the original, potentially getter-backed
+ * `data` again — so there is no longer a SECOND read anywhere in the path
+ * that could possibly disagree with the first.
+ */
+/**
+ * `captureSnapshot()`'ın kendi tespit ettiği (dışarıdan yakalanmış GERÇEK
+ * bir hata olmayan) her reddetme için — bir senkron `new Error(detail)`
+ * her zaman `cause` olarak iliştirilir, böylece `UnserializableStateError`
+ * hâlâ "bir temel nedeni korur" sözleşmesini tutar (bkz. bu dosyanın kendi
+ * testi, "preserves the underlying cause for a thrown serialization
+ * failure") — artık bu neden `JSON.stringify()`'ın kendi native hatası
+ * değil, bu fonksiyonun kendi, aynı derecede gerçek doğrulama hatasıdır.
+ */
+function rejectUnserializable(statePath: string, detail: string): never {
+  throw new UnserializableStateError(statePath, new Error(detail), detail);
+}
+
+function captureSnapshot(value: unknown, jsonPath: string, statePath: string, canOmit: boolean, ancestors: Set<object>): unknown {
+  if (value === null) return null;
   if (value === undefined) {
-    if (canOmit) return;
-    throw new UnserializableStateError(
+    if (canOmit) return undefined;
+    rejectUnserializable(
       statePath,
-      undefined,
       `'${jsonPath}' is undefined in a position with no safe 'omit' equivalent (an array element, or the ` +
-        `top-level value itself) — JSON.stringify() would silently turn this into null, a DIFFERENT value ` +
-        `from what was actually written`
+        `top-level value itself) — serializing this would silently produce null or lose it, a DIFFERENT value ` +
+        `from what was actually captured`
     );
   }
   const type = typeof value;
   if (type === "number") {
     if (!Number.isFinite(value as number)) {
-      throw new UnserializableStateError(
+      rejectUnserializable(
         statePath,
-        undefined,
-        `'${jsonPath}' is a non-finite number (${String(value)}) — JSON.stringify() would silently coerce it ` +
-          `to null, a DIFFERENT value from what was actually written`
+        `'${jsonPath}' is a non-finite number (${String(value)}) — serializing this would silently coerce it ` +
+          `to null, a DIFFERENT value from what was actually captured`
       );
     }
-    return;
+    return value;
   }
-  if (type === "string" || type === "boolean") return;
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => assertNoLossySerialization(item, `${jsonPath}[${index}]`, statePath, false));
-    return;
-  }
+  if (type === "string" || type === "boolean") return value;
   if (type === "object") {
-    const proto = Object.getPrototypeOf(value);
+    const objectValue = value as object;
+    // P2 fix (finding 9): the OLD design relied on a PRIOR, separate
+    // `JSON.stringify(data, ...)` call to already have proven the object
+    // graph acyclic before this walk ever ran — that separate call is
+    // GONE now (this function is the only pass), so cycle detection must
+    // live HERE. `ancestors` tracks the current recursion path (removed
+    // on the way back out via `finally`), never every object ever visited
+    // — a value legitimately referenced from two DIFFERENT, non-cyclic
+    // places (e.g. two array elements pointing at the same shared object)
+    // is not a cycle and must not be rejected.
+    if (ancestors.has(objectValue)) {
+      rejectUnserializable(statePath, `'${jsonPath}' contains a circular reference`);
+    }
+    if (Array.isArray(objectValue)) {
+      ancestors.add(objectValue);
+      try {
+        return objectValue.map((item, index) => captureSnapshot(item, `${jsonPath}[${index}]`, statePath, false, ancestors));
+      } finally {
+        ancestors.delete(objectValue);
+      }
+    }
+    const proto = Object.getPrototypeOf(objectValue);
     if (proto !== Object.prototype && proto !== null) {
-      throw new UnserializableStateError(
+      rejectUnserializable(
         statePath,
-        undefined,
-        `'${jsonPath}' is an instance of '${Object.prototype.toString.call(value)}' rather than a plain ` +
-          `object — JSON.stringify() does not represent it faithfully`
+        `'${jsonPath}' is an instance of '${Object.prototype.toString.call(objectValue)}' rather than a plain ` +
+          `object — it cannot be captured faithfully`
       );
     }
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      assertNoLossySerialization(nested, `${jsonPath}.${key}`, statePath, true);
+    ancestors.add(objectValue);
+    try {
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(objectValue as Record<string, unknown>)) {
+        // Exactly ONE read of this property — whatever it returns (even a
+        // getter/Proxy-backed value) is what both validation AND the
+        // eventual serialized bytes are based on, permanently.
+        const capturedValue = captureSnapshot(
+          (objectValue as Record<string, unknown>)[key],
+          `${jsonPath}.${key}`,
+          statePath,
+          true,
+          ancestors
+        );
+        // An omitted (`undefined`) property is left OUT of the snapshot
+        // entirely — matching `JSON.stringify({a: undefined})`'s own
+        // "{}" behavior (property absence, not a stored null).
+        if (capturedValue !== undefined) {
+          result[key] = capturedValue;
+        }
+      }
+      return result;
+    } finally {
+      ancestors.delete(objectValue);
     }
-    return;
   }
-  throw new UnserializableStateError(statePath, undefined, `'${jsonPath}' is of unsupported type '${type}'`);
+  rejectUnserializable(statePath, `'${jsonPath}' is of unsupported type '${type}'`);
 }
 
 /**
@@ -180,17 +261,23 @@ function assertNoLossySerialization(value: unknown, jsonPath: string, statePath:
  */
 export class FileStateStore implements StateStore {
   write(path: string, data: unknown): void {
-    // Herhangi bir dosya sistemi eylemi (dizin oluşturma dahil) başlamadan
-    // ÖNCE: yeni durumun GERÇEKTEN geçerli JSON'a serileştirilebildiği
-    // doğrulanır — bkz. `UnserializableStateError`'ın üstündeki fix notu.
-    // `JSON.stringify` fırlatabilir (döngüsel referans, BigInt) VEYA
-    // sessizce `undefined` DÖNDÜREBİLİR (fırlatmadan) — ikisi de burada
-    // AYNI, tipli hataya sarılır ve hedef dosyaya HİÇ dokunulmadan
-    // fırlatılır.
+    // P2 fix (independent Codex review, "FileStateStore must validate and
+    // serialize ONE captured snapshot", finding 9): `data` is read EXACTLY
+    // ONCE, here, by `captureSnapshot()` — bkz. onun üstündeki fix notu
+    // for the full rationale. Everything below (the round-trip check, the
+    // actual bytes written to disk) operates on `snapshot` — a detached,
+    // plain-data copy — never on `data` again, so a getter/Proxy-backed
+    // value that could answer differently on a second read never gets the
+    // chance to.
+    const snapshot = captureSnapshot(data, "$", path, false, new Set());
+
     let serialized: string;
     try {
-      const result = JSON.stringify(data, null, 2);
+      const result = JSON.stringify(snapshot, null, 2);
       if (typeof result !== "string") {
+        // Unreachable in practice — `captureSnapshot()` already rejects
+        // every value `JSON.stringify()` could otherwise silently drop
+        // (undefined, functions, symbols) — kept as defense in depth.
         throw new UnserializableStateError(path);
       }
       serialized = result;
@@ -199,26 +286,15 @@ export class FileStateStore implements StateStore {
       throw new UnserializableStateError(path, err);
     }
 
-    // Savunma derinliği (defense in depth): bir replacer/reviver
-    // KULLANILMADIĞI için `JSON.stringify`'ın bir dize DÖNDÜRMESİ zaten
-    // dil düzeyinde "bu dize geçerli JSON'dur" garantisidir — ama
-    // gelecekte bir replacer eklenirse bile bu round-trip doğrulaması
-    // koruma sağlar, ve maliyeti ihmal edilebilir düzeydedir.
+    // Savunma derinliği (defense in depth): `snapshot` is already known-
+    // JSON-safe by construction, but this round-trip check remains a
+    // cheap, independent proof that the bytes about to be written parse
+    // back to valid JSON.
     try {
       JSON.parse(serialized);
     } catch (err) {
       throw new UnserializableStateError(path, err);
     }
-
-    // P2 fix (35th independent review round, finding 9, "reject lossy
-    // state serialization"): bkz. `assertNoLossySerialization()`'ın
-    // üstündeki fix notu. Runs over the ORIGINAL `data` (never the
-    // already-produced `serialized` text, which by definition cannot
-    // distinguish "a genuine null" from "a NaN silently coerced to
-    // null") — safe from infinite recursion on a circular reference
-    // because `JSON.stringify()` above already succeeded, which is only
-    // possible for an acyclic object graph.
-    assertNoLossySerialization(data, "$", path, true);
 
     const dir = dirname(path);
     mkdirSync(dir, { recursive: true });

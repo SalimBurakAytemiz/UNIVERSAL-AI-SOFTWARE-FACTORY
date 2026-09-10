@@ -33,15 +33,95 @@
 // (Part F) — so there remains exactly ONE authoritative place a phase
 // transition happens, never a second, parallel "closure" mechanism.
 
-import { isVerifiedEvidenceRef } from "../requirements-traceability/traceability.js";
+import { execFileSync } from "node:child_process";
+import { isAuthenticatedVerificationArtifact, isOutcomeVerifiedEvidenceRef, type EvidenceRef } from "../requirements-traceability/traceability.js";
 import type { InvariantGuard, InvariantGuardReport } from "../invariants/invariant-guard.js";
 import type { InvariantViolation } from "../invariants/invariant-guard.js";
 import { ScopeLock } from "./scope-lock.js";
 import type { FounderDecisionLedger } from "../decisions/decision-ledger.js";
-import { computeRealityMatrix } from "./reality-matrix.js";
+import { computeRealityMatrix, type RealityMatrixSummary } from "./reality-matrix.js";
 import type { StateStore } from "../state/file-store.js";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 import { deepFreezeClone } from "../util/immutable.js";
+
+/**
+ * P1 fix (independent Codex review, "phase closure must reject incomplete
+ * authoritative P0 requirements", finding 2): the ONLY statuses that
+ * represent genuinely closure-ready work — either evidence-backed
+ * completion (UNIT_TESTED or higher, per `traceability.ts`'s own
+ * `PROGRESS_ORDER`) or an explicit, deliberate retirement
+ * (DEPRECATED/SUPERSEDED, which baseline section 294 already treats as
+ * "no longer an active progress claim", never a blocker). Every OTHER
+ * status this registry recognizes — DEFINED, PLANNED,
+ * IMPLEMENTATION_IN_PROGRESS, IMPLEMENTED, BLOCKED, and the reality
+ * matrix's own derived `UNSUPPORTED_CLAIM` — represents work that is
+ * DEFINED but not yet PROVEN, and must never silently permit a phase to
+ * close around it. This closed the exact reproduction: the real P0
+ * registry's own `blockedRequirementIds`-only check (bkz. aşağısı) let
+ * `guardClean` report `true` while 1 DEFINED and 6
+ * IMPLEMENTATION_IN_PROGRESS requirements — none of them BLOCKED — sat
+ * genuinely unfinished in the SAME authoritative registry this function
+ * itself computes `realityMatrix` from.
+ */
+const CLOSURE_READY_EFFECTIVE_STATUSES: ReadonlySet<string> = new Set([
+  "UNIT_TESTED",
+  "INTEGRATION_TESTED",
+  "PROOF_VERIFIED",
+  "PRODUCTION_VERIFIED",
+  "DEPRECATED",
+  "SUPERSEDED"
+]);
+
+/**
+ * P1 fix (independent Codex review, "bind the closing SHA to trusted
+ * repository state", finding 5): thrown when this repository's actual,
+ * checked-out commit cannot be resolved from a trusted source (git
+ * itself) — a closure attempt can never fall back to trusting a caller's
+ * own claim about what HEAD is when the trusted source is unavailable;
+ * FAIL CLOSED instead.
+ */
+export class UntrustedRepositoryIdentityError extends Error {
+  constructor(rootDir: string, cause?: unknown) {
+    super(
+      `Could not resolve the actual repository HEAD commit at '${rootDir}' from a trusted source (git). A phase ` +
+        `closure attempt can never trust a caller's own claim about which commit is being closed — if the real, ` +
+        `checked-out repository identity cannot be independently verified, closure fails closed rather than ` +
+        `proceeding on unverifiable trust.`,
+      { cause }
+    );
+    this.name = "UntrustedRepositoryIdentityError";
+  }
+}
+
+const GIT_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
+
+/**
+ * P1 fix (independent Codex review, "bind the closing SHA to trusted
+ * repository state", finding 5): the ONE trusted source of "what commit is
+ * actually checked out here" — `git rev-parse HEAD`, run directly against
+ * `rootDir`, never a value any caller supplies. Comparing TWO
+ * caller-controlled fields against each other (the prior behavior this
+ * finding reproduced: `closingCommitSha` vs. `review.reviewedCommitSha`,
+ * both attacker/caller-suppliable) proves only that the caller was
+ * internally consistent, never which revision is genuinely being closed.
+ * `attemptPhaseClosure()` below binds BOTH of those caller-supplied fields
+ * against THIS independently-resolved value, so a caller can no longer
+ * declare an arbitrary "closing" identity — transitively, a review must
+ * have reviewed the EXACT commit this repository's own git metadata says
+ * is checked out right now.
+ */
+export function resolveTrustedRepositoryHeadSha(rootDir: string): string {
+  let sha: string;
+  try {
+    sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: rootDir, encoding: "utf8" }).trim();
+  } catch (err) {
+    throw new UntrustedRepositoryIdentityError(rootDir, err);
+  }
+  if (!GIT_COMMIT_SHA_PATTERN.test(sha)) {
+    throw new UntrustedRepositoryIdentityError(rootDir, new Error(`unexpected 'git rev-parse HEAD' output: '${sha}'`));
+  }
+  return sha;
+}
 
 export type IndependentReviewResult = "CLEAN" | "PENDING" | "FOUND_ISSUES";
 export type PhaseClosureOutcome = "CLOSED" | "REJECTED";
@@ -68,22 +148,44 @@ export interface IndependentReviewEvidence {
   readonly reviewedBranch?: string;
   readonly reviewTimestamp: string;
   readonly outcome: IndependentReviewResult;
-  /** Repository-relative path to a real, durable, re-checkable artifact recording this review (a review report, an exported transcript, a signed verdict file). */
-  readonly evidenceRef: string;
+  /**
+   * P1 fix (independent Codex review, "phase verification and independent
+   * review must use verified outcome artifacts", finding 4): this used to
+   * be a bare `string` path — mere file EXISTENCE (`isVerifiedEvidenceRef()`)
+   * was the entire check, so any existing file (a random source module,
+   * `package.json`) satisfied it. Now a full `EvidenceRef` (bkz.
+   * `requirements-traceability/traceability.ts`), authenticated via the
+   * SAME Evidence Gate `isOutcomeVerifiedEvidenceRef()`/`isAuthenticatedVerificationArtifact()`
+   * hardened for finding 3 — the artifact must be shaped like a genuine
+   * verification-flow output and name a recognized `verificationSource`,
+   * never merely "a file that happens to exist".
+   */
+  readonly evidenceRef: EvidenceRef;
 }
 
 export interface PhaseClosureAttempt {
   readonly phaseId: string;
   readonly requestedBy: string;
   readonly reason: string;
-  /** Repository-relative paths to real, on-disk verification artifacts (logs, proof files, CI output). Must be non-empty. */
-  readonly verificationEvidenceRefs: readonly string[];
+  /**
+   * P1 fix (independent Codex review, "phase verification and independent
+   * review must use verified outcome artifacts", finding 4): bare
+   * `string` paths (mere existence) no longer satisfy this — every entry
+   * must be an outcome-verified `EvidenceRef` (bkz.
+   * `IndependentReviewEvidence.evidenceRef`'in fix notu). Must be
+   * non-empty.
+   */
+  readonly verificationEvidenceRefs: readonly EvidenceRef[];
   readonly independentReview: IndependentReviewEvidence;
   /**
-   * The exact commit SHA this closure attempt is closing. Compared
-   * against `independentReview.reviewedCommitSha` — a review of commit A
-   * must never be allowed to close commit B (independent Codex review's
-   * own explicit regression scenario).
+   * The commit SHA this closure attempt CLAIMS to be closing. Compared
+   * against `independentReview.reviewedCommitSha` (a review of commit A
+   * must never be allowed to close commit B) AND — per finding 5, "bind
+   * the closing SHA to trusted repository state" — against the
+   * INDEPENDENTLY resolved actual repository HEAD (bkz.
+   * `resolveTrustedRepositoryHeadSha()`'in üstündeki fix notu); comparing
+   * only the first pair proves nothing but the caller's own internal
+   * consistency, since both were, until this fix, equally caller-suppliable.
    */
   readonly closingCommitSha: string;
 }
@@ -97,7 +199,19 @@ export interface PhaseClosureManifestRecord {
   readonly createdAt: string;
   readonly invariantViolations: readonly InvariantViolation[];
   readonly blockedRequirementIds: readonly string[];
-  readonly verificationEvidenceRefs: readonly string[];
+  /**
+   * P1 fix (independent Codex review, "phase closure must reject
+   * incomplete authoritative P0 requirements", finding 2): every
+   * requirement in the authoritative Implementation Reality Matrix whose
+   * `effectiveStatus` is not yet closure-ready (bkz.
+   * `CLOSURE_READY_EFFECTIVE_STATUSES`'in üstündeki fix notu) — a strict
+   * SUPERSET of `blockedRequirementIds` (BLOCKED is one of several
+   * not-yet-ready statuses), kept as its own field so the manifest states
+   * plainly WHY closure was refused, not only which requirements were
+   * outright BLOCKED.
+   */
+  readonly incompleteRequirementIds: readonly string[];
+  readonly verificationEvidenceRefs: readonly EvidenceRef[];
   readonly independentReview: IndependentReviewEvidence;
   readonly closingCommitSha: string;
   readonly rejectionReasons: readonly string[];
@@ -147,6 +261,16 @@ export interface AttemptPhaseClosureDeps {
   readonly ledger: FounderDecisionLedger;
   readonly scopeLockPath: string;
   readonly ledgerPath: string;
+  /**
+   * P1 fix (independent Codex review, "bind the closing SHA to trusted
+   * repository state", finding 5): resolves the ACTUAL repository HEAD
+   * commit from a trusted source — defaults to
+   * `resolveTrustedRepositoryHeadSha()` (real `git rev-parse HEAD`).
+   * Overridable ONLY so tests can exercise this gate deterministically
+   * without needing a real git checkout at their temp `rootDir`; every
+   * genuine call site should rely on the real default.
+   */
+  readonly resolveHeadCommitSha?: (rootDir: string) => string;
 }
 
 const SAFE_GOVERNANCE_IDENTIFIER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
@@ -227,15 +351,191 @@ function intentPath(manifestDir: string, phaseId: string, manifestId: string): s
 
 type PendingClosureIntentStatus = "PREPARED" | "COMMITTED" | "ABANDONED";
 
+/**
+ * P1 fix (independent Codex review, "recovery must revalidate persisted
+ * phase-closure intents", finding 6): this record used to ALSO persist
+ * `guardReport` and the fully-computed `manifest` — the CONCLUSION of
+ * evaluating the original attempt — and `recoverPendingPhaseClosure()`
+ * trusted both blindly, never re-deriving them from live state. A forged
+ * or stale intent (mismatched `phaseId`/`manifestId`, a fabricated
+ * `guardReport.allBlockingSatisfied: true`, empty verification evidence,
+ * incomplete independent-review data, a fake SHA) was promoted straight to
+ * CLOSED with NOTHING re-checked. Fixed: this record now persists ONLY the
+ * ORIGINAL REQUEST (`attempt`) — the untrusted input a caller made, never
+ * this module's own prior conclusion about it. `recoverPendingPhaseClosure()`
+ * re-runs the EXACT SAME gate `attemptPhaseClosure()` itself uses
+ * (`evaluateClosureAttempt()`, bkz. aşağısı) against LIVE authoritative
+ * state before ever completing or finalizing anything.
+ */
 interface PendingClosureIntent {
   readonly status: PendingClosureIntentStatus;
   readonly phaseId: string;
   readonly manifestId: string;
   readonly decisionId: string;
-  readonly reason: string;
-  readonly guardReport: InvariantGuardReport;
-  readonly manifest: PhaseClosureManifestRecord;
+  readonly attempt: PhaseClosureAttempt;
   readonly createdAt: string;
+}
+
+function describeEvidenceRef(ref: EvidenceRef): string {
+  return typeof ref === "string" ? ref : ref.path;
+}
+
+/**
+ * P1 fix (independent Codex review): the ONE authoritative gate — shared
+ * verbatim by `attemptPhaseClosure()` (a fresh request) AND
+ * `recoverPendingPhaseClosure()` (finding 6: re-validating a persisted,
+ * UNTRUSTED intent) — so a crash-recovered closure can never be evaluated
+ * by a second, differently-scoped copy of this logic. Deliberately does
+ * NOT check `attempt.phaseId`'s current ScopeLock state: `attemptPhaseClosure()`
+ * requires it to be exactly `LOCKED_FOR_CLOSURE`, while `recoverPendingPhaseClosure()`
+ * legitimately re-runs this same gate when the phase may ALREADY be
+ * `CLOSED` (steps (2)-(4) already durably completed; only finalize
+ * remains) — each caller applies its own, correctly-scoped state check
+ * around this shared evaluation.
+ */
+function evaluateClosureAttempt(
+  attempt: PhaseClosureAttempt,
+  deps: {
+    readonly invariantGuard: InvariantGuard;
+    readonly requirementsDir: string;
+    readonly rootDir: string;
+    readonly resolveHeadCommitSha?: (rootDir: string) => string;
+  }
+): { readonly rejectionReasons: string[]; readonly guardReport: InvariantGuardReport; readonly realityMatrix: RealityMatrixSummary } {
+  const rejectionReasons: string[] = [];
+
+  if (attempt.verificationEvidenceRefs.length === 0) {
+    rejectionReasons.push(
+      "no verification evidence references were supplied — a bare 'tests passed' claim is never sufficient " +
+        "for phase closure (this round's own Part D/G requirement)"
+    );
+  } else {
+    // P1 fix (independent Codex review, "phase verification and
+    // independent review must use verified outcome artifacts", finding
+    // 4): `isVerifiedEvidenceRef()` (mere existence) is no longer
+    // sufficient here — bkz. `IndependentReviewEvidence.evidenceRef`'in
+    // fix notu. Reuses the SAME, finding-3-hardened Evidence Gate every
+    // other outcome claim in this codebase now goes through.
+    const unresolved = attempt.verificationEvidenceRefs.filter((ref) => !isOutcomeVerifiedEvidenceRef(ref, deps.rootDir));
+    if (unresolved.length > 0) {
+      rejectionReasons.push(
+        `${unresolved.length} verification evidence reference(s) are not outcome-verified, trusted evidence ` +
+          `(a genuine, recognized verification artifact naming a trusted source and a successful outcome): ` +
+          unresolved.map(describeEvidenceRef).join(", ")
+      );
+    }
+  }
+
+  const guardReport = deps.invariantGuard.runAll();
+  if (!guardReport.allBlockingSatisfied) {
+    rejectionReasons.push(
+      `the Central Invariant Guard reports unresolved BLOCKING violation(s): ` +
+        guardReport.violations
+          .filter((v) => v.severity === "BLOCKING")
+          .map((v) => `${v.invariantId}: ${v.detail}`)
+          .join("; ")
+    );
+  }
+
+  const realityMatrix = computeRealityMatrix(deps.requirementsDir, deps.rootDir);
+  // P1 fix (independent Codex review, "phase closure must reject
+  // incomplete authoritative P0 requirements", finding 2): bkz.
+  // `CLOSURE_READY_EFFECTIVE_STATUSES`'in üstündeki fix notu — a strict
+  // superset of the old BLOCKED-only check.
+  const incompleteEntries = realityMatrix.entries.filter((e) => !CLOSURE_READY_EFFECTIVE_STATUSES.has(e.effectiveStatus));
+  if (incompleteEntries.length > 0) {
+    rejectionReasons.push(
+      `${incompleteEntries.length} requirement(s) in the authoritative Implementation Reality Matrix have not ` +
+        `yet reached a closure-ready status (UNIT_TESTED or higher, or DEPRECATED/SUPERSEDED): ` +
+        incompleteEntries.map((e) => `${e.requirementId} (status: ${e.effectiveStatus})`).join(", ")
+    );
+  }
+
+  // P1 fix (independent Codex review, "verify independent review evidence
+  // before phase closure"): a bare `independentReviewResult` string used
+  // to be the whole check — any caller could type "CLEAN". Now every
+  // structural field of the review evidence is checked, the evidence
+  // reference itself must resolve via the SAME Evidence Gate every other
+  // claim in this codebase goes through, AND the review must have
+  // reviewed the EXACT commit this attempt is closing — a review of
+  // commit A must never be allowed to close commit B.
+  const review = attempt.independentReview;
+  if (!review.reviewId || !review.reviewerIdentity || !review.reviewTimestamp || !review.reviewedCommitSha) {
+    rejectionReasons.push(
+      "independent review evidence is incomplete — reviewId, reviewerIdentity, reviewTimestamp and " +
+        "reviewedCommitSha are all required; a bare outcome string is never sufficient for phase closure"
+    );
+  } else if (!isAuthenticatedVerificationArtifact(review.evidenceRef, deps.rootDir)) {
+    // P1 fix (independent Codex review, finding 4): bkz.
+    // `IndependentReviewEvidence.evidenceRef`'in fix notu — the review's
+    // OWN evidence artifact must be a genuine, recognized, trustworthy-
+    // sourced artifact, not merely a file that happens to exist.
+    rejectionReasons.push(
+      `independent review evidenceRef '${describeEvidenceRef(review.evidenceRef)}' does not resolve to a ` +
+        `genuine, recognized, trusted verification artifact`
+    );
+  } else if (review.reviewedCommitSha !== attempt.closingCommitSha) {
+    rejectionReasons.push(
+      `independent review reviewed commit '${review.reviewedCommitSha}', but this attempt is closing commit ` +
+        `'${attempt.closingCommitSha}' — a review of one commit must never close a different commit`
+    );
+  } else if (review.outcome !== "CLEAN") {
+    rejectionReasons.push(
+      `independent review outcome is '${review.outcome}', not CLEAN — a phase may only close after a LATER ` +
+        `independent review of the exact closing commit explicitly returns CLEAN; a locally-run verification ` +
+        `suite, however thoroughly it passes, can never itself satisfy this`
+    );
+  }
+
+  // P1 fix (independent Codex review, "bind the closing SHA to trusted
+  // repository state", finding 5): `attempt.closingCommitSha` (and,
+  // transitively via the check above, `review.reviewedCommitSha`) is now
+  // bound against the ACTUAL, independently-resolved repository HEAD —
+  // never only against each other, which proves nothing but the caller's
+  // own internal consistency.
+  try {
+    const trustedHeadSha = (deps.resolveHeadCommitSha ?? resolveTrustedRepositoryHeadSha)(deps.rootDir);
+    if (trustedHeadSha !== attempt.closingCommitSha) {
+      rejectionReasons.push(
+        `attempt.closingCommitSha ('${attempt.closingCommitSha}') does not match the actual, independently-` +
+          `resolved repository HEAD ('${trustedHeadSha}') — a caller can never declare which commit is being ` +
+          `closed; repository identity is resolved from a trusted source, never from caller-supplied text`
+      );
+    }
+  } catch (err) {
+    rejectionReasons.push(`repository identity could not be independently verified from a trusted source: ${String(err)}`);
+  }
+
+  return { rejectionReasons, guardReport, realityMatrix };
+}
+
+function buildManifest(
+  attempt: PhaseClosureAttempt,
+  manifestId: string,
+  outcome: PhaseClosureOutcome,
+  rejectionReasons: readonly string[],
+  guardReport: InvariantGuardReport,
+  realityMatrix: RealityMatrixSummary,
+  decisionId?: string
+): PhaseClosureManifestRecord {
+  return {
+    manifestId,
+    phaseId: attempt.phaseId,
+    outcome,
+    requestedBy: attempt.requestedBy,
+    reason: attempt.reason,
+    createdAt: new Date().toISOString(),
+    invariantViolations: guardReport.violations,
+    blockedRequirementIds: realityMatrix.blockedRequirementIds,
+    incompleteRequirementIds: realityMatrix.entries
+      .filter((e) => !CLOSURE_READY_EFFECTIVE_STATUSES.has(e.effectiveStatus))
+      .map((e) => e.requirementId),
+    verificationEvidenceRefs: attempt.verificationEvidenceRefs,
+    independentReview: attempt.independentReview,
+    closingCommitSha: attempt.closingCommitSha,
+    rejectionReasons,
+    ...(outcome === "CLOSED" && decisionId !== undefined ? { decisionId } : {})
+  };
 }
 
 /**
@@ -318,71 +618,7 @@ export function attemptPhaseClosure(
     throw new DuplicateClosureManifestError(attempt.phaseId, manifestId);
   }
 
-  const rejectionReasons: string[] = [];
-
-  if (attempt.verificationEvidenceRefs.length === 0) {
-    rejectionReasons.push(
-      "no verification evidence references were supplied — a bare 'tests passed' claim is never sufficient " +
-        "for phase closure (this round's own Part D/G requirement)"
-    );
-  } else {
-    const unresolved = attempt.verificationEvidenceRefs.filter((ref) => !isVerifiedEvidenceRef(ref, deps.rootDir));
-    if (unresolved.length > 0) {
-      rejectionReasons.push(
-        `${unresolved.length} verification evidence reference(s) do not resolve to a real, on-disk artifact: ${unresolved.join(", ")}`
-      );
-    }
-  }
-
-  const guardReport = deps.invariantGuard.runAll();
-  if (!guardReport.allBlockingSatisfied) {
-    rejectionReasons.push(
-      `the Central Invariant Guard reports unresolved BLOCKING violation(s): ` +
-        guardReport.violations
-          .filter((v) => v.severity === "BLOCKING")
-          .map((v) => `${v.invariantId}: ${v.detail}`)
-          .join("; ")
-    );
-  }
-
-  const realityMatrix = computeRealityMatrix(deps.requirementsDir, deps.rootDir);
-  if (realityMatrix.blockedRequirementIds.length > 0) {
-    rejectionReasons.push(
-      `${realityMatrix.blockedRequirementIds.length} requirement(s) in the authoritative Implementation Reality ` +
-        `Matrix are still BLOCKED: ${realityMatrix.blockedRequirementIds.join(", ")}`
-    );
-  }
-
-  // P1 fix (independent Codex review, "verify independent review evidence
-  // before phase closure"): a bare `independentReviewResult` string used
-  // to be the whole check — any caller could type "CLEAN". Now every
-  // structural field of the review evidence is checked, the evidence
-  // reference itself must resolve via the SAME Evidence Gate every other
-  // claim in this codebase goes through, AND the review must have
-  // reviewed the EXACT commit this attempt is closing — a review of
-  // commit A must never be allowed to close commit B.
-  const review = attempt.independentReview;
-  if (!review.reviewId || !review.reviewerIdentity || !review.reviewTimestamp || !review.reviewedCommitSha) {
-    rejectionReasons.push(
-      "independent review evidence is incomplete — reviewId, reviewerIdentity, reviewTimestamp and " +
-        "reviewedCommitSha are all required; a bare outcome string is never sufficient for phase closure"
-    );
-  } else if (!isVerifiedEvidenceRef(review.evidenceRef, deps.rootDir)) {
-    rejectionReasons.push(
-      `independent review evidenceRef '${review.evidenceRef}' does not resolve to a real, on-disk, durable artifact`
-    );
-  } else if (review.reviewedCommitSha !== attempt.closingCommitSha) {
-    rejectionReasons.push(
-      `independent review reviewed commit '${review.reviewedCommitSha}', but this attempt is closing commit ` +
-        `'${attempt.closingCommitSha}' — a review of one commit must never close a different commit`
-    );
-  } else if (review.outcome !== "CLEAN") {
-    rejectionReasons.push(
-      `independent review outcome is '${review.outcome}', not CLEAN — a phase may only close after a LATER ` +
-        `independent review of the exact closing commit explicitly returns CLEAN; a locally-run verification ` +
-        `suite, however thoroughly it passes, can never itself satisfy this`
-    );
-  }
+  const { rejectionReasons, guardReport, realityMatrix } = evaluateClosureAttempt(attempt, deps);
 
   const currentState = deps.scopeLock.getState(attempt.phaseId);
   if (currentState !== "LOCKED_FOR_CLOSURE") {
@@ -407,23 +643,9 @@ export function attemptPhaseClosure(
   // commit steps below — no side effect has happened yet at this point.
   const willClose = rejectionReasons.length === 0;
   const outcome: PhaseClosureOutcome = willClose ? "CLOSED" : "REJECTED";
-
-  const manifest: PhaseClosureManifestRecord = {
-    manifestId,
-    phaseId: attempt.phaseId,
-    outcome,
-    requestedBy: attempt.requestedBy,
-    reason: attempt.reason,
-    createdAt: new Date().toISOString(),
-    invariantViolations: guardReport.violations,
-    blockedRequirementIds: realityMatrix.blockedRequirementIds,
-    verificationEvidenceRefs: attempt.verificationEvidenceRefs,
-    independentReview: review,
-    closingCommitSha: attempt.closingCommitSha,
-    rejectionReasons,
-    ...(willClose ? { decisionId } : {})
-  };
-  const frozen = deepFreezeClone(manifest);
+  const frozen = deepFreezeClone(
+    buildManifest(attempt, manifestId, outcome, rejectionReasons, guardReport, realityMatrix, willClose ? decisionId : undefined)
+  );
 
   if (!willClose) {
     // A rejection makes no authoritative-state claim at all — a single
@@ -434,14 +656,18 @@ export function attemptPhaseClosure(
 
   // --- Staged, crash-recoverable commit protocol (willClose === true) ---
   const iPath = intentPath(deps.manifestDir, attempt.phaseId, manifestId);
+  // P1 fix (independent Codex review, "recovery must revalidate persisted
+  // phase-closure intents", finding 6): persists ONLY the original
+  // request (`attempt`) — bkz. `PendingClosureIntent`'in üstündeki fix
+  // notu — never this function's own computed `guardReport`/`manifest`
+  // conclusion, which `recoverPendingPhaseClosure()` must independently
+  // re-derive, never trust.
   const intent: PendingClosureIntent = {
     status: "PREPARED",
     phaseId: attempt.phaseId,
     manifestId,
     decisionId,
-    reason: attempt.reason,
-    guardReport,
-    manifest: frozen,
+    attempt,
     createdAt: new Date().toISOString()
   };
   // (1) PREPARE. If this throws, nothing else has happened — scenario A.
@@ -484,8 +710,39 @@ export interface RecoverPendingPhaseClosureDeps {
   readonly manifestDir: string;
   readonly scopeLockPath: string;
   readonly ledgerPath: string;
+  /**
+   * P1 fix (independent Codex review, "recovery must revalidate persisted
+   * phase-closure intents", finding 6): a PREPARED intent is UNTRUSTED
+   * persisted input — recovery must re-run the FULL closure gate
+   * (`evaluateClosureAttempt()`) against LIVE authoritative state, so it
+   * needs the SAME authoritative sources `attemptPhaseClosure()` itself
+   * reads, never a value trusted from the intent record.
+   */
+  readonly invariantGuard: InvariantGuard;
+  readonly requirementsDir: string;
+  readonly rootDir: string;
+  readonly resolveHeadCommitSha?: (rootDir: string) => string;
 }
 
+/**
+ * P1 fix (independent Codex review, "recovery must revalidate persisted
+ * phase-closure intents", finding 6): Codex reproduced a malformed,
+ * fabricated PREPARED intent (mismatched phaseId/manifestId, a forged
+ * `allBlockingSatisfied: true`, empty verification evidence, incomplete
+ * review data, a fake SHA) being promoted straight to CLOSED — the old
+ * implementation trusted `intent.guardReport`/`intent.manifest` as already-
+ * decided fact and only ever replayed the mechanical persistence steps
+ * (2)-(6), never re-checking whether the underlying claim actually holds.
+ * Fixed: a PREPARED intent now names ONLY the ORIGINAL REQUEST
+ * (`intent.attempt`) — recovery re-runs `evaluateClosureAttempt()` (the
+ * EXACT SAME gate `attemptPhaseClosure()` uses for a fresh request)
+ * against LIVE state before completing or finalizing anything. A
+ * malformed/stale intent that no longer holds up (or never genuinely did)
+ * is ABANDONED and an honest REJECTED manifest is durably recorded
+ * reflecting what live re-evaluation actually found — never silently
+ * discarded (preserving "why didn't this close?"), and never promoted to
+ * CLOSED on the strength of a persisted claim alone.
+ */
 export function recoverPendingPhaseClosure(
   phaseId: string,
   manifestId: string,
@@ -516,9 +773,30 @@ export function recoverPendingPhaseClosure(
   if (currentState === "OPEN") {
     // Something has reopened this phase since the crash — resurrecting a
     // stale closure over that would silently override an explicit,
-    // presumably-later governance decision. Abandon, never resume.
+    // presumably-later governance decision. Abandon, never resume. Checked
+    // BEFORE re-evaluating the gate: an explicit later reopen decision is
+    // never second-guessed by re-running the ORIGINAL request's own gate.
     deps.store.write(iPath, { ...intent, status: "ABANDONED" as PendingClosureIntentStatus });
     return undefined;
+  }
+
+  // P1 fix (finding 6): re-run the FULL gate against LIVE authoritative
+  // state, using ONLY `intent.attempt` (the untrusted original request) —
+  // never `intent`'s own persisted conclusion about it.
+  const { rejectionReasons, guardReport, realityMatrix } = evaluateClosureAttempt(intent.attempt, deps);
+
+  if (rejectionReasons.length > 0) {
+    // The persisted intent no longer holds up (authoritative state
+    // genuinely changed since PREPARE) — OR never genuinely did (a
+    // forged/malformed intent). Either way: FAIL CLOSED. Never promote to
+    // CLOSED on the strength of a persisted claim; record the honest,
+    // freshly-computed REJECTED outcome instead.
+    deps.store.write(iPath, { ...intent, status: "ABANDONED" as PendingClosureIntentStatus });
+    const rejected = deepFreezeClone(
+      buildManifest(intent.attempt, manifestId, "REJECTED", rejectionReasons, guardReport, realityMatrix)
+    );
+    deps.store.write(path, rejected);
+    return rejected;
   }
 
   if (currentState === "LOCKED_FOR_CLOSURE") {
@@ -527,12 +805,12 @@ export function recoverPendingPhaseClosure(
       // never captured it — reconcile from the ALREADY-existing ledger
       // evidence rather than re-recording it (close() would throw
       // DuplicateDecisionError attempting to record it a second time).
-      deps.scopeLock.reconcileFromExistingDecision(phaseId, "CLOSED", intent.reason, intent.decisionId);
+      deps.scopeLock.reconcileFromExistingDecision(phaseId, "CLOSED", intent.attempt.reason, intent.decisionId);
     } else {
       // Step (2)/(3) never ran at all — safe to run the transition fresh,
-      // using the SAME guardReport and decisionId already captured
-      // durably in the intent record.
-      deps.scopeLock.close(phaseId, intent.reason, intent.guardReport, intent.decisionId);
+      // using the FRESHLY re-derived guardReport (never a persisted one)
+      // and the decisionId already captured durably in the intent record.
+      deps.scopeLock.close(phaseId, intent.attempt.reason, guardReport, intent.decisionId);
     }
     deps.ledger.saveTo(deps.store, deps.ledgerPath);
     deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
@@ -541,9 +819,12 @@ export function recoverPendingPhaseClosure(
   // consistent (ScopeLock.loadFrom() itself would have refused to restore
   // an inconsistent CLOSED record) — only finalize/commit remain.
 
-  deps.store.write(path, intent.manifest);
+  const closedManifest = deepFreezeClone(
+    buildManifest(intent.attempt, manifestId, "CLOSED", [], guardReport, realityMatrix, intent.decisionId)
+  );
+  deps.store.write(path, closedManifest);
   deps.store.write(iPath, { ...intent, status: "COMMITTED" as PendingClosureIntentStatus });
-  return intent.manifest;
+  return closedManifest;
 }
 
 export function readPhaseClosureManifest(

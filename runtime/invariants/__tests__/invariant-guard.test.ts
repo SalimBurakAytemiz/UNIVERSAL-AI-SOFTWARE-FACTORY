@@ -152,7 +152,11 @@ describe("createDefaultInvariantGuard: 'requirement-registry-loads-cleanly' and 
     tempRoot = mkdtempSync(join(tmpdir(), "uasf-invariant-guard-"));
     const requirementsDir = join(tempRoot, "specification", "requirements");
     mkdirSync(requirementsDir, { recursive: true });
-    const proofFile = join(tempRoot, "proof.txt");
+    // P1 fix (independent Codex review, "do not trust caller-authored
+    // evidence outcomes"): the evidence artifact's path must now be
+    // shaped like a genuine recognized verification artifact (bkz.
+    // traceability.ts'in fix notu) — `proof.txt` no longer qualifies.
+    const proofFile = join(tempRoot, "proof.test.ts");
     writeFileSync(proofFile, "real evidence file");
     writeFileSync(
       join(requirementsDir, "clean.yml"),
@@ -166,7 +170,7 @@ describe("createDefaultInvariantGuard: 'requirement-registry-loads-cleanly' and 
         "  status: UNIT_TESTED",
         "  implementation_refs: []",
         "  test_refs:",
-        "    - path: proof.txt",
+        "    - path: proof.test.ts",
         "      type: TEST_RESULT",
         "      outcome: PASS",
         "      verificationSource: 'npm test (vitest)'",

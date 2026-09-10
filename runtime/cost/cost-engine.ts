@@ -485,15 +485,72 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function assertValidPersistedScope(scope: unknown, context: string): asserts scope is ReservationOwnership {
+/**
+ * P1 fix (independent Codex review, "validate reservation ownership before
+ * live persistence"): the shared shape check both the RESTORE path
+ * (`assertValidPersistedScope()`, below) and the LIVE WRITE path
+ * (`assertValidLiveReservationScope()`, bkz. `createReservation()`'ın fix
+ * notu) now funnel through — a single source of truth for "what counts as
+ * a structurally valid `ReservationOwnership`", so the two paths can never
+ * silently drift apart on this boundary again. Returns a human-readable
+ * reason string (never throws itself) so each caller can wrap it in its
+ * OWN appropriately-named error type without duplicating the field-by-
+ * field logic.
+ */
+function reservationOwnershipShapeError(scope: unknown): string | undefined {
   if (!isPlainObject(scope)) {
-    throw new CorruptCostStateError(`${context}.scope is not a plain object`);
+    return "scope is not a plain object";
   }
   for (const key of ["taskId", "agentId", "projectId", "runId", "provider", "modelId"]) {
     const value = scope[key];
     if (value !== undefined && typeof value !== "string") {
-      throw new CorruptCostStateError(`${context}.scope.${key} is neither a string nor undefined`);
+      return `scope.${key} is neither a string nor undefined`;
     }
+  }
+  return undefined;
+}
+
+function assertValidPersistedScope(scope: unknown, context: string): asserts scope is ReservationOwnership {
+  const reason = reservationOwnershipShapeError(scope);
+  if (reason) {
+    throw new CorruptCostStateError(`${context}.${reason}`);
+  }
+}
+
+/**
+ * P1 fix (independent Codex review, "validate reservation ownership before
+ * live persistence"): reproduced —
+ * `createReservation({ taskId: 123 } as any, ...)` used to succeed and
+ * durably persist a numeric `taskId`, even though a freshly-constructed
+ * `CostEngine` reloading that SAME persisted ledger would immediately
+ * throw `CorruptCostStateError` via `assertValidPersistedScope()` above —
+ * the live write path accepted state the restore path was ALREADY proven
+ * to reject. A caller bypassing TypeScript (`as any`, plain JS, a
+ * genuinely untyped caller) could therefore durably corrupt the ledger:
+ * the write itself "succeeds," but the reservation becomes permanently
+ * unrecoverable the moment this process restarts — the exact "live write
+ * and restore-time read disagree about what is valid" defect class this
+ * codebase has already closed once for `CostEntry` identity (bkz.
+ * `assertValidCostEntryIdentity()`'in üstündeki fix notu, round 36 finding
+ * 10) — this closes the IDENTICAL class for `ReservationOwnership`.
+ */
+export class InvalidReservationScopeError extends Error {
+  constructor(context: string, reason: string) {
+    super(
+      `Refusing to create reservation in ${context}: ${reason}. A live reservation scope that fails this exact ` +
+        `check is one 'assertValidPersistedScope()' (bkz. restore-time doğrulama) would ALSO reject on the next ` +
+        `restart — accepting it now would durably persist a live write that restore then refuses, silently ` +
+        `making a genuinely-open reservation's protected capacity unrecoverable after a restart (baseline ` +
+        `section 147, 277).`
+    );
+    this.name = "InvalidReservationScopeError";
+  }
+}
+
+function assertValidLiveReservationScope(scope: unknown, context: string): asserts scope is ReservationOwnership {
+  const reason = reservationOwnershipShapeError(scope);
+  if (reason) {
+    throw new InvalidReservationScopeError(context, reason);
   }
 }
 
@@ -1164,6 +1221,11 @@ export class CostEngine {
    */
   createReservation(scope: ReservationOwnership, amountUsd: number): LedgerReservation {
     assertValidMonetaryAmount(amountUsd, "CostEngine.createReservation");
+    // P1 fix (independent Codex review, "validate reservation ownership
+    // before live persistence"): checked BEFORE any state mutation or
+    // `#withDurableMutation()` lock acquisition — bkz.
+    // `assertValidLiveReservationScope()`'un üstündeki fix notu.
+    assertValidLiveReservationScope(scope, "CostEngine.createReservation");
     // P1 fix (30th independent review round, finding 3, "serialize
     // persistent cost-ledger updates"): bkz. `record()`'un üstündeki fix
     // notu — `#withDurableMutation()`'ın kilit altındaki resenkronizasyonu

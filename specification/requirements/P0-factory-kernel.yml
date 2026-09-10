@@ -1679,6 +1679,42 @@
     instance of "serialization failure -> destination replaced/corrupted"
     was found.
 
+    P1 fix (independent review, "P0 FINAL CLOSURE REMEDIATION — NINE
+    REPRODUCED EXISTING-P0 BLOCKERS", finding 8, "completed paid work
+    lacking a durable checkpoint"): `orchestrator.ts`'s `bootstrapProject()`
+    is this requirement's own bootstrap-pipeline consumer of durable
+    state, and its ONE genuinely non-idempotent, billable step (the paid
+    `modelGateway.invoke()` call) had NO durable checkpoint of its own — a
+    crash/retry between that call succeeding and the bootstrap finishing
+    caused a SECOND real charge for one logical bootstrap, a direct
+    violation of "kalıcı durum: süreç yeniden başlasa bile kaybolmaz"
+    (bölüm 277) independent of this file's own OWN write-path
+    correctness. Fixed by reusing the SAME `stateStore` this function
+    already writes genome.json/organization.json/bootstrap.json through
+    (no new persistence mechanism): a `bootstrap-transactions/
+    <projectId>.json` checkpoint is written immediately after the paid
+    invocation succeeds and before `scaffoldProjectOs()` runs, and is
+    consulted FIRST on every call — a retry reuses the already-billed
+    invocation's response instead of invoking (and paying for) the model
+    again. New regression tests in `orchestrator.test.ts` prove the exact
+    reproduction (interrupt bootstrap after the paid call but before
+    scaffolding finishes via a pre-placed file blocking a subdirectory
+    mkdir, confirm the model was invoked exactly once and a transaction
+    checkpoint was durably written, then retry and confirm the model is
+    STILL invoked exactly once and total recorded cost is still the one
+    real charge, not double), a no-crash/no-retry non-regression case, and
+    a case proving a second, independent project's own checkpoint is
+    never short-circuited by an unrelated project's. Bypass-verified: with
+    the checkpoint read/write reverted, the exact reproduction test failed
+    (transaction file never created) while the other two tests were
+    unaffected; restored and reconfirmed green. This finding EXPLICITLY
+    CORRECTS an earlier round's classification of the same underlying
+    defect as "found but deliberately not fixed, routed to backlog" (see
+    `project-state/current.yml`'s corrected `known_limitations` entry) —
+    a fresh independent review established the real, currently-live harm
+    (double billing) that the earlier "no current reader of these files"
+    reasoning had missed.
+
 - id: UASF-REQ-0022
   title: Audit (foundation)
   description: Append-only audit log for policy/approval/budget decisions.

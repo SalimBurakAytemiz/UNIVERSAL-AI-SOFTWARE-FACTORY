@@ -54,7 +54,11 @@ describe("computeRealityMatrix", () => {
     tempRoot = mkdtempSync(join(tmpdir(), "uasf-reality-matrix-"));
     const requirementsDir = join(tempRoot, "specification", "requirements");
     mkdirSync(requirementsDir, { recursive: true });
-    writeFileSync(join(tempRoot, "proof.txt"), "real evidence");
+    // P1 fix (independent Codex review, "do not trust caller-authored
+    // evidence outcomes"): an outcome-bearing evidence ref's own path must
+    // now be shaped like a genuine recognized verification artifact (bkz.
+    // traceability.ts'in fix notu) — a bare `proof.txt` no longer qualifies.
+    writeFileSync(join(tempRoot, "proof.test.ts"), "real evidence");
     writeFileSync(
       join(requirementsDir, "clean.yml"),
       [
@@ -67,7 +71,7 @@ describe("computeRealityMatrix", () => {
         "  status: UNIT_TESTED",
         "  implementation_refs: []",
         "  test_refs:",
-        "    - path: proof.txt",
+        "    - path: proof.test.ts",
         "      type: TEST_RESULT",
         "      outcome: PASS",
         "      verificationSource: 'npm test (vitest)'",

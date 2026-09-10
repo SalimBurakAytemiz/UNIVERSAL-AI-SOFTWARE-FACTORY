@@ -2487,4 +2487,171 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (independent review, finding 8, 'completed paid work lacking a durable checkpoint'): a crash " +
+      "between the paid model invocation succeeding and bootstrap finishing must not cause a retry to pay for " +
+      "(or invoke) the model a second time",
+    () => {
+      function gatewayWithCountingProvider(id: string, costUsd: number): { gateway: ModelGateway; invocationCount: () => number } {
+        let count = 0;
+        const provider: ModelProvider = {
+          id,
+          async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+            count++;
+            return { modelId: model.modelId, provider: id, costUsd, output: request.prompt };
+          }
+        };
+        const gateway = new ModelGateway();
+        gateway.registerProvider(provider);
+        return { gateway, invocationCount: () => count };
+      }
+
+      it(
+        "BLOCKER regression, exact reproduction: interrupting bootstrap AFTER the paid invocation completes but " +
+          "BEFORE scaffolding finishes, then retrying against the SAME baseDir, invokes the model exactly ONCE " +
+          "and records exactly ONE charge — not two",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-retry-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "counting",
+            modelId: "counting-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const { gateway: modelGateway, invocationCount } = gatewayWithCountingProvider("counting", 0.6);
+          const projectId = "proj-bootstrap-retry";
+
+          // Simulate "crash after the paid call, before scaffolding
+          // finishes": a plain FILE pre-placed where scaffoldProjectOs()
+          // needs to create the "state" subdirectory makes its mkdirSync
+          // throw — AFTER modelGateway.invoke() (inside the SAME execute
+          // callback) has already run and been billed.
+          mkdirSync(join(tempRoot, projectId), { recursive: true });
+          writeFileSync(join(tempRoot, projectId, "state"), "not a directory");
+
+          await expect(
+            bootstrapProject({
+              genomeCandidate: validGenome(projectId),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: registry,
+              modelGateway,
+              budgetLimits: { perTaskUsd: 10 }
+            })
+          ).rejects.toThrow();
+
+          expect(invocationCount()).toBe(1);
+          const transactionPath = join(tempRoot, "bootstrap-transactions", `${projectId}.json`);
+          expect(existsSync(transactionPath)).toBe(true);
+          const transaction = JSON.parse(readFileSync(transactionPath, "utf8"));
+          expect(transaction.status).toBe("MODEL_COMPLETED");
+          expect(transaction.modelInvocation.costUsd).toBe(0.6);
+
+          // "Restart": whatever crashed is fixed, then bootstrap is retried
+          // against the SAME baseDir/projectId.
+          unlinkSync(join(tempRoot, projectId, "state"));
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          // The model was NOT invoked a second time...
+          expect(invocationCount()).toBe(1);
+          // ...and total recorded cost is still exactly the ONE real charge —
+          // not $1.20 (0.6 x 2) as the unfixed defect reproduced.
+          expect(result.totalCostUsd).toBe(0.6);
+          expect(existsSync(join(result.scaffold.projectRoot, "project-genome", "genome.json"))).toBe(true);
+          expect(existsSync(join(result.scaffold.projectRoot, "organization", "organization.json"))).toBe(true);
+          expect(existsSync(result.statePath)).toBe(true);
+        }
+      );
+
+      it(
+        "no regression: a bootstrap that completes successfully on its FIRST attempt (no crash/retry) invokes " +
+          "the model exactly once and records exactly one charge, exactly as before this fix",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-no-retry-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "counting",
+            modelId: "counting-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const { gateway: modelGateway, invocationCount } = gatewayWithCountingProvider("counting", 0.6);
+
+          const result = await bootstrapProject({
+            genomeCandidate: validGenome("proj-bootstrap-no-retry"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          expect(invocationCount()).toBe(1);
+          expect(result.totalCostUsd).toBe(0.6);
+        }
+      );
+
+      it(
+        "a SECOND, independent project (different projectId) under the same baseDir gets its OWN transaction " +
+          "record and its OWN genuine invocation — one project's checkpoint never short-circuits another's",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-retry-multi-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "counting",
+            modelId: "counting-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          const { gateway: modelGateway, invocationCount } = gatewayWithCountingProvider("counting", 0.6);
+
+          await bootstrapProject({
+            genomeCandidate: validGenome("proj-multi-a"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+          expect(invocationCount()).toBe(1);
+
+          const resultB = await bootstrapProject({
+            genomeCandidate: validGenome("proj-multi-b"),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          // A distinct project genuinely invokes the model again — its own
+          // transaction record is keyed separately by its own projectId.
+          expect(invocationCount()).toBe(2);
+          expect(resultB.totalCostUsd).toBe(0.6);
+        }
+      );
+    }
+  );
 });
