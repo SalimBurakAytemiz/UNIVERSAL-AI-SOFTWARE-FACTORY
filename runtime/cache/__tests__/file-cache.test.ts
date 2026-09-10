@@ -2,9 +2,15 @@ import { describe, expect, it, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { FileStateStore } from "../../state/file-store.js";
 import { FileCache, computeWithFileCache } from "../file-cache.js";
 import { InvalidTtlError } from "../cache.js";
+
+/** Mirrors FileCache's own private computeLeasePath() exactly, so a test can inspect/fabricate the durable lease record directly. */
+function computeLeasePathFor(cachePath: string, key: string): string {
+  return `${cachePath}.compute.${createHash("sha256").update(key).digest("hex")}.lease`;
+}
 
 describe("FileCache (durable cache, backed by StateStore)", () => {
   let tempRoot: string;
@@ -504,4 +510,160 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       expect(cache.get("k")).toBe("v");
     });
   });
+
+  describe(
+    "P1 fix (independent review, 'renew compute leases while their owners are active', finding 3): a " +
+      "genuinely long-running compute() must keep its lease alive rather than looking abandoned once the " +
+      "original computeLeaseTtlMs window elapses",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a compute() call taking far longer than computeLeaseTtlMs " +
+          "keeps renewing its own lease, so a SECOND FileCache instance (simulating another process, via a " +
+          "separate instance sharing the SAME durable path — never the same in-process inFlight dedup) never " +
+          "sees the lease as abandoned and never runs its own duplicate compute()",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-renewal-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const leaseTtlMs = 150;
+          // Two DISTINCT instances sharing one durable path — this is what
+          // actually exercises `negotiateComputeOwnership()`'s cross-
+          // instance lease negotiation; two calls through the SAME
+          // instance would instead be deduplicated in-process by
+          // `inFlight` before ever reaching it (bkz. the "do not hold the
+          // lock across await" describe block above), which would hide
+          // this exact defect.
+          const processA = new FileCache<string>(new FileStateStore(), cachePath, undefined, leaseTtlMs);
+          const processB = new FileCache<string>(new FileStateStore(), cachePath, undefined, leaseTtlMs);
+
+          let computeCallsA = 0;
+          let computeCallsB = 0;
+
+          const resultAPromise = processA.computeAndSet("shared-key", async () => {
+            computeCallsA++;
+            // Deliberately several multiples of leaseTtlMs — under the
+            // unfixed, one-shot-lease implementation this alone would let
+            // B observe an "expired" lease and claim ownership for itself.
+            await new Promise((resolve) => setTimeout(resolve, 600));
+            return "A-value";
+          });
+
+          // Give A a head start so it has genuinely claimed ownership
+          // (and persisted its own lease) before B ever contends.
+          await new Promise((resolve) => setTimeout(resolve, 40));
+
+          const resultBPromise = processB.computeAndSet("shared-key", async () => {
+            computeCallsB++;
+            return "B-value";
+          });
+
+          const [resultA, resultB] = await Promise.all([resultAPromise, resultBPromise]);
+
+          expect(computeCallsA).toBe(1);
+          // The critical assertion: B's compute callback never ran at
+          // all — it kept observing a live (renewed) lease and simply
+          // waited/reused A's genuine result, exactly as a same-process
+          // `inFlight` follower would, but achieved here purely through
+          // the durable, cross-instance lease protocol.
+          expect(computeCallsB).toBe(0);
+          expect(resultA.value).toBe("A-value");
+          expect(resultB.value).toBe("A-value");
+          expect(resultA.cached).toBe(false);
+          expect(resultB.cached).toBe(true);
+        },
+        10_000
+      );
+
+      it(
+        "no-regression: a compute() call that finishes well within computeLeaseTtlMs behaves exactly as before " +
+          "(a concurrent second instance still single-flights normally)",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-renewal-fast-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const processA = new FileCache<string>(new FileStateStore(), cachePath, undefined, 5_000);
+          const processB = new FileCache<string>(new FileStateStore(), cachePath, undefined, 5_000);
+
+          let computeCallsB = 0;
+          const resultAPromise = processA.computeAndSet("fast-key", async () => "fast-value");
+          const resultBPromise = processB.computeAndSet("fast-key", async () => {
+            computeCallsB++;
+            return "should-never-be-used";
+          });
+
+          const [resultA, resultB] = await Promise.all([resultAPromise, resultBPromise]);
+          expect(resultA.value).toBe("fast-value");
+          expect([resultA.cached, resultB.cached].includes(false)).toBe(true);
+          // Whichever instance did not win still observes the genuine
+          // persisted value, never its own placeholder.
+          expect([resultA.value, resultB.value]).toEqual(["fast-value", "fast-value"]);
+          expect(computeCallsB).toBeLessThanOrEqual(1);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P1 fix (independent review, 'fence compute-lease release by owner', finding 4): a failed compute() must " +
+      "never delete a successor's already-claimed, genuinely live lease",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: while an owner's compute() is still in flight, a successor " +
+          "claims a fresh lease for the SAME key (simulating 'the original lease legitimately expired and " +
+          "someone else took over') — when the ORIGINAL owner's call then fails, the successor's live lease " +
+          "must survive completely untouched",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-fence-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const stateStore = new FileStateStore();
+          const cache = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+          const leasePath = computeLeasePathFor(cachePath, "fence-key");
+          const fabricatedSuccessorExpiresAt = Date.now() + 60_000;
+
+          const failure = new Error("simulated compute failure");
+          await expect(
+            cache.computeAndSet("fence-key", () => {
+              // At this point the REAL implementation has already claimed
+              // ownership and persisted ITS OWN lease record — confirm
+              // that precondition, then fabricate a successor's fresh,
+              // genuinely live lease directly (a DIFFERENT ownerId),
+              // simulating "this owner's lease already (legitimately)
+              // expired, and another process has since claimed a brand
+              // new one" without needing a real timing race.
+              const ownersLease = stateStore.read<{ ownerId: string; expiresAt: number }>(leasePath);
+              expect(ownersLease).toBeDefined();
+              expect(typeof ownersLease!.ownerId).toBe("string");
+              stateStore.write(leasePath, { ownerId: "successor-owner", expiresAt: fabricatedSuccessorExpiresAt });
+              throw failure;
+            })
+          ).rejects.toThrow(failure);
+
+          // The successor's lease must be EXACTLY as fabricated — the
+          // failed original owner's release must have changed nothing.
+          const leaseAfter = stateStore.read<{ ownerId: string; expiresAt: number }>(leasePath);
+          expect(leaseAfter).toEqual({ ownerId: "successor-owner", expiresAt: fabricatedSuccessorExpiresAt });
+        }
+      );
+
+      it("no-regression: a failed compute() whose lease was never taken over by anyone else still releases its own lease immediately (no full-TTL wait for a retry)", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-fence-noop-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const stateStore = new FileStateStore();
+        const cache = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+        const leasePath = computeLeasePathFor(cachePath, "retry-key");
+
+        await expect(
+          cache.computeAndSet("retry-key", () => {
+            throw new Error("simulated compute failure");
+          })
+        ).rejects.toThrow("simulated compute failure");
+
+        const releasedLease = stateStore.read<{ ownerId: string; expiresAt: number }>(leasePath);
+        expect(releasedLease?.expiresAt).toBe(0);
+
+        // A fresh attempt for the same key must succeed immediately —
+        // never blocked waiting out the original 10s TTL.
+        const result = await cache.computeAndSet("retry-key", () => "recovered-value");
+        expect(result).toEqual({ value: "recovered-value", cached: false });
+      });
+    }
+  );
 });

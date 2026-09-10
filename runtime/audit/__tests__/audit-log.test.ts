@@ -598,4 +598,48 @@ describe("AuditLog", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (P0 closure remediation batch, root-cause class 2, 'sparse arrays silently changing " +
+      "during JSON persistence'): canonicalizeAuditValue() must reject a hole in an array payload " +
+      "field, never silently reproduce it the way Array.prototype.map() does",
+    () => {
+      it(
+        "root-cause proof: Array.prototype.map() never invokes its callback for a genuine hole, " +
+          "and silently reproduces the hole in the result — this is exactly why canonicalizeAuditValue() " +
+          "cannot use .map() for arrays",
+        () => {
+          const sparse: unknown[] = [1, , 3];
+          const mapped = sparse.map((x) => x);
+          expect(Object.prototype.hasOwnProperty.call(mapped, 1)).toBe(false);
+          expect(JSON.stringify(mapped)).toBe("[1,null,3]");
+        }
+      );
+
+      it("BLOCKER regression, exact reproduction: a sparse array payload field is rejected, never silently hashed as if it had a null", () => {
+        const log = new AuditLog();
+        const sparse: unknown[] = [1, , 3];
+        expect(() =>
+          log.append({
+            type: "OK",
+            actor: "x",
+            payload: { items: sparse },
+            timestamp: new Date().toISOString()
+          })
+        ).toThrow(UnsupportedAuditPayloadError);
+      });
+
+      it("no regression: a genuinely dense array payload field is still stored and hashed normally", () => {
+        const log = new AuditLog();
+        const record = log.append({
+          type: "OK",
+          actor: "x",
+          payload: { items: [1, 2, 3] },
+          timestamp: new Date().toISOString()
+        });
+        expect(record.payload).toEqual({ items: [1, 2, 3] });
+        expect(log.verifyIntegrity()).toBe(true);
+      });
+    }
+  );
 });

@@ -1559,6 +1559,66 @@ factory:
     itself, and did not create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7. The next
     step remains an independent review of this exact commit; P0 is explicitly NOT CLOSED.
 
+    UPDATE (P0 CLOSURE REMEDIATION — CURRENT 8 REVIEW FINDINGS round): P0 REMAINS READY_FOR_INDEPENDENT_REVIEW
+    (LOCKED_FOR_CLOSURE) — still NOT CLOSED. An independent P0 closure review examined a prior commit on this
+    branch and found EIGHT actionable findings (6 P1, 2 P2); this round's task was explicitly scope-locked to
+    fix all eight as ONE consolidated corrective batch, plus a narrow same-root-cause audit against the round's
+    own 8 named classes — no new feature work, no new governance subsystem, no new branch, no merge, no Codex
+    invocation, no CLOSED declaration. All eight findings are fixed, individually regression-tested, and
+    individually bypass-verified (revert to the pre-fix behavior, confirm the exact predicted regression fails,
+    restore, reconfirm green): (1) `file-store.ts`'s `captureSnapshot()` copied an arbitrary state object's own
+    property keys via bracket/dot-equivalent assignment, so a genuine own `"__proto__"` key silently mutated the
+    copy's actual prototype instead of being stored — fixed with `Object.defineProperty()`, the same pattern
+    `audit-log.ts` already used for the identical class; (2) the SAME function's array branch used `.map()`,
+    which silently reproduces a sparse array's holes rather than rejecting them, letting a hole collapse to
+    `null` at JSON-persistence time — fixed with an explicit hole-rejecting loop; (3)/(4) `file-cache.ts`'s
+    cross-process compute lease was acquired once and never renewed across the awaited `compute()` call, so a
+    slow computation could outlive its own lease TTL while still running, AND `releaseComputeLease()` released
+    unconditionally by key rather than verifying the caller still owned the lease, letting a stale owner release
+    a successor's live lease — fixed by adding a fenced `compareAndSwapComputeLease()` primitive (only the
+    current genuine owner's own lease can be renewed or released) and a periodic renewal timer for the whole
+    duration of the compute; (5) `orchestrator.ts`'s `bootstrapProject()` performed its one paid, non-idempotent
+    model-invocation stage with no durable, crash-recoverable, concurrency-safe checkpoint of its own — fixed by
+    reusing the JUST-hardened `FileCache`/`computeAndSet()` single-flight+lease+fencing machinery (findings 3/4)
+    as that checkpoint, adding zero new locking code; (6) `phase-closure.ts`'s `recoverPendingPhaseClosure()`
+    trusted a persisted closure intent's own `phaseId`/`manifestId` without verifying they matched the phase and
+    manifest recovery was actually requested for — a governance-identifier path collision (`${phaseId}-
+    ${manifestId}` string concatenation, `-` used as both separator and a legal identifier character) could let
+    recovery apply the wrong intent — fixed with an explicit identity-verification check
+    (`MismatchedClosureIntentError`); (7) the SAME recovery path, when the authoritative Scope Lock already
+    reported `CLOSED`, never verified the recovered intent's `decisionId` matched the ACTUAL closing Decision
+    Ledger record — fixed by cross-checking both the Scope Lock's recorded `decisionId` and the ledger record's
+    `project`/`source` fields against the recovered intent before treating recovery as already-committed; (8)
+    `phase-closure.ts`'s independent-review evidence gate validated `reviewId`/`reviewerIdentity`/
+    `reviewedCommitSha`/`reviewTimestamp` by bare truthiness alone, so a whitespace-only identity or an informal,
+    non-canonical timestamp string satisfied the gate — fixed by routing identity fields through the same
+    `isNonBlankIdentity()` this codebase already uses for every other "who genuinely did this" field, and the
+    timestamp through `cost-engine.ts`'s own canonical-ISO-8601 round-trip check, both reused rather than
+    reimplemented. The narrow root-cause audit, strictly limited to these eight exact classes (no open-ended
+    hardening, no P0 scope expansion), found and fixed ONE further genuine direct instance beyond the eight:
+    `audit-log.ts`'s `canonicalizeAuditValue()` also used `.map()` over an arbitrary payload's array fields —
+    the same class-2 sparse-array-silently-changing-during-JSON-persistence defect as finding 2, just in the
+    audit trail's own canonicalization path rather than the state store's — fixed identically (explicit
+    hole-rejecting loop), regression-tested, and bypass-verified. No other genuine direct instance of any of the
+    eight classes was found elsewhere in `runtime/` (`freezeRecord()`'s shallow spread-copy in
+    `runtime/util/immutable.ts` was examined for class 1 and ruled out: every call site passes a value whose
+    own keys are fixed, compile-time-known interface field names, never an attacker/externally-named key like
+    `"__proto__"`, so the exploitable precondition finding 1 and its audit-log twin both require does not hold
+    there). Full required verification sequence green on the resulting commit: lint (clean, after removing one
+    now-unused `eslint-disable` comment left over from this round's own test authoring), typecheck (clean),
+    build (clean), 1592/1592 tests across 51 files (up from 1579 immediately before this round's work began,
+    +8 finding-specific regression describe-blocks plus the one narrow-audit sibling fix's own regression
+    tests), validate:requirements (46 schema-valid records, unchanged), history-and-current-tree-aware
+    secret-scan (PASS), production install verification (PASS — `npm ci --omit=dev` genuinely runnable, compiled
+    CLI + js-yaml + ajv all functional), Factory Doctor (READY — Node.js, npm, Python, Git, Docker), all 9 P0
+    proofs green (13 assertions). No requirement's status was raised beyond what this round's actual change
+    supports; P0's persisted Scope Lock state is UNCHANGED by this round (still LOCKED_FOR_CLOSURE /
+    READY_FOR_INDEPENDENT_REVIEW) — this round ran no phase-transition API call, since it supplied no new
+    independent review result of its own to act on. P0 remains explicitly NOT CLOSED; the next step is an
+    independent review of this exact commit. Per explicit instruction, this round does NOT merge, does NOT move
+    to P1, does NOT declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work
+    stayed on claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -5237,6 +5297,25 @@ blockers:
     and verified per the full required sequence. P0 remains BLOCKED_PENDING_REVIEW, awaiting the next independent
     Codex review to return CLEAN. Per explicit instruction, this round does not merge, does not move to P1, does
     not declare P0 complete, does not invoke Codex itself, and did not create a new branch.
+  - >-
+    Awaiting the next independent P0 closure review of the pushed fixes — an independent P0 closure review found
+    EIGHT actionable findings (6 P1, 2 P2): prototype-sensitive `"__proto__"` keys copied unsafely into an
+    ordinary object in `file-store.ts`'s `captureSnapshot()`; the same function's array branch silently
+    reproducing sparse-array holes via `.map()`; `file-cache.ts`'s cross-process compute lease neither renewed
+    during a long-running compute nor fenced against a stale owner releasing a successor's lease;
+    `orchestrator.ts`'s one paid bootstrap stage having no durable, crash-recoverable checkpoint;
+    `phase-closure.ts`'s crash-recovery path trusting a persisted intent's own phase/manifest identity and
+    trusting a `CLOSED` phase's recovered decision without cross-checking the Decision Ledger; and the same
+    file's independent-review evidence gate accepting merely truthy (whitespace-only, informal-timestamp)
+    identity fields. All eight fixed, individually regression-tested, and individually bypass-verified; see
+    `factory.p0_status`'s own "P0 CLOSURE REMEDIATION — CURRENT 8 REVIEW FINDINGS" entry for full root-cause,
+    fix, and evidence detail. A narrow root-class audit limited to the same 8 classes found and fixed one further
+    genuine sibling instance (the identical sparse-array class in `audit-log.ts`'s `canonicalizeAuditValue()`).
+    Verified per the full required sequence: lint, typecheck, build, 1592/1592 tests, validate:requirements,
+    history-and-current-tree-aware secret-scan, production install verification, Factory Doctor, all 9 P0 proofs.
+    P0 remains READY_FOR_INDEPENDENT_REVIEW (LOCKED_FOR_CLOSURE), explicitly NOT CLOSED. Per explicit instruction,
+    this round does not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself,
+    and did not create a new branch.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement

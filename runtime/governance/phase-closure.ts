@@ -37,12 +37,14 @@ import { execFileSync } from "node:child_process";
 import { isAuthenticatedVerificationArtifact, isOutcomeVerifiedEvidenceRef, type EvidenceRef } from "../requirements-traceability/traceability.js";
 import type { InvariantGuard, InvariantGuardReport } from "../invariants/invariant-guard.js";
 import type { InvariantViolation } from "../invariants/invariant-guard.js";
-import { ScopeLock } from "./scope-lock.js";
+import { ScopeLock, expectedLedgerSourceForPhaseState } from "./scope-lock.js";
 import type { FounderDecisionLedger } from "../decisions/decision-ledger.js";
 import { computeRealityMatrix, type RealityMatrixSummary } from "./reality-matrix.js";
 import type { StateStore } from "../state/file-store.js";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 import { deepFreezeClone } from "../util/immutable.js";
+import { isNonBlankIdentity } from "../util/identity.js";
+import { isCanonicalIsoTimestamp } from "../cost/cost-engine.js";
 
 /**
  * P1 fix (independent Codex review, "phase closure must reject incomplete
@@ -94,6 +96,46 @@ export class UntrustedRepositoryIdentityError extends Error {
 }
 
 const GIT_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
+
+/**
+ * P1 fix (independent review, "reject recovery intents for another phase
+ * or manifest" / "match recovered decisions against an already-closed
+ * phase", findings 6 & 7): `recoverPendingPhaseClosure()` used to treat a
+ * persisted intent record found AT the requested `(phaseId, manifestId)`
+ * path as automatically BELONGING to that exact target — but
+ * `intentPath()`/`manifestPath()` join `phaseId`/`manifestId` with a plain
+ * `-` separator, and `assertSafeGovernanceIdentifier()` ALLOWS `-` inside
+ * either identifier: `phaseId="P0-sub"`/`manifestId="manifest"` and
+ * `phaseId="P0"`/`manifestId="sub-manifest"` both resolve to the IDENTICAL
+ * file `P0-sub-manifest.intent.json` — a genuine path collision between
+ * two DIFFERENT closure attempts. Recovery also never verified an
+ * ALREADY-CLOSED phase's own authoritative `decisionId` (bkz.
+ * `ScopeLock.get()`) actually matches `intent.decisionId` before
+ * finalizing — it only ASSUMED consistency because `ScopeLock.loadFrom()`
+ * validates records at RESTORE time, never re-checking that assumption
+ * against the SPECIFIC intent being recovered right here. Either gap lets
+ * a colliding/forged/stale intent be silently promoted to a real
+ * governance outcome for the WRONG phase or the WRONG decision. Fixed:
+ * `recoverPendingPhaseClosure()` now verifies exact identity consistency
+ * (requested phaseId/manifestId, the intent's own persisted
+ * phaseId/manifestId, `intent.attempt.phaseId`, and — when the phase is
+ * already CLOSED — the phase's live, authoritative `decisionId` AND its
+ * matching Decision Ledger record) BEFORE taking any recovery action,
+ * throwing this error (never silently returning `undefined`, which a
+ * caller could misread as the unremarkable "nothing pending" case) and
+ * writing NOTHING — no phase transition, no finalized manifest — on any
+ * mismatch.
+ */
+export class MismatchedClosureIntentError extends Error {
+  constructor(detail: string) {
+    super(
+      `Refusing to recover a phase-closure intent: ${detail}. A persisted intent's identity must exactly match ` +
+        `the requested recovery target before any recovery action is taken — this is fail-closed governance ` +
+        `state, never resolved by trusting whichever record happens to be found on disk.`
+    );
+    this.name = "MismatchedClosureIntentError";
+  }
+}
 
 /**
  * P1 fix (independent Codex review, "bind the closing SHA to trusted
@@ -460,10 +502,32 @@ function evaluateClosureAttempt(
   // reviewed the EXACT commit this attempt is closing — a review of
   // commit A must never be allowed to close commit B.
   const review = attempt.independentReview;
-  if (!review.reviewId || !review.reviewerIdentity || !review.reviewTimestamp || !review.reviewedCommitSha) {
+  // P1 fix (independent review, "require meaningful independent-review
+  // metadata", finding 8): the checks above used bare TRUTHINESS
+  // (`!review.reviewerIdentity`) — a whitespace-only string like `"   "`
+  // is truthy, so it satisfied this check while naming no genuine
+  // reviewer at all; a `reviewTimestamp` of `"yesterday-ish"` passed
+  // identically, since nothing here ever confirmed it was a real,
+  // parseable moment in time. Fixed: `reviewId`/`reviewerIdentity`/
+  // `reviewedCommitSha` now go through the SAME `isNonBlankIdentity()`
+  // (trim + non-empty) this codebase already requires for every other
+  // "who/what genuinely did this" field (approver identities, founder
+  // confirmations), and `reviewTimestamp` must be a canonical ISO-8601
+  // timestamp (reusing `cost-engine.ts`'s own established round-trip
+  // check, never a second, differently-scoped date-parsing rule) — a
+  // merely `Date.parse()`-able informal string no longer qualifies.
+  if (
+    !isNonBlankIdentity(review.reviewId) ||
+    !isNonBlankIdentity(review.reviewerIdentity) ||
+    !isNonBlankIdentity(review.reviewedCommitSha) ||
+    typeof review.reviewTimestamp !== "string" ||
+    !isCanonicalIsoTimestamp(review.reviewTimestamp)
+  ) {
     rejectionReasons.push(
-      "independent review evidence is incomplete — reviewId, reviewerIdentity, reviewTimestamp and " +
-        "reviewedCommitSha are all required; a bare outcome string is never sufficient for phase closure"
+      "independent review evidence is incomplete or malformed — reviewId, reviewerIdentity and " +
+        "reviewedCommitSha must each be a genuine, non-blank identity (never merely a truthy string), and " +
+        "reviewTimestamp must be a canonical ISO-8601 timestamp (e.g. new Date().toISOString()); a bare outcome " +
+        "string, a blank/whitespace identity, or an informal timestamp are never sufficient for phase closure"
     );
   } else if (!isAuthenticatedVerificationArtifact(review.evidenceRef, deps.rootDir)) {
     // P1 fix (independent Codex review, finding 4): bkz.
@@ -769,6 +833,26 @@ export function recoverPendingPhaseClosure(
     return undefined;
   }
 
+  // P1 fix (independent review, "reject recovery intents for another phase
+  // or manifest", finding 6): `intentPath()`/`manifestPath()` join
+  // `phaseId`/`manifestId` with a plain `-`, which `-` is itself a
+  // permitted character inside either identifier — `("P0-sub", "manifest")`
+  // and `("P0", "sub-manifest")` collide on the SAME file. An intent
+  // genuinely prepared for a DIFFERENT (phaseId, manifestId) pair — or one
+  // whose own `attempt.phaseId` disagrees with either — must never be
+  // treated as belonging to THIS recovery call: verified here, BEFORE any
+  // state inspection or recovery action, against the intent's own
+  // persisted identity fields (captured at PREPARE time, bkz.
+  // `PendingClosureIntent`'in üstündeki fix notu).
+  if (intent.phaseId !== phaseId || intent.manifestId !== manifestId || intent.attempt.phaseId !== phaseId) {
+    throw new MismatchedClosureIntentError(
+      `the persisted intent at '${iPath}' identifies phaseId='${intent.phaseId}'/manifestId='${intent.manifestId}'/` +
+        `attempt.phaseId='${intent.attempt.phaseId}', but recovery was requested for phaseId='${phaseId}'/` +
+        `manifestId='${manifestId}' — this is either a colliding governance-identifier path or a forged/corrupt ` +
+        `intent record`
+    );
+  }
+
   const currentState = deps.scopeLock.getState(phaseId);
   if (currentState === "OPEN") {
     // Something has reopened this phase since the crash — resurrecting a
@@ -814,10 +898,41 @@ export function recoverPendingPhaseClosure(
     }
     deps.ledger.saveTo(deps.store, deps.ledgerPath);
     deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
+  } else {
+    // currentState === "CLOSED": steps (2)-(4) are ASSUMED already fully,
+    // durably consistent (ScopeLock.loadFrom() itself would have refused
+    // to restore an inconsistent CLOSED record) — but that assumption is
+    // about the phase's restore-time consistency in general, never a
+    // check that THIS SPECIFIC intent is the one that produced it.
+    //
+    // P1 fix (independent review, "match recovered decisions against an
+    // already-closed phase", finding 7): a stale or forged intent sharing
+    // this phase's `(phaseId, manifestId)` path (bkz. finding 6's fix
+    // notu for how that collision can happen) but naming a WRONG
+    // `decisionId` used to be finalized here anyway — the manifest below
+    // would then attribute this phase's closure to a decision that never
+    // actually closed it. Verified here, directly, against this phase's
+    // OWN live, authoritative `ScopeLock` record AND its matching
+    // Decision Ledger entry — never merely assumed from `loadFrom()`'s
+    // separate, general restore-time check.
+    const phaseRecord = deps.scopeLock.get(phaseId);
+    if (!phaseRecord || phaseRecord.decisionId !== intent.decisionId) {
+      throw new MismatchedClosureIntentError(
+        `phase '${phaseId}' is CLOSED under decisionId='${phaseRecord?.decisionId ?? "(none)"}', but the ` +
+          `recovered intent claims decisionId='${intent.decisionId}' — this intent did not produce this phase's ` +
+          `actual closure`
+      );
+    }
+    const closingDecision = deps.ledger.get(intent.decisionId);
+    const expectedSource = expectedLedgerSourceForPhaseState("CLOSED");
+    if (!closingDecision || closingDecision.project !== phaseId || closingDecision.source !== expectedSource) {
+      throw new MismatchedClosureIntentError(
+        `decisionId='${intent.decisionId}' has no matching Decision Ledger record for phase '${phaseId}' closed ` +
+          `via '${expectedSource}' — the intent's claimed decision does not check out against authoritative ` +
+          `ledger evidence`
+      );
+    }
   }
-  // currentState === "CLOSED": steps (2)-(4) already fully, durably
-  // consistent (ScopeLock.loadFrom() itself would have refused to restore
-  // an inconsistent CLOSED record) — only finalize/commit remain.
 
   const closedManifest = deepFreezeClone(
     buildManifest(intent.attempt, manifestId, "CLOSED", [], guardReport, realityMatrix, intent.decisionId)

@@ -113,7 +113,16 @@ function describeInvalidPersistedPhaseLock(value: unknown): string | undefined {
  * inside these three methods, each of which records its OWN, distinct
  * source string before doing so.
  */
-function expectedLedgerSourceForPhaseState(state: PhaseLockState): string {
+/**
+ * P1 fix (independent review, "match recovered decisions against an
+ * already-closed phase", finding 7): exported so
+ * `runtime/governance/phase-closure.ts`'s `recoverPendingPhaseClosure()`
+ * can verify an ALREADY-CLOSED phase's authoritative Decision Ledger
+ * source against the SAME expected-source table `loadFrom()`/
+ * `reconcileFromExistingDecision()` already use here, rather than
+ * hand-duplicating the `"ScopeLock.close"` literal in a second file.
+ */
+export function expectedLedgerSourceForPhaseState(state: PhaseLockState): string {
   switch (state) {
     case "LOCKED_FOR_CLOSURE":
       return "ScopeLock.lock";

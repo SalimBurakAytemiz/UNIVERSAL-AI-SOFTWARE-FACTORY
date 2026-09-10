@@ -261,6 +261,62 @@ export class FileCache<T = unknown> {
   }
 
   /**
+   * P1 fix (independent review, "fence compute-lease release by owner",
+   * finding 4): the ONE place a caller may mutate an EXISTING compute
+   * lease it believes it still owns (renewal, and release-on-failure) —
+   * bkz. `renewComputeLease()`/`releaseComputeLease()` aşağısı. Both used
+   * to write UNCONDITIONALLY: `releaseComputeLease()` wrote
+   * `{ownerId, expiresAt: 0}` regardless of what was CURRENTLY persisted,
+   * so an owner whose OWN lease had already (perhaps wrongly) been
+   * treated as expired — letting a successor claim a fresh lease with a
+   * DIFFERENT ownerId — could still overwrite that successor's genuinely
+   * live lease with its own now-stale `{expiresAt: 0}` record the moment
+   * its (still in-flight, now-doomed) `compute()` call finally failed,
+   * immediately exposing the key to a THIRD contender even though the
+   * successor's computation was still legitimately running. Fixed with a
+   * compare-and-swap: the write only happens if the CURRENTLY persisted
+   * lease still names `expectedOwnerId` as its owner — read and write
+   * happen inside the SAME short, synchronous `computeLockPath(key)`
+   * critical section (never spanning an `await`), so no other contender's
+   * own negotiation/renewal/release can interleave between the check and
+   * the write. A stale caller whose ownership has already moved on gets
+   * `false` and changes nothing — the successor's lease survives
+   * untouched, exactly what finding 4 requires.
+   */
+  private compareAndSwapComputeLease(key: string, expectedOwnerId: string, newExpiresAt: number): boolean {
+    const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
+    try {
+      const current = this.readComputeLease(key);
+      if (!current || current.ownerId !== expectedOwnerId) {
+        return false;
+      }
+      this.writeComputeLease(key, expectedOwnerId, newExpiresAt);
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * P1 fix (independent review, "renew compute leases while their owners
+   * are active", finding 3): called periodically (bkz.
+   * `#computeCrossProcess()`'in kendi renewal timer'ı) for as long as this
+   * owner's `compute()` call is genuinely still running, EXTENDING the
+   * durable lease's `expiresAt` well before it would otherwise elapse — a
+   * genuinely long-running (e.g. a real, slow model/network call)
+   * computation no longer looks "abandoned" to another contender's
+   * `negotiateComputeOwnership()` merely because the ORIGINAL,
+   * one-shot `computeLeaseTtlMs` window has passed while it was still
+   * legitimately in flight. Routed through `compareAndSwapComputeLease()`
+   * so a renewal can never resurrect/steal a lease this owner no longer
+   * actually holds (the fenced-out case: the returned `false` here simply
+   * means "stop renewing," never "reclaim by force").
+   */
+  private renewComputeLease(key: string, ownerId: string): boolean {
+    return this.compareAndSwapComputeLease(key, ownerId, Date.now() + this.computeLeaseTtlMs);
+  }
+
+  /**
    * P1 fix (independent Codex review, "do not hold the synchronous cache
    * lock across await" — reproduced: a caller holding `computeLockPath()`'s
    * synchronous, directory-based file lock across `await compute()` forces
@@ -353,14 +409,18 @@ export class FileCache<T = unknown> {
    * before it can attempt its own fresh compute. A best-effort write: if
    * it itself fails, the lease still naturally expires at its own
    * `expiresAt` — bounded recovery, never a permanent deadlock.
+   *
+   * P1 fix (independent review, "fence compute-lease release by owner",
+   * finding 4): routed through `compareAndSwapComputeLease()` — bkz. onun
+   * üstündeki fix notu for the exact reproduction this closes. `ownerId`
+   * no longer naming the CURRENT lease owner (because it already expired
+   * and a successor has since claimed a fresh one) now means this call
+   * changes NOTHING, rather than overwriting the successor's live lease
+   * with a fabricated already-expired record under this stale owner's
+   * name.
    */
   private releaseComputeLease(key: string, ownerId: string): void {
-    const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
-    try {
-      this.writeComputeLease(key, ownerId, 0);
-    } finally {
-      release();
-    }
+    this.compareAndSwapComputeLease(key, ownerId, 0);
   }
 
   async #computeCrossProcess(
@@ -379,6 +439,30 @@ export class FileCache<T = unknown> {
         return { value: outcome.value, cached: true };
       }
       if (outcome.kind === "owner") {
+        // P1 fix (independent review, "renew compute leases while their
+        // owners are active", finding 3): a periodic, best-effort renewal
+        // — well inside `computeLeaseTtlMs` (a third of it, so at least
+        // two renewal attempts land before the ORIGINAL claim would ever
+        // elapse) — keeps this lease looking genuinely live to every other
+        // contender's `negotiateComputeOwnership()` for as long as
+        // `compute()` below is still actually running, no matter how much
+        // longer than the original TTL window it takes. Each tick is its
+        // OWN short, synchronous critical section (bkz.
+        // `renewComputeLease()`/`compareAndSwapComputeLease()`'in fix
+        // notları) — never a lock held across this `await compute()`
+        // itself. `.unref()` so a leaked timer (there should never be one,
+        // given the `finally` below) cannot itself keep the process alive.
+        // If the process crashes outright, renewal simply stops firing —
+        // the lease then naturally elapses at its own last-renewed
+        // `expiresAt`, exactly the same bounded "dead/crashed owners
+        // eventually stop renewing, successors recover only once genuinely
+        // stale" recovery shape this file's lease design already
+        // documents for the ORIGINAL, one-shot claim.
+        const renewalIntervalMs = Math.max(1, Math.floor(this.computeLeaseTtlMs / 3));
+        const renewalTimer = setInterval(() => {
+          this.renewComputeLease(key, ownerId);
+        }, renewalIntervalMs);
+        renewalTimer.unref?.();
         try {
           // No lock held here at all — an `await`-bound computation never
           // blocks the event loop, and never blocks another contender's own
@@ -389,6 +473,8 @@ export class FileCache<T = unknown> {
         } catch (err) {
           this.releaseComputeLease(key, ownerId);
           throw err;
+        } finally {
+          clearInterval(renewalTimer);
         }
       }
       // "busy": another contender holds a live lease. Sleep via an

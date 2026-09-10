@@ -39,6 +39,7 @@ import { MockProvider } from "../models/providers/mock-provider.js";
 import { CostEngine } from "../cost/cost-engine.js";
 import { assertValidBudgetLimits, BudgetGuard, type BudgetLimits } from "../budget/budget.js";
 import { FileStateStore, type StateStore } from "../state/file-store.js";
+import { FileCache } from "../cache/file-cache.js";
 import { traceRequirements } from "../cli/commands/trace-requirement.js";
 import type { TraceabilityIssue } from "../requirements-traceability/traceability.js";
 import { freezeRecord } from "../util/immutable.js";
@@ -265,26 +266,37 @@ export interface BootstrapProjectResult {
  * already ran and was billed" from "the model has never run," so it
  * called `modelGateway.invoke()` a SECOND time, incurring a SECOND real
  * charge for a single logical bootstrap (`baseline bölüm 277`, "kalıcı
- * durum: süreç yeniden başlasa bile kaybolmaz" ihlali). This record is
- * the minimal durable checkpoint needed to close that window: written
- * via the SAME `stateStore` this function already uses for its other
- * durable state (no new persistence mechanism), keyed by
- * `genome.project.id` (bkz. `resolveTransactionPath()`), and consulted
- * FIRST, inside `gateway.authorize()`'s own `execute` callback, before
- * `modelGateway.invoke()` is ever called again for the same project.
+ * durum: süreç yeniden başlasa bile kaybolmaz" ihlali).
+ *
+ * P1 fix (independent review, "serialize bootstrapProject() transaction
+ * claims", finding 5): the finding-8 fix above closed the CRASH-RETRY
+ * window but left a genuinely CONCURRENT one wide open — TWO
+ * `bootstrapProject()` calls for the SAME project, running at the same
+ * time, both did a plain `stateStore.read(transactionPath)`, both saw
+ * "no checkpoint yet," and both proceeded to call the paid
+ * `modelGateway.invoke()` independently: a classic check-then-act race,
+ * doubling real spend for one logical bootstrap even with the crash-
+ * retry checkpoint fully in place. Fixed by routing the paid invocation
+ * through the EXISTING durable, single-flight/lease `FileCache`
+ * (`runtime/cache/file-cache.ts` — the SAME mechanism this session's own
+ * findings 3/4 just hardened: cross-process compute ownership negotiated
+ * via a short, non-`await`-spanning file-lock critical section, a
+ * TTL-bounded lease renewed for as long as the real computation is still
+ * running, and a fenced release on failure) instead of a hand-rolled
+ * read-then-write pair — no new lock/lease/workflow machinery is
+ * introduced here at all. A second, concurrent caller for the SAME
+ * project now genuinely WAITS on the first caller's in-flight lease
+ * (never independently deciding "nobody has claimed this yet") and reuses
+ * its real result once persisted; a caller whose lease-holder crashed
+ * recovers exactly the way `FileCache`'s own lease design already
+ * guarantees (bounded by the lease TTL, never a permanent deadlock).
  * `scaffoldProjectOs()` and the three `stateStore.write()` calls that
  * follow are already idempotent (recursive `mkdirSync`, deterministic
  * overwrites) and therefore need no equivalent staged-transaction
  * machinery of their own — this checkpoint exists ONLY to make the one
- * genuinely non-idempotent, billable step in this function safe to
- * retry.
+ * genuinely non-idempotent, billable step in this function safe under
+ * BOTH crash-retry and real concurrency.
  */
-interface BootstrapTransactionRecord {
-  readonly projectId: string;
-  readonly status: "MODEL_COMPLETED";
-  readonly modelInvocation: ModelInvocationResponse;
-  readonly completedAt: string;
-}
 
 /**
  * P1 fix (11th independent review round targeted audit, same class as
@@ -447,19 +459,23 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   assertFilesystemConfinement(projectRoot, join("organization", "organization.json"));
   assertFilesystemConfinement(projectRoot, join("state", "bootstrap.json"));
   // P1 fix (independent review, finding 8, "completed paid work lacking a
-  // durable checkpoint"): validated in this SAME synchronous, pre-paid-work
-  // prefix as the three destinations above, for the same reason — a
-  // symlink-escape at this path must be rejected before any billed
-  // invocation, not discovered afterward. Deliberately anchored under
-  // `baseDir` (bkz. üstündeki `BootstrapTransactionRecord`'ın fix notu),
-  // NOT `projectRoot`: `projectRoot`'s own directory tree does not exist
-  // yet at this point (`scaffoldProjectOs()` has not run), so a retry that
-  // crashed before scaffolding ever started still needs a stable location
-  // to find this project's transaction record.
-  const transactionPath = assertFilesystemConfinement(
-    baseDir,
-    join("bootstrap-transactions", `${genome.project.id}.json`)
-  );
+  // durable checkpoint"; extended by finding 5, "serialize
+  // bootstrapProject() transaction claims"): validated in this SAME
+  // synchronous, pre-paid-work prefix as the three destinations above, for
+  // the same reason — a symlink-escape at this path must be rejected
+  // before any billed invocation, not discovered afterward. Deliberately
+  // anchored under `baseDir`, NOT `projectRoot`: `projectRoot`'s own
+  // directory tree does not exist yet at this point (`scaffoldProjectOs()`
+  // has not run), so a retry (or a genuinely concurrent call) that never
+  // got as far as scaffolding still needs a stable, SHARED location to
+  // find this project's transaction record. A single shared file (one
+  // `FileCache`, bkz. `bootstrapTransactionCache` aşağısı, keyed per
+  // `genome.project.id`) rather than one file per project — this is the
+  // SAME durable cache mechanism `runtime/cache/file-cache.ts` already
+  // provides, reused here rather than hand-rolling a second, narrower
+  // read-then-write checkpoint that (bkz. finding 5's fix notu) has no
+  // cross-process claim atomicity of its own.
+  const transactionsPath = assertFilesystemConfinement(baseDir, "bootstrap-transactions.json");
   const organization = composeOrganizationFromGenome(genome, risk);
 
   // P2 fix (13th independent review round targeted audit, same class as
@@ -648,6 +664,19 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
       : new CostEngine(() => new Date(), { store: stateStore, path: join(baseDir, "cost-ledger.json") }));
   const budget = new BudgetGuard(costEngine, budgetGuardLimits);
   const modelGateway = callerModelGateway ?? defaultBootstrapModelGateway();
+  // P1 fix (independent review, "serialize bootstrapProject() transaction
+  // claims", finding 5): the durable, cross-process single-flight/lease
+  // primitive this bootstrap's one paid, non-idempotent step now goes
+  // through instead of a hand-rolled read-then-write checkpoint — bkz.
+  // `transactionsPath`'in ve `gateway.authorize()`'ın execute callback'inin
+  // üstündeki fix notları for the full rationale. Keyed by
+  // `genome.project.id` inside the shared `transactionsPath` file — the
+  // SAME `stateStore` this function already uses for every other durable
+  // write, so a genuinely concurrent second `bootstrapProject()` call for
+  // this SAME project (sharing this same `stateStore`/`baseDir`) observes
+  // and waits on THIS instance's in-flight lease rather than independently
+  // deciding "nobody has claimed this yet."
+  const bootstrapTransactionCache = new FileCache<ModelInvocationResponse>(stateStore, transactionsPath);
 
   // Yalnızca `gateway.authorize()`'ın kendi `execute` geri çağırması
   // İÇİNDE atanır — bu, hem ücretli model çağrısının HEM DE gerçek dosya
@@ -699,50 +728,40 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     scaffoldAction,
     async () => {
     // P1 fix (independent review, finding 8, "completed paid work lacking
-    // a durable checkpoint"): consult the durable transaction record
-    // BEFORE invoking the paid model a second time. A retry after a crash
-    // that happened AFTER the invocation below already completed (but
-    // before this whole bootstrap finished) reuses the ALREADY-BILLED,
-    // ALREADY-COMMITTED `modelInvocation` this record captured on the
-    // attempt that actually paid for it — never a fresh `invoke()` call —
-    // so provider-invocation-count and total cost for this project stay
-    // exactly what the first, genuinely successful invocation produced,
-    // no matter how many times bootstrap is retried afterward.
-    const existingTransaction = stateStore.read<BootstrapTransactionRecord>(transactionPath);
-    if (existingTransaction && existingTransaction.status === "MODEL_COMPLETED") {
-      invocationResponse = existingTransaction.modelInvocation;
-    } else {
-      invocationResponse = await modelGateway.invoke(
-        modelDecision.model,
-        {
-          prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
-          taskType: "bootstrap-summary"
-        },
-        {
-          policy,
-          budget,
-          risk: 0,
-          taskId: `bootstrap:${genome.project.id}`,
-          projectId: genome.project.id,
-          description: `Bootstrap summary for project '${genome.project.id}'`
-        }
-      );
-      // Persisted immediately after the paid call succeeds, and BEFORE
-      // `scaffoldProjectOs()` runs — the residual crash window between the
-      // provider genuinely completing and this local write landing is
-      // real and unavoidable (no distributed transaction spans an
-      // external provider call), but every crash on either side of THIS
-      // line is now covered: before it, no charge was ever recorded as
-      // having happened and `invoke()` retries in full; after it, this
-      // exact record is what the next retry above reuses instead of
-      // paying again.
-      stateStore.write(transactionPath, {
-        projectId: genome.project.id,
-        status: "MODEL_COMPLETED",
-        modelInvocation: invocationResponse,
-        completedAt: new Date().toISOString()
-      } satisfies BootstrapTransactionRecord);
-    }
+    // a durable checkpoint"; extended by finding 5, "serialize
+    // bootstrapProject() transaction claims"): `bootstrapTransactionCache`'s
+    // own `computeAndSet()` (bkz. runtime/cache/file-cache.ts) IS this
+    // bootstrap's crash-recoverable, cross-process-atomic checkpoint —
+    // negotiating durable ownership of "who invokes the model for THIS
+    // project" via a short, non-`await`-spanning file-lock critical
+    // section BEFORE ever calling `compute()` below, renewing its lease
+    // for as long as that call is genuinely in flight, and persisting the
+    // result exactly once. A retry after a crash (the paid call already
+    // completed, but before this whole bootstrap finished) reuses the
+    // ALREADY-BILLED, ALREADY-COMMITTED response a fresh lookup finds; a
+    // genuinely CONCURRENT second `bootstrapProject()` call for this SAME
+    // project (finding 5's own exact reproduction) observes and waits on
+    // this in-flight lease instead of independently deciding "nobody has
+    // claimed this yet" and invoking a second, duplicate, real charge.
+    invocationResponse = (
+      await bootstrapTransactionCache.computeAndSet(genome.project.id, () =>
+        modelGateway.invoke(
+          modelDecision.model,
+          {
+            prompt: `Summarize the initial bootstrap for project '${genome.project.id}'.`,
+            taskType: "bootstrap-summary"
+          },
+          {
+            policy,
+            budget,
+            risk: 0,
+            taskId: `bootstrap:${genome.project.id}`,
+            projectId: genome.project.id,
+            description: `Bootstrap summary for project '${genome.project.id}'`
+          }
+        )
+      )
+    ).value;
     const scaffoldResult = scaffoldProjectOs(baseDir, genome.project.id);
 
     // P1 fix (5th independent review round, "final-destination / dangling

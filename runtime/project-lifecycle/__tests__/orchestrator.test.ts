@@ -28,6 +28,7 @@ import { ApprovalWorkflow } from "../../policy-engine/approval.js";
 import { createDefaultModelRegistry, ModelRegistry } from "../../models/registry.js";
 import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
 import { FileStateStore, type StateStore } from "../../state/file-store.js";
+import { FileCache } from "../../cache/file-cache.js";
 import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetExceededError, InvalidBudgetLimitError, type BudgetLimits } from "../../budget/budget.js";
@@ -1165,7 +1166,14 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             })
           ).rejects.toThrow(BudgetExceededError);
 
-          expect(readdirSync(tempRoot)).toHaveLength(0);
+          // No PROJECT directory was ever created — the rejection happened
+          // before any scaffold mutation. A durable compute-lease artifact
+          // for the attempted (and released, per finding 4) invocation
+          // claim may legitimately exist directly under tempRoot now (bkz.
+          // finding 5's fix notu, "serialize bootstrapProject() transaction
+          // claims" — orchestrator.ts's bootstrapTransactionCache), so this
+          // no longer asserts the whole directory is empty.
+          expect(existsSync(join(tempRoot, "proj-too-tight-budget"))).toBe(false);
         }
       );
 
@@ -1275,7 +1283,11 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             })
           ).rejects.toThrow(UnknownProviderError);
 
-          expect(readdirSync(tempRoot)).toHaveLength(0);
+          // bkz. yukarıdaki "too-tight-budget" testinin fix notu — a
+          // released compute-lease artifact under tempRoot is now expected
+          // (finding 5); the meaningful invariant is that no PROJECT
+          // directory was ever created.
+          expect(existsSync(join(tempRoot, "proj-unknown-provider"))).toBe(false);
         }
       );
 
@@ -1311,7 +1323,11 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             })
           ).rejects.toThrow(providerError);
 
-          expect(readdirSync(tempRoot)).toHaveLength(0);
+          // bkz. "too-tight-budget" testinin fix notu — a released
+          // compute-lease artifact under tempRoot is now expected (finding
+          // 5); the meaningful invariant is that no PROJECT directory was
+          // ever created.
+          expect(existsSync(join(tempRoot, "proj-failing-provider"))).toBe(false);
           // The reservation was released on provider failure — no cost was
           // ever recorded, proving no synthetic spend occurred despite the
           // model being "selected."
@@ -1627,11 +1643,13 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
 
           // The winning call genuinely scaffolded its project...
           expect(existsSync(join(rootA, "proj-reserve-race-a"))).toBe(true);
-          // ...but the REJECTED call left NO project tree behind at all —
-          // proving the budget reservation was checked and enforced
-          // BEFORE any filesystem mutation, not merely before an
-          // eventual, too-late spend() call.
-          expect(readdirSync(rootB)).toHaveLength(0);
+          // ...but the REJECTED call left NO PROJECT TREE behind at all —
+          // proving the budget reservation was checked and enforced BEFORE
+          // any filesystem mutation, not merely before an eventual,
+          // too-late spend() call. (A released compute-lease artifact
+          // under rootB is now an expected byproduct of finding 5's fix —
+          // bkz. the "too-tight-budget" testinin fix notu — so this no
+          // longer asserts rootB is completely empty.)
           expect(existsSync(join(rootB, "proj-reserve-race-b"))).toBe(false);
 
           rmSync(rootA, { recursive: true, force: true });
@@ -1663,7 +1681,11 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           })
         ).rejects.toThrow(BudgetExceededError);
 
-        expect(readdirSync(tempRoot)).toHaveLength(0);
+        // bkz. "too-tight-budget" testinin fix notu — a released
+        // compute-lease artifact under tempRoot is now expected (finding
+        // 5); the meaningful invariant is that no PROJECT directory was
+        // ever created.
+        expect(existsSync(join(tempRoot, "proj-reserve-sequential"))).toBe(false);
       });
     }
   );
@@ -2547,11 +2569,18 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           ).rejects.toThrow();
 
           expect(invocationCount()).toBe(1);
-          const transactionPath = join(tempRoot, "bootstrap-transactions", `${projectId}.json`);
-          expect(existsSync(transactionPath)).toBe(true);
-          const transaction = JSON.parse(readFileSync(transactionPath, "utf8"));
-          expect(transaction.status).toBe("MODEL_COMPLETED");
-          expect(transaction.modelInvocation.costUsd).toBe(0.6);
+          // P1 fix (independent review, finding 5, "serialize
+          // bootstrapProject() transaction claims"): the per-project
+          // checkpoint file (one JSON file per project) is superseded by a
+          // single, shared durable FileCache — bkz.
+          // orchestrator.ts's `bootstrapTransactionCache`'in fix notu —
+          // keyed by projectId, at ONE shared path under baseDir.
+          const transactionsPath = join(tempRoot, "bootstrap-transactions.json");
+          expect(existsSync(transactionsPath)).toBe(true);
+          const transactionCache = new FileCache<{ costUsd: number }>(new FileStateStore(), transactionsPath);
+          const persistedInvocation = transactionCache.get(projectId);
+          expect(persistedInvocation).toBeDefined();
+          expect(persistedInvocation?.costUsd).toBe(0.6);
 
           // "Restart": whatever crashed is fixed, then bootstrap is retried
           // against the SAME baseDir/projectId.
@@ -2651,6 +2680,127 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           expect(invocationCount()).toBe(2);
           expect(resultB.totalCostUsd).toBe(0.6);
         }
+      );
+    }
+  );
+
+  describe(
+    "P1 fix (independent review, finding 5, 'serialize bootstrapProject() transaction claims'): two genuinely " +
+      "CONCURRENT bootstrapProject() calls for the SAME project must never both invoke (and pay for) the model",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: two concurrent bootstrapProject() calls for the SAME project, " +
+          "with a compute delay long enough for both to genuinely contend -> the provider is invoked exactly " +
+          "ONCE, cost is recorded exactly once, and both calls resolve successfully to the same real cost",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-concurrent-claim-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "counting-delayed",
+            modelId: "counting-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          let invocationCount = 0;
+          const provider: ModelProvider = {
+            id: "counting-delayed",
+            async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+              invocationCount++;
+              // Long enough that BOTH concurrent calls' own synchronous
+              // prefixes (through claiming/observing the transaction
+              // lease) have genuinely run before either compute()
+              // resolves — without finding 5's fix, both calls' plain
+              // read-then-write checkpoint check would independently see
+              // "no checkpoint yet" and both reach this line.
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              return { modelId: model.modelId, provider: "counting-delayed", costUsd: 0.6, output: request.prompt };
+            }
+          };
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(provider);
+
+          const projectId = "proj-concurrent-claim";
+          const makeInput = (): BootstrapProjectInput => ({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          // Issued back-to-back, synchronously, with NEITHER awaited yet —
+          // both calls genuinely contend for the SAME project's
+          // transaction claim (same pattern as the existing concurrent-
+          // budgetLimits/reserve-race tests elsewhere in this file).
+          const [resultA, resultB] = await Promise.all([bootstrapProject(makeInput()), bootstrapProject(makeInput())]);
+
+          expect(invocationCount).toBe(1);
+          expect(resultA.totalCostUsd).toBe(0.6);
+          expect(resultB.totalCostUsd).toBe(0.6);
+          expect(existsSync(join(tempRoot, projectId, "project-genome", "genome.json"))).toBe(true);
+        },
+        10_000
+      );
+
+      it(
+        "no-regression: two concurrent bootstrapProject() calls for TWO DIFFERENT projects both genuinely " +
+          "invoke the model — one project's transaction claim never blocks an unrelated project's",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-concurrent-distinct-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "counting-parallel",
+            modelId: "counting-summarizer",
+            tier: "MOCK",
+            costPerCall: 0.6,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          let invocationCount = 0;
+          const provider: ModelProvider = {
+            id: "counting-parallel",
+            async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+              invocationCount++;
+              await new Promise((resolve) => setTimeout(resolve, 50));
+              return { modelId: model.modelId, provider: "counting-parallel", costUsd: 0.6, output: request.prompt };
+            }
+          };
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(provider);
+
+          const [resultA, resultB] = await Promise.all([
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-parallel-a"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: registry,
+              modelGateway,
+              budgetLimits: { perTaskUsd: 10 }
+            }),
+            bootstrapProject({
+              genomeCandidate: validGenome("proj-parallel-b"),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: registry,
+              modelGateway,
+              budgetLimits: { perTaskUsd: 10 }
+            })
+          ]);
+
+          expect(invocationCount).toBe(2);
+          expect(resultA.totalCostUsd).toBe(0.6);
+          expect(resultB.totalCostUsd).toBe(0.6);
+        },
+        10_000
       );
     }
   );

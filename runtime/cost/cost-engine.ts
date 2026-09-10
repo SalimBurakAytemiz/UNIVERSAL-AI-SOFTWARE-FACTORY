@@ -673,8 +673,14 @@ function assertValidPersistedCostState(data: unknown): asserts data is Persisted
  * holds for a string already in that one canonical shape — rather than
  * merely "parseable somehow." Fail closed on anything else, per this
  * file's established persisted-state philosophy.
+ *
+ * Exported (independent review, "require meaningful independent-review
+ * metadata", finding 8) so `runtime/governance/phase-closure.ts` can
+ * apply this SAME canonical-timestamp rule to an independent review's
+ * `reviewTimestamp`, rather than hand-duplicating the round-trip check in
+ * a second file.
  */
-function isCanonicalIsoTimestamp(value: string): boolean {
+export function isCanonicalIsoTimestamp(value: string): boolean {
   const parsed = new Date(value);
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }

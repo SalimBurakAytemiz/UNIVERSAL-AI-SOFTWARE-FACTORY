@@ -190,7 +190,37 @@ function captureSnapshot(value: unknown, jsonPath: string, statePath: string, ca
     if (Array.isArray(objectValue)) {
       ancestors.add(objectValue);
       try {
-        return objectValue.map((item, index) => captureSnapshot(item, `${jsonPath}[${index}]`, statePath, false, ancestors));
+        // P2 fix (independent review, "reject sparse arrays before
+        // persistence", finding 2): `Array.prototype.map()` SKIPS a hole
+        // (an index with no own property, e.g. `Array(1)` or
+        // `[1, , 3]`) — its callback never runs for that index, so a hole
+        // used to pass through this walk WITHOUT ever being read or
+        // validated. `JSON.stringify()`, by contrast, always visits every
+        // index from 0 to `length - 1` and treats a missing one exactly
+        // like an `undefined` array element: silently coerced to the JSON
+        // literal `null`. The result was a value that changed shape
+        // between validation and the bytes actually written — a hole
+        // (`1 in Array(1)` is `false`) becoming a stored `null`
+        // (`1 in [null]` is `true`) on the very next `read()`/restart,
+        // the same "validation and serialization must observe the SAME
+        // captured snapshot" violation this function exists to close.
+        // Fixed: iterate every index explicitly and reject (fail closed)
+        // the instant a hole is found, rather than silently letting
+        // `.map()` step over it.
+        const length = objectValue.length;
+        const result: unknown[] = new Array(length);
+        for (let index = 0; index < length; index++) {
+          if (!Object.prototype.hasOwnProperty.call(objectValue, index)) {
+            rejectUnserializable(
+              statePath,
+              `'${jsonPath}[${index}]' is a sparse array hole (no own value at this index) — ` +
+                `JSON.stringify() would silently coerce this position to null, a DIFFERENT value from what ` +
+                `was actually captured, and there is no genuine value here to validate or persist`
+            );
+          }
+          result[index] = captureSnapshot(objectValue[index], `${jsonPath}[${index}]`, statePath, false, ancestors);
+        }
+        return result;
       } finally {
         ancestors.delete(objectValue);
       }
@@ -221,7 +251,34 @@ function captureSnapshot(value: unknown, jsonPath: string, statePath: string, ca
         // entirely — matching `JSON.stringify({a: undefined})`'s own
         // "{}" behavior (property absence, not a stored null).
         if (capturedValue !== undefined) {
-          result[key] = capturedValue;
+          // P1 fix (independent review, "preserve own __proto__ fields in
+          // state snapshots", finding 1): JSON-derived state can
+          // legitimately carry an OWN property literally named
+          // `"__proto__"` — `Object.keys()` above sees it as an ordinary
+          // string key. But `result[key] = capturedValue` for THAT
+          // specific key is not an ordinary property write: `result` is a
+          // plain object (`Object.prototype` in its chain, no own
+          // `"__proto__"` of its own yet), so bracket/dot assignment to
+          // `"__proto__"` invokes `Object.prototype`'s legacy `__proto__`
+          // ACCESSOR instead of creating an own data property — silently
+          // changing `result`'s actual [[Prototype]] (or being ignored
+          // entirely, for a value the accessor's setter rejects) rather
+          // than storing the value at all. The snapshot returned would
+          // then be missing the very property the caller supplied — a
+          // durable-state-integrity violation (bölüm 277) identical in
+          // shape to the one `runtime/audit/audit-log.ts`'s
+          // `canonicalizeAuditValue()` already closed (36th independent
+          // review round, finding 9) for the exact same reason.
+          // `Object.defineProperty()` always creates/redefines a genuine
+          // OWN data property under the exact key given, never consulting
+          // any inherited accessor of that name — reused here verbatim
+          // rather than inventing a second, differently-scoped rule.
+          Object.defineProperty(result, key, {
+            value: capturedValue,
+            writable: true,
+            enumerable: true,
+            configurable: true
+          });
         }
       }
       return result;

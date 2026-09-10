@@ -164,7 +164,30 @@ function canonicalizeAuditValue(value: unknown, path: string): unknown {
   }
   if (type === "string" || type === "boolean" || type === "number") return value;
   if (Array.isArray(value)) {
-    return value.map((item, index) => canonicalizeAuditValue(item, `${path}[${index}]`));
+    // P1 fix (P0 closure remediation batch, root-cause class 2, "sparse
+    // arrays silently changing during JSON persistence"): `.map()` never
+    // invokes its callback for an index that is a genuine HOLE (e.g. an
+    // array built via `new Array(3)` then only `arr[1] = x` assigned) —
+    // it silently reproduces the hole in the result array instead of
+    // rejecting it. `hashOf()` (JSON.stringify-based, bkz. yukarısı) then
+    // silently turns that surviving hole into `null` at hash-computation
+    // time, so the hash would authenticate a DIFFERENT array shape than
+    // the one actually appended — the exact tamper-evidence gap this
+    // function otherwise exists to close. Reusing the same explicit,
+    // hole-rejecting loop already established in `file-store.ts`'s
+    // `captureSnapshot()` for the identical root cause.
+    const length = value.length;
+    const result: unknown[] = new Array(length);
+    for (let index = 0; index < length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, index)) {
+        throw new UnsupportedAuditPayloadError(
+          `${path}[${index}]`,
+          "a hole in a sparse array (no own element at this index) — JSON.stringify() would silently turn it into null"
+        );
+      }
+      result[index] = canonicalizeAuditValue(value[index], `${path}[${index}]`);
+    }
+    return result;
   }
   if (type === "object") {
     // Only a genuine plain object (Object.prototype, or a null-prototype

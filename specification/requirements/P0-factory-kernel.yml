@@ -1557,7 +1557,7 @@
     - path: "runtime/state/__tests__/file-store.test.ts"
       type: TEST_RESULT
       outcome: PASS
-      verificationSource: "npm test (vitest), full repository suite — verified this closure round (P0 CLOSURE REMEDIATION, 9-finding batch)"
+      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 CLOSURE REMEDIATION, 8-finding batch: findings 1/2, __proto__-key and sparse-array captureSnapshot() fixes)"
     - path: "runtime/decisions/__tests__/decision-ledger.test.ts"
       type: TEST_RESULT
       outcome: PASS
@@ -1569,7 +1569,7 @@
     - path: "runtime/project-lifecycle/__tests__/orchestrator.test.ts"
       type: TEST_RESULT
       outcome: PASS
-      verificationSource: "npm test (vitest), full repository suite — verified this closure round (P0 CLOSURE REMEDIATION, 9-finding batch)"
+      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 CLOSURE REMEDIATION, 8-finding batch: finding 5, bootstrap paid-stage durable checkpoint reused from FileCache)"
   proof_refs:
     - path: "proofs/p0-integrated-flow/proof.test.ts"
       type: PROOF_RESULT
@@ -1728,7 +1728,7 @@
     - path: "runtime/audit/__tests__/audit-log.test.ts"
       type: TEST_RESULT
       outcome: PASS
-      verificationSource: "npm test (vitest), full repository suite — verified this closure round (P0 CLOSURE REMEDIATION, 9-finding batch)"
+      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 CLOSURE REMEDIATION, 8-finding batch narrow root-cause audit: canonicalizeAuditValue() sparse-array-in-.map() sibling fix to finding 2, same class)"
     - path: "runtime/budget/__tests__/budget.test.ts"
       type: TEST_RESULT
       outcome: PASS
@@ -3962,7 +3962,7 @@
     - path: "runtime/cache/__tests__/file-cache.test.ts"
       type: TEST_RESULT
       outcome: PASS
-      verificationSource: "npm test (vitest), full repository suite — verified this closure round (P0 CLOSURE REMEDIATION, 9-finding batch)"
+      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 CLOSURE REMEDIATION, 8-finding batch: findings 3/4, compute-lease renewal-during-async-work and stale-owner-release fencing via new compareAndSwapComputeLease())"
     - path: "runtime/cache/__tests__/file-cache.cross-process.test.ts"
       type: TEST_RESULT
       outcome: PASS
@@ -5963,7 +5963,7 @@
     - path: "runtime/governance/__tests__/phase-closure.test.ts"
       type: TEST_RESULT
       outcome: PASS
-      verificationSource: "npm test (vitest), full repository suite — verified this closure round (P0 CLOSURE REMEDIATION, 9-finding batch)"
+      verificationSource: "npm test (vitest), full repository suite — re-verified this closure round (P0 CLOSURE REMEDIATION, 8-finding batch: findings 6/7/8, recovered-intent identity/decision mismatch guards and non-truthy independent-review evidence validation)"
     - path: "runtime/governance/__tests__/governance-integration.test.ts"
       type: TEST_RESULT
       outcome: PASS

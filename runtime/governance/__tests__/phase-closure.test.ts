@@ -278,6 +278,102 @@ describe("attemptPhaseClosure", () => {
   });
 
   describe(
+    "P1 fix (independent review, 'require meaningful independent-review metadata', finding 8): a merely truthy " +
+      "reviewerIdentity/reviewTimestamp must not satisfy the independent-review evidence gate",
+    () => {
+      it("BLOCKER regression, exact reproduction: reviewerIdentity = '   ' (whitespace-only, truthy) is rejected", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { reviewerIdentity: "   " })
+          }),
+          "m1",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("incomplete or malformed"))).toBe(true);
+      });
+
+      it("BLOCKER regression: reviewTimestamp = 'yesterday-ish' (an informal, non-canonical string) is rejected", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { reviewTimestamp: "yesterday-ish" })
+          }),
+          "m1",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("incomplete or malformed"))).toBe(true);
+      });
+
+      it("BLOCKER regression: a Date.parse()-able but non-canonical reviewTimestamp (date-only, no time) is also rejected", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { reviewTimestamp: "2024-01-01" })
+          }),
+          "m1",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("incomplete or malformed"))).toBe(true);
+      });
+
+      it.each(["reviewId", "reviewedCommitSha"] as const)(
+        "BLOCKER regression: a whitespace-only %s is rejected",
+        (field) => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          const manifest = attemptPhaseClosure(
+            baseAttempt({
+              verificationEvidenceRefs: [evidenceRef()],
+              independentReview: reviewFor("CLEAN", { [field]: "   " })
+            }),
+            "m1",
+            "d2",
+            deps
+          );
+          expect(manifest.outcome).toBe("REJECTED");
+          expect(manifest.rejectionReasons.some((r) => r.includes("incomplete or malformed"))).toBe(true);
+        }
+      );
+
+      it("no-regression: a genuine, non-blank reviewerIdentity and a canonical ISO-8601 reviewTimestamp (new Date().toISOString()) still close normally", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", {
+              reviewerIdentity: "independent-reviewer",
+              reviewTimestamp: new Date().toISOString()
+            })
+          }),
+          "m1",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("CLOSED");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (36th independent review round, finding 2, 'confine generated phase-manifest paths'): " +
       "phaseId/manifestId must be validated as safe identifiers and filesystem-confined",
     () => {
@@ -986,6 +1082,203 @@ describe("attemptPhaseClosure", () => {
         expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
         expect(deps.ledger.get("d-genuine")).toBeDefined();
       });
+    }
+  );
+
+  describe(
+    "P1 fix (independent review, 'reject recovery intents for another phase or manifest', finding 6): a " +
+      "persisted intent whose own identity disagrees with the requested recovery target must be rejected, never " +
+      "silently treated as belonging to it",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: (phaseId='P0', manifestId='sub-manifest') and " +
+          "(phaseId='P0-sub', manifestId='manifest') collide on the SAME intent file path — recovering the " +
+          "SECOND identity against an intent genuinely prepared for the FIRST throws, rather than silently " +
+          "acting on the mismatched intent",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const crashingStore: typeof deps.store = {
+            write: (path: string, data: unknown) => {
+              if (path === deps.ledgerPath || path === deps.scopeLockPath) {
+                throw new Error("simulated crash before durable ledger/scope-lock persistence");
+              }
+              deps.store.write(path, data);
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+
+          // Genuinely prepares an intent for (phaseId="P0", manifestId=
+          // "sub-manifest") — crashing right after the intent write, per
+          // the established crash-recovery test pattern above.
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ phaseId: "P0", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+              "sub-manifest",
+              "d2",
+              { ...deps, store: crashingStore }
+            )
+          ).toThrow("simulated crash");
+
+          // Sanity: the collision is real — both identities resolve to the
+          // identical intent file on disk.
+          const collidingPath = join(deps.manifestDir, "P0-sub-manifest.intent.json");
+          expect(existsSync(collidingPath)).toBe(true);
+
+          // Recovering under the OTHER identity that collides on the same
+          // path must throw — never silently complete (or reject) a
+          // closure for phase "P0-sub" using an intent that was actually
+          // prepared for phase "P0".
+          expect(() => recoverPendingPhaseClosure("P0-sub", "manifest", deps)).toThrow(
+            /identifies phaseId='P0'/
+          );
+
+          // "P0-sub" — the OTHER identity colliding on this same path —
+          // was never touched at all by the rejected recovery attempt.
+          expect(deps.scopeLock.getState("P0-sub")).toBe("OPEN");
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0-sub", "manifest")).toBeUndefined();
+
+          // The ORIGINAL, correctly-identified recovery still works fine.
+          const recovered = recoverPendingPhaseClosure("P0", "sub-manifest", deps);
+          expect(recovered?.outcome).toBe("CLOSED");
+        }
+      );
+
+      it("no-regression: a genuinely matching intent (requested identity equals the intent's own persisted identity) still recovers normally", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+        const crashingStore: typeof deps.store = {
+          write: (path: string, data: unknown) => {
+            if (path === deps.ledgerPath || path === deps.scopeLockPath) {
+              throw new Error("simulated crash");
+            }
+            deps.store.write(path, data);
+          },
+          read: deps.store.read.bind(deps.store),
+          exists: deps.store.exists.bind(deps.store)
+        };
+
+        expect(() =>
+          attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "manifest-matching",
+            "d2",
+            { ...deps, store: crashingStore }
+          )
+        ).toThrow("simulated crash");
+
+        const recovered = recoverPendingPhaseClosure("P0", "manifest-matching", deps);
+        expect(recovered?.outcome).toBe("CLOSED");
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (independent review, 'match recovered decisions against an already-closed phase', finding 7): " +
+      "recovery for an ALREADY-CLOSED phase must verify the phase's OWN authoritative decisionId (and matching " +
+      "Decision Ledger record) against the recovered intent's claimed decisionId before finalizing anything",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: phase 'P0' is genuinely CLOSED under decisionId 'd-real', but a " +
+          "forged/stale PREPARED intent for a DIFFERENT manifestId claims decisionId 'd-forged' — recovery " +
+          "throws instead of finalizing a manifest attributing this closure to a decision that never produced it",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          // Genuinely close "P0" under a REAL decisionId.
+          const realManifest = attemptPhaseClosure(
+            baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "manifest-real",
+            "d-real",
+            deps
+          );
+          expect(realManifest.outcome).toBe("CLOSED");
+          expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+
+          // Fabricate a forged PREPARED intent for a DIFFERENT manifestId
+          // (so recovery does not short-circuit on an already-existing
+          // manifest), claiming a decisionId that never actually closed
+          // this phase.
+          const forgedIntentPath = join(deps.manifestDir, "P0-manifest-fake.intent.json");
+          deps.store.write(forgedIntentPath, {
+            status: "PREPARED",
+            phaseId: "P0",
+            manifestId: "manifest-fake",
+            decisionId: "d-forged",
+            attempt: baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            createdAt: new Date().toISOString()
+          });
+
+          expect(() => recoverPendingPhaseClosure("P0", "manifest-fake", deps)).toThrow(
+            /did not produce this phase's actual closure/
+          );
+
+          // Nothing was finalized under the forged identity, and the REAL
+          // closure remains exactly as it was.
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-fake")).toBeUndefined();
+          expect(deps.ledger.get("d-forged")).toBeUndefined();
+          expect(deps.scopeLock.get("P0")?.decisionId).toBe("d-real");
+        }
+      );
+
+      it(
+        "no-regression: recovery for a phase that is ALREADY CLOSED (ScopeLock/ledger durably transitioned) but " +
+          "whose FINAL MANIFEST write has not yet landed still finalizes normally when the intent's decisionId " +
+          "genuinely matches the phase's own authoritative decision",
+        () => {
+          const deps = makeDeps();
+          writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+
+          const manifestFilePath = join(deps.manifestDir, "P0-manifest-already-closed.json");
+          // Crash AFTER ScopeLock/ledger are durably transitioned to
+          // CLOSED, but BEFORE the final manifest file itself is written —
+          // reproducing "currentState is already CLOSED going INTO
+          // recovery, with no manifest yet" without relying on a second,
+          // separate recovery call to get there.
+          const crashingStore: typeof deps.store = {
+            write: (path: string, data: unknown) => {
+              if (path === manifestFilePath) {
+                throw new Error("simulated crash before the final manifest write");
+              }
+              deps.store.write(path, data);
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+              "manifest-already-closed",
+              "d2",
+              { ...deps, store: crashingStore }
+            )
+          ).toThrow("simulated crash before the final manifest write");
+
+          // ScopeLock/ledger are already genuinely, durably CLOSED — only
+          // the manifest file itself is missing.
+          expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-already-closed")).toBeUndefined();
+
+          // Recovery (now with the REAL, non-crashing store) hits finding
+          // 7's check for an already-CLOSED phase — the intent's
+          // decisionId ('d2') genuinely matches ScopeLock's own
+          // authoritative decisionId for "P0", so it finalizes normally.
+          const recovered = recoverPendingPhaseClosure("P0", "manifest-already-closed", deps);
+          expect(recovered?.outcome).toBe("CLOSED");
+          expect(readPhaseClosureManifest(deps.store, deps.manifestDir, "P0", "manifest-already-closed")?.outcome).toBe(
+            "CLOSED"
+          );
+        }
+      );
     }
   );
 });

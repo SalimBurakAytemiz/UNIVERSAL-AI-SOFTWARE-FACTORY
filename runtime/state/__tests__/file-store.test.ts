@@ -468,4 +468,128 @@ describe("FileStateStore", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (independent review, 'preserve own __proto__ fields in state snapshots', finding 1): an own " +
+      "property literally named '__proto__' must be captured as ordinary data, never consulted as the legacy " +
+      "prototype accessor",
+    () => {
+      it("BLOCKER regression, exact reproduction: an own '__proto__' data property (as JSON.parse produces) is persisted and read back as ordinary data, with no prototype mutation", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-proto-field-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        // Mirrors what JSON.parse('{"__proto__":{"x":1}}') actually
+        // produces: an object with an OWN data property named
+        // "__proto__" (via CreateDataProperty/DefineOwnProperty
+        // semantics), never a real prototype change.
+        const value: Record<string, unknown> = {};
+        Object.defineProperty(value, "__proto__", {
+          value: { x: 1 },
+          writable: true,
+          enumerable: true,
+          configurable: true
+        });
+        expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+
+        store.write(path, value);
+
+        const raw = JSON.parse(readFileSync(path, "utf8"));
+        expect(Object.prototype.hasOwnProperty.call(raw, "__proto__")).toBe(true);
+        expect(raw.__proto__).toEqual({ x: 1 });
+        expect(Object.getPrototypeOf(raw)).toBe(Object.prototype);
+
+        const restored = store.read<Record<string, unknown>>(path)!;
+        expect(Object.prototype.hasOwnProperty.call(restored, "__proto__")).toBe(true);
+        expect((restored as { __proto__: unknown }).__proto__).toEqual({ x: 1 });
+        expect(Object.getPrototypeOf(restored)).toBe(Object.prototype);
+      });
+
+      it("no-regression: an own '__proto__' property with a non-object value (which the legacy setter would silently ignore) is still stored as ordinary data", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-proto-field-scalar-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const value: Record<string, unknown> = { keep: "yes" };
+        Object.defineProperty(value, "__proto__", {
+          value: "not-an-object",
+          writable: true,
+          enumerable: true,
+          configurable: true
+        });
+
+        store.write(path, value);
+        const restored = store.read<Record<string, unknown>>(path)!;
+        expect(restored.keep).toBe("yes");
+        expect(Object.prototype.hasOwnProperty.call(restored, "__proto__")).toBe(true);
+        expect(restored.__proto__).toBe("not-an-object");
+      });
+
+      it("no-regression: ordinary objects with no own '__proto__' property are completely unaffected", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-proto-field-noop-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        store.write(path, { a: 1, b: "two" });
+        expect(store.read(path)).toEqual({ a: 1, b: "two" });
+      });
+    }
+  );
+
+  describe(
+    "P2 fix (independent review, 'reject sparse arrays before persistence', finding 2): a sparse array hole " +
+      "must never silently pass through as an unvalidated null",
+    () => {
+      it("BLOCKER regression, exact reproduction: Array(1) (a single hole, no own value at index 0) is rejected — nothing is persisted", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-sparse-array-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const sparse = Array(1);
+        expect(Object.prototype.hasOwnProperty.call(sparse, 0)).toBe(false);
+
+        expect(() => store.write(path, sparse)).toThrow(UnserializableStateError);
+        expect(store.exists(path)).toBe(false);
+      });
+
+      it("BLOCKER regression: a sparse array with a real value AFTER the hole ([1, , 3]) is also rejected — never silently coerced to [1, null, 3]", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-sparse-array-mixed-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const sparse = [1, , 3];
+        expect(() => store.write(path, sparse)).toThrow(UnserializableStateError);
+        expect(store.exists(path)).toBe(false);
+      });
+
+      it("a sparse array nested inside an otherwise-valid object is rejected without persisting any part of it", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-sparse-array-nested-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const value = { name: "ok", items: Array(2) };
+        expect(() => store.write(path, value)).toThrow(UnserializableStateError);
+        expect(store.exists(path)).toBe(false);
+      });
+
+      it("no-regression: a dense array containing an explicit null at every index (not a hole) is accepted and round-trips exactly", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-dense-array-nulls-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        const dense = [1, null, 3];
+        expect(() => store.write(path, dense)).not.toThrow();
+        expect(store.read(path)).toEqual([1, null, 3]);
+      });
+
+      it("no-regression: an ordinary empty array (length 0, no holes) is accepted", () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-state-empty-array-"));
+        const path = join(tempRoot, "state.json");
+        const store = new FileStateStore();
+
+        expect(() => store.write(path, [])).not.toThrow();
+        expect(store.read(path)).toEqual([]);
+      });
+    }
+  );
 });
