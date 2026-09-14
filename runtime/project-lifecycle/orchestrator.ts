@@ -761,7 +761,31 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     // retry that changes any of them is, correctly, a NEW governed
     // transaction (this finding's own explicit option A) rather than a
     // stale reuse of an unrelated prior computation.
-    const bootstrapTransactionKey = `${genome.project.id}:${modelDecision.model.provider}:${modelDecision.model.modelId}`;
+    //
+    // P2 fix (P0 closure remediation, current 7-finding round, finding 6,
+    // "hash/canonically encode the bootstrap checkpoint tuple"): reproduced
+    // — `ModelRecord.provider`/`.modelId` are plain, unrestricted `string`
+    // fields (bkz. runtime/models/registry.ts'in ModelRecord tanımı) — real
+    // provider/model identifiers can themselves legitimately contain `:`
+    // (namespaced provider ids, or a Bedrock-style modelId like
+    // "anthropic.claude-v2:1"). The three-way `:`-join above therefore
+    // suffered the EXACT SAME ambiguous-delimiter class this finding names:
+    // `provider="a:b", modelId="c"` and `provider="a", modelId="b:c"` (same
+    // projectId) both produced the checkpoint key `"<projectId>:a:b:c"`,
+    // letting a bootstrap for one provider/model pair silently reuse — and
+    // report as evidence — another pair's already-billed result. Fixed:
+    // `JSON.stringify()` of a FIXED-ARITY 3-tuple is a canonical, provably
+    // collision-free structured encoding for this purpose — its own
+    // internal quote/backslash escaping means no two DISTINCT tuples of
+    // strings can ever serialize to the identical output (an embedded `"`
+    // or `,` in any field is escaped, never confusable with the structural
+    // brackets/commas JSON.stringify itself emits) — never ambiguous string
+    // concatenation with a delimiter that valid input can itself contain.
+    const bootstrapTransactionKey = JSON.stringify([
+      genome.project.id,
+      modelDecision.model.provider,
+      modelDecision.model.modelId
+    ]);
     invocationResponse = (
       await bootstrapTransactionCache.computeAndSet(bootstrapTransactionKey, () =>
         modelGateway.invoke(

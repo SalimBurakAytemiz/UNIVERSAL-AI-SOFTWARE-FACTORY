@@ -493,6 +493,26 @@ function canonicalProviderConfigFingerprint(
   }));
   labeled.sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 
+  // P2 fix (P0 closure remediation, current 7-finding round, narrow
+  // root-cause audit, direct equivalent of finding 5, "encode manifest
+  // identities without delimiter collisions"): reproduced — `label` is
+  // built directly from `Reflect.ownKeys(provider)`, an ARBITRARY property
+  // (or, for symbols, `String(key)`-rendered) name a `ModelProvider`
+  // implementation can set to any string, including one containing `:` or
+  // `|` — the exact two characters this used to join each entry with
+  // (`${label}:${hash}`) and join entries with (`.join("|")`). Two
+  // structurally DIFFERENT providers could therefore serialize to the
+  // IDENTICAL fingerprint string (one property whose hash happens to equal
+  // a substring straddling a `label` containing `:`/`|`), which
+  // `computeProviderReplacementIdentityDigest()` folds verbatim into the
+  // `model.provider.replace` approval's bound `identityDigest` (bkz. onun
+  // üstündeki fix notu) — a genuine "approval for candidate A satisfied by
+  // a differently-shaped candidate B" risk, the same class already fixed
+  // for `phase-closure.ts`'s manifest paths and `orchestrator.ts`'s
+  // bootstrap checkpoint key. Fixed identically to `identityDigestOf()`
+  // (bkz. yukarısı) itself: `JSON.stringify()` of the ordered `[label,
+  // hash]` pairs is a canonical, structurally collision-free encoding —
+  // no delimiter search a crafted property name could confuse.
   const entries = labeled.map(({ key, label }) => {
     const descriptor = Object.getOwnPropertyDescriptor(provider, key);
     const value = descriptor && "value" in descriptor ? descriptor.value : resolvedAccessors.get(key);
@@ -501,9 +521,9 @@ function canonicalProviderConfigFingerprint(
     // `canonicalizeConfigValueForFingerprint()`'in fix notu.
     const canonical = canonicalizeConfigValueForFingerprint(value, id, key, new Set());
     const serialized = JSON.stringify(canonical);
-    return `${label}:${createHash("sha256").update(serialized).digest("hex")}`;
+    return [label, createHash("sha256").update(serialized).digest("hex")] as const;
   });
-  return entries.join("|");
+  return JSON.stringify(entries);
 }
 
 /**

@@ -326,15 +326,43 @@ export class FileCache<T = unknown> {
    */
   private readComputeLease(
     key: string
-  ): { readonly ownerId: string; readonly expiresAt: number; readonly completed: boolean; readonly value?: T } | undefined {
-    const raw = this.stateStore.read<{ ownerId?: unknown; expiresAt?: unknown; completed?: unknown; value?: unknown }>(
-      this.computeLeasePath(key)
-    );
+  ):
+    | {
+        readonly ownerId: string;
+        readonly expiresAt: number;
+        readonly completed: boolean;
+        readonly value?: T;
+        readonly cacheExpiresAt?: number;
+      }
+    | undefined {
+    const raw = this.stateStore.read<{
+      ownerId?: unknown;
+      expiresAt?: unknown;
+      completed?: unknown;
+      value?: unknown;
+      cacheExpiresAt?: unknown;
+    }>(this.computeLeasePath(key));
     if (!raw || typeof raw.ownerId !== "string" || typeof raw.expiresAt !== "number" || !Number.isFinite(raw.expiresAt)) {
       return undefined;
     }
     const completed = raw.completed === true;
-    return { ownerId: raw.ownerId, expiresAt: raw.expiresAt, completed, value: completed ? (raw.value as T) : undefined };
+    // P1 fix (P0 closure remediation, current 7-finding round, finding 1,
+    // "expire completed cache checkpoints with the cache entry"): bkz.
+    // `recordComputeCompletion()`/`negotiateComputeOwnership()`'in üstündeki
+    // fix notu. Only meaningful when `completed` — an in-progress lease's
+    // own `expiresAt` already means something else entirely (lease
+    // ownership TTL, not cache validity).
+    const cacheExpiresAt =
+      completed && typeof raw.cacheExpiresAt === "number" && Number.isFinite(raw.cacheExpiresAt)
+        ? raw.cacheExpiresAt
+        : undefined;
+    return {
+      ownerId: raw.ownerId,
+      expiresAt: raw.expiresAt,
+      completed,
+      value: completed ? (raw.value as T) : undefined,
+      cacheExpiresAt
+    };
   }
 
   private writeComputeLease(key: string, ownerId: string, expiresAt: number): void {
@@ -366,14 +394,38 @@ export class FileCache<T = unknown> {
    * this completed record and returns the ALREADY-PAID-FOR value instead
    * of ever calling `compute()` again for this key.
    */
-  private recordComputeCompletion(key: string, ownerId: string, value: T): boolean {
+  //
+  // P1 fix (P0 closure remediation, current 7-finding round, finding 1,
+  // "expire completed cache checkpoints with the cache entry"): reproduced
+  // — this record's own `expiresAt` field is the LEASE's bookkeeping
+  // deadline (bkz. yukarısı), completely unrelated to the caller-supplied
+  // `ttlMs` the AUTHORITATIVE main cache entry (`set()`, bkz. aşağısı)
+  // observes. `negotiateComputeOwnership()` used to trust a `completed`
+  // record's `value` FOREVER, regardless of whether the main cache entry
+  // it represents had already expired — a `ttlMs: 0` (or any finite ttl)
+  // value could therefore outlive its own explicitly requested expiry
+  // indefinitely, since the completed checkpoint had no expiry concept of
+  // its own at all. Fixed: this method now ALSO computes and persists
+  // `cacheExpiresAt` — the SAME deadline `set()` itself would compute
+  // (`ttlMs !== undefined ? Date.now() + ttlMs : undefined`) for the value
+  // this checkpoint carries — so `negotiateComputeOwnership()` can refuse
+  // to resurrect a checkpoint whose own authoritative cache deadline has
+  // already passed, exactly as if no checkpoint existed at all.
+  private recordComputeCompletion(key: string, ownerId: string, value: T, ttlMs: number | undefined): boolean {
     const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
     try {
       const current = this.readComputeLease(key);
       if (!current || current.ownerId !== ownerId) {
         return false;
       }
-      this.stateStore.write(this.computeLeasePath(key), { ownerId, expiresAt: current.expiresAt, completed: true, value });
+      const cacheExpiresAt = ttlMs !== undefined ? Date.now() + ttlMs : undefined;
+      this.stateStore.write(this.computeLeasePath(key), {
+        ownerId,
+        expiresAt: current.expiresAt,
+        completed: true,
+        value,
+        cacheExpiresAt
+      });
       return true;
     } finally {
       release();
@@ -475,6 +527,18 @@ export class FileCache<T = unknown> {
    *       novel mechanism.
    */
   async computeAndSet(key: string, compute: () => Promise<T> | T, ttlMs?: number): Promise<ComputeWithFileCacheResult<T>> {
+    // P1 fix (P0 closure remediation, current 7-finding round, finding 4,
+    // "validate TTL before invoking compute"): reproduced — an invalid
+    // `ttlMs` (negative/NaN/Infinity) used to be validated only deep inside
+    // `#computeCrossProcess()`'s eventual `this.set(key, value, ttlMs)` /
+    // `recordComputeCompletion()` calls, both of which run AFTER `compute()`
+    // (bkz. `#computeCrossProcess()`'in `await compute()` satırı) has already
+    // been invoked and its real, possibly billable side effect has already
+    // happened. Fixed: validated here, as the very FIRST thing this method
+    // does — before even checking for a same-process in-flight computation
+    // to join — so an invalid `ttlMs` fails closed with ZERO side effects,
+    // mirroring the identical fix in `cache.ts`'s `Cache.computeAndSet()`.
+    assertValidTtl(ttlMs);
     const existing = this.inFlight.get(key);
     if (existing) {
       // A same-process follower always reports a cache HIT regardless of
@@ -515,17 +579,34 @@ export class FileCache<T = unknown> {
       // P1 fix (P0 final closure remediation, finding 2): a `completed`
       // lease (bkz. `recordComputeCompletion()`'ın fix notu) means the
       // paid work genuinely finished — checked and returned BEFORE the
-      // ordinary liveness check below, and regardless of whether
-      // `expiresAt` has since passed, since "completed" is a stronger,
-      // permanent fact than "still within its original TTL window."
-      // Returning it here is exactly what stops a retrying caller from
-      // ever invoking `compute()` (and the real, billable provider) a
-      // second time merely because the main cache's own write of this
-      // same value failed on a previous attempt.
+      // ordinary liveness check below. Returning it here is exactly what
+      // stops a retrying caller from ever invoking `compute()` (and the
+      // real, billable provider) a second time merely because the main
+      // cache's own write of this same value failed on a previous attempt.
+      //
+      // P1 fix (P0 closure remediation, current 7-finding round, finding 1,
+      // "expire completed cache checkpoints with the cache entry"):
+      // reproduced — the completed check above used to be UNCONDITIONAL,
+      // trusting `existingLease.value` forever regardless of the AUTHORITATIVE
+      // cache deadline (`cacheExpiresAt`, bkz. `recordComputeCompletion()`'ın
+      // fix notu) that value was ever meant to observe — a `ttlMs: 0` (or
+      // any finite ttl) result could therefore outlive its own explicitly
+      // requested expiry indefinitely, since this checkpoint had no expiry
+      // concept of its own. Fixed: a completed checkpoint is only trusted
+      // while its own `cacheExpiresAt` has not yet passed (`undefined`
+      // means the original computation requested no ttl at all — correctly
+      // still valid forever). Once that deadline passes, this checkpoint is
+      // treated as if it never existed — falling through to claim a FRESH
+      // lease directly below (deliberately skipping the ordinary `busy`
+      // check just below, whose `expiresAt` field means something entirely
+      // different — lease ownership TTL, not cache validity — and could
+      // otherwise wrongly report "busy" for a key nobody is actually
+      // computing right now).
       if (existingLease?.completed) {
-        return { kind: "value", value: existingLease.value as T };
-      }
-      if (existingLease && existingLease.expiresAt > now) {
+        if (existingLease.cacheExpiresAt === undefined || existingLease.cacheExpiresAt > now) {
+          return { kind: "value", value: existingLease.value as T };
+        }
+      } else if (existingLease && existingLease.expiresAt > now) {
         return { kind: "busy" };
       }
       this.writeComputeLease(key, ownerId, now + this.computeLeaseTtlMs);
@@ -659,7 +740,7 @@ export class FileCache<T = unknown> {
           // the same path an ordinary losing contender takes — so it
           // recovers the SUCCESSOR's real, already-committed value on the
           // next iteration instead of ever overwriting it with its own.
-          const committed = this.recordComputeCompletion(key, ownerId, value);
+          const committed = this.recordComputeCompletion(key, ownerId, value, ttlMs);
           if (!committed) {
             continue;
           }

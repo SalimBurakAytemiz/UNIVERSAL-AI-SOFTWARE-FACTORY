@@ -3,7 +3,53 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, existsSync, 
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
-import { acquireFileLock, FileLockTimeoutError, InvalidFileLockOptionsError, sanitizeReclaimToken } from "../file-lock.js";
+
+/**
+ * P2 fix (P0 closure remediation, current 7-finding round, finding 7):
+ * `acquireFileLock()` calls `writeFileSync` directly from "node:fs" — it
+ * accepts no injectable filesystem, so genuinely reproducing "the metadata
+ * write specifically fails" requires intercepting this ONE built-in
+ * function. `vi.mock()` (hoisted above every import, per Vitest's own
+ * contract) is the only mechanism that reliably intercepts a named import
+ * of a built-in module under Vitest's ESM handling — a direct
+ * `vi.spyOn()`/CJS `require()` mutation of "node:fs" was tried first and
+ * does NOT intercept the call (proven by both throwing at spy-setup time
+ * and, for the CJS mutation, the target function silently continuing to
+ * use the ORIGINAL implementation). The mock below is a pure passthrough
+ * to the REAL `node:fs` for every export and every call EXCEPT the one
+ * path this suite's own `failWritePath` control variable (via `vi.hoisted()`,
+ * so it is visible to the hoisted mock factory) names for the CURRENT
+ * test — every other test in this file (all of which rely on genuine
+ * filesystem behavior) is completely unaffected.
+ */
+const { getFailWritePath, setFailWritePath } = vi.hoisted(() => {
+  let failWritePath: string | null = null;
+  return {
+    getFailWritePath: () => failWritePath,
+    setFailWritePath: (path: string | null) => {
+      failWritePath = path;
+    }
+  };
+});
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    writeFileSync: (path: Parameters<typeof actual.writeFileSync>[0], ...rest: unknown[]) => {
+      if (typeof path === "string" && path === getFailWritePath()) {
+        throw Object.assign(new Error("simulated ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return (actual.writeFileSync as (...args: unknown[]) => unknown)(path, ...rest);
+    }
+  };
+});
+import {
+  acquireFileLock,
+  FileLockTimeoutError,
+  InvalidFileLockOptionsError,
+  LockMetadataPersistenceError,
+  sanitizeReclaimToken
+} from "../file-lock.js";
 
 // P2 fix (22nd independent review round, "validate lock metadata before
 // using owner PID"): Codex reproduced that syntactically valid JSON with
@@ -691,6 +737,66 @@ describe(
 
       expect(elapsed).toBeLessThan(2_000);
       release();
+    });
+  }
+);
+
+describe(
+  "P2 fix (P0 closure remediation, current 7-finding round, finding 7, 'abort lock acquisition if owner " +
+    "metadata cannot be persisted'): acquireFileLock() must succeed ONLY when both the lock directory AND its " +
+    "owner metadata are durably written",
+  () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it(
+      "BLOCKER regression, exact reproduction: directory creation succeeds but the owner-metadata write fails " +
+        "— acquisition throws, the lock directory does not remain as a successfully-acquired lock, and an " +
+        "immediate subsequent legitimate acquisition can proceed",
+      () => {
+        const root = mkdtempSync(join(tmpdir(), "uasf-file-lock-metafail-"));
+        tempDirs.push(root);
+        const lockDirPath = join(root, "cache.lock");
+        const metaPath = join(lockDirPath, "owner.json");
+
+        setFailWritePath(metaPath);
+        try {
+          expect(() => acquireFileLock(lockDirPath, { timeoutMs: 200, pollIntervalMs: 10 })).toThrow(
+            LockMetadataPersistenceError
+          );
+
+          // The lock directory must NOT remain as a successfully-acquired,
+          // orphaned lock — the caller that failed to acquire it holds no
+          // handle at all, and nothing is left behind to block anyone else.
+          expect(existsSync(lockDirPath)).toBe(false);
+        } finally {
+          setFailWritePath(null);
+        }
+
+        // An immediate subsequent, genuinely legitimate acquisition must
+        // proceed normally — this is the exact "does not remain blocked
+        // until stale recovery" guarantee this finding requires.
+        const start = Date.now();
+        const release = acquireFileLock(lockDirPath, { timeoutMs: 2_000, pollIntervalMs: 10 });
+        const elapsed = Date.now() - start;
+        expect(elapsed).toBeLessThan(500); // near-instant — never waited out any stale-recovery window
+        expect(existsSync(metaPath)).toBe(true);
+        release();
+      }
+    );
+
+    it("no regression: a genuinely successful metadata write still returns a normal, usable lock handle", () => {
+      const root = mkdtempSync(join(tmpdir(), "uasf-file-lock-metaok-"));
+      tempDirs.push(root);
+      const lockDirPath = join(root, "cache.lock");
+      const metaPath = join(lockDirPath, "owner.json");
+
+      const release = acquireFileLock(lockDirPath, { timeoutMs: 200, pollIntervalMs: 10 });
+      expect(existsSync(lockDirPath)).toBe(true);
+      expect(existsSync(metaPath)).toBe(true);
+      release();
+      expect(existsSync(lockDirPath)).toBe(false);
     });
   }
 );

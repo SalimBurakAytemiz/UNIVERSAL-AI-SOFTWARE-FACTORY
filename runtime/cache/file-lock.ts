@@ -32,6 +32,46 @@ export class FileLockTimeoutError extends Error {
   }
 }
 
+/**
+ * P2 fix (P0 closure remediation, current 7-finding round, finding 7,
+ * "abort lock acquisition if owner metadata cannot be persisted"):
+ * reproduced — `acquireFileLock()`'s `mkdirSync(lockDirPath)` (the
+ * exclusive-ownership primitive) could succeed while the immediately
+ * following `writeFileSync(metaPath, ...)` (owner metadata: pid/token/
+ * acquiredAt) then failed — disk exhaustion, quota, permission, or any
+ * other I/O error. The OLD code (bkz. bu satırın kaldırılan try/catch'i)
+ * treated that write as purely best-effort and returned a normal, usable
+ * release callback regardless. But `releaseFileLock()` (aşağısı) can ONLY
+ * remove the lock directory after confirming ownership by reading and
+ * matching `meta.token` — with no metadata file, `readLockMeta()` returns
+ * `null`, `releaseFileLock()` treats that exactly like "already reclaimed
+ * by someone else" and returns WITHOUT removing anything. The caller that
+ * successfully created the directory is therefore left holding a release
+ * callback that can never actually release its own half-created lock — the
+ * directory survives, invisible to any ownership-based release, blocking
+ * every subsequent legitimate acquisition until this codebase's OWN
+ * separate stale-recovery path (bkz. `isLockStale()`/`tryReclaimStaleLock()`)
+ * eventually judges it abandoned by age alone. Fixed: acquisition succeeds
+ * ONLY when BOTH the directory AND its owner metadata are durably in place.
+ * A metadata-write failure immediately removes the just-created directory
+ * (safe and unconditional for the exact same reason the deadline-recheck
+ * cleanup above it already is — `mkdirSync()` just succeeded, so no other
+ * process could have raced in before this point, meaning this can never be
+ * a successor's lock) and re-throws the original error, leaving no lock
+ * handle and no orphaned ownership state behind at all.
+ */
+export class LockMetadataPersistenceError extends Error {
+  constructor(lockDirPath: string, cause: unknown) {
+    super(
+      `Failed to persist owner metadata for the cross-process lock '${lockDirPath}' after successfully creating ` +
+        `its directory — the lock directory has been removed and acquisition aborted, rather than returning a ` +
+        `lock handle that could never actually be released.`,
+      { cause }
+    );
+    this.name = "LockMetadataPersistenceError";
+  }
+}
+
 export interface FileLockOptions {
   /** How long to wait for the lock before throwing FileLockTimeoutError. */
   readonly timeoutMs?: number;
@@ -726,13 +766,38 @@ export function acquireFileLock(lockDirPath: string, options: FileLockOptions = 
         rmSync(lockDirPath, { recursive: true, force: true });
         throw new FileLockTimeoutError(lockDirPath, timeoutMs);
       }
+      // P2 fix (P0 closure remediation, current 7-finding round, finding 7,
+      // "abort lock acquisition if owner metadata cannot be persisted"):
+      // reproduced — this write used to be purely best-effort (bkz. bu
+      // satırın kaldırılmış yorumu, "dizinin kendisi zaten alınmıştır" gibi
+      // metadata'sız devam edilebileceğini varsayan gerekçe) — a genuine
+      // I/O failure here (disk full, quota, permission) left `lockDirPath`
+      // existing but ownerless, and `releaseFileLock()`'ın kendi token
+      // kontrolü (bkz. onun üstündeki fix notu) bu durumda HİÇBİR ŞEY
+      // yapmadan geri döner (`!meta` -> "zaten başkası tarafından ele
+      // geçirilmiş" varsayımıyla) — bu process kendi az önce yarattığı
+      // kilidi ASLA release edemez, sonraki HER meşru alıcı bu artık dizin
+      // stale-recovery ile kurtarılana kadar bloke olur. Fixed: bir
+      // metadata yazma hatası artık BAŞARISIZ bir acquisition'dır — dizin
+      // hemen kaldırılır (bkz. hemen üstündeki deadline-recheck temizliği
+      // ile AYNI gerekçe: `mkdirSync()` az önce başarılı oldu, bu yüzden
+      // BAŞKA hiçbir process bu dizini henüz kendi kilidi sanamaz, o yüzden
+      // bu kaldırma ASLA bir ardılın kilidini silmez) ve orijinal hata
+      // `LockMetadataPersistenceError` içinde sarmalanarak fırlatılır —
+      // hiçbir kullanılabilir kilit handle'ı DÖNMEZ, hiçbir sahipsiz durum
+      // GERİDE KALMAZ.
       try {
         const meta: LockMeta = { pid: process.pid, token, acquiredAt: Date.now() };
         writeFileSync(metaPath, JSON.stringify(meta), "utf8");
-      } catch {
-        // En iyi çaba (best-effort): metadata yazılamasa bile kilidin
-        // kendisi (dizin) zaten alınmıştır; sadece BİLİNMEYEN-sahip
-        // stale tespiti dizin mtime'ına geri düşer.
+      } catch (metaErr) {
+        try {
+          rmSync(lockDirPath, { recursive: true, force: true });
+        } catch {
+          // En iyi çaba: dizin kaldırma da başarısız olsa bile, orijinal
+          // metadata hatası yine de fırlatılır — hiçbir durumda sessizce
+          // "başarılı" bir handle döndürülmez.
+        }
+        throw new LockMetadataPersistenceError(lockDirPath, metaErr);
       }
       let released = false;
       return () => {

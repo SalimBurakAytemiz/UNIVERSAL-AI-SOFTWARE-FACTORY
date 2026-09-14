@@ -1681,6 +1681,83 @@ factory:
     instruction, this round does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke
     Codex itself, and did NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.
 
+    P0 CLOSURE REMEDIATION — CURRENT 7 REVIEW FINDINGS: an independent P0 closure review found SEVEN actionable
+    findings (3 P1, 4 P2), fixed as one consolidated corrective batch, each reproduced, root-caused, fixed,
+    regression-tested, and bypass-verified (temporarily reverted, confirmed the exact predicted failure, restored,
+    reconfirmed green). Finding 1 (P1): `file-cache.ts`'s durable "computation completed" checkpoint (bkz.
+    `recordComputeCompletion()`/`negotiateComputeOwnership()`) trusted its cached value UNCONDITIONALLY once
+    written, with no expiry concept of its own distinct from the value's requested ttl — a `ttlMs: 0` (or any
+    finite ttl) result could outlive its own explicitly requested expiry indefinitely. Fixed: the completed
+    checkpoint now carries its own `cacheExpiresAt`, and is only trusted while that deadline has not passed;
+    once it has, `negotiateComputeOwnership()` falls through to claim a fresh lease rather than resurrecting the
+    stale value. Finding 2 (P1): `phase-closure.ts`'s `attemptPhaseClosure()`/`recoverPendingPhaseClosure()` each
+    acquired only a narrow, differently-keyed (per-manifest) lock while both mutated the SAME shared Decision
+    Ledger/Scope Lock files — two processes closing different phases after loading the same snapshot could both
+    proceed and one's transition could be silently discarded. Fixed: all closure/recovery critical sections now
+    serialize under one shared `governanceStateLockPath()` outer lock (per-manifest lock nested inside,
+    consistent ordering), with a new `assertGovernanceStateNotStale()` check that detects a concurrent change and
+    fails closed (`ConcurrentGovernanceStateChangedError`) rather than silently overwriting it. Finding 3 (P1):
+    the same file's crash-recovery path, on finding a phase ALREADY authoritatively CLOSED (Ledger/ScopeLock
+    durably committed, only the manifest write crashed), still re-ran `evaluateClosureAttempt()` against
+    POSSIBLY-CHANGED live conditions before finalizing — a live invariant regression between the crash and
+    recovery could downgrade an already-CLOSED phase to REJECTED, contradicting the authoritative outcome. Fixed:
+    the CLOSED branch is now checked and finalized from the authoritative committed transaction BEFORE any
+    live-condition re-evaluation can run; a genuinely still-`LOCKED_FOR_CLOSURE` phase is unaffected and still
+    evaluates normally. Finding 4 (P2): `Cache.computeAndSet()`/`FileCache.computeAndSet()` (`cache.ts`/
+    `file-cache.ts`) validated an invalid `ttlMs` only inside the later `set()`/`recordComputeCompletion()` call,
+    AFTER the caller's `compute()` callback (a real, potentially billable model/provider call) had already run —
+    a caller retrying after the resulting rejection could repeat the same billable work. Fixed: `ttlMs` is now
+    validated as the very first statement of both methods, before any in-flight check or `compute()` invocation,
+    so an invalid ttl fails closed with zero side effects. Finding 5 (P2): `phase-closure.ts`'s `manifestPath()`/
+    `intentPath()` joined `phaseId`/`manifestId` with a plain `-`, a character `SAFE_GOVERNANCE_IDENTIFIER_PATTERN`
+    explicitly permits inside either — `("P0-sub","manifest")` and `("P0","sub-manifest")` collided onto the
+    identical file. Fixed via a length-prefixed encoding (`encodeGovernanceIdentityComponent()`) for each
+    identifier before concatenation — the explicit length prefix makes the boundary between the two encoded
+    identifiers unambiguous regardless of their contents, a structurally collision-free representation rather
+    than a delimiter search a crafted identifier could confuse; `manifestPath()`/`intentPath()` are now exported
+    so tests compute expected paths via the real function rather than duplicating the formula. Finding 6 (P2):
+    `orchestrator.ts`'s `bootstrapTransactionKey` joined `projectId:provider:modelId` with `:`, but provider/model
+    identifiers are unrestricted strings that can themselves legitimately contain `:` — `provider="a:b",
+    modelId="c"` and `provider="a", modelId="b:c"` (same project) produced the identical checkpoint key, letting
+    one provider/model pair's bootstrap silently reuse another's already-billed result. Fixed: the key is now
+    `JSON.stringify([projectId, provider, modelId])`, a canonical fixed-arity encoding whose own quote/escaping
+    makes it provably collision-free for distinct string tuples. Finding 7 (P2): `file-lock.ts`'s
+    `acquireFileLock()` treated its owner-metadata write (`writeFileSync(metaPath, ...)`, immediately after the
+    directory-creation primitive succeeds) as purely best-effort — a genuine I/O failure (disk exhaustion, quota,
+    permission) left the lock directory existing but ownerless, and `releaseFileLock()`'s own token check then
+    refuses to remove it (indistinguishable from "already reclaimed by someone else"), permanently orphaning the
+    caller's own half-created lock until stale-recovery eventually reclaims it by age. Fixed: a metadata-write
+    failure now immediately removes the just-created directory (safe and unconditional, since `mkdirSync()` just
+    succeeded — no other process could have raced in first) and re-throws the original error wrapped in a new
+    `LockMetadataPersistenceError`, returning no usable lock handle at all. A narrow root-cause audit strictly
+    scoped to these 7 exact classes (no general hardening sweep) found ONE genuine direct sibling instance:
+    `models/gateway.ts`'s `canonicalProviderConfigFingerprint()` (finding 5's exact class) joined each
+    `${label}:${hash}` provider-property entry with `|`, where `label` is derived from `Reflect.ownKeys(provider)`
+    — an arbitrary property/symbol name a `ModelProvider` implementation can set to any string, including one
+    containing `:` or `|` — letting two structurally different providers collide onto the identical fingerprint,
+    which is folded into the `model.provider.replace` approval's bound `identityDigest`. Fixed identically to
+    `identityDigestOf()`'s own already-safe pattern: each `[label, hash]` pair is now encoded via `JSON.stringify()`
+    of the ordered pair array rather than delimiter-joined string concatenation; reproduced with a genuine
+    collision on the OLD code (bypass-verified), fixed, and regression-tested. No other candidate examined for
+    any of the 7 classes (cost-engine.ts reservations/reconciliation, budget.ts, models/router.ts, capability-
+    gateway/gateway.ts, policy-engine/approval.ts, file-lock.ts's own `acquireReclaimGate()`/`writeGateIdentity()`)
+    turned out to be a genuine direct equivalent — each was individually checked and ruled out with a stated
+    reason (already fixed by a prior round's identical pattern, already validates before any side effect, or
+    (for `acquireReclaimGate()`) its release is unconditional same-process cleanup rather than the metadata-
+    dependent release path `acquireFileLock()` has, so no caller-visible orphaned handle exists there). Full
+    required verification sequence green on the resulting commit: lint (clean), typecheck (clean), build (clean),
+    1660/1660 tests across 53 files (up from 1658 before this round's fixes; zero skipped), validate:requirements
+    (46 schema-valid records, unchanged), history-and-current-tree-aware secret-scan (PASS), production install
+    verification (PASS — `npm ci --omit=dev` genuinely runnable), Factory Doctor (READY — Node.js, npm, Python,
+    Git, Docker), all 9 P0 proofs green (13 assertions). No requirement's status was raised beyond what this
+    round's actual change supports — only `verificationSource` evidence strings were appended to the specific
+    requirements (UASF-REQ-0007, UASF-REQ-0024, UASF-REQ-0036, UASF-REQ-0045) whose implementation/test files
+    this batch actually touched. With all 7 findings (plus the one audit-found sibling) closed and every
+    mandatory check green, phase status remains READY_FOR_INDEPENDENT_REVIEW (not CLOSED — independent closure
+    remains Codex's own job). Per explicit instruction, this round does NOT merge, does NOT move to P1, does NOT
+    declare P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work stayed on
+    claude/ai-factory-baseline-v1-seawq7.
+
 # Structured closure record (baseline section 277, durable evidence).
 # This is the machine-checkable counterpart to the `p0_status` narrative
 # above — see that field for the full reasoning and caveats. Nothing here
@@ -5378,6 +5455,24 @@ blockers:
     P0 remains READY_FOR_INDEPENDENT_REVIEW (LOCKED_FOR_CLOSURE), explicitly NOT CLOSED. Per explicit instruction,
     this round does not merge, does not move to P1, does not declare P0 complete, does not invoke Codex itself,
     and did not create a new branch.
+  - >-
+    Awaiting the next independent P0 closure review of the pushed fixes — an independent P0 closure review found
+    SEVEN actionable findings (3 P1, 4 P2): `file-cache.ts`'s completed compute-checkpoint outliving its own
+    cache TTL; `phase-closure.ts`'s independent per-manifest locks racing the shared Decision Ledger/Scope Lock
+    files; the same file's crash-recovery re-evaluating live conditions after a phase was already authoritatively
+    CLOSED; `cache.ts`/`file-cache.ts`'s `computeAndSet()` validating TTL only after `compute()` already ran;
+    `phase-closure.ts`'s `manifestPath()`/`intentPath()` colliding via an unrestricted `-` delimiter; and
+    `orchestrator.ts`'s bootstrap checkpoint key colliding via an unrestricted `:` delimiter. All seven fixed,
+    individually regression-tested, and individually bypass-verified; see `factory.p0_status`'s own "P0 CLOSURE
+    REMEDIATION — CURRENT 7 REVIEW FINDINGS" entry for full root-cause, fix, and evidence detail. A narrow
+    root-class audit limited to the same 7 classes found and fixed one further genuine sibling instance (the
+    identical delimiter-collision class in `models/gateway.ts`'s `canonicalProviderConfigFingerprint()`, which
+    feeds the `model.provider.replace` approval's bound identity digest). Verified per the full required
+    sequence: lint, typecheck, build, 1660/1660 tests, validate:requirements, history-and-current-tree-aware
+    secret-scan, production install verification, Factory Doctor, all 9 P0 proofs. P0 remains
+    READY_FOR_INDEPENDENT_REVIEW, explicitly NOT CLOSED. Per explicit instruction, this round does not merge,
+    does not move to P1, does not declare P0 complete, does not invoke Codex itself, and did not create a new
+    branch.
 
 governance_decision_recorded: >
   A request (received three times, with increasing detail) to implement

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import {
   ModelGateway,
   UnknownProviderError,
@@ -2090,6 +2091,78 @@ describe("ModelGateway + MockProvider", () => {
         const goodAgain = new RegisteredSymbolProvider("https://good.example.com");
         expect(computeProviderReplacementIdentityDigest(good, "mock")).toBe(
           computeProviderReplacementIdentityDigest(goodAgain, "mock")
+        );
+      });
+    }
+  );
+
+  describe(
+    "P2 fix (P0 closure remediation, current 7-finding round, narrow root-cause audit, direct equivalent of " +
+      "finding 5, 'encode manifest identities without delimiter collisions'): a property name crafted to " +
+      "contain ':' and '|' must never let two structurally different providers collide onto the same " +
+      "canonicalProviderConfigFingerprint()",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a provider with a single property whose NAME is crafted to " +
+          "embed another property's own '${label}:${hash}' entry no longer collides with a provider that " +
+          "genuinely has that as two SEPARATE properties",
+        () => {
+          const valueP = "https://p.example.com";
+          const valueQ = "https://q.example.com";
+          // Mirrors canonicalProviderConfigFingerprint()'s own per-property
+          // hash formula for a plain string value (canonicalization is the
+          // identity function for strings, then JSON.stringify then sha256).
+          const hashOf = (v: string) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
+          const hashP = hashOf(valueP);
+
+          // The SAME class/prototype for both instances — isolates the test
+          // to ONLY each instance's own (Reflect.ownKeys) properties, never
+          // to computeProviderReplacementIdentityDigest()'s OTHER, already
+          // fingerprint-independent components (`constructor.name`,
+          // `invoke.toString()`), which a two-different-classes version of
+          // this test would otherwise (and initially DID, before this fix)
+          // conflate with the actual per-property fingerprint collision.
+          class FlexibleProvider implements ModelProvider {
+            readonly id = "mock";
+            async invoke(): Promise<ModelInvocationResponse> {
+              return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+            }
+          }
+
+          // Under the OLD `${label}:${hash}` join (entries joined by '|'),
+          // this provider's fingerprint is exactly:
+          //   "str:id:<hashOf('mock')>|str:p:<hashP>|str:q:<hashOf(valueQ)>"
+          const genuine = new FlexibleProvider() as FlexibleProvider & Record<string, string>;
+          genuine.p = valueP;
+          genuine.q = valueQ;
+
+          // This provider instead has ONE property whose NAME is crafted to
+          // read as "p:<hashP>|str:q" — under the OLD scheme this single
+          // entry, `${maliciousLabel}:${hashOf(valueQ)}`, serializes to the
+          // BYTE-IDENTICAL joined string as the genuine two-property case
+          // above, despite being a structurally different object.
+          const maliciousKey = `p:${hashP}|str:q`;
+          const forged = new FlexibleProvider() as FlexibleProvider & Record<string, string>;
+          forged[maliciousKey] = valueQ;
+
+          expect(computeProviderReplacementIdentityDigest(genuine, "mock")).not.toBe(
+            computeProviderReplacementIdentityDigest(forged, "mock")
+          );
+        }
+      );
+
+      it("no-regression: two structurally identical providers still fingerprint identically", () => {
+        class SimpleProvider implements ModelProvider {
+          readonly id = "mock";
+          constructor(readonly endpoint: string) {}
+          async invoke(): Promise<ModelInvocationResponse> {
+            return { modelId: "m", provider: "mock", costUsd: 0, output: "x" };
+          }
+        }
+        const a = new SimpleProvider("https://a.example.com");
+        const b = new SimpleProvider("https://a.example.com");
+        expect(computeProviderReplacementIdentityDigest(a, "mock")).toBe(
+          computeProviderReplacementIdentityDigest(b, "mock")
         );
       });
     }

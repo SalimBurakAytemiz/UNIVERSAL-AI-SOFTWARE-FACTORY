@@ -151,6 +151,21 @@ export class Cache<T = unknown> {
    * stuck in-flight entry blocking a subsequent retry.
    */
   async computeAndSet(key: string, compute: () => Promise<T> | T, ttlMs?: number): Promise<ComputeWithCacheResult<T>> {
+    // P1 fix (P0 closure remediation, current 7-finding round, finding 4,
+    // "validate TTL before invoking compute"): reproduced — an invalid
+    // `ttlMs` (negative/NaN/Infinity) used to be validated only INSIDE the
+    // eventual `this.set(key, value, ttlMs)` call below, which runs AFTER
+    // `compute()` has already been scheduled (line below, `Promise.resolve().then(compute)`)
+    // AND awaited. A side-effecting or billable `compute()` — a real
+    // provider/model call, a network request — would therefore genuinely
+    // run and incur its cost/effect, only for the WHOLE operation to then
+    // reject once `set()` finally validated its `ttlMs`. A caller retrying
+    // after that rejection could repeat the same billable work. Fixed:
+    // validated here, as the very FIRST thing this method does — before
+    // even checking for an in-flight computation to join — so an invalid
+    // `ttlMs` fails closed with ZERO side effects, exactly like `set()`'s
+    // own already-established "reject before any mutation" contract.
+    assertValidTtl(ttlMs);
     const existing = this.inFlight.get(key);
     if (existing) {
       return { value: await existing, cached: true };

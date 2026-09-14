@@ -155,6 +155,57 @@ describe("Cache / computeWithCache", () => {
   });
 
   describe(
+    "P1 fix (P0 closure remediation, current 7-finding round, finding 4, 'validate TTL before invoking " +
+      "compute'): computeAndSet() must reject an invalid ttlMs BEFORE compute() ever runs",
+    () => {
+      it.each([NaN, Infinity, -Infinity, -1, -100])(
+        "BLOCKER regression, exact reproduction: invalid ttlMs (%s) rejects with zero compute() invocations",
+        async (ttlMs) => {
+          const cache = new Cache<string>();
+          let computeCalls = 0;
+          const compute = () => {
+            computeCalls++;
+            return "should-never-be-cached";
+          };
+
+          await expect(cache.computeAndSet("k", compute, ttlMs)).rejects.toThrow(InvalidTtlError);
+          expect(computeCalls).toBe(0); // rejected BEFORE any side effect
+          expect(cache.has("k")).toBe(false);
+        }
+      );
+
+      it("no regression: ttlMs: 0 still runs compute() and caches the immediately-expiring result", async () => {
+        const cache = new Cache<string>();
+        let computeCalls = 0;
+        const result = await cache.computeAndSet(
+          "k",
+          () => {
+            computeCalls++;
+            return "v";
+          },
+          0
+        );
+        expect(computeCalls).toBe(1);
+        expect(result).toEqual({ value: "v", cached: false });
+      });
+
+      it("no regression: a genuinely positive ttlMs still runs compute() and caches normally", async () => {
+        const cache = new Cache<string>();
+        const result = await cache.computeAndSet("k", () => "v", 1000);
+        expect(result).toEqual({ value: "v", cached: false });
+        expect(cache.get("k")).toBe("v");
+      });
+
+      it("no regression: omitting ttlMs entirely still runs compute() and caches normally", async () => {
+        const cache = new Cache<string>();
+        const result = await cache.computeAndSet("k", () => "v");
+        expect(result).toEqual({ value: "v", cached: false });
+        expect(cache.get("k")).toBe("v");
+      });
+    }
+  );
+
+  describe(
     "P2 fix (independent Codex review's own narrow root-cause audit, same class as file-cache.ts's " +
       "'deduplicate concurrent durable cache computations'): concurrent computeWithCache() calls for the " +
       "SAME missing key must single-flight, never both run compute()",

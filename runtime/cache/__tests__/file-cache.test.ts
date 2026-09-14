@@ -512,6 +512,50 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
   });
 
   describe(
+    "P1 fix (P0 closure remediation, current 7-finding round, finding 4, 'validate TTL before invoking " +
+      "compute'): computeAndSet() must reject an invalid ttlMs BEFORE compute() ever runs",
+    () => {
+      it.each([NaN, Infinity, -Infinity, -1, -100])(
+        "BLOCKER regression, exact reproduction: invalid ttlMs (%s) rejects with zero compute() invocations",
+        async (ttlMs) => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-invoke-"));
+          const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+          const compute = vi.fn(async () => "should-never-be-cached");
+
+          await expect(cache.computeAndSet("k", compute, ttlMs)).rejects.toThrow(InvalidTtlError);
+          expect(compute).toHaveBeenCalledTimes(0); // rejected BEFORE any side effect
+          expect(cache.has("k")).toBe(false);
+        }
+      );
+
+      it("no regression: ttlMs: 0 still runs compute() and caches the immediately-expiring result", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-invoke-zero-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        const compute = vi.fn(async () => "v");
+        const result = await cache.computeAndSet("k", compute, 0);
+        expect(compute).toHaveBeenCalledTimes(1);
+        expect(result).toEqual({ value: "v", cached: false });
+      });
+
+      it("no regression: a genuinely positive ttlMs still runs compute() and caches normally", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-invoke-positive-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        const result = await cache.computeAndSet("k", async () => "v", 1000);
+        expect(result).toEqual({ value: "v", cached: false });
+        expect(cache.get("k")).toBe("v");
+      });
+
+      it("no regression: omitting ttlMs entirely still runs compute() and caches normally", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-ttl-invoke-undefined-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        const result = await cache.computeAndSet("k", async () => "v");
+        expect(result).toEqual({ value: "v", cached: false });
+        expect(cache.get("k")).toBe("v");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (independent review, 'renew compute leases while their owners are active', finding 3): a " +
       "genuinely long-running compute() must keep its lease alive rather than looking abandoned once the " +
       "original computeLeaseTtlMs window elapses",
@@ -880,6 +924,130 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
         expect(() => new FileCache<string>(store, cachePath)).not.toThrow();
         expect(() => new FileCache<string>(store, cachePath, undefined, 10_000)).not.toThrow();
         expect(() => new FileCache<string>(store, cachePath, undefined, 3)).not.toThrow();
+      });
+    }
+  );
+
+  describe(
+    "P1 fix (P0 closure remediation, current 7-finding round, finding 1, 'expire completed cache checkpoints " +
+      "with the cache entry'): a completed compute checkpoint must not resurrect a value whose own authoritative " +
+      "cache ttlMs has genuinely elapsed",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: ttlMs: 0 (already expired at write time) must not be " +
+          "resurrected forever by its own completed compute checkpoint",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-checkpoint-expiry-zero-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const cache = new FileCache<string>(new FileStateStore(), cachePath);
+
+          let calls = 0;
+          const first = await cache.computeAndSet(
+            "k",
+            () => {
+              calls++;
+              return "v1";
+            },
+            0
+          );
+          expect(first).toEqual({ value: "v1", cached: false });
+          expect(calls).toBe(1);
+
+          // The main cache entry is already expired (ttlMs: 0) the instant
+          // it was written — but the completed checkpoint used to have no
+          // expiry concept of its own and would resurrect "v1" forever.
+          const second = await cache.computeAndSet(
+            "k",
+            () => {
+              calls++;
+              return "v2";
+            },
+            0
+          );
+          expect(second).toEqual({ value: "v2", cached: false });
+          expect(calls).toBe(2);
+        }
+      );
+
+      it(
+        "BLOCKER regression, exact reproduction: a completed checkpoint for a finite, positive ttlMs must not " +
+          "survive past that ttlMs's own real-time expiry",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-checkpoint-expiry-finite-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const cache = new FileCache<string>(new FileStateStore(), cachePath);
+
+          let calls = 0;
+          const first = await cache.computeAndSet(
+            "k",
+            () => {
+              calls++;
+              return "v1";
+            },
+            20
+          );
+          expect(first).toEqual({ value: "v1", cached: false });
+          expect(calls).toBe(1);
+
+          await new Promise((resolve) => setTimeout(resolve, 80)); // well past the 20ms ttl
+
+          const second = await cache.computeAndSet(
+            "k",
+            () => {
+              calls++;
+              return "v2";
+            },
+            20
+          );
+          expect(second).toEqual({ value: "v2", cached: false });
+          expect(calls).toBe(2);
+        }
+      );
+
+      it("no regression: a completed checkpoint still serves as a fast, correct heal WITHIN its own ttl window", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-checkpoint-within-ttl-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const cache = new FileCache<string>(new FileStateStore(), cachePath);
+
+        let calls = 0;
+        const first = await cache.computeAndSet(
+          "k",
+          () => {
+            calls++;
+            return "v1";
+          },
+          10_000
+        );
+        expect(first).toEqual({ value: "v1", cached: false });
+
+        const second = await cache.computeAndSet(
+          "k",
+          () => {
+            calls++;
+            return "v2";
+          },
+          10_000
+        );
+        expect(second).toEqual({ value: "v1", cached: true });
+        expect(calls).toBe(1);
+      });
+
+      it("no regression: an undefined ttlMs (no expiry requested) checkpoint remains valid indefinitely", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-checkpoint-no-ttl-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const cache = new FileCache<string>(new FileStateStore(), cachePath);
+
+        let calls = 0;
+        await cache.computeAndSet("k", () => {
+          calls++;
+          return "v1";
+        });
+        const second = await cache.computeAndSet("k", () => {
+          calls++;
+          return "v2";
+        });
+        expect(second).toEqual({ value: "v1", cached: true });
+        expect(calls).toBe(1);
       });
     }
   );

@@ -2579,10 +2579,14 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           expect(existsSync(transactionsPath)).toBe(true);
           const transactionCache = new FileCache<{ costUsd: number }>(new FileStateStore(), transactionsPath);
           // P1 fix (P0 final closure remediation, finding 9): the checkpoint
-          // key is now `${projectId}:${provider}:${modelId}`, not the bare
-          // projectId — bkz. orchestrator.ts'in bootstrapTransactionKey fix
-          // notu.
-          const persistedInvocation = transactionCache.get(`${projectId}:counting:counting-summarizer`);
+          // key now binds projectId/provider/modelId, not the bare
+          // projectId. P2 fix (P0 closure remediation, current 7-finding
+          // round, finding 6): that binding is now a canonical
+          // `JSON.stringify()` of the 3-tuple, not an ambiguous `:`-join —
+          // bkz. orchestrator.ts'in bootstrapTransactionKey fix notu.
+          const persistedInvocation = transactionCache.get(
+            JSON.stringify([projectId, "counting", "counting-summarizer"])
+          );
           expect(persistedInvocation).toBeDefined();
           expect(persistedInvocation?.costUsd).toBe(0.6);
 
@@ -2787,8 +2791,8 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             new FileStateStore(),
             transactionsPath
           );
-          const persistedA = transactionCache.get(`${projectId}:provider-a:model-a`);
-          const persistedB = transactionCache.get(`${projectId}:provider-b:model-b`);
+          const persistedA = transactionCache.get(JSON.stringify([projectId, "provider-a", "model-a"]));
+          const persistedB = transactionCache.get(JSON.stringify([projectId, "provider-b", "model-b"]));
           expect(persistedA?.provider).toBe("provider-a");
           expect(persistedB?.provider).toBe("provider-b");
         }
@@ -2841,6 +2845,108 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
 
           expect(callsA()).toBe(1);
           expect(result.totalCostUsd).toBe(0.4);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P2 fix (P0 closure remediation, current 7-finding round, finding 6, 'hash/canonically encode the " +
+      "bootstrap checkpoint tuple'): provider/modelId containing ':' must never let two DIFFERENT invocation " +
+      "identities collide onto the SAME checkpoint",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: providerId='a:b'/modelId='c' and providerId='a'/modelId='b:c' " +
+          "— which collided onto the identical checkpoint key under the old `:`-join — genuinely invoke their " +
+          "OWN provider, never reusing each other's cached response",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap-colon-tuple-"));
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const registry = new ModelRegistry();
+          registry.register({
+            provider: "a:b",
+            modelId: "c",
+            tier: "MOCK",
+            costPerCall: 0.4,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+
+          let countAB = 0;
+          let countBC = 0;
+          const providerAB: ModelProvider = {
+            id: "a:b",
+            async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+              countAB++;
+              return { modelId: model.modelId, provider: "a:b", costUsd: 0.4, output: `AB:${request.prompt}` };
+            }
+          };
+          const providerA: ModelProvider = {
+            id: "a",
+            async invoke(model: ModelRecord, request: ModelInvocationRequest): Promise<ModelInvocationResponse> {
+              countBC++;
+              return { modelId: model.modelId, provider: "a", costUsd: 0.4, output: `A:${request.prompt}` };
+            }
+          };
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(providerAB);
+          modelGateway.registerProvider(providerA);
+
+          const projectId = "proj-bootstrap-colon-tuple";
+
+          const resultFirst = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+          expect(countAB).toBe(1);
+          expect(countBC).toBe(0);
+          expect(resultFirst.totalCostUsd).toBe(0.4);
+
+          // Live routing change: the SAME project now routes to the OTHER
+          // half of the ambiguous tuple — providerId="a", modelId="b:c" —
+          // which the OLD `${projectId}:${provider}:${modelId}` join would
+          // have serialized to the IDENTICAL checkpoint key as above.
+          registry.register({
+            provider: "a",
+            modelId: "b:c",
+            tier: "MOCK",
+            costPerCall: 0.4,
+            capabilities: ["summarization"],
+            status: "ACTIVE"
+          });
+          registry.updateStatus("c", "RETIRED");
+
+          const resultSecond = await bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: registry,
+            modelGateway,
+            budgetLimits: { perTaskUsd: 10 }
+          });
+
+          // providerA/modelId="b:c" must have been genuinely invoked — never
+          // silently short-circuited by the first tuple's stale checkpoint.
+          expect(countAB).toBe(1);
+          expect(countBC).toBe(1);
+          expect(resultSecond.totalCostUsd).toBe(0.8);
+
+          const transactionsPath = join(tempRoot, "bootstrap-transactions.json");
+          const transactionCache = new FileCache<{ provider: string; modelId: string; costUsd: number }>(
+            new FileStateStore(),
+            transactionsPath
+          );
+          const persistedFirst = transactionCache.get(JSON.stringify([projectId, "a:b", "c"]));
+          const persistedSecond = transactionCache.get(JSON.stringify([projectId, "a", "b:c"]));
+          expect(persistedFirst?.provider).toBe("a:b");
+          expect(persistedFirst?.modelId).toBe("c");
+          expect(persistedSecond?.provider).toBe("a");
+          expect(persistedSecond?.modelId).toBe("b:c");
         }
       );
     }
