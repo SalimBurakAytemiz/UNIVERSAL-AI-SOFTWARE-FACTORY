@@ -246,6 +246,28 @@ export class FileCache<T = unknown> {
     return this.lookup(key).value;
   }
 
+  /**
+   * TR (P0 CLOSURE REMEDIATION fix notu, blocker 7 — UASF-REQ-0036, baseline
+   * §77): `set()` HER ZAMAN `expiresAt`'ı `Date.now() + ttlMs` olarak YENİDEN
+   * hesaplar — bu, YENİ bir değer için doğrudur (bkz. `#computeCrossProcess()`'in
+   * OWNER dalı), ama bir `completed` lease kaydını ana önbelleğe "onarmak"
+   * (heal) için KULLANILDIĞINDA YANLIŞTIR: o değer zaten GEÇMİŞTE, kendi
+   * ÖZGÜN mutlak `cacheExpiresAt` sınırıyla hesaplanmıştı — `set()`'i
+   * `ttlMs` ile tekrar çağırmak bu sınırı SESSİZCE `Date.now() + ttlMs`'e
+   * ÖTELER, tıpkı bir önceki turun Blocker 5'inin (okuma sırasında TTL
+   * uzatma) kapattığı sınıfın AYNISI — burada bir OKUMA/onarım yazımı
+   * yoluyla. Çözüm: bu özel, yalnızca-onarım yazma yolu, YENİDEN
+   * HESAPLAMAK yerine ÇAĞIRANIN sağladığı MUTLAK `expiresAt` değerini
+   * DOĞRUDAN yazar — orijinal pencere asla genişletilmez.
+   */
+  private setWithAbsoluteExpiry(key: string, value: T, expiresAt: number | undefined): void {
+    this.withLock(() => {
+      const all = this.loadAll();
+      all.set(key, { value, computedAt: Date.now(), expiresAt });
+      this.saveAll(all);
+    });
+  }
+
   set(key: string, value: T, ttlMs?: number): void {
     // P2 fix (34th independent review round, finding 11, "validate TTL
     // values before persisting"): bkz. cache.ts'in `assertValidTtl`'ının
@@ -568,7 +590,7 @@ export class FileCache<T = unknown> {
     key: string,
     ownerId: string
   ):
-    | { readonly kind: "value"; readonly value: T; readonly source: "cache" | "lease" }
+    | { readonly kind: "value"; readonly value: T; readonly source: "cache" | "lease"; readonly cacheExpiresAt?: number }
     | { readonly kind: "owner" }
     | { readonly kind: "busy" } {
     const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
@@ -622,7 +644,12 @@ export class FileCache<T = unknown> {
           // (heal) için `this.set()` çağırması MEŞRUDUR — çünkü ana
           // önbellekte bu anahtar için HENÜZ hiçbir girdi yok, dolayısıyla
           // "uzatılacak" mevcut bir `expiresAt` de yoktur.
-          return { kind: "value", value: existingLease.value as T, source: "lease" };
+          return {
+            kind: "value",
+            value: existingLease.value as T,
+            source: "lease",
+            cacheExpiresAt: existingLease.cacheExpiresAt
+          };
         }
       } else if (existingLease && existingLease.expiresAt > now) {
         return { kind: "busy" };
@@ -680,29 +707,34 @@ export class FileCache<T = unknown> {
         //
         // TR (BLOCKER 5 fix notu, "FINAL P0 CLOSURE REMEDIATION" —
         // UASF-REQ-0036, baseline §77, "cache-validity invariant"): bu
-        // `this.set()` çağrısı eskiden `outcome.kind === "value"` OLAN HER
-        // durumda KOŞULSUZ çalışıyordu — `outcome.source === "cache"` (yani
-        // değer zaten ana önbellekte GEÇERLİ olarak duruyordu, hiçbir
-        // "onarım" gerekmiyordu) durumunda bile. `set()` HER ZAMAN
-        // `expiresAt`'ı `Date.now() + ttlMs` olarak YENİDEN yazdığından, bu
-        // ana önbellekteki GEÇERLİ bir girdinin özgün `computedAt`/
-        // `expiresAt`'ını her okuma anında sessizce ileri ötelüyordu —
-        // mutlak (absolute) TTL semantiğini fiilen kaymalı (sliding) bir
-        // TTL'e dönüştürüyordu: TTL=100ms ile t=0'da yazılan bir değer,
-        // t=90'da okunduğunda (hâlâ geçerli) `set()` süresini t=190'a kadar
-        // uzatıyor, t=110'da (özgün pencereye göre süresi dolmuş olması
-        // gerekirken) HÂLÂ `cached: true` ile aynı bayat değeri
-        // döndürüyordu — tekrarlanan okumalar bayat bir sonucu SÜRESİZ
-        // canlı tutabiliyordu. Düzeltme: yalnızca `outcome.source ===
-        // "lease"` iken (değer HENÜZ ana önbellekte yoktu, gerçekten bir
-        // "onarım" yazımıdır — yeni bir `expiresAt` atamak burada zararsızdır
-        // çünkü uzatılacak ÖNCEKİ bir ana-önbellek süresi yoktur) `set()`
-        // çağrılır; `outcome.source === "cache"` iken ana önbellek OLDUĞU
-        // GİBİ bırakılır — bir OKUMA asla bir girdinin geçerlilik sınırını
-        // uzatmaz.
+        // yazım eskiden `outcome.kind === "value"` OLAN HER durumda
+        // KOŞULSUZ çalışıyordu — `outcome.source === "cache"` (yani değer
+        // zaten ana önbellekte GEÇERLİ olarak duruyordu, hiçbir "onarım"
+        // gerekmiyordu) durumunda bile. Düzeltme: yalnızca `outcome.source
+        // === "lease"` iken (değer HENÜZ ana önbellekte yoktu, gerçekten
+        // bir "onarım" yazımıdır) bir yazım yapılır; `outcome.source ===
+        // "cache"` iken ana önbellek OLDUĞU GİBİ bırakılır.
+        //
+        // TR (BLOCKER 7 fix notu, "P0 CLOSURE REMEDIATION" — UASF-REQ-0036):
+        // bağımsız inceleme, YUKARIDAKİ blocker-5 düzeltmesinin KENDİSİNİN
+        // hâlâ eksik olduğunu gösterdi: bu dal `this.set(key, outcome.value,
+        // ttlMs)` çağırıyordu — `set()` HER ZAMAN `expiresAt`'ı `Date.now()
+        // + ttlMs` olarak YENİDEN HESAPLAR, bu değerin `existingLease`
+        // üzerinde zaten kayıtlı olan ÖZGÜN mutlak `outcome.cacheExpiresAt`
+        // sınırını SESSİZCE ÖTELER — tam olarak blocker 5'in kapattığı sınıf
+        // ("bir okuma/onarım, geçerlilik sınırını asla uzatmamalı"), yalnızca
+        // OKUMA yerine LEASE-ONARIM yazma yolunda. Somut senaryo: t=0'da
+        // ttlMs=100 ile hesaplanan bir değer (cacheExpiresAt=100), t=90'da
+        // (hâlâ geçerliyken) onarılırsa, eski kod YENİ bir `expiresAt=190`
+        // yazardı — de facto TTL'i ikiye katlayan, t=100-190 arası
+        // ÖZGÜN pencereden SONRA da hâlâ "geçerli" görünen bayat bir kayıt.
+        // Düzeltme: `setWithAbsoluteExpiry()` — `outcome.cacheExpiresAt`'ı
+        // (lease kaydında zaten kalıcı olan ÖZGÜN mutlak sınır) YENİDEN
+        // HESAPLAMADAN doğrudan yazar; onarım hiçbir zaman yeni bir TTL
+        // penceresi YARATMAZ.
         if (outcome.source === "lease") {
           try {
-            this.set(key, outcome.value, ttlMs);
+            this.setWithAbsoluteExpiry(key, outcome.value, outcome.cacheExpiresAt);
           } catch {
             // Best-effort heal only — see fix note above.
           }

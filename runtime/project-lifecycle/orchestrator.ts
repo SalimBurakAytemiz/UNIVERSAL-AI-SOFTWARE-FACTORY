@@ -40,6 +40,7 @@ import { CostEngine } from "../cost/cost-engine.js";
 import { assertValidBudgetLimits, BudgetGuard, type BudgetLimits } from "../budget/budget.js";
 import { FileStateStore, type StateStore } from "../state/file-store.js";
 import { FileCache } from "../cache/file-cache.js";
+import { acquireFileLock } from "../cache/file-lock.js";
 import { traceRequirements } from "../cli/commands/trace-requirement.js";
 import type { TraceabilityIssue } from "../requirements-traceability/traceability.js";
 import { freezeRecord } from "../util/immutable.js";
@@ -476,6 +477,39 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
   // read-then-write checkpoint that (bkz. finding 5's fix notu) has no
   // cross-process claim atomicity of its own.
   const transactionsPath = assertFilesystemConfinement(baseDir, "bootstrap-transactions.json");
+  // TR (P0 CLOSURE REMEDIATION fix notu, blocker 6 — UASF-REQ-0042): bağımsız
+  // inceleme, `bootstrapTransactionCache`'in YALNIZCA ücretli MODEL ÇAĞRISI
+  // adımını (proje+sağlayıcı+model anahtarıyla) serileştirdiğini, ama
+  // AYNI PROJE için GERÇEKTEN EŞZAMANLI iki `bootstrapProject()` çağrısının
+  // (ör. bir WEB bootstrap'ı ile bir GAME yeniden-bootstrap'ı) — FARKLI
+  // modellere yönlendirildiklerinde bootstrapTransactionCache'te ASLA
+  // çakışmayacağını, bu yüzden ikisinin de scaffold + genome/organization/
+  // bootstrap.json YAZMA adımına SERBESTÇE, birbirinden habersiz şekilde
+  // aynı anda girebileceğini kanıtladı — `stateStore.write()` çağrılarının
+  // her biri KENDİ İÇİNDE atomik olsa da (bkz. BLOCKER 3'ün üstteki fix
+  // notu, "BOOTSTRAP_IN_PROGRESS" işaretleyicisi), o işaretleyici yalnızca
+  // SIRALI bir yeniden denemedeki yarım kalmış bir yazmayı KURTARILABİLİR
+  // kılar — iki bağımsız sürecin/çağrının aynı anda İÇ İÇE geçmiş
+  // yazmalarını ASLA ENGELLEMEZ: A'nın genome.json (WEB) yazımı ile B'nin
+  // genome.json (GAME) yazımı, ardından A'nın organization.json (WEB)
+  // yazımı ile B'nin organization.json (GAME) yazımı rastgele sırayla
+  // serpiştirilebilir — sonuçta disk üzerinde GAME genome.json + WEB
+  // organization.json gibi KARIŞIK bir nesil kombinasyonu, "SUCCESS" olarak
+  // işaretlenmiş biçimde kalabilir.
+  //
+  // Çözüm (mevcut mimariyle uyumlu EN KÜÇÜK mekanizma — `file-lock.ts`'in
+  // ZATEN var olan, bu kod tabanının başka yerlerinde de kullanılan
+  // `acquireFileLock()` birincilini yeniden kullanarak): scaffold + üç
+  // yazma dizisi artık PROJE KAPSAMLI, karşılıklı dışlayan bir kilit
+  // İÇİNDE çalışır (bkz. `bootstrapLockPath` aşağısı, `genome.project.id`
+  // ile anahtarlanır — FARKLI projeler için eşzamanlı bootstraplar
+  // gereksiz yere serileştirilmez). Bu, AYNI proje için iki eşzamanlı
+  // çağrının scaffold+yazma kritik bölümüne ASLA aynı anda giremeyeceğini
+  // garanti eder: ikincisi, birincisi TAMAMEN bitene (SUCCESS ile ya da
+  // kurtarılabilir bir IN_PROGRESS durumuyla) kadar bekler — bu yüzden
+  // nihai disk durumu her zaman TEK, tutarlı bir neslin genome+organization
+  // +bootstrap üçlüsünü yansıtır, asla ikisinin karışımını değil.
+  const bootstrapLockPath = assertFilesystemConfinement(baseDir, `${genome.project.id}.bootstrap.lock`);
   const organization = composeOrganizationFromGenome(genome, risk);
 
   // P2 fix (13th independent review round targeted audit, same class as
@@ -805,7 +839,15 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
         )
       )
     ).value;
-    const scaffoldResult = scaffoldProjectOs(baseDir, genome.project.id);
+    // TR (blocker 6 fix notu): bkz. `bootstrapLockPath`'in üstündeki fix
+    // notu — scaffold + genome/organization/bootstrap.json yazma dizisi
+    // BAŞTAN SONA bu proje-kapsamlı kilit İÇİNDE çalışır; `finally` bloğu,
+    // yazmalardan HERHANGİ biri başarısız olsa bile kilidin ASLA sızmadığını
+    // garanti eder.
+    const releaseBootstrapLock = acquireFileLock(bootstrapLockPath);
+    let scaffoldResult: ScaffoldResult;
+    try {
+    scaffoldResult = scaffoldProjectOs(baseDir, genome.project.id);
 
     // TR (BLOCKER 3 fix notu, "FINAL P0 CLOSURE REMEDIATION" — UASF-REQ-0042,
     // baseline §303, "Genome -> Organization -> State" yetkili ilişkisi):
@@ -924,6 +966,9 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     });
 
     return scaffoldResult;
+    } finally {
+      releaseBootstrapLock();
+    }
     },
     approvalReference,
     (result) => {

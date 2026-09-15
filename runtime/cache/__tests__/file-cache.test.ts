@@ -1137,4 +1137,82 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       });
     }
   );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 7 (UASF-REQ-0036, 'completed-lease recovery restarts the result TTL and " +
+      "can serve a value after its original absolute expiry')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: healing a completed lease into the main cache (because the " +
+          "main cache's own write of that value never landed) must preserve the ORIGINAL absolute cacheExpiresAt " +
+          "— never recompute a fresh Date.now()+ttlMs window the way an ordinary set() would",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-heal-ttl-restart-"));
+          const cachePath = join(tempRoot, "cache.json");
+          const stateStore = new FileStateStore();
+          const cache = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+          const leasePath = computeLeasePathFor(cachePath, "k");
+
+          // A durable, completed lease from a PRIOR attempt whose own main-
+          // cache write never landed — its absolute cache deadline is only
+          // ~80ms away, genuinely still valid right now but about to expire.
+          const originalCacheExpiresAt = Date.now() + 80;
+          stateStore.write(leasePath, {
+            ownerId: "prior-owner",
+            expiresAt: Date.now() + 60_000,
+            completed: true,
+            value: "v",
+            cacheExpiresAt: originalCacheExpiresAt
+          });
+
+          const result = await cache.computeAndSet("k", () => {
+            throw new Error("must never recompute — a genuinely completed lease already exists");
+          });
+          expect(result).toEqual({ value: "v", cached: true });
+          // Immediately after the heal, the ORIGINAL window has not yet
+          // elapsed — the healed main-cache entry is still valid.
+          expect(cache.get("k")).toBe("v");
+
+          // Wait until AFTER the ORIGINAL cacheExpiresAt has passed, but
+          // still WELL WITHIN what a bugged `Date.now() + ttlMs` (10s) heal
+          // window would consider valid.
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          expect(cache.get("k")).toBeUndefined();
+        }
+      );
+
+      it("no regression: healing a completed lease with no cacheExpiresAt (an original ttlMs of undefined) remains valid indefinitely", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-heal-no-ttl-"));
+        const cachePath = join(tempRoot, "cache.json");
+        const stateStore = new FileStateStore();
+        const cache = new FileCache<string>(stateStore, cachePath, undefined, 10_000);
+        const leasePath = computeLeasePathFor(cachePath, "k");
+
+        stateStore.write(leasePath, {
+          ownerId: "prior-owner",
+          expiresAt: Date.now() + 60_000,
+          completed: true,
+          value: "v"
+          // cacheExpiresAt deliberately omitted — the original computation requested no ttl at all.
+        });
+
+        const result = await cache.computeAndSet("k", () => {
+          throw new Error("must never recompute");
+        });
+        expect(result).toEqual({ value: "v", cached: true });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(cache.get("k")).toBe("v");
+      });
+
+      it("no regression: a genuinely fresh compute (no pre-existing lease) still gets a normal Date.now()+ttlMs window", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-lease-heal-fresh-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"), undefined, 10_000);
+        const result = await cache.computeAndSet("k", () => "fresh-value", 100);
+        expect(result).toEqual({ value: "fresh-value", cached: false });
+        expect(cache.get("k")).toBe("fresh-value");
+        await new Promise((resolve) => setTimeout(resolve, 130));
+        expect(cache.get("k")).toBeUndefined();
+      });
+    }
+  );
 });

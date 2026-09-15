@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { ApprovalWorkflow } from "../approval.js";
+import {
+  ApprovalWorkflow,
+  UnauthorizedApproverError,
+  SelfApprovalNotPermittedError
+} from "../approval.js";
 import { AuditLog, type AuditEvent, type AuditRecord } from "../../audit/audit-log.js";
 
 /**
@@ -94,6 +98,107 @@ describe("ApprovalWorkflow", () => {
         workflow.beginExecution("appr-1");
         const executed = workflow.completeExecution("appr-1");
         expect(executed.status).toBe("EXECUTED");
+      });
+    }
+  );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 1 (UASF-REQ-0019, UASF-REQ-0020, default-deny, " +
+      "'risk-5 Founder authority can be forged because caller-controlled decidedBy text is accepted')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: without an authorizedApprovers allowlist, ANY non-blank " +
+          "decidedBy string is still accepted (documents the pre-existing, intentionally preserved default " +
+          "behavior for the ~60 call sites that never opt in)",
+        () => {
+          const workflow = new ApprovalWorkflow(new AuditLog());
+          workflow.requestFor("appr-1", { actionType: "risky", risk: 5, description: "y" });
+          const approved = workflow.approve("appr-1", "totally-unverified-self-declared-founder");
+          expect(approved.status).toBe("APPROVED");
+        }
+      );
+
+      it(
+        "fix verification: when constructed with an authorizedApprovers allowlist, approve() with a " +
+          "decidedBy NOT in that list is rejected with UnauthorizedApproverError (fail-closed/default-deny)",
+        () => {
+          const workflow = new ApprovalWorkflow(new AuditLog(), ["founder@example.com"]);
+          workflow.requestFor("appr-1", { actionType: "risky", risk: 5, description: "y" });
+          expect(() => workflow.approve("appr-1", "attacker-forged-identity")).toThrow(UnauthorizedApproverError);
+          expect(workflow.get("appr-1")?.status).toBe("PENDING");
+        }
+      );
+
+      it(
+        "fix verification: when constructed with an authorizedApprovers allowlist, approve() with a " +
+          "decidedBy that IS a member (case/whitespace-insensitively) succeeds",
+        () => {
+          const workflow = new ApprovalWorkflow(new AuditLog(), ["founder@example.com"]);
+          workflow.requestFor("appr-1", { actionType: "risky", risk: 5, description: "y" });
+          const approved = workflow.approve("appr-1", "  Founder@Example.com  ");
+          expect(approved.status).toBe("APPROVED");
+        }
+      );
+
+      it(
+        "fix verification: reject() and requestChanges() are also gated by the authorizedApprovers " +
+          "allowlist when configured",
+        () => {
+          const workflow = new ApprovalWorkflow(new AuditLog(), ["founder@example.com"]);
+          workflow.requestFor("appr-1", { actionType: "risky", risk: 5, description: "y" });
+          workflow.requestFor("appr-2", { actionType: "risky", risk: 5, description: "y" });
+          expect(() => workflow.reject("appr-1", "not-the-founder")).toThrow(UnauthorizedApproverError);
+          expect(() => workflow.requestChanges("appr-2", "not-the-founder", "needs work")).toThrow(
+            UnauthorizedApproverError
+          );
+        }
+      );
+
+      it(
+        "fix verification: a requester can never approve its own request, even with a genuine non-blank " +
+          "identity and no allowlist configured (self-approval prevention, mirrors the phase-closure " +
+          "reviewer/requester-independence pattern)",
+        () => {
+          const workflow = new ApprovalWorkflow(new AuditLog());
+          workflow.requestFor(
+            "appr-1",
+            { actionType: "risky", risk: 5, description: "y" },
+            { requestedBy: "same-identity@example.com" }
+          );
+          expect(() => workflow.approve("appr-1", "same-identity@example.com")).toThrow(
+            SelfApprovalNotPermittedError
+          );
+          expect(workflow.get("appr-1")?.status).toBe("PENDING");
+        }
+      );
+
+      it(
+        "no regression: a DIFFERENT decidedBy than requestedBy still approves normally when no allowlist " +
+          "is configured",
+        () => {
+          const workflow = new ApprovalWorkflow(new AuditLog());
+          workflow.requestFor(
+            "appr-1",
+            { actionType: "risky", risk: 5, description: "y" },
+            { requestedBy: "requester@example.com" }
+          );
+          const approved = workflow.approve("appr-1", "reviewer@example.com");
+          expect(approved.status).toBe("APPROVED");
+        }
+      );
+
+      it("no regression: requests created via requestFor() without a requestedBy are unaffected by self-approval checks", () => {
+        const workflow = new ApprovalWorkflow(new AuditLog());
+        workflow.requestFor("appr-1", { actionType: "risky", risk: 5, description: "y" });
+        const approved = workflow.approve("appr-1", "anyone@example.com");
+        expect(approved.status).toBe("APPROVED");
+      });
+
+      it("no regression: the legacy request() method (never sets requestedBy) is unaffected by self-approval checks", () => {
+        const workflow = new ApprovalWorkflow(new AuditLog());
+        workflow.request("appr-1", "some action", 5);
+        const approved = workflow.approve("appr-1", "anyone@example.com");
+        expect(approved.status).toBe("APPROVED");
       });
     }
   );

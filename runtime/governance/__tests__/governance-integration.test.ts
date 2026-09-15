@@ -105,7 +105,12 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
       ledger,
       scopeLockPath,
       ledgerPath,
-      resolveHeadCommitSha: () => closingCommitSha
+      resolveHeadCommitSha: () => closingCommitSha,
+      // TR (BLOCKER 2 & 4 fix notları): bu geçici dizinin gerçek bir git
+      // checkout'u yok — bkz. `isEvidenceCommittedToRepositoryHead()`/
+      // `resolveWorkingTreeIsClean()`'in fix notları.
+      isEvidenceCommittedToHead: () => true,
+      isWorkingTreeClean: () => true
     };
     // P1 fix (independent Codex review, "phase verification and
     // independent review must use verified outcome artifacts", finding

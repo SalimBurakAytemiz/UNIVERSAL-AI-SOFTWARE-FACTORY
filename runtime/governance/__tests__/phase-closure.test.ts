@@ -176,7 +176,17 @@ describe("attemptPhaseClosure", () => {
       rootDir: tempRoot,
       scopeLockPath,
       ledgerPath,
-      resolveHeadCommitSha: () => DEFAULT_COMMIT_SHA
+      resolveHeadCommitSha: () => DEFAULT_COMMIT_SHA,
+      // TR (BLOCKER 2 fix notu): bkz. `isEvidenceCommittedToRepositoryHead()`'in
+      // fix notu — bu geçici dizinlerin gerçek bir git checkout'u yok, bu
+      // yüzden bu testlerin çoğunluğu "kanıt gerçekten commit edilmiş" diye
+      // varsayar; blocker 2'ye ÖZGÜ testler bunu açıkça `false` ile override
+      // eder (bkz. aşağısı).
+      isEvidenceCommittedToHead: () => true,
+      // TR (blocker 4 fix notu): bkz. `resolveWorkingTreeIsClean()`'in fix
+      // notu — AYNI nedenle (gerçek git checkout'u yok) override edilir;
+      // blocker 4'e ÖZGÜ testler bunu açıkça `false` ile override eder.
+      isWorkingTreeClean: () => true
     };
   }
 
@@ -2284,6 +2294,210 @@ describe("attemptPhaseClosure", () => {
         );
         expect(manifest.outcome).toBe("REJECTED");
         expect(manifest.rejectionReasons.some((r) => r.includes("can never also be its own independent reviewer"))).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 2 (UASF-REQ-0045, 'caller-authored JSON can fabricate an independent " +
+      "CLEAN review')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a genuinely matching evidence JSON file (content-authenticated " +
+          "against the claimed review, exactly as the prior round's fix required) is STILL rejected when it is " +
+          "not committed to the repository's trusted HEAD — the caller could have written it moments before " +
+          "calling attemptPhaseClosure()",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          const manifest = attemptPhaseClosure(
+            baseAttempt({
+              verificationEvidenceRefs: [evidenceRef()],
+              independentReview: reviewFor("CLEAN")
+            }),
+            "m-not-committed",
+            "d2",
+            { ...deps, isEvidenceCommittedToHead: () => false }
+          );
+          expect(manifest.outcome).toBe("REJECTED");
+          expect(manifest.rejectionReasons.some((r) => r.includes("is not committed to the repository's"))).toBe(true);
+        }
+      );
+
+      it("fix verification: the SAME evidence, once genuinely committed to the trusted HEAD, closes normally", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN")
+          }),
+          "m-committed",
+          "d2",
+          { ...deps, isEvidenceCommittedToHead: () => true }
+        );
+        expect(manifest.outcome).toBe("CLOSED");
+      });
+
+      it(
+        "no regression: the real (non-git-checkout) default of isEvidenceCommittedToHead fails closed rather " +
+          "than throwing an uncaught error, when this temp root genuinely has no git repository",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          // TR: burada `isEvidenceCommittedToHead` HİÇ override edilmez —
+          // gerçek varsayılan (`isEvidenceCommittedToRepositoryHead()`, gerçek
+          // `git cat-file -e`) bu geçici dizine karşı çalışır ve dizinin
+          // gerçek bir git deposu OLMADIĞI için `false` döner.
+          const { isEvidenceCommittedToHead, ...depsWithoutOverride } = deps;
+          void isEvidenceCommittedToHead;
+          const manifest = attemptPhaseClosure(
+            baseAttempt({
+              verificationEvidenceRefs: [evidenceRef()],
+              independentReview: reviewFor("CLEAN")
+            }),
+            "m-real-default",
+            "d2",
+            depsWithoutOverride
+          );
+          expect(manifest.outcome).toBe("REJECTED");
+          expect(manifest.rejectionReasons.some((r) => r.includes("is not committed to the repository's"))).toBe(true);
+        }
+      );
+    }
+  );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 4 (UASF-REQ-0045, 'a reviewed HEAD can still close while tracked " +
+      "working-tree changes exist')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: closure is REJECTED when the tracked working tree has " +
+          "uncommitted changes, even with otherwise-perfect evidence and a genuinely matching CLEAN review",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          const manifest = attemptPhaseClosure(
+            baseAttempt({
+              verificationEvidenceRefs: [evidenceRef()],
+              independentReview: reviewFor("CLEAN")
+            }),
+            "m-dirty-tree",
+            "d2",
+            { ...deps, isWorkingTreeClean: () => false }
+          );
+          expect(manifest.outcome).toBe("REJECTED");
+          expect(manifest.rejectionReasons.some((r) => r.includes("uncommitted changes relative to HEAD"))).toBe(true);
+          expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+        }
+      );
+
+      it("fix verification: a genuinely clean tracked working tree closes normally", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN")
+          }),
+          "m-clean-tree",
+          "d2",
+          { ...deps, isWorkingTreeClean: () => true }
+        );
+        expect(manifest.outcome).toBe("CLOSED");
+      });
+
+      it("no regression: repository working-tree cleanliness resolution failing fails closed rather than trusting the caller", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN")
+          }),
+          "m-tree-check-fails",
+          "d2",
+          {
+            ...deps,
+            isWorkingTreeClean: () => {
+              throw new Error("simulated: git not available");
+            }
+          }
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("could not be independently verified"))).toBe(true);
+      });
+    }
+  );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 5 (UASF-REQ-0010, UASF-REQ-0021, UASF-REQ-0045, 'malformed decision-ledger " +
+      "entries can be silently discarded during closure/save')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: a malformed persisted decision-ledger entry (missing " +
+          "decisionId) used to be silently skipped by the staleness check, letting closure's own saveTo() " +
+          "silently overwrite it; it must now fail closed instead",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          // TR: kalıcı Ledger dosyasına DOĞRUDAN, bozuk (decisionId'siz) bir
+          // kayıt yazılır — sanki başka bir süreç/bozulma bu kaydı üretmiş gibi.
+          deps.store.write(deps.ledgerPath, [{ status: "ACTIVE", reason: "some prior decision with no id" }]);
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({
+                verificationEvidenceRefs: [evidenceRef()],
+                independentReview: reviewFor("CLEAN")
+              }),
+              "m-malformed-ledger",
+              "d2",
+              deps
+            )
+          ).toThrow(/malformed record/);
+          // The phase must remain exactly as it was — no CLOSED claim, no
+          // manifest written, nothing silently lost.
+          expect(deps.scopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+          expect(existsSync(manifestPath(deps.manifestDir, "P0", "m-malformed-ledger"))).toBe(false);
+        }
+      );
+
+      it(
+        "BLOCKER regression: a non-object entry (e.g. a bare string) in the persisted decision-ledger array " +
+          "also fails closed rather than being silently skipped",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+          deps.store.write(deps.ledgerPath, ["not-a-decision-record"]);
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({
+                verificationEvidenceRefs: [evidenceRef()],
+                independentReview: reviewFor("CLEAN")
+              }),
+              "m-malformed-ledger-2",
+              "d2",
+              deps
+            )
+          ).toThrow(/malformed record/);
+        }
+      );
+
+      it("no regression: a genuinely well-formed, unrelated prior decision in the persisted ledger does not block closure", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        deps.ledger.record("d-unrelated", "OTHER", "some unrelated decision", "test-suite");
+        deps.ledger.saveTo(deps.store, deps.ledgerPath);
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN")
+          }),
+          "m-unrelated-decision-fine",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("CLOSED");
       });
     }
   );

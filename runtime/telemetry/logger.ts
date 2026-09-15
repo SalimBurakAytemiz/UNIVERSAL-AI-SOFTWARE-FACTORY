@@ -160,7 +160,36 @@ const URL_USERINFO_PATTERN = /(:\/\/[^/\s:@]+):([^/\s:@]+)@/g;
  * BLOCKER regressions (shell-quoted curl invocation; multi-component
  * Digest/AWS/Cookie values) continue to pass unchanged.
  */
-const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)((?:[^'\n]|'(?=[A-Za-z0-9]))+)/gi;
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 8 — UASF-REQ-0038, baseline
+ * §124/§307): `SECRET_ASSIGNMENT_PATTERN`'in BLOCKER 4 fix'iyle AYNI kök
+ * neden, farklı bir etiket için: eski desen `\b(authorization\s*:\s*)`,
+ * "authorization" kelimesinden HEMEN SONRA ayırıcının (`:`) geldiğini
+ * varsayıyordu — ama bir `JSON.stringify()` çıktısında anahtar KENDİSİ de
+ * tırnaklıdır: `"Authorization":"Bearer xyz"` — burada "Authorization"
+ * kelimesinden hemen sonra gelen karakter `:` DEĞİL, anahtarı KAPATAN
+ * tırnak işaretidir (`"`). Bu tek karakter yüzünden eski desen HİÇ
+ * EŞLEŞMİYOR, JSON-gömülü bir Authorization/Cookie değeri TAMAMEN
+ * redaksiyonsuz kalıyordu.
+ *
+ * Çözüm: `SECRET_ASSIGNMENT_PATTERN` ile AYNI iki parça — (1) etiket ile
+ * ayırıcı arasına, JSON'ın anahtar-kapama tırnağını tanıyan `(["']?)`
+ * eklenir; (2) DEĞER artık İKİ ayrı dal olarak eşleşir: JSON'ın kendi
+ * tırnaklı dize değerini (`(["'])((?:(?!\4)[^\\]|\\.)*)\4` — kapanış
+ * tırnağını doğru şekilde bulur, kaçışlı tırnakları/ters eğik çizgileri
+ * onurlandırır, ASLA değerin İÇİNDEKİ bir virgül/parantezde durmaz AMA
+ * ayrıca ASLA değerin kendi kapanış tırnağını AŞIP JSON'ın geri kalanını
+ * (bir sonraki anahtar/değer çiftini) yutmaz — "ordinary log context'i
+ * yok etmeden" gereğinin karşılığı budur) VEYA (mevcut, ZATEN test edilmiş
+ * düz-metin/apostrof-toleranslı dal, `(?:[^'\n]|'(?=[A-Za-z0-9]))+` —
+ * DEĞİŞTİRİLMEDEN korunur, ör. `Authorization: Digest ..., response="x"`
+ * gibi JSON-olmayan başlık biçimleri için). Yakalanan `valueQuote`, sonuçta
+ * DEĞERİN etrafında AYNEN korunur (bkz. `redactSecretsInString()`'ın
+ * değiştirme geri çağırması) — yalnızca değer gizlenir, JSON'ın
+ * sözdizimsel şekli olduğu gibi kalır.
+ */
+const AUTHORIZATION_HEADER_PATTERN =
+  /\b(authorization)(["']?)(\s*:\s*)(?:(["'])((?:(?!\4)[^\\]|\\.)*)\4|((?:[^'\n]|'(?=[A-Za-z0-9]))+))/gi;
 /**
  * P1 fix (29th independent review round, finding 4): same fix as
  * `AUTHORIZATION_HEADER_PATTERN` above, for the identical reason — the
@@ -175,7 +204,9 @@ const AUTHORIZATION_HEADER_PATTERN = /\b(authorization\s*:\s*)((?:[^'\n]|'(?=[A-
  * aware boundary fix as `AUTHORIZATION_HEADER_PATTERN` above, for the
  * identical reason (`Cookie: note=O'Connor; sessionid=SECRET`).
  */
-const COOKIE_HEADER_PATTERN = /\b(cookie\s*:\s*)((?:[^'\n]|'(?=[A-Za-z0-9]))+)/gi;
+/** TR (blocker 8 fix notu): bkz. `AUTHORIZATION_HEADER_PATTERN`'ın fix notu — AYNI JSON-anahtar/değer tırnak kaçışı, "cookie" etiketi için. */
+const COOKIE_HEADER_PATTERN =
+  /\b(cookie)(["']?)(\s*:\s*)(?:(["'])((?:(?!\4)[^\\]|\\.)*)\4|((?:[^'\n]|'(?=[A-Za-z0-9]))+))/gi;
 const BARE_BEARER_TOKEN_PATTERN = /\bbearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
 /**
  * P1 fix (37th independent review round, finding 7, "redact bare,
@@ -248,12 +279,24 @@ function redactSecretsInString(text: string): string {
     // portion after the header name, whatever scheme/format it uses,
     // BEFORE the narrower bare-Bearer pattern below runs (so it is never
     // double-matched/left partially redacted).
-    .replace(AUTHORIZATION_HEADER_PATTERN, "$1[REDACTED]")
+    .replace(
+      AUTHORIZATION_HEADER_PATTERN,
+      (_match, label: string, labelQuote: string, sep: string, valueQuote: string | undefined) =>
+        valueQuote !== undefined
+          ? `${label}${labelQuote}${sep}${valueQuote}[REDACTED]${valueQuote}`
+          : `${label}${labelQuote}${sep}[REDACTED]`
+    )
     // A bare "Bearer <token>" with no preceding "Authorization:" label —
     // e.g. copied directly from a header value into a log message.
     .replace(BARE_BEARER_TOKEN_PATTERN, "Bearer [REDACTED]")
     // "Cookie: <value>" headers (session identifiers, auth cookies).
-    .replace(COOKIE_HEADER_PATTERN, "$1[REDACTED]")
+    .replace(
+      COOKIE_HEADER_PATTERN,
+      (_match, label: string, labelQuote: string, sep: string, valueQuote: string | undefined) =>
+        valueQuote !== undefined
+          ? `${label}${labelQuote}${sep}${valueQuote}[REDACTED]${valueQuote}`
+          : `${label}${labelQuote}${sep}[REDACTED]`
+    )
     // Common "key = value" / "key: value" secret assignment forms embedded
     // anywhere in a larger string (e.g. inside a logged command line, a
     // dumped config snippet, or a raw request body excerpt) — including

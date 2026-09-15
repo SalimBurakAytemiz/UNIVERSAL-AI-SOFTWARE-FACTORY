@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { detectTraceabilityIssues, isOutcomeVerifiedEvidenceRef } from "../traceability.js";
+import { detectTraceabilityIssues, isOutcomeVerifiedEvidenceRef, isCommittedToRepositoryHead } from "../traceability.js";
 import { traceRequirements } from "../../cli/commands/trace-requirement.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -661,6 +661,68 @@ describe(
         repoRoot
       );
       expect(issues.map((i) => i.issue)).toEqual(["MISSING_PROOF_REFS"]);
+    });
+  }
+);
+
+describe(
+  "P0 CLOSURE REMEDIATION, blocker 3 (UASF-REQ-0045, 'a source test file plus caller-claimed PASS/" +
+    "verificationSource can be treated as execution evidence without proof the command actually ran')",
+  () => {
+    it(
+      "isCommittedToRepositoryHead: real default reproduction — a genuine, path-shaped, trusted-source " +
+        "evidence ref pointing at a real file in a NON-git directory is not committed to any HEAD",
+      () => {
+        const root = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker3-"));
+        try {
+          mkdirSync(join(root, "proofs"), { recursive: true });
+          writeFileSync(join(root, "proofs", "fabricated.test.ts"), "// never actually executed by anything");
+          const ref = {
+            path: "proofs/fabricated.test.ts",
+            type: "TEST_RESULT" as const,
+            outcome: "PASS",
+            verificationSource: "npm test (vitest)"
+          };
+          // TR: varsayılan (no-op) parametreyle mevcut davranış DEĞİŞMEZ —
+          // bu, sadece `isCommittedToRepositoryHead()`'in KENDİSİNİN gerçek
+          // git olmayan bir dizine karşı `false` döndüğünü kanıtlar.
+          expect(isCommittedToRepositoryHead(root, "proofs/fabricated.test.ts")).toBe(false);
+          // Ve default (no-op) parametreyle bu HÂLÂ true döner — bu turun
+          // kapsamı dışındaki çağıranlar (reality-matrix.ts, invariant-guard.ts)
+          // etkilenmesin diye.
+          expect(isOutcomeVerifiedEvidenceRef(ref, root)).toBe(true);
+          // Ama bir çağıran GERÇEK korumayı AÇIKÇA isterse (bkz.
+          // `phase-closure.ts`'in blocker-3 fix notu), reddedilir.
+          expect(isOutcomeVerifiedEvidenceRef(ref, root, isCommittedToRepositoryHead)).toBe(false);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it(
+      "fix verification: the SAME evidence ref, once genuinely committed to the repository's real HEAD " +
+        "(the actual VERIFIED_ARTIFACT_PATH file already tracked in this repo), passes the opt-in git-commit gate",
+      () => {
+        const ref = {
+          path: VERIFIED_ARTIFACT_PATH,
+          type: "TEST_RESULT" as const,
+          outcome: "PASS",
+          verificationSource: "npm test (vitest)"
+        };
+        expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot, isCommittedToRepositoryHead)).toBe(true);
+      }
+    );
+
+    it("no regression: an explicit isCommittedToHead override is honored exactly as injected, for both true and false", () => {
+      const ref = {
+        path: VERIFIED_ARTIFACT_PATH,
+        type: "TEST_RESULT" as const,
+        outcome: "PASS",
+        verificationSource: "npm test (vitest)"
+      };
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot, () => true)).toBe(true);
+      expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot, () => false)).toBe(false);
     });
   }
 );

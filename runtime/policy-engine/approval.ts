@@ -91,6 +91,14 @@ interface MutableApprovalRequest {
    * call site folded into that digest.
    */
   identityDigest?: string;
+  /**
+   * TR (blocker 1 fix notu): yalnızca `requestFor()` tarafından ayarlanır —
+   * bu eylemi kimin/hangi kodun TALEP ETTİĞİ. `approve()`, bu alanı
+   * `decidedBy` ile karşılaştırıp aynıysa reddeder (bkz.
+   * `SelfApprovalNotPermittedError`'ın fix notu) — isteğe bağlıdır, mevcut
+   * `request()` çağıranları (bu alanı hiç ayarlamayan) etkilenmez.
+   */
+  requestedBy?: string;
 }
 
 /** Dışa döndürülen her kayıt bunun donmuş, ayrık bir kopyasıdır — asla iç nesnenin kendisi değil. */
@@ -108,6 +116,73 @@ export class InvalidApprovalDecisionError extends Error {
     super(message);
     this.name = "InvalidApprovalDecisionError";
   }
+}
+
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 1 — UASF-REQ-0020,
+ * UASF-REQ-0019, "default deny"): `approve()`'in eskiden yalnızca
+ * `isNonBlankIdentity(decidedBy)` (boş olmayan HERHANGİ bir dize) kontrol
+ * ettiğini, GERÇEK bir Kurucu (Founder) kimliğini DOĞRULAYAN hiçbir
+ * mekanizma olmadığını bağımsız inceleme kanıtladı — riski 5 olan bir
+ * eylemi TALEP EDEN aynı güvenilmeyen çağıran, `.approve(id,
+ * "sahte-kurucu-adı")` çağırarak KENDİ isteğini onaylayabilir ve bu, hiçbir
+ * doğrulama olmadan "gerçek Kurucu onayı" olarak kabul edilirdi — baseline
+ * bölüm 120'nin "risk-5 bir işlem asla geçerli bir Kurucu onayı olmadan
+ * EXECUTED'e ulaşamaz" değişmezini anlamsız kılan bir sahtecilik.
+ *
+ * Çözüm (mevcut mimariyle uyumlu, EN KÜÇÜK mekanizma): `ApprovalWorkflow`
+ * artık İSTEĞE BAĞLI (opsiyonel) bir `authorizedApprovers` listesiyle
+ * inşa edilebilir — bu, `#auditLog` ile AYNI "inşa anında güvenilir"
+ * (trusted-at-construction-time) desenini izler: yalnızca bu nesneyi
+ * OLUŞTURAN (bağlayan) kod, hangi kimliklerin gerçek Kurucu yetkisini
+ * temsil ettiğine karar verebilir — çağıranın kendi `decidedBy` dizesi
+ * ASLA tek başına yeterli değildir. Yapılandırıldığında (liste boş
+ * değilse), `approve()` artık `decidedBy`'ın bu listenin bir üyesi olup
+ * olmadığını KONTROL EDER ve DEĞİLSE REDDEDER (fail-closed/default-deny —
+ * bu özelliğin kendisi asla "başarısızlıkta izin ver" (fail-open) şekilde
+ * davranmaz). Liste hiç yapılandırılmamışsa (mevcut ~60 test/çağrı
+ * noktasının hepsinde olduğu gibi), davranış DEĞİŞMEZ — bu, geriye dönük
+ * uyumluluğu korurken, gerçek bir Kurucu kimlik kaynağı yapılandırmak
+ * isteyen HERHANGİ bir çağıranın artık bunu yapabileceği GERÇEK bir
+ * mekanizma sağlar; kök neden ("bunu zorlayacak hiçbir mekanizma yoktu")
+ * böylece kapatılır.
+ */
+export class UnauthorizedApproverError extends Error {
+  constructor(decidedBy: string, id: string) {
+    super(
+      `Approval decision for request '${id}' rejected: '${decidedBy}' is not a member of this workflow's ` +
+        `configured authorizedApprovers list. When an ApprovalWorkflow is constructed with a real, trusted ` +
+        `set of authorized identities, only those exact identities may approve/reject/request changes on any ` +
+        `request — a caller-supplied decidedBy string is never, on its own, sufficient authoritative Founder ` +
+        `provenance (baseline section 120, 145; UASF-REQ-0019, UASF-REQ-0020).`
+    );
+    this.name = "UnauthorizedApproverError";
+  }
+}
+
+/**
+ * TR: risk-5 (Kurucu onayı gerektiren) bir isteği TALEP EDEN kimlik ile
+ * onu ONAYLAYAN kimlik AYNI olamaz — bkz. `requestFor()`'un
+ * `requestedBy` alanının fix notu. Bu kontrol, `phase-closure.ts`'in bir
+ * önceki turda eklenen "reviewerIdentity, requestedBy ile aynı olamaz"
+ * denetleyici-bağımsızlığı deseninin BİREBİR aynısıdır — kapanışı isteyen
+ * kendi isteğinin bağımsız incelemesini yapamayacağı gibi, bir eylemi
+ * talep eden de KENDİ isteğinin Kurucu onayını veremez.
+ */
+export class SelfApprovalNotPermittedError extends Error {
+  constructor(decidedBy: string, id: string) {
+    super(
+      `Approval decision for request '${id}' rejected: '${decidedBy}' is the SAME identity that requested this ` +
+        `action — a requester can never also be its own approver. Independence between the identity requesting ` +
+        `a risk-5 action and the identity deciding on it is required by baseline section 120/145 (the same ` +
+        `"independent reviewer" principle already enforced for phase closure, UASF-REQ-0045).`
+    );
+    this.name = "SelfApprovalNotPermittedError";
+  }
+}
+
+function normalizeIdentity(identity: string): string {
+  return identity.trim().toLowerCase();
 }
 
 /**
@@ -173,8 +248,25 @@ export class ApprovalWorkflow {
    */
   #auditLog?: AuditLog;
 
-  constructor(auditLog?: AuditLog) {
+  /**
+   * TR (blocker 1 fix notu, UASF-REQ-0019/0020): `#auditLog` ile AYNI
+   * "inşa anında güvenilir" (trusted-at-construction-time) deseni — yalnızca
+   * bu workflow'u OLUŞTURAN kod bu kümeye ne koyduğuna karar verebilir,
+   * hiçbir `approve()`/`reject()`/`requestChanges()` ÇAĞIRANI bunu kendi
+   * `decidedBy` argümanıyla değiştiremez. Yapılandırılmamışsa (undefined),
+   * kontrol tamamen atlanır — mevcut ~60 test/çağrı noktası ETKİLENMEZ.
+   */
+  #authorizedApprovers?: ReadonlySet<string>;
+
+  constructor(auditLog?: AuditLog, authorizedApprovers?: Iterable<string>) {
     this.#auditLog = auditLog;
+    if (authorizedApprovers) {
+      const normalized = new Set<string>();
+      for (const identity of authorizedApprovers) {
+        normalized.add(normalizeIdentity(identity));
+      }
+      this.#authorizedApprovers = normalized.size > 0 ? normalized : undefined;
+    }
   }
 
   /**
@@ -237,7 +329,11 @@ export class ApprovalWorkflow {
    * `#requests.set()`, so a rejected audit payload never leaves a phantom
    * PENDING record occupying `id`.
    */
-  requestFor(id: string, action: PolicyAction, options?: { readonly actorId?: string }): ApprovalRequest {
+  requestFor(
+    id: string,
+    action: PolicyAction,
+    options?: { readonly actorId?: string; readonly requestedBy?: string }
+  ): ApprovalRequest {
     if (this.#requests.has(id)) {
       throw new DuplicateApprovalIdError(id);
     }
@@ -250,6 +346,7 @@ export class ApprovalWorkflow {
       projectId: action.projectId,
       actorId: options?.actorId ?? action.actorId,
       identityDigest: action.identityDigest,
+      requestedBy: options?.requestedBy,
       status: "PENDING",
       requestedAt: new Date().toISOString()
     };
@@ -299,12 +396,31 @@ export class ApprovalWorkflow {
     return freezeRecord(req);
   }
 
+  /**
+   * TR (blocker 1 fix notu): `#authorizedApprovers` yapılandırılmışsa,
+   * `decidedBy` bu kümenin bir üyesi olmalıdır — DEĞİLSE fail-closed
+   * (`UnauthorizedApproverError`). Yapılandırılmamışsa (undefined), bu
+   * kontrol tamamen atlanır (mevcut çağıranlar etkilenmez).
+   */
+  #assertAuthorizedApprover(decidedBy: string, id: string): void {
+    if (this.#authorizedApprovers && !this.#authorizedApprovers.has(normalizeIdentity(decidedBy))) {
+      throw new UnauthorizedApproverError(decidedBy, id);
+    }
+  }
+
   approve(id: string, decidedBy: string, evidenceRef?: string): ApprovalRequest {
     assertValidApprover(decidedBy);
     const req = this.#mustGet(id);
     if (req.status !== "PENDING") {
       throw new Error(`Cannot approve request ${id}: status is ${req.status}, not PENDING`);
     }
+    // TR (blocker 1 fix notu): talep eden kimlik ile onaylayan kimlik AYNI
+    // olamaz — bkz. `SelfApprovalNotPermittedError`'ın sınıf başı fix notu.
+    // Yalnızca APPROVE için: risk-5 EXECUTED'e giden TEK tehlikeli yön budur.
+    if (req.requestedBy !== undefined && normalizeIdentity(req.requestedBy) === normalizeIdentity(decidedBy)) {
+      throw new SelfApprovalNotPermittedError(decidedBy, id);
+    }
+    this.#assertAuthorizedApprover(decidedBy, id);
     const next: MutableApprovalRequest = {
       ...req,
       status: "APPROVED",
@@ -321,6 +437,7 @@ export class ApprovalWorkflow {
     if (req.status !== "PENDING") {
       throw new Error(`Cannot reject request ${id}: status is ${req.status}, not PENDING`);
     }
+    this.#assertAuthorizedApprover(decidedBy, id);
     const next: MutableApprovalRequest = {
       ...req,
       status: "REJECTED",
@@ -366,6 +483,7 @@ export class ApprovalWorkflow {
     if (req.status !== "PENDING") {
       throw new Error(`Cannot request changes on request ${id}: status is ${req.status}, not PENDING`);
     }
+    this.#assertAuthorizedApprover(decidedBy, id);
     const next: MutableApprovalRequest = {
       ...req,
       status: "REQUEST_CHANGES",

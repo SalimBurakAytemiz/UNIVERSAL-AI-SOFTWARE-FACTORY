@@ -166,6 +166,20 @@ export function resolveTrustedRepositoryHeadSha(rootDir: string): string {
   return sha;
 }
 
+/**
+ * TR (blocker 4 fix notu): `resolveTrustedRepositoryHeadSha()` ile AYNI
+ * güvenilir kaynak (git) — izlenen (tracked) dosyalarda commit edilmemiş
+ * değişiklik olup olmadığını sorar. `--untracked-files=no`, izlenmeyen
+ * dosyaları KASITLI OLARAK dışarıda bırakır (bkz. çağıranın fix notu).
+ */
+export function resolveWorkingTreeIsClean(rootDir: string): boolean {
+  const output = execFileSync("git", ["status", "--porcelain", "--untracked-files=no"], {
+    cwd: rootDir,
+    encoding: "utf8"
+  });
+  return output.trim().length === 0;
+}
+
 export type IndependentReviewResult = "CLEAN" | "PENDING" | "FOUND_ISSUES";
 export type PhaseClosureOutcome = "CLOSED" | "REJECTED";
 
@@ -325,6 +339,23 @@ export interface AttemptPhaseClosureDeps {
    * default — every genuine call site should leave this unset.
    */
   readonly lockOptions?: FileLockOptions;
+  /**
+   * TR (blocker 2 fix notu): bağımsız incelemenin evidenceRef'inin GERÇEKTEN
+   * güvenilir HEAD'e commit edilmiş olduğunu doğrular — bkz.
+   * `isEvidenceCommittedToRepositoryHead()`'in fix notu. Varsayılan: gerçek
+   * `git cat-file -e`. Yalnızca testlerin gerçek bir git checkout'u olmayan
+   * geçici dizinlerde bu geçidi deterministik çalıştırabilmesi için
+   * override edilebilir; gerçek hiçbir çağrı noktası bunu değiştirmemelidir.
+   */
+  readonly isEvidenceCommittedToHead?: (rootDir: string, headSha: string, relativePath: string) => boolean;
+  /**
+   * TR (blocker 4 fix notu): bkz. `resolveWorkingTreeIsClean()`'in fix
+   * notu. Varsayılan: gerçek `git status --porcelain`. Yalnızca testlerin
+   * gerçek bir git checkout'u olmayan geçici dizinlerde bu geçidi
+   * deterministik çalıştırabilmesi için override edilebilir; gerçek hiçbir
+   * çağrı noktası bunu değiştirmemelidir.
+   */
+  readonly isWorkingTreeClean?: (rootDir: string) => boolean;
 }
 
 const SAFE_GOVERNANCE_IDENTIFIER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
@@ -540,10 +571,51 @@ function isGenuineIndependentReviewRecord(value: unknown): value is IndependentR
  * bir deneme AYNI bu fonksiyondan geçer — ikinci, farklı kapsamlı bir kopya
  * asla oluşturulmaz (bu dosyanın genel tasarım ilkesi: "tek yetkili geçit").
  */
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 2 — UASF-REQ-0045): bir
+ * önceki turun `isContentAuthenticatedIndependentReview()` fix'i, kanıt
+ * dosyasının İÇERİĞİNİN iddia edilen inceleme alanlarıyla EŞLEŞTİĞİNİ
+ * doğruluyordu — ama bağımsız inceleme şunu kanıtladı: hem o JSON dosyasını
+ * HEM DE onu iddia eden `IndependentReviewEvidence` nesnesini AYNI çağıran
+ * (kapanışı isteyen SÜREÇ) `attemptPhaseClosure()`'ı çağırmadan HEMEN ÖNCE
+ * kendisi yazabilir — "içerik eşleşiyor" kontrolü, sahte bir iddiayı sahte
+ * bir dosyayla tutarlı hale getirmekten daha fazlasını KANITLAMAZ. Kanıt
+ * dosyasının GERÇEKTEN bağımsız bir kaynaktan geldiğini gösteren TEK var
+ * olan güvenilir birincil (primitive) bu depoda: git'in kendi commit
+ * geçmişi (bkz. `resolveTrustedRepositoryHeadSha()`'ın AYNI güven deseni).
+ * Çözüm: inceleme kanıtı artık yalnızca diskte VAR OLMakla kalmayıp, deponun
+ * GÜVENİLİR HEAD'ine GERÇEKTEN COMMIT EDİLMİŞ olmalıdır (`git cat-file -e
+ * <headSha>:<yol>`) — bu, kapanışı isteyen sürecin, çağrıdan hemen önce
+ * sıradan bir dosya yazıp onu "bağımsız inceleme kanıtı" olarak sunmasını
+ * engeller: sahte bir kanıt üretmek artık kalıcı, yazar/zaman damgalı bir
+ * git commit'i GEREKTİRİR (Blocker 4'ün "kirli çalışma ağacı reddedilir"
+ * kontrolüyle birlikte düşünüldüğünde, kapanış anındaki çalışma ağacı zaten
+ * HEAD ile birebir aynı olmalıdır — yani buradaki "commit edilmiş" kontrolü
+ * "diskte var olan" ile "depoda kalıcı olan" arasındaki farkı GERÇEKTEN
+ * anlamlı kılar). `resolveHeadSha`/`isEvidenceCommittedToHead`,
+ * `resolveTrustedRepositoryHeadSha()`'ın kendisiyle AYNI nedenle (testlerin
+ * gerçek bir git checkout'u olmayan geçici dizinlerde bu geçidi
+ * deterministik çalıştırabilmesi için) enjekte edilebilir tutulur — gerçek
+ * hiçbir çağrı noktası bunu override ETMEMELİDİR.
+ */
+function isEvidenceCommittedToRepositoryHead(rootDir: string, headSha: string, relativePath: string): boolean {
+  try {
+    execFileSync("git", ["cat-file", "-e", `${headSha}:${relativePath}`], {
+      cwd: rootDir,
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isContentAuthenticatedIndependentReview(
   review: IndependentReviewEvidence,
   rootDir: string,
-  store: StateStore
+  store: StateStore,
+  resolveHeadSha: (rootDir: string) => string,
+  isEvidenceCommittedToHead: (rootDir: string, headSha: string, relativePath: string) => boolean
 ): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
   if (typeof review.evidenceRef === "string") {
     return {
@@ -560,6 +632,13 @@ function isContentAuthenticatedIndependentReview(
       reason: `independent review evidenceRef must have type 'REVIEW_RESULT', got '${review.evidenceRef.type}'`
     };
   }
+  // TR: burada `isAuthenticatedVerificationArtifact()`'a git-commit
+  // kontrolünü KASITLI OLARAK enjekte ETMİYORUZ (varsayılan no-op kalır) —
+  // bu inceleme kanıtı için git-commit doğrulaması zaten birazdan, DAHA
+  // ÖZGÜL bir hata mesajıyla (`isEvidenceCommittedToHead`, bkz. aşağısı)
+  // ayrıca yapılıyor; ikisini AYNI ANDA enjekte etmek yalnızca hangi
+  // kontrolün önce başarısız olacağına bağlı olarak daha az açıklayıcı bir
+  // hata mesajı üretir, güvenliği artırmaz.
   if (!isAuthenticatedVerificationArtifact(review.evidenceRef, rootDir)) {
     return {
       ok: false,
@@ -588,6 +667,30 @@ function isContentAuthenticatedIndependentReview(
         "independent review evidenceRef must reference a JSON evidence record whose content genuinely attests " +
         "the claimed review (reviewId/reviewerIdentity/reviewedCommitSha/reviewTimestamp/outcome) — a source or " +
         "test file's mere existence on disk proves nothing about what any review actually concluded"
+    };
+  }
+
+  // TR (blocker 2 fix notu): kanıt dosyası, çağıranın kendi anlık disk
+  // yazmasından ayırt edilemeyen bir şey değil, deponun GÜVENİLİR HEAD'ine
+  // GERÇEKTEN commit edilmiş olmalıdır — bkz. üstteki
+  // `isEvidenceCommittedToRepositoryHead()`'in fix notu.
+  let headSha: string;
+  try {
+    headSha = resolveHeadSha(rootDir);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `repository identity could not be independently verified from a trusted source: ${String(err)}`
+    };
+  }
+  if (!isEvidenceCommittedToHead(rootDir, headSha, review.evidenceRef.path)) {
+    return {
+      ok: false,
+      reason:
+        `independent review evidenceRef at '${review.evidenceRef.path}' is not committed to the repository's ` +
+        `trusted HEAD revision ('${headSha}') — an untracked or merely-written-to-disk file proves nothing about ` +
+        `a review genuinely performed by anyone other than the closure caller itself; independent review evidence ` +
+        `must be durable, git-committed history, never a file the caller can write moments before closing`
     };
   }
 
@@ -661,6 +764,8 @@ function evaluateClosureAttempt(
     // gerekli — bkz. o fonksiyonun üstündeki fix notu.
     readonly store: StateStore;
     readonly resolveHeadCommitSha?: (rootDir: string) => string;
+    readonly isEvidenceCommittedToHead?: (rootDir: string, headSha: string, relativePath: string) => boolean;
+    readonly isWorkingTreeClean?: (rootDir: string) => boolean;
   }
 ): { readonly rejectionReasons: string[]; readonly guardReport: InvariantGuardReport; readonly realityMatrix: RealityMatrixSummary } {
   const rejectionReasons: string[] = [];
@@ -677,7 +782,21 @@ function evaluateClosureAttempt(
     // sufficient here — bkz. `IndependentReviewEvidence.evidenceRef`'in
     // fix notu. Reuses the SAME, finding-3-hardened Evidence Gate every
     // other outcome claim in this codebase now goes through.
-    const unresolved = attempt.verificationEvidenceRefs.filter((ref) => !isOutcomeVerifiedEvidenceRef(ref, deps.rootDir));
+    // TR (blocker 3 fix notu): `isOutcomeVerifiedEvidenceRef()` artık
+    // KENDİSİ de bir git-commit doğrulaması yapıyor — bu fonksiyonun
+    // ZATEN sahip olduğu `resolveHeadCommitSha`/`isEvidenceCommittedToHead`
+    // mekanizmasına adapte edilir.
+    const isCommittedToHeadAdapter = (candidateRootDir: string, relativePath: string): boolean => {
+      try {
+        const headSha = (deps.resolveHeadCommitSha ?? resolveTrustedRepositoryHeadSha)(candidateRootDir);
+        return (deps.isEvidenceCommittedToHead ?? isEvidenceCommittedToRepositoryHead)(candidateRootDir, headSha, relativePath);
+      } catch {
+        return false;
+      }
+    };
+    const unresolved = attempt.verificationEvidenceRefs.filter(
+      (ref) => !isOutcomeVerifiedEvidenceRef(ref, deps.rootDir, isCommittedToHeadAdapter)
+    );
     if (unresolved.length > 0) {
       rejectionReasons.push(
         `${unresolved.length} verification evidence reference(s) are not outcome-verified, trusted evidence ` +
@@ -760,7 +879,13 @@ function evaluateClosureAttempt(
         `reviewer; independence requires a genuinely distinct reviewer identity`
     );
   } else {
-    const contentCheck = isContentAuthenticatedIndependentReview(review, deps.rootDir, deps.store);
+    const contentCheck = isContentAuthenticatedIndependentReview(
+      review,
+      deps.rootDir,
+      deps.store,
+      deps.resolveHeadCommitSha ?? resolveTrustedRepositoryHeadSha,
+      deps.isEvidenceCommittedToHead ?? isEvidenceCommittedToRepositoryHead
+    );
     if (!contentCheck.ok) {
       // P1 fix (independent Codex review, finding 4) + BLOCKER 2 fix
       // (bkz. `isContentAuthenticatedIndependentReview()`'in üstündeki fix
@@ -801,6 +926,37 @@ function evaluateClosureAttempt(
     }
   } catch (err) {
     rejectionReasons.push(`repository identity could not be independently verified from a trusted source: ${String(err)}`);
+  }
+
+  // TR (P0 CLOSURE REMEDIATION fix notu, blocker 4 — UASF-REQ-0045):
+  // bağımsız incelenmiş bir HEAD hâlâ, izlenen (tracked) dosyalarda commit
+  // edilmemiş değişiklikler varken kapanabiliyordu — bağımsız inceleme,
+  // İNCELENEN durumla (git HEAD'in commit edilmiş içeriği) kapanışın
+  // GERÇEKTE bağlandığı durumun (disk üzerindeki, henüz commit edilmemiş
+  // değişiklikleri de içerebilen çalışma ağacı) AYNI ŞEY olmayabileceğini
+  // gösterdi — bir inceleyici HEAD'i inceler, ama kapanışı isteyen taraf bu
+  // arada izlenen dosyalarda sessizce DEĞİŞİKLİK yapmış olabilir; kapanış
+  // yine de "incelenen HEAD kapatılıyor" diye iddia ederdi. Çözüm: kapanış,
+  // izlenen çalışma ağacının GİT HEAD'İYLE BİREBİR AYNI olduğunu (`git
+  // status --porcelain --untracked-files=no` boş çıktı verir) doğrular —
+  // izlenmeyen (untracked) dosyalar kasıtlı olarak YOK SAYILIR (ör. build
+  // çıktıları, scratch dosyaları asla "izlenen, incelenmiş durum" iddiasının
+  // bir parçası değildir). Bu, Blocker 2'nin git-commit kanıt kontrolüyle
+  // BİRLİKTE düşünüldüğünde anlamlıdır: çalışma ağacı GERÇEKTEN temizse,
+  // diskteki herhangi bir dosyayı okumak İLE onu git HEAD'inden okumak
+  // ÖZDEŞTİR — "incelenen" ile "kapatılan" arasında sessiz bir sapma
+  // imkânsız hâle gelir.
+  try {
+    if (!(deps.isWorkingTreeClean ?? resolveWorkingTreeIsClean)(deps.rootDir)) {
+      rejectionReasons.push(
+        "the repository's tracked working tree has uncommitted changes relative to HEAD — a phase closure must " +
+          "bind the reviewed, closing commit to the ACTUAL state being closed; an independent review of HEAD " +
+          "proves nothing about tracked files that have since (or concurrently) been modified on disk but never " +
+          "committed. Commit or discard tracked changes before attempting closure."
+      );
+    }
+  } catch (err) {
+    rejectionReasons.push(`repository working-tree cleanliness could not be independently verified: ${String(err)}`);
   }
 
   return { rejectionReasons, guardReport, realityMatrix };
@@ -899,6 +1055,42 @@ function governanceStateLockPath(scopeLockPath: string): string {
  * `DuplicateClosureManifestError` already establishes for the sibling
  * manifest-identity race (finding 8 of the prior closure round).
  */
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 5 — UASF-REQ-0010,
+ * UASF-REQ-0021, UASF-REQ-0045): `assertGovernanceStateNotStale()` ve
+ * `assertLedgerStateNotStale()` (aşağısı), kalıcı dosyadaki HER kaydı
+ * döngüyle gezerken, kayıt beklenen ŞEKİLDE DEĞİLSE (obje değil, `null`,
+ * veya `phaseId`/`decisionId` alanı bir dize değilse) o kaydı sessizce
+ * `continue` ile ATLIYORDU — sanki hiç var olmamış gibi. Bağımsız inceleme
+ * şunu gösterdi: bu, bozuk/beklenmedik şekilli bir kaydı "yok" ile
+ * KARIŞTIRIR — ve bu fonksiyonların TEK amacı, birazdan çalışacak
+ * `ledger.saveTo()`/`scopeLock.saveTo()`'nun kalıcı dosyadaki bir kaydı
+ * SESSİZCE ÜZERİNE YAZMASINI engellemektir. Bozuk bir kayıt atlanınca, bu
+ * koruma o kayıt için TAMAMEN DEVRE DIŞI kalır — takip eden `saveTo()`,
+ * çağıranın o kaydı hiç bilmeyen bellek-içi görünümünü yazar ve bozuk kayıt
+ * (kim bilir hangi yetkili Founder kararını/scope-lock durumunu temsil
+ * ediyordu) KALICI OLARAK KAYBOLUR, hiçbir hata/uyarı olmadan. Kök neden:
+ * "karşılaştırılamayan kayıt" ile "kayıt yok" birbirine karıştırılmıştı.
+ * Çözüm: HERHANGİ bir kaydın beklenen şekle uymaması artık `continue`
+ * DEĞİL, fail-closed bir istisna fırlatır — ne saveTo() çağrılır ne de
+ * bozuk kayıt sessizce silinir; çağıran, kalıcı dosyayı onarmak/kurtarmak
+ * zorunda kalır.
+ */
+export class MalformedGovernanceRecordError extends Error {
+  constructor(kind: "scope-lock" | "decision-ledger", path: string, raw: unknown) {
+    super(
+      `Refusing to persist a governance-state transition: the persisted ${kind} file at '${path}' contains a ` +
+        `malformed record (${JSON.stringify(raw)}) that cannot be safely checked for staleness. A malformed ` +
+        `authoritative governance record must never be silently skipped or discarded — doing so would let a ` +
+        `subsequent save silently overwrite it with an in-memory snapshot that never knew it existed, permanently ` +
+        `losing whatever Founder decision or scope-lock history it represented. Fail closed: repair or manually ` +
+        `recover the persisted file before retrying (baseline section 147; UASF-REQ-0010, UASF-REQ-0021, ` +
+        `UASF-REQ-0045).`
+    );
+    this.name = "MalformedGovernanceRecordError";
+  }
+}
+
 export class ConcurrentGovernanceStateChangedError extends Error {
   constructor(context: string) {
     super(
@@ -946,11 +1138,11 @@ function assertGovernanceStateNotStale(store: StateStore, scopeLockPath: string,
   }
   for (const raw of persisted) {
     if (typeof raw !== "object" || raw === null) {
-      continue;
+      throw new MalformedGovernanceRecordError("scope-lock", scopeLockPath, raw);
     }
     const candidate = raw as { phaseId?: unknown; state?: unknown; decisionId?: unknown };
     if (typeof candidate.phaseId !== "string") {
-      continue;
+      throw new MalformedGovernanceRecordError("scope-lock", scopeLockPath, raw);
     }
     const known = scopeLock.get(candidate.phaseId);
     if (!known || known.state !== candidate.state || known.decisionId !== candidate.decisionId) {
@@ -1000,11 +1192,11 @@ function assertLedgerStateNotStale(store: StateStore, ledgerPath: string, ledger
   }
   for (const raw of persisted) {
     if (typeof raw !== "object" || raw === null) {
-      continue;
+      throw new MalformedGovernanceRecordError("decision-ledger", ledgerPath, raw);
     }
     const candidate = raw as { decisionId?: unknown; status?: unknown; supersededBy?: unknown };
     if (typeof candidate.decisionId !== "string") {
-      continue;
+      throw new MalformedGovernanceRecordError("decision-ledger", ledgerPath, raw);
     }
     const known = ledger.get(candidate.decisionId);
     if (!known || known.status !== candidate.status || known.supersededBy !== candidate.supersededBy) {
@@ -1273,6 +1465,15 @@ export interface RecoverPendingPhaseClosureDeps {
    * genuine call site should leave this unset.
    */
   readonly lockOptions?: FileLockOptions;
+  /**
+   * TR (blocker 2 fix notu): bkz. `AttemptPhaseClosureDeps`'in AYNI alanının
+   * fix notu — `evaluateClosureAttempt()`'in tek yetkili geçidi her iki
+   * çağıran (`attemptPhaseClosure()`/`recoverPendingPhaseClosure()`) için de
+   * AYNI şekilde çalışmalıdır.
+   */
+  readonly isEvidenceCommittedToHead?: (rootDir: string, headSha: string, relativePath: string) => boolean;
+  /** TR (blocker 4 fix notu): bkz. `AttemptPhaseClosureDeps`'in AYNI alanının fix notu. */
+  readonly isWorkingTreeClean?: (rootDir: string) => boolean;
 }
 
 /**

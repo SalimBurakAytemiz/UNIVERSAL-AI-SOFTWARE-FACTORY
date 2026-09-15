@@ -15,6 +15,8 @@ function findRepoRootForTest(startDir: string): string {
 }
 const REAL_REPO_ROOT = findRepoRootForTest(dirname(fileURLToPath(import.meta.url)));
 const REAL_REQUIREMENTS_DIR = join(REAL_REPO_ROOT, "specification", "requirements");
+const tsxBin = join(REAL_REPO_ROOT, "node_modules", ".bin", "tsx");
+const bootstrapLockWorkerPath = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "bootstrap-lock-worker.ts");
 import {
   bootstrapProject,
   computeScaffoldActionIdentityDigest,
@@ -29,6 +31,7 @@ import { createDefaultModelRegistry, ModelRegistry } from "../../models/registry
 import { InvalidProjectGenomeError } from "../../project-genome/genome.js";
 import { FileStateStore, type StateStore } from "../../state/file-store.js";
 import { FileCache } from "../../cache/file-cache.js";
+import { spawn } from "node:child_process";
 import { InvalidProjectIdError, PathEscapeError, assertWithinRoot } from "../../sandbox/sandbox.js";
 import { CostEngine } from "../../cost/cost-engine.js";
 import { BudgetExceededError, InvalidBudgetLimitError, type BudgetLimits } from "../../budget/budget.js";
@@ -3064,9 +3067,114 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
             })
           ]);
 
-          expect(invocationCount).toBe(2);
+    expect(invocationCount).toBe(2);
           expect(resultA.totalCostUsd).toBe(0.6);
           expect(resultB.totalCostUsd).toBe(0.6);
+        },
+        10_000
+      );
+    }
+  );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 6 (UASF-REQ-0042, 'concurrent WEB/GAME bootstrapProject() calls can " +
+      "leave mixed-generation genome.json, organization.json and bootstrap.json while recording SUCCESS')",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: bootstrapProject() genuinely acquires a PROJECT-SCOPED " +
+          "exclusive lock around its entire scaffold+write critical section — a call cannot proceed past it " +
+          "while a REAL second OS process holds the same lock. Without this, the model-invocation lease alone " +
+          "(which only serializes the paid provider call, not the subsequent scaffold + genome/organization/" +
+          "bootstrap.json writes) leaves that write phase completely unprotected, exactly the gap independent " +
+          "review found. `acquireFileLock()`'s own wait is a genuinely blocking synchronous loop (`Atomics.wait`), " +
+          "so a single in-process simulation cannot exercise this — a real child process is required (mirrors " +
+          "the SAME `tsx`-spawned-worker pattern runtime/cache/__tests__/file-cache.cross-process.test.ts " +
+          "already established for file-lock.ts's own cross-process regressions)",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap6-lock-contention-"));
+          const projectId = "proj-blocker6-lock-contended";
+          // TR: `orchestrator.ts`'in KENDİSİNİN `bootstrapLockPath` için
+          // kullandığı AYNI türetme — `assertFilesystemConfinement(baseDir,
+          // \`${projectId}.bootstrap.lock\`)` — burada `baseDir` zaten
+          // temiz bir geçici dizin olduğundan sonuç düz `join()` ile
+          // birebir aynıdır.
+          const lockPath = join(tempRoot, `${projectId}.bootstrap.lock`);
+          const holdMs = 300;
+          const child = spawn(tsxBin, [bootstrapLockWorkerPath, lockPath, String(holdMs)], {
+            stdio: ["ignore", "pipe", "pipe"]
+          });
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error("worker did not report LOCK_ACQUIRED in time")), 5000);
+              child.stdout?.on("data", (chunk: Buffer) => {
+                if (chunk.toString().includes("LOCK_ACQUIRED")) {
+                  clearTimeout(timer);
+                  resolve();
+                }
+              });
+              child.on("error", (err) => {
+                clearTimeout(timer);
+                reject(err);
+              });
+            });
+
+            const policy = new PolicyEngine();
+            policy.addRule(lowRiskAllowRule(2));
+            const modelGateway = new ModelGateway();
+            modelGateway.registerProvider(new MockProvider());
+
+            const startedAt = Date.now();
+            const result = await bootstrapProject({
+              genomeCandidate: validGenome(projectId),
+              baseDir: tempRoot,
+              policy,
+              modelRegistry: createDefaultModelRegistry(),
+              modelGateway
+            });
+            const elapsedMs = Date.now() - startedAt;
+
+            // A correct implementation genuinely BLOCKS until the real
+            // child process releases its lock — elapsed time must be at
+            // least close to the child's hold duration. Without the fix,
+            // bootstrapProject() never touches this lock file at all and
+            // would complete almost instantly, regardless of the child.
+            expect(elapsedMs).toBeGreaterThanOrEqual(holdMs - 50);
+            expect(result.genome.project.id).toBe(projectId);
+            expect(existsSync(join(tempRoot, projectId, "state", "bootstrap.json"))).toBe(true);
+          } finally {
+            child.kill("SIGKILL");
+          }
+        },
+        15_000
+      );
+
+      it(
+        "no-regression: two concurrent bootstrapProject() calls for the SAME project (no external lock holder) " +
+          "both eventually succeed — the new project-scoped lock serializes them without deadlocking or " +
+          "rejecting a legitimate concurrent bootstrap outright",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap6-no-deadlock-"));
+          const projectId = "proj-blocker6-no-deadlock";
+          const policy = new PolicyEngine();
+          policy.addRule(lowRiskAllowRule(2));
+          const modelGateway = new ModelGateway();
+          modelGateway.registerProvider(new MockProvider());
+
+          const makeInput = (): BootstrapProjectInput => ({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway
+          });
+
+          const [resultA, resultB] = await Promise.all([bootstrapProject(makeInput()), bootstrapProject(makeInput())]);
+          expect(resultA.genome.project.id).toBe(projectId);
+          expect(resultB.genome.project.id).toBe(projectId);
+          const bootstrapState = JSON.parse(
+            readFileSync(join(tempRoot, projectId, "state", "bootstrap.json"), "utf8")
+          ) as { status: string };
+          expect(bootstrapState.status).toBe("BOOTSTRAP_COMPLETE");
         },
         10_000
       );

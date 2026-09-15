@@ -969,4 +969,95 @@ describe("Logger", () => {
       });
     }
   );
+
+  describe(
+    "P0 CLOSURE REMEDIATION, blocker 8 (UASF-REQ-0038, 'JSON-string messages redact password but still leak " +
+      "Authorization and Cookie values')",
+    () => {
+      it("BLOCKER regression 1/5, exact reproduction: a JSON-embedded Authorization header value must be redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: JSON.stringify({ Authorization: "Bearer synthetic-review-token" }) // secret-scan:allow (fake fixture value)
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-token");
+        expect(line).toContain("[REDACTED]");
+        // The surrounding JSON syntax (quotes, colon, label) is preserved.
+        expect(line).toContain('\\"Authorization\\":\\"[REDACTED]\\"');
+      });
+
+      it("BLOCKER regression 2/5, exact reproduction: a JSON-embedded Cookie header value must be redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: JSON.stringify({ Cookie: "sessionid=synthetic-review-session" }) // secret-scan:allow (fake fixture value)
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-session");
+        expect(line).toContain("[REDACTED]");
+        expect(line).toContain('\\"Cookie\\":\\"[REDACTED]\\"');
+      });
+
+      it("BLOCKER regression 3/5: a JSON-embedded Authorization value alongside other, ordinary fields on the SAME line does not swallow the rest of the JSON object", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: JSON.stringify({
+            Authorization: "Bearer synthetic-review-token", // secret-scan:allow (fake fixture value)
+            requestId: "req-widget-42",
+            status: "ok"
+          })
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-token");
+        expect(line).toContain("[REDACTED]");
+        // Ordinary trailing context on the same JSON object must survive
+        // intact — the value capture must stop at ITS OWN closing quote,
+        // never run on to swallow the rest of the JSON structure.
+        expect(line).toContain("req-widget-42");
+        expect(line).toContain('\\"status\\":\\"ok\\"');
+      });
+
+      it("no regression 4/5: the pre-existing plaintext 'Authorization: <scheme> <value>' and 'Cookie: <value>' header forms each remain fully redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: "Authorization: Digest username=\"O'Connor\", response=\"synthetic-review-digest\"" // secret-scan:allow (fake fixture value)
+        });
+        logger.log({
+          eventType: "provider-error",
+          message: "Cookie: note=O'Connor; sessionid=synthetic-review-session" // secret-scan:allow (fake fixture value)
+        });
+
+        const authLine = sink.mock.calls[0]![0] as string;
+        const cookieLine = sink.mock.calls[1]![0] as string;
+        expect(authLine).not.toContain("synthetic-review-digest");
+        expect(authLine).toContain("[REDACTED]");
+        expect(cookieLine).not.toContain("synthetic-review-session");
+        expect(cookieLine).toContain("[REDACTED]");
+      });
+
+      it("no regression 5/5: ordinary, non-Authorization/Cookie JSON fields (including ones that merely contain the substring 'auth') pass through unredacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-response",
+          message: JSON.stringify({ authorMode: "reviewer", status: "ok" })
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).toContain("reviewer");
+        expect(line).toContain('\\"status\\":\\"ok\\"');
+        expect(line).not.toContain("[REDACTED]");
+      });
+    }
+  );
 });

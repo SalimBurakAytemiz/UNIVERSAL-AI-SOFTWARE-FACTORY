@@ -6,6 +6,7 @@
 // "no unsupported upgrades" kuralının denetlenebilir hâlidir.
 
 import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
 
@@ -325,7 +326,62 @@ function hasVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boo
  * function answers "is this a genuine, type-appropriate, trustworthy-
  * sourced artifact?" — never "did it succeed?".
  */
-export function isAuthenticatedVerificationArtifact(ref: EvidenceRef, rootDir: string): boolean {
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 3 — UASF-REQ-0045): bağımsız
+ * inceleme, `isAuthenticatedVerificationArtifact()`'ın HÂLÂ kapatmadığı bir
+ * sınıfı gösterdi: `looksLikeRecognizedVerificationArtifact()`'ın
+ * `\.(test|spec)\.(ts|js|mjs|cjs)$` deseni, dosyanın GERÇEKTEN çalıştırılıp
+ * çalıştırılmadığına dair HİÇBİR ŞEY kanıtlamaz — bu yalnızca dosyanın adının
+ * "test dosyası gibi göründüğü" anlamına gelir. Bir kaynak test DOSYASI
+ * (henüz hiç çalıştırılmamış, veya asla çalıştırılmayacak olsa bile) artı
+ * çağıranın kendi `outcome: "PASS"`/`verificationSource` iddiası, GERÇEK bir
+ * çalıştırma kanıtı OLMADAN bu geçidi geçebiliyordu — kök neden: "dosya var"
+ * ile "komut gerçekten çalıştı ve geçti" birbirine karıştırılmıştı.
+ *
+ * Çözüm (mevcut mimariyle uyumlu, `phase-closure.ts`'in blocker-2 fix'iyle
+ * AYNI birincil (primitive) — git'in kendi commit geçmişi): bir kanıt
+ * referansının deponun GÜVENİLİR HEAD'ine GERÇEKTEN COMMIT EDİLMİŞ olduğunu
+ * doğrulayan `isCommittedToRepositoryHead()` (aşağısı) eklendi ve
+ * `isAuthenticatedVerificationArtifact()`/`isOutcomeVerifiedEvidenceRef()`'e
+ * enjekte edilebilir bir `isCommittedToHead` parametresi olarak eklendi.
+ *
+ * TR (kapsam notu — "tüm depoyu yeniden tasarlama" DEĞİL): bu iki fonksiyon,
+ * `detectTraceabilityIssues()` üzerinden `reality-matrix.ts` ve
+ * `invariants/invariant-guard.ts` dahil ÇOK sayıda modül tarafından, çoğu
+ * gerçek bir git checkout'u OLMAYAN geçici test dizinlerine karşı çağrılır.
+ * Bu parametrenin varsayılanını GERÇEK git kontrolüne bağlamak, bu turun
+ * kapsamı dışındaki tüm o modüllerin (ve onların testlerinin) davranışını
+ * SESSİZCE değiştirir — "yalnızca 8 doğrulanmış tıkanmayı düzelt, depoyu
+ * yeniden tarama/tasarlama" talimatını ihlal eder. Bu yüzden varsayılan,
+ * HİÇBİR mevcut çağıranı etkilemeyen bir no-op'tur (`() => true`) — Blocker
+ * 1'in `authorizedApprovers` deseniyle AYNI "sıfır etki alanı" felsefesi.
+ * Gerçek korumayı almak isteyen ÇAĞIRAN (bu turda: `phase-closure.ts`'in
+ * HER İKİ kanıt kontrolü — `verificationEvidenceRefs` VE bağımsız inceleme
+ * kanıtı, ikisi de zaten blocker-2'nin `isEvidenceCommittedToHead`
+ * mekanizmasını kullanıyor) GERÇEK `isCommittedToRepositoryHead()`'i AÇIKÇA
+ * geçirir. Bu hâlâ kriptografik olarak sahteye karşı kanıtlanamaz bir
+ * mekanizma değildir (bkz. bu fonksiyonun DAHA ÖNCEKİ fix notu, "heuristic
+ * gate, not a signed proof chain") — ama onu kullanmayı SEÇEN her çağıran
+ * için "diskte anlık olarak yazılmış bir dosyaya işaret et, geri kalanını
+ * uydur" saldırısını kapatır.
+ */
+export function isCommittedToRepositoryHead(rootDir: string, relativePath: string): boolean {
+  try {
+    execFileSync("git", ["cat-file", "-e", `HEAD:${relativePath}`], {
+      cwd: rootDir,
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isAuthenticatedVerificationArtifact(
+  ref: EvidenceRef,
+  rootDir: string,
+  isCommittedToHead: (rootDir: string, relativePath: string) => boolean = () => true
+): boolean {
   if (!isVerifiedEvidenceRef(ref, rootDir)) return false;
   if (typeof ref === "string") return false;
   if (ref.type === "ARTIFACT_REFERENCE") return false;
@@ -338,17 +394,28 @@ export function isAuthenticatedVerificationArtifact(ref: EvidenceRef, rootDir: s
   // genuine verification-flow output, and `verificationSource` must name a
   // mechanism this Factory actually recognizes as one of its own.
   if (!looksLikeRecognizedVerificationArtifact(ref.path)) return false;
-  return isTrustedVerificationSource(ref.verificationSource);
+  if (!isTrustedVerificationSource(ref.verificationSource)) return false;
+  // TR (blocker 3 fix notu): bkz. üstteki `isCommittedToRepositoryHead()`'in
+  // fix notu.
+  return isCommittedToHead(rootDir, ref.path);
 }
 
-export function isOutcomeVerifiedEvidenceRef(ref: EvidenceRef, rootDir: string): boolean {
-  if (!isAuthenticatedVerificationArtifact(ref, rootDir)) return false;
+export function isOutcomeVerifiedEvidenceRef(
+  ref: EvidenceRef,
+  rootDir: string,
+  isCommittedToHead: (rootDir: string, relativePath: string) => boolean = () => true
+): boolean {
+  if (!isAuthenticatedVerificationArtifact(ref, rootDir, isCommittedToHead)) return false;
   const outcome = (ref as StructuredEvidenceRef).outcome;
   return outcome !== undefined && EVIDENCE_SUCCESS_OUTCOMES.has(outcome);
 }
 
-function hasOutcomeVerifiedEvidence(refs: readonly EvidenceRef[], rootDir: string): boolean {
-  return refs.some((ref) => isOutcomeVerifiedEvidenceRef(ref, rootDir));
+function hasOutcomeVerifiedEvidence(
+  refs: readonly EvidenceRef[],
+  rootDir: string,
+  isCommittedToHead: (rootDir: string, relativePath: string) => boolean
+): boolean {
+  return refs.some((ref) => isOutcomeVerifiedEvidenceRef(ref, rootDir, isCommittedToHead));
 }
 
 /**
@@ -438,7 +505,14 @@ export function isTrustedVerificationSource(source: string): boolean {
  */
 export function detectTraceabilityIssues(
   requirements: readonly TraceableRequirement[],
-  rootDir: string
+  rootDir: string,
+  // TR (blocker 3 fix notu): bkz. `isCommittedToRepositoryHead()`'in fix
+  // notu, "kapsam notu" — bu fonksiyonun `reality-matrix.ts`/
+  // `invariant-guard.ts` gibi bu turun kapsamı DIŞINDaki çağıranları
+  // etkilenmesin diye varsayılan bir no-op'tur; gerçek korumayı isteyen
+  // çağıran (ör. `phase-closure.ts`) `isCommittedToRepositoryHead()`'i
+  // AÇIKÇA geçirir.
+  isCommittedToHead: (rootDir: string, relativePath: string) => boolean = () => true
 ): TraceabilityIssue[] {
   const issues: TraceabilityIssue[] = [];
 
@@ -453,8 +527,8 @@ export function detectTraceabilityIssues(
     // claim. `hasImplementation` deliberately keeps the weaker existence
     // check: an implementation reference is legitimately just "this file
     // exists".
-    const hasProof = hasOutcomeVerifiedEvidence(req.proofRefs, rootDir);
-    const hasTest = hasOutcomeVerifiedEvidence(req.testRefs, rootDir);
+    const hasProof = hasOutcomeVerifiedEvidence(req.proofRefs, rootDir, isCommittedToHead);
+    const hasTest = hasOutcomeVerifiedEvidence(req.testRefs, rootDir, isCommittedToHead);
     const hasImplementation = hasVerifiedEvidence(req.implementationRefs, rootDir);
 
     if (rank >= progressRank("IMPLEMENTATION_IN_PROGRESS") && !hasImplementation && !hasTest && !hasProof) {
