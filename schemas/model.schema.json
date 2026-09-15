@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/SalimBurakAytemiz/UNIVERSAL-AI-SOFTWARE-FACTORY/schemas/model.schema.json",
+  "title": "Model Registry Record",
+  "description": "A single provider/model record for the Model Registry (baseline section 60). Do not hardcode assumptions that a provider is permanently free, cheap, or premium — tier/costPerCall are data, not code.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["provider", "modelId", "tier", "costPerCall", "capabilities", "status"],
+  "properties": {
+    "provider": { "type": "string", "minLength": 1 },
+    "modelId": { "type": "string", "minLength": 1 },
+    "tier": {
+      "type": "string",
+      "enum": ["MOCK", "LOCAL_FREE", "VERY_LOW_COST", "STANDARD", "PREMIUM", "CRITICAL_REVIEW"],
+      "description": "Baseline section 61 model tiers."
+    },
+    "costClass": {
+      "type": "string",
+      "enum": ["FREE", "VERY_LOW", "LOW", "STANDARD", "HIGH", "PREMIUM"],
+      "description": "P2 fix (23rd independent review round, 'align model JSON schema with runtime model record contract'): optional, purely advisory categorical label — the runtime ModelRegistry/ModelRecord contract (runtime/models/registry.ts) has no 'costClass' field and never reads or writes one; cheapest-capable-model routing and cost accounting are entirely driven by 'costPerCall' (the authoritative, required field below). costClass was previously (incorrectly) marked required here even though no runtime record has ever populated it, which made every genuine ModelRecord schema-invalid. Retained as optional for any external tooling that wants a coarse-grained classification alongside the authoritative price, but it carries no routing or accounting weight."
+    },
+    "costPerCall": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Flat estimated cost per call in USD — the SOLE, AUTHORITATIVE field used for the cheapest-capable-model comparison and all cost accounting (runtime/models/registry.ts's ModelRecord, runtime/models/router.ts's selectModel()). A simplification of real per-token pricing, sufficient for routing decisions at P0. Required: every real runtime ModelRecord always carries this field, and routing/accounting cannot function correctly without it."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "classification", "tagging", "formatting", "summarization", "simple-docs",
+          "boilerplate", "simple-tests", "data-extraction",
+          "implementation", "code-review", "debugging", "integrations", "test-generation",
+          "critical-architecture", "security-reasoning", "distributed-systems", "incident-analysis"
+        ]
+      },
+      "minItems": 1
+    },
+    "contextWindow": { "type": "integer", "minimum": 1 },
+    "structuredOutput": { "type": "boolean" },
+    "toolUse": { "type": "boolean" },
+    "vision": { "type": "boolean" },
+    "status": {
+      "type": "string",
+      "enum": ["DISCOVERED", "EVALUATED", "APPROVED", "ACTIVE", "MONITORED", "DEPRECATED", "RETIRED"]
+    }
+  }
+}

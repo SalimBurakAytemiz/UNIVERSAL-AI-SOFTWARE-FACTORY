@@ -1,0 +1,10 @@
+# Baseline section 288: critical, architecture- and security-sensitive
+# areas are owned by the Human Founder. Other areas may gain additional
+# owners as the project organization grows (baseline section 34).
+
+/specification/           @SalimBurakAytemiz
+/schemas/                 @SalimBurakAytemiz
+/.github/                 @SalimBurakAytemiz
+/runtime/policy-engine/   @SalimBurakAytemiz
+/SECURITY.md              @SalimBurakAytemiz
+/scripts/secret-scan.mjs  @SalimBurakAytemiz

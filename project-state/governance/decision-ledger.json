@@ -1,0 +1,10 @@
+[
+  {
+    "decisionId": "round35-p0-lock-for-closure",
+    "project": "P0",
+    "decision": "Phase 'P0' locked for closure: Round 35 consolidated closure batch: all 12 findings fixed, 4 governance mechanisms implemented and integrated, narrow root-cause audit complete, full local verification suite green. P0 set to READY_FOR_INDEPENDENT_REVIEW (LOCKED_FOR_CLOSURE) pending a LATER independent Codex review returning INDEPENDENT_REVIEW_RESULT: CLEAN. Not CLOSED.",
+    "source": "ScopeLock.lock",
+    "status": "ACTIVE",
+    "createdAt": "2026-09-09T06:33:24.155Z"
+  }
+]
