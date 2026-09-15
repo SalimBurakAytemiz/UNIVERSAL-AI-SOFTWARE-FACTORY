@@ -866,4 +866,107 @@ describe("Logger", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 4, 'JSON-embedded passwords bypass log redaction'): " +
+      "SECRET_ASSIGNMENT_PATTERN must recognize JSON's own `\"key\":\"value\"` property syntax (a quote " +
+      "closing the label immediately before the separator), not only bare/unquoted `key: value` assignments",
+    () => {
+      it("BLOCKER regression 1/7: a direct structured password field (an object key, not a string) is redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({ eventType: "provider-error", password: "synthetic-review-password" } as never); // secret-scan:allow (fake fixture value)
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-password");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("BLOCKER regression 2/7: a nested structured password field (an object nested under an innocuous key) is redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          details: { auth: { password: "synthetic-review-password" } } // secret-scan:allow (fake fixture value)
+        } as never);
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-password");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("BLOCKER regression 3/7, exact reproduction: a password embedded via JSON.stringify() into an ordinary string field must be redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: JSON.stringify({ password: "synthetic-review-password" }) // secret-scan:allow (fake fixture value)
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-password");
+        expect(line).toContain("[REDACTED]");
+        // The surrounding JSON syntax (quotes, colon) is preserved — only
+        // the secret VALUE is replaced.
+        expect(line).toContain('\\"password\\":\\"[REDACTED]\\"');
+      });
+
+      it("BLOCKER regression 4/7: multiple JSON-embedded secrets in the same string are ALL redacted, not just the first", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: JSON.stringify({
+            password: "synthetic-review-password", // secret-scan:allow (fake fixture value)
+            apiKey: "synthetic-review-api-key", // secret-scan:allow (fake fixture value)
+            nested: { secret: "synthetic-review-secret" } // secret-scan:allow (fake fixture value)
+          })
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-password");
+        expect(line).not.toContain("synthetic-review-api-key");
+        expect(line).not.toContain("synthetic-review-secret");
+        expect((line.match(/\[REDACTED\]/g) ?? []).length).toBeGreaterThanOrEqual(3);
+      });
+
+      it("no regression 5/7: ordinary, non-secret JSON embedded in a string field passes through with its real content intact", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-response",
+          message: JSON.stringify({ status: "ok", count: 3, name: "widget" })
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).toContain("widget");
+        expect(line).toContain('\\"status\\":\\"ok\\"');
+        expect(line).not.toContain("[REDACTED]");
+      });
+
+      it("BLOCKER regression 6/7: malformed/truncated JSON-like text still has a recognizable 'label':'value' secret redacted", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        logger.log({
+          eventType: "provider-error",
+          message: '{"password":"synthetic-review-password", "incomplete": [1, 2,' // secret-scan:allow (fake fixture value)
+        });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).not.toContain("synthetic-review-password");
+        expect(line).toContain("[REDACTED]");
+      });
+
+      it("no regression 7/7: an already-redacted JSON-shaped string is idempotent — stays redacted, no crash, no double-marking", () => {
+        const sink = vi.fn();
+        const logger = new Logger(sink);
+        const alreadyRedacted = '{"password":"[REDACTED]"}';
+        logger.log({ eventType: "provider-error", message: alreadyRedacted });
+
+        const line = sink.mock.calls[0]![0] as string;
+        expect(line).toContain('\\"password\\":\\"[REDACTED]\\"');
+        expect(line).not.toContain("[REDACTED][REDACTED]");
+      });
+    }
+  );
 });

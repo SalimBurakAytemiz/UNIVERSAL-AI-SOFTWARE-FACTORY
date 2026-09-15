@@ -48,6 +48,21 @@
       "enum": ["P0", "P1", "P2", "P3"],
       "description": "Implementation phase per baseline section 304."
     },
+    "type": {
+      "type": "string",
+      "enum": [
+        "BUSINESS",
+        "PRODUCT",
+        "FUNCTIONAL",
+        "NON_FUNCTIONAL",
+        "SECURITY",
+        "PERFORMANCE",
+        "ACCESSIBILITY",
+        "COMPLIANCE",
+        "OPERATIONAL"
+      ],
+      "description": "The requirement-TYPE taxonomy from baseline section 48 (Requirements Engine) — distinct from `category` (the P0-P3 implementation PHASE, baseline section 304). Optional: existing requirement records that predate this field remain valid without it (BLOCKER 6 fix, FINAL P0 CLOSURE REMEDIATION, UASF-REQ-0012)."
+    },
     "priority": {
       "type": "string",
       "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]

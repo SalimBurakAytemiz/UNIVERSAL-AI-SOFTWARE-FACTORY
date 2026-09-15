@@ -973,28 +973,44 @@
   description: Support BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL/... requirement types with stable IDs.
   source_baseline: "BASELINE-V1 section 48"
   category: P0
+  type: FUNCTIONAL
   priority: MEDIUM
-  status: IMPLEMENTATION_IN_PROGRESS
+  status: UNIT_TESTED
   implementation_refs:
     - "schemas/requirement.schema.json"
-  test_refs: []
+    - "runtime/cli/commands/baseline-status.ts"
+  test_refs:
+    - path: "runtime/cli/__tests__/baseline-status.test.ts"
+      type: TEST_RESULT
+      outcome: PASS
+      verificationSource: "npm test (vitest)"
   proof_refs: []
   security_refs: []
   notes: >
     The Baseline Requirement Registry itself is the first instance of
     this engine's data model. P1 finding (P0 final closure remediation,
-    finding 1, "authoritative P0 registry is not closure-ready"):
-    genuinely investigated rather than status-upgraded on request —
-    `schemas/requirement.schema.json`'s `category` field is the
-    IMPLEMENTATION PHASE (P0/P1/P2/P3, baseline section 304), never the
-    BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL requirement-TYPE taxonomy
-    this requirement actually promises — no field for that taxonomy
-    exists anywhere in this registry today. This is a genuine
-    implementation gap, not a stale-status/missing-test case like the
-    other seven requirements in this same finding. Left at
-    IMPLEMENTATION_IN_PROGRESS rather than force-closed; remains a
-    legitimate P0 blocker until the type taxonomy is actually added to
-    the schema and a real record uses it.
+    finding 1, "authoritative P0 registry is not closure-ready"): the
+    original gap was genuine — `schemas/requirement.schema.json`'s
+    `category` field is the IMPLEMENTATION PHASE (P0/P1/P2/P3, baseline
+    section 304), never the BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL/
+    SECURITY/PERFORMANCE/ACCESSIBILITY/COMPLIANCE/OPERATIONAL
+    requirement-TYPE taxonomy this requirement actually promises, and no
+    field for that taxonomy existed anywhere in this registry. FINAL P0
+    CLOSURE REMEDIATION, blocker 6: the taxonomy is now implemented as an
+    OPTIONAL `type` enum field on `schemas/requirement.schema.json`
+    (backward-compatible — existing records that predate the field remain
+    valid without it), mirrored as an exported `RequirementType` union +
+    `REQUIREMENT_TYPES` const in `runtime/cli/commands/baseline-status.ts`
+    (the ONE authoritative loader every runtime consumer — `factory
+    baseline status`, `factory trace requirement`, `bootstrapProject()`'s
+    own preflight check — already goes through), and this record itself
+    (`type: FUNCTIONAL`) is the first real, schema-validated use of it.
+    Covered by real, outcome-verified tests exercising every one of the 9
+    canonical types plus invalid/case-mismatched/absent-field cases (bkz.
+    `runtime/cli/__tests__/baseline-status.test.ts`'s own blocker-6 describe
+    block). Status raised only to UNIT_TESTED, not further: no dedicated
+    proof/integration coverage exists yet for this specific field beyond
+    the unit-level schema/loader tests.
 
 - id: UASF-REQ-0013
   title: Requirements traceability

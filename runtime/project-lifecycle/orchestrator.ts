@@ -22,7 +22,7 @@
 //      duruma yazılır; süreç yeniden başlasa bile kaybolmaz (bölüm 277).
 
 import { existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseProjectGenome, type ProjectGenome } from "../project-genome/genome.js";
@@ -807,6 +807,53 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     ).value;
     const scaffoldResult = scaffoldProjectOs(baseDir, genome.project.id);
 
+    // TR (BLOCKER 3 fix notu, "FINAL P0 CLOSURE REMEDIATION" — UASF-REQ-0042,
+    // baseline §303, "Genome -> Organization -> State" yetkili ilişkisi):
+    // Aşağıdaki ÜÇ `stateStore.write()` çağrısı (genome.json, organization.json,
+    // bootstrap.json) birbirinden BAĞIMSIZ, ayrı ayrı atomik dosya yazmalarıdır
+    // — her biri KENDİ İÇİNDE atomiktir (bkz. `file-store.ts`'in temp-dosya +
+    // rename deseni), ama ÜÇÜ BİRLİKTE tek bir işlem DEĞİLDİR. Bağımsız
+    // inceleme, tam olarak bunun sömürülebileceğini kanıtladı: mevcut bir WEB
+    // projesi GAME olarak yeniden bootstrap edilirken yeni genome.json yazımı
+    // BAŞARILI olur, ardından organization.json yazımı BAŞARISIZ olursa, disk
+    // üzerinde şu üçü birlikte kalır: YENİ genome.json (GAME) + ESKİ
+    // organization.json (WEB) + ESKİ bootstrap.json ("SUCCESS" — önceki WEB
+    // bootstrap'ından kalma). Hiçbir kod bu üçünü tek bir işlem olarak GERİ
+    // ALMAZ ya da tutarsızlığı İŞARETLEMEZ — bir okuyucu, disk üzerinde
+    // "SUCCESS" yazan bootstrap.json'ı görüp GENOME ve ORGANIZATION'ın
+    // GERÇEKTEN aynı, tamamlanmış nesle ait olduğunu varsayar, oysa değildir.
+    //
+    // Çözüm (mevcut mimariyle uyumlu EN KÜÇÜK mekanizma — genel bir veritabanı
+    // işlem çerçevesi icat etmeden): `bootstrap.json`, bu üç dosyanın YETKİLİ
+    // "tamamlandı mı?" işaretidir. Genome/organization yazımlarından ÖNCE,
+    // bootstrap.json'a açıkça "BOOTSTRAP_IN_PROGRESS" durumunu taşıyan bir
+    // kayıt yazılır — bu, HERHANGİ bir önceki "SUCCESS" kaydını hemen geçersiz
+    // kılar (bkz. `file-store.ts`'in atomic rename'i: bu tek yazım kendi
+    // içinde ya tam olur ya da hiç olmaz). Ardından genome.json, sonra
+    // organization.json yazılır. Yalnızca HER İKİSİ de gerçekten başarılı
+    // olursa, bootstrap.json en son kez GERÇEK "SUCCESS" kaydıyla üzerine
+    // yazılır. Böylece HERHANGİ bir noktada (genome yazımı, organization
+    // yazımı, ya da son SUCCESS yazımı) başarısız olursa, bootstrap.json HİÇBİR
+    // ZAMAN "SUCCESS" İDDİA ETMEZ — ya (A) hiçbir şey değişmemiş önceki tutarlı
+    // durumda kalır (ilk IN_PROGRESS yazımı başarısız olursa), ya da (B) açıkça
+    // BOOTSTRAP_IN_PROGRESS olarak işaretlenmiş, kurtarılabilir/eksik bir
+    // durumda kalır — asla "genome YENİ + organization ESKİ + SUCCESS" gibi
+    // çelişkili bir yetkili durum olarak YORUMLANAMAZ. `generationId`, bu
+    // TEK bootstrap denemesini benzersiz şekilde etiketler (bir yeniden
+    // deneme ya da eşzamanlı ikinci bir çağrı ile karıştırılmaması için).
+    //
+    // `stateStore` artık YUKARIDA (costEngine'in kendi durable persistence
+    // ihtiyacı için, bkz. o satırın üstündeki fix notu) çözülmüştür — burada
+    // tekrar oluşturulmaz, aynı örnek kullanılmaya devam eder.
+    const generationId = randomUUID();
+    statePath = assertFilesystemConfinement(scaffoldResult.projectRoot, join("state", "bootstrap.json"));
+    stateStore.write(statePath, {
+      status: "BOOTSTRAP_IN_PROGRESS",
+      projectId: genome.project.id,
+      generationId,
+      startedAt: new Date().toISOString()
+    });
+
     // P1 fix (5th independent review round, "final-destination / dangling
     // symlink escape"): eskiden bu dosya yolları düz `join()` ile
     // oluşturuluyordu — scaffoldProjectOs() klasörleri onaylasa bile, bu
@@ -817,9 +864,6 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
     // eder ve dosyayı GERÇEKTEN symlink'in işaret ettiği (baseDir dışı)
     // konumda oluşturur. Artık her nihai dosya yolu, gerçek yazmadan HEMEN
     // önce assertFilesystemConfinement() ile ayrıca doğrulanır.
-    // `stateStore` artık YUKARIDA (costEngine'in kendi durable persistence
-    // ihtiyacı için, bkz. o satırın üstündeki fix notu) çözülmüştür — burada
-    // tekrar oluşturulmaz, aynı örnek kullanılmaya devam eder.
     stateStore.write(
       assertFilesystemConfinement(scaffoldResult.projectRoot, join("project-genome", "genome.json")),
       genome
@@ -829,9 +873,10 @@ export async function bootstrapProject(input: BootstrapProjectInput): Promise<Bo
       organization
     );
 
-    statePath = assertFilesystemConfinement(scaffoldResult.projectRoot, join("state", "bootstrap.json"));
     totalCostUsd = costEngine.totalFor({ projectId: genome.project.id });
     stateStore.write(statePath, {
+      status: "BOOTSTRAP_COMPLETE",
+      generationId,
       bootstrappedAt: new Date().toISOString(),
       projectId: genome.project.id,
       organizationTeams: organization.teams,

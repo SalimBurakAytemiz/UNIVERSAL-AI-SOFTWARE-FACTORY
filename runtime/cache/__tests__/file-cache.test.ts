@@ -1051,4 +1051,90 @@ describe("FileCache (durable cache, backed by StateStore)", () => {
       });
     }
   );
+
+  describe(
+    "P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 5, 'cache hit extends original TTL'): " +
+      "negotiateComputeOwnership()'s durable 'heal' write must never re-stamp expiresAt for a value that " +
+      "was ALREADY valid in the main cache — a read must never convert absolute TTL semantics into sliding TTL",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: TTL=100ms — t=0 computeAndSet() computes and persists; t=90ms " +
+          "a hit correctly reuses the cached value; t=110ms (past the ORIGINAL 100ms window) must recompute, " +
+          "never reuse the stale value merely because the t=90ms hit was observed in between",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-sliding-ttl-"));
+          const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+          let calls = 0;
+          const compute = () => {
+            calls++;
+            return `v${calls}`;
+          };
+
+          const first = await cache.computeAndSet("k", compute, 100);
+          expect(first).toEqual({ value: "v1", cached: false });
+
+          await new Promise((resolve) => setTimeout(resolve, 90));
+          const second = await cache.computeAndSet("k", compute, 100);
+          expect(second).toEqual({ value: "v1", cached: true });
+
+          await new Promise((resolve) => setTimeout(resolve, 20)); // now ~t=110ms, past the ORIGINAL window
+          const third = await cache.computeAndSet("k", compute, 100);
+          expect(third).toEqual({ value: "v2", cached: false });
+          expect(calls).toBe(2);
+        },
+        10_000
+      );
+
+      it(
+        "BLOCKER regression: repeated hits near expiry never push the deadline outward — the entry still " +
+          "expires at its ORIGINAL boundary regardless of how many times it was read in between",
+        async () => {
+          tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-sliding-ttl-repeated-"));
+          const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+          let calls = 0;
+          const compute = () => {
+            calls++;
+            return `v${calls}`;
+          };
+
+          await cache.computeAndSet("k", compute, 100);
+          // Five repeated hits, spread across the original 100ms window.
+          for (let i = 0; i < 5; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 15));
+            const hit = await cache.computeAndSet("k", compute, 100);
+            expect(hit.cached).toBe(true);
+          }
+          // ~t=75ms so far; wait past the ORIGINAL t=100ms deadline.
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          const afterExpiry = await cache.computeAndSet("k", compute, 100);
+          expect(afterExpiry.cached).toBe(false);
+          expect(calls).toBe(2);
+        },
+        10_000
+      );
+
+      it("no regression: a genuinely fresh, never-previously-cached value still computes and persists normally", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-sliding-ttl-fresh-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        const result = await cache.computeAndSet("k", () => "v1", 100);
+        expect(result).toEqual({ value: "v1", cached: false });
+        expect(cache.get("k")).toBe("v1");
+      });
+
+      it("no regression: an undefined ttlMs (no expiry requested) entry is unaffected by this fix and remains valid indefinitely across repeated hits", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-file-cache-sliding-ttl-no-ttl-"));
+        const cache = new FileCache<string>(new FileStateStore(), join(tempRoot, "cache.json"));
+        let calls = 0;
+        const compute = () => {
+          calls++;
+          return `v${calls}`;
+        };
+        await cache.computeAndSet("k", compute);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const hit = await cache.computeAndSet("k", compute);
+        expect(hit).toEqual({ value: "v1", cached: true });
+        expect(calls).toBe(1);
+      });
+    }
+  );
 });

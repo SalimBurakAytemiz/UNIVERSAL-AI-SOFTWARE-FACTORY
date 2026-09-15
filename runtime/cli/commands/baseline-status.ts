@@ -14,10 +14,54 @@ import yaml from "js-yaml";
 import { Ajv, type ValidateFunction } from "ajv";
 import requirementSchema from "../../../schemas/requirement.schema.json" with { type: "json" };
 
+/**
+ * P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 6, "implement the
+ * documented requirement type taxonomy" — UASF-REQ-0012, baseline §48/§304):
+ * the canonical requirement-TYPE taxonomy baseline section 48 (Requirements
+ * Engine) actually promises — distinct from `category` (the P0-P3
+ * implementation PHASE, baseline section 304). Kept as its own exported
+ * union (mirrors `RequirementStatus` in `requirements-traceability/
+ * traceability.ts`) so TypeScript callers get compile-time checking, while
+ * `schemas/requirement.schema.json`'s own `type` enum remains the SINGLE
+ * authoritative source of truth for what a valid value is at RUNTIME
+ * (bkz. `getRequirementValidator()` aşağısı) — this union is kept in sync
+ * with that enum by hand, exactly as `RequirementStatus`'s own union
+ * already is.
+ */
+export type RequirementType =
+  | "BUSINESS"
+  | "PRODUCT"
+  | "FUNCTIONAL"
+  | "NON_FUNCTIONAL"
+  | "SECURITY"
+  | "PERFORMANCE"
+  | "ACCESSIBILITY"
+  | "COMPLIANCE"
+  | "OPERATIONAL";
+
+export const REQUIREMENT_TYPES: readonly RequirementType[] = [
+  "BUSINESS",
+  "PRODUCT",
+  "FUNCTIONAL",
+  "NON_FUNCTIONAL",
+  "SECURITY",
+  "PERFORMANCE",
+  "ACCESSIBILITY",
+  "COMPLIANCE",
+  "OPERATIONAL"
+];
+
 export interface RequirementRecord {
   readonly id: string;
   readonly category: string;
   readonly status: string;
+  /**
+   * Optional (bkz. `schemas/requirement.schema.json`'ın `type` alanı fix
+   * notu): bu alanı önceleyen mevcut kayıtlar, alan olmadan da geçerli
+   * kalır — mecburi hale getirmek, bu turun kapsamı dışında sessiz bir
+   * geriye-dönük-uyumsuzluk (backward-incompatibility) yaratırdı.
+   */
+  readonly type?: RequirementType;
   readonly [key: string]: unknown;
 }
 

@@ -115,21 +115,42 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
     const verificationEvidenceRefs = [
       { path: "proof.test.ts", type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest)" }
     ];
-    const reviewEvidenceRef = { path: "proof.test.ts", type: "REVIEW_RESULT" as const, outcome: "CLEAN", verificationSource: "npm test (vitest)" };
+    // BLOCKER 2 fix (FINAL P0 CLOSURE REMEDIATION): a review's evidenceRef
+    // must now resolve to a genuine JSON evidence record whose CONTENT
+    // corroborates the claimed review (bkz. `phase-closure.ts`'in
+    // `isContentAuthenticatedIndependentReview()`'ın fix notu) — pointing
+    // at the SAME source file used for TEST_RESULT evidence no longer
+    // qualifies. `mkdirSync(..., { recursive: true })` because `proofs/`
+    // does not otherwise exist under this fixture's temp root.
+    mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+    const reviewEvidencePath = join(tempRoot, "proofs", "review-evidence.json");
+    const reviewEvidenceRef = { path: "proofs/review-evidence.json", type: "REVIEW_RESULT" as const, outcome: "CLEAN", verificationSource: "npm test (vitest)" };
+    const pendingReview = {
+      reviewId: "rev-1",
+      reviewerIdentity: "independent-reviewer",
+      reviewedCommitSha: closingCommitSha,
+      reviewTimestamp: new Date().toISOString(),
+      outcome: "PENDING" as const,
+      evidenceRef: reviewEvidenceRef
+    };
+    writeFileSync(
+      reviewEvidencePath,
+      JSON.stringify({
+        kind: "INDEPENDENT_REVIEW_RECORD",
+        reviewId: pendingReview.reviewId,
+        reviewerIdentity: pendingReview.reviewerIdentity,
+        reviewedCommitSha: pendingReview.reviewedCommitSha,
+        reviewTimestamp: pendingReview.reviewTimestamp,
+        outcome: pendingReview.outcome
+      })
+    );
     const pendingAttempt = attemptPhaseClosure(
       {
         phaseId: "P0",
         requestedBy: "integration-test",
         reason: "attempting closure before independent review",
         verificationEvidenceRefs,
-        independentReview: {
-          reviewId: "rev-1",
-          reviewerIdentity: "independent-reviewer",
-          reviewedCommitSha: closingCommitSha,
-          reviewTimestamp: new Date().toISOString(),
-          outcome: "PENDING",
-          evidenceRef: reviewEvidenceRef
-        },
+        independentReview: pendingReview,
         closingCommitSha
       },
       "manifest-pending",
@@ -142,20 +163,32 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
     // 6. Only once an independent review explicitly returns CLEAN does
     // closure succeed, and it is recorded in the SAME ledger as every
     // other governance action above (no separate decision-log subsystem).
+    const cleanReview = {
+      reviewId: "rev-2",
+      reviewerIdentity: "independent-reviewer",
+      reviewedCommitSha: closingCommitSha,
+      reviewTimestamp: new Date().toISOString(),
+      outcome: "CLEAN" as const,
+      evidenceRef: reviewEvidenceRef
+    };
+    writeFileSync(
+      reviewEvidencePath,
+      JSON.stringify({
+        kind: "INDEPENDENT_REVIEW_RECORD",
+        reviewId: cleanReview.reviewId,
+        reviewerIdentity: cleanReview.reviewerIdentity,
+        reviewedCommitSha: cleanReview.reviewedCommitSha,
+        reviewTimestamp: cleanReview.reviewTimestamp,
+        outcome: cleanReview.outcome
+      })
+    );
     const closedAttempt = attemptPhaseClosure(
       {
         phaseId: "P0",
         requestedBy: "integration-test",
         reason: "independent review returned CLEAN",
         verificationEvidenceRefs,
-        independentReview: {
-          reviewId: "rev-2",
-          reviewerIdentity: "independent-reviewer",
-          reviewedCommitSha: closingCommitSha,
-          reviewTimestamp: new Date().toISOString(),
-          outcome: "CLEAN",
-          evidenceRef: reviewEvidenceRef
-        },
+        independentReview: cleanReview,
         closingCommitSha
       },
       "manifest-closed",

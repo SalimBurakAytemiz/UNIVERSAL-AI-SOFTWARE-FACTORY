@@ -35,6 +35,23 @@ import { acquireFileLock, FileLockTimeoutError } from "../../cache/file-lock.js"
  */
 const EVIDENCE_ARTIFACT_PATH = "proof.test.ts";
 
+/**
+ * BLOCKER 2 fix (FINAL P0 CLOSURE REMEDIATION): `reviewFor()` below must now
+ * write a genuine, matching `INDEPENDENT_REVIEW_RECORD` JSON file for every
+ * review evidence it constructs (bkz. `phase-closure.ts`'in
+ * `isContentAuthenticatedIndependentReview()`'ın fix notu) — a bare path to
+ * an unrelated `.test.ts` source file, this suite's OLD fixture shape, no
+ * longer authenticates as review evidence at all. `tempRoot` is set by each
+ * test's own `makeDeps()` call (bkz. aşağısı) BEFORE `reviewFor()` is ever
+ * invoked in that same test body, so referencing it here (module scope,
+ * shared with the describe block below) always reflects the CURRENT test's
+ * temp directory. `proofs/` is one of `traceability.ts`'s own recognized
+ * evidence-artifact directory patterns, reused here rather than inventing a
+ * new one.
+ */
+let tempRoot: string;
+const REVIEW_EVIDENCE_ARTIFACT_PATH = "proofs/review-evidence.json";
+
 function evidenceRef(
   type: EvidenceRefType = "TEST_RESULT",
   path: string = EVIDENCE_ARTIFACT_PATH,
@@ -60,15 +77,41 @@ const DEFAULT_COMMIT_SHA = "abc123def456";
 
 /** A structurally-complete, evidence-backed review record — `outcome` is the one field tests usually vary. */
 function reviewFor(outcome: IndependentReviewResult, overrides: Partial<IndependentReviewEvidence> = {}): IndependentReviewEvidence {
-  return {
+  const record: IndependentReviewEvidence = {
     reviewId: "rev-1",
     reviewerIdentity: "independent-reviewer",
     reviewedCommitSha: DEFAULT_COMMIT_SHA,
     reviewTimestamp: new Date().toISOString(),
     outcome,
-    evidenceRef: evidenceRef("REVIEW_RESULT"),
+    evidenceRef: evidenceRef("REVIEW_RESULT", REVIEW_EVIDENCE_ARTIFACT_PATH),
     ...overrides
   };
+  // TR: yalnızca çağıran `evidenceRef`'i AÇIKÇA override ETMEDİYSE gerçek,
+  // eşleşen bir kanıt dosyası yazılır — bir test kasıtlı olarak kötü/eksik/
+  // uyumsuz bir evidenceRef kuruyorsa (ör. "does/not/exist.log",
+  // "package.json"), burada onun yerine geçerli bir dosya yazmak o testin
+  // amacını bozar.
+  if (overrides.evidenceRef === undefined && tempRoot) {
+    const resolvedPath = join(tempRoot, REVIEW_EVIDENCE_ARTIFACT_PATH);
+    mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+    writeFileSync(
+      resolvedPath,
+      JSON.stringify(
+        {
+          kind: "INDEPENDENT_REVIEW_RECORD",
+          reviewId: record.reviewId,
+          reviewerIdentity: record.reviewerIdentity,
+          reviewedCommitSha: record.reviewedCommitSha,
+          ...(record.reviewedBranch !== undefined ? { reviewedBranch: record.reviewedBranch } : {}),
+          reviewTimestamp: record.reviewTimestamp,
+          outcome: record.outcome
+        },
+        null,
+        2
+      )
+    );
+  }
+  return record;
 }
 
 interface AttemptOverrides extends Partial<Omit<PhaseClosureAttempt, "independentReview" | "closingCommitSha">> {
@@ -92,7 +135,6 @@ function baseAttempt(overrides: AttemptOverrides = {}): PhaseClosureAttempt {
 }
 
 describe("attemptPhaseClosure", () => {
-  let tempRoot: string;
   afterEach(() => {
     if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
   });
@@ -1748,6 +1790,193 @@ describe("attemptPhaseClosure", () => {
   );
 
   describe(
+    "P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 1, 'phase closure can lose authoritative Founder decision " +
+      "history'): the shared-lock staleness check must ALSO cover the Decision Ledger, not only the Scope Lock " +
+      "— a closure that durably persists its ledger entry but then crashes before persisting scope state must " +
+      "never let a stale sibling closure silently overwrite that ledger entry",
+    () => {
+      it(
+        "BLOCKER regression, exact reproduction: Closure A persists its decision to the Ledger then crashes " +
+          "before persisting Scope Lock (leaving the Scope Lock file byte-identical to what Closure B's own " +
+          "stale snapshot already believes) — Closure B, for a DIFFERENT phase, must still fail closed rather " +
+          "than silently overwriting A's newer Ledger entry",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "lock-p0");
+          deps.scopeLock.lock("P1", "ready", deps.invariantGuard.runAll(), "lock-p1");
+          deps.ledger.saveTo(deps.store, deps.ledgerPath);
+          deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
+
+          // Two SEPARATE, genuinely independent in-memory snapshots, both
+          // loaded from the SAME shared files at the SAME point in time —
+          // exactly what two real concurrent processes would each hold.
+          const ledgerA = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          const scopeLockA = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, ledgerA);
+          const ledgerB = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          const scopeLockB = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, ledgerB);
+
+          // Closure A's own store: the Ledger write (step 3 of the staged
+          // commit protocol) succeeds genuinely, but the IMMEDIATELY
+          // FOLLOWING Scope Lock write (step 4) throws — reproducing "a
+          // crash between persisting the ledger and persisting scope
+          // state" without needing a real process crash.
+          const crashingStoreA: typeof deps.store = {
+            write: (path: string, data: unknown) => {
+              if (path === deps.scopeLockPath) {
+                throw new Error("simulated crash after ledger persisted, before scope-lock persisted");
+              }
+              deps.store.write(path, data);
+            },
+            read: deps.store.read.bind(deps.store),
+            exists: deps.store.exists.bind(deps.store)
+          };
+          const depsA = { ...deps, store: crashingStoreA, scopeLock: scopeLockA, ledger: ledgerA };
+          const depsB = { ...deps, scopeLock: scopeLockB, ledger: ledgerB };
+
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ phaseId: "P0", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+              "m-a",
+              "close-p0",
+              depsA
+            )
+          ).toThrow("simulated crash");
+
+          // Sanity: the exact partial-persistence precondition is real —
+          // the Ledger already durably contains A's new decision, but the
+          // Scope Lock file was never touched (P0 still LOCKED_FOR_CLOSURE
+          // on disk), so the OLD scope-lock-only staleness check would see
+          // NOTHING out of the ordinary from B's point of view.
+          const ledgerAfterCrash = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          expect(ledgerAfterCrash.get("close-p0")?.status).toBe("ACTIVE");
+          const scopeLockAfterCrash = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, ledgerAfterCrash);
+          expect(scopeLockAfterCrash.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
+
+          // Closure B, for the DIFFERENT phase P1, still holds its OWN
+          // STALE Ledger snapshot (loaded BEFORE A's Ledger write landed —
+          // it has never heard of decisionId 'close-p0'). Without this
+          // finding's fix, B's own eventual `ledger.saveTo()` would
+          // silently overwrite the Ledger file with a snapshot that omits
+          // A's already-committed decision entirely, destroying it.
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ phaseId: "P1", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+              "m-b",
+              "close-p1",
+              depsB
+            )
+          ).toThrow(ConcurrentGovernanceStateChangedError);
+
+          // A's Ledger entry must survive intact — never silently discarded
+          // by B's (correctly rejected) stale write attempt.
+          const finalLedger = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          expect(finalLedger.get("close-p0")?.status).toBe("ACTIVE");
+          expect(finalLedger.get("close-p0")?.project).toBe("P0");
+          // B's own phase was never touched by its own rejected attempt.
+          const finalScopeLock = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, finalLedger);
+          expect(finalScopeLock.getState("P1")).toBe("LOCKED_FOR_CLOSURE");
+        }
+      );
+
+      it(
+        "no regression: after the ledger-staleness rejection, reloading the latest authoritative state and " +
+          "retrying succeeds without losing either decision",
+        () => {
+          const deps = makeDeps();
+          deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "lock-p0");
+          deps.scopeLock.lock("P1", "ready", deps.invariantGuard.runAll(), "lock-p1");
+          deps.ledger.saveTo(deps.store, deps.ledgerPath);
+          deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
+
+          const ledgerA = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          const scopeLockA = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, ledgerA);
+          const ledgerB = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          const scopeLockB = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, ledgerB);
+
+          attemptPhaseClosure(
+            baseAttempt({ phaseId: "P0", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "m-a",
+            "close-p0",
+            { ...deps, scopeLock: scopeLockA, ledger: ledgerA }
+          );
+
+          const depsB = { ...deps, scopeLock: scopeLockB, ledger: ledgerB };
+          expect(() =>
+            attemptPhaseClosure(
+              baseAttempt({ phaseId: "P1", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+              "m-b",
+              "close-p1",
+              depsB
+            )
+          ).toThrow(ConcurrentGovernanceStateChangedError);
+
+          const freshLedgerB = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          const freshScopeLockB = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, freshLedgerB);
+          const closedP1 = attemptPhaseClosure(
+            baseAttempt({ phaseId: "P1", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+            "m-b2",
+            "close-p1-retry",
+            { ...deps, scopeLock: freshScopeLockB, ledger: freshLedgerB }
+          );
+          expect(closedP1.outcome).toBe("CLOSED");
+
+          const finalLedger = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+          expect(finalLedger.get("close-p0")?.status).toBe("ACTIVE");
+          expect(finalLedger.get("close-p1-retry")?.status).toBe("ACTIVE");
+        }
+      );
+
+      it("no regression: recoverPendingPhaseClosure() is equally protected by the ledger-staleness check", () => {
+        const deps = makeDeps();
+        writeFileSync(join(deps.tempRoot, EVIDENCE_ARTIFACT_PATH), "verification output");
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "lock-p0");
+        deps.scopeLock.lock("P1", "ready", deps.invariantGuard.runAll(), "lock-p1");
+        deps.ledger.saveTo(deps.store, deps.ledgerPath);
+        deps.scopeLock.saveTo(deps.store, deps.scopeLockPath);
+
+        // B loads ITS OWN snapshot pair while the on-disk state only knows
+        // about 'lock-p0'/'lock-p1' — this is the realistic staleness
+        // window: the snapshot is fully self-consistent at load time (both
+        // decisionIds cross-validate against staleLedgerB), it simply
+        // predates A's later write below.
+        const staleLedgerB = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+        const staleScopeLockB = ScopeLock.loadFrom(deps.store, deps.scopeLockPath, staleLedgerB);
+
+        // A genuinely completes and durably persists its OWN decision
+        // AFTER B's snapshot above was already loaded — exactly the
+        // ledger-only partial-persistence gap this finding targets.
+        deps.ledger.record("close-p0", "P0", "closed via test", "phase-closure");
+        deps.ledger.saveTo(deps.store, deps.ledgerPath);
+
+        // Fabricate B's own PREPARED recovery intent for P1 (as if B had
+        // reached PREPARE and then crashed before touching the Ledger or
+        // Scope Lock at all) so recoverPendingPhaseClosure() has a pending
+        // intent to resume.
+        const intentPathForB = intentPath(deps.manifestDir, "P1", "m-b");
+        deps.store.write(intentPathForB, {
+          status: "PREPARED",
+          phaseId: "P1",
+          manifestId: "m-b",
+          decisionId: "close-p1",
+          attempt: baseAttempt({ phaseId: "P1", verificationEvidenceRefs: [evidenceRef()], independentReviewResult: "CLEAN" }),
+          createdAt: new Date().toISOString()
+        });
+
+        // B's stale ledger snapshot has never heard of 'close-p0' — recovery
+        // must fail closed instead of letting B's eventual ledger.saveTo()
+        // silently overwrite A's already-committed decision.
+        expect(() =>
+          recoverPendingPhaseClosure("P1", "m-b", { ...deps, scopeLock: staleScopeLockB, ledger: staleLedgerB })
+        ).toThrow(ConcurrentGovernanceStateChangedError);
+
+        // A's ledger entry must still be intact.
+        const finalLedger = FounderDecisionLedger.loadFrom(deps.store, deps.ledgerPath);
+        expect(finalLedger.get("close-p0")?.status).toBe("ACTIVE");
+      });
+    }
+  );
+
+  describe(
     "P1 fix (P0 closure remediation, current 7-finding round, finding 3, 'preserve already-closed authoritative " +
       "outcomes during recovery'): recovery must never downgrade an ALREADY-CLOSED phase to REJECTED merely " +
       "because mutable live state (the Central Invariant Guard, the Implementation Reality Matrix, evidence) " +
@@ -1876,6 +2105,186 @@ describe("attemptPhaseClosure", () => {
           expect(freshScopeLock.getState("P0")).toBe("LOCKED_FOR_CLOSURE");
         }
       );
+    }
+  );
+
+  describe(
+    "P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 2, 'fabricated independent review evidence can satisfy " +
+      "closure'): the independent review gate must fail closed on invented metadata and must independently " +
+      "verify the review evidence artifact's OWN CONTENT genuinely corroborates the claimed review, never " +
+      "trusting caller-typed fields merely because a plausibly-shaped file happens to exist",
+    () => {
+      /** Writes a genuine INDEPENDENT_REVIEW_RECORD JSON file at proofs/review-evidence.json, independent of reviewFor()'s own auto-write. */
+      function writeReviewRecord(deps: ReturnType<typeof makeDeps>, fields: Record<string, unknown>): void {
+        mkdirSync(join(deps.tempRoot, "proofs"), { recursive: true });
+        writeFileSync(join(deps.tempRoot, "proofs", "review-evidence.json"), JSON.stringify(fields));
+      }
+
+      const reviewJsonRef = () =>
+        evidenceRef("REVIEW_RESULT", "proofs/review-evidence.json", "CLEAN", "npm test (vitest)");
+
+      it("BLOCKER regression 1/7: invented independent-review metadata backed by a real file with UNRELATED content is REJECTED, not accepted merely because a plausibly-shaped file exists", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        writeReviewRecord(deps, {
+          kind: "INDEPENDENT_REVIEW_RECORD",
+          reviewId: "totally-different-review",
+          reviewerIdentity: "someone-else",
+          reviewedCommitSha: "unrelated-sha",
+          reviewTimestamp: "2020-01-01T00:00:00.000Z",
+          outcome: "CLEAN"
+        });
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { evidenceRef: reviewJsonRef() })
+          }),
+          "m-invented-metadata",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("does not match the claimed review metadata"))).toBe(true);
+      });
+
+      it("BLOCKER regression 2/7: a proof.test.ts source-file reference (mere existence, no machine-checkable review result) cannot satisfy the independent review gate", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { evidenceRef: evidenceRef("REVIEW_RESULT") })
+          }),
+          "m-proof-test-ts",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("must reference a JSON evidence record"))).toBe(true);
+      });
+
+      it("BLOCKER regression 3/7: review evidence content genuinely recorded for ANOTHER commit must never close THIS commit", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        writeReviewRecord(deps, {
+          kind: "INDEPENDENT_REVIEW_RECORD",
+          reviewId: "rev-1",
+          reviewerIdentity: "independent-reviewer",
+          reviewedCommitSha: "some-other-commit-sha",
+          reviewTimestamp: "2020-01-01T00:00:00.000Z",
+          outcome: "CLEAN"
+        });
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: {
+              reviewId: "rev-1",
+              reviewerIdentity: "independent-reviewer",
+              reviewedCommitSha: DEFAULT_COMMIT_SHA,
+              reviewTimestamp: "2020-01-01T00:00:00.000Z",
+              outcome: "CLEAN",
+              evidenceRef: reviewJsonRef()
+            }
+          }),
+          "m-wrong-commit-content",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("does not match the claimed review metadata"))).toBe(true);
+      });
+
+      it("BLOCKER regression 4/7: malformed review evidence content (not a genuine INDEPENDENT_REVIEW_RECORD) is REJECTED", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        mkdirSync(join(deps.tempRoot, "proofs"), { recursive: true });
+        writeFileSync(join(deps.tempRoot, "proofs", "review-evidence.json"), "{ not: valid json ]");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { evidenceRef: reviewJsonRef() })
+          }),
+          "m-malformed-content",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(
+          manifest.rejectionReasons.some(
+            (r) =>
+              r.includes("does not contain a genuine, well-formed") ||
+              r.includes("does not resolve") ||
+              r.includes("could not be read as valid JSON")
+          )
+        ).toBe(true);
+      });
+
+      it("BLOCKER regression 5/7: missing review evidence (evidenceRef names a JSON path that does not exist on disk) is REJECTED", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", {
+              evidenceRef: evidenceRef("REVIEW_RESULT", "proofs/does-not-exist.json", "CLEAN", "npm test (vitest)")
+            })
+          }),
+          "m-missing-content",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("does not resolve to a genuine"))).toBe(true);
+      });
+
+      it("BLOCKER regression 6/7: a non-CLEAN review, even with genuinely matching content, must never close a phase", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("FOUND_ISSUES")
+          }),
+          "m-found-issues",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("not CLEAN"))).toBe(true);
+      });
+
+      it("BLOCKER regression 7/7: valid, genuinely-matching CLEAN independent review evidence — and ONLY this — satisfies the gate", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN")
+          }),
+          "m-genuine-clean",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("CLOSED");
+        expect(deps.scopeLock.getState("P0")).toBe("CLOSED");
+      });
+
+      it("no regression: a reviewer identity identical to the closure requester is rejected as not independent", () => {
+        const deps = makeDeps();
+        deps.scopeLock.lock("P0", "ready", deps.invariantGuard.runAll(), "d1");
+        const manifest = attemptPhaseClosure(
+          baseAttempt({
+            requestedBy: "same-person",
+            verificationEvidenceRefs: [evidenceRef()],
+            independentReview: reviewFor("CLEAN", { reviewerIdentity: "same-person" })
+          }),
+          "m-self-review",
+          "d2",
+          deps
+        );
+        expect(manifest.outcome).toBe("REJECTED");
+        expect(manifest.rejectionReasons.some((r) => r.includes("can never also be its own independent reviewer"))).toBe(true);
+      });
     }
   );
 });

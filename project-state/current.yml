@@ -7466,3 +7466,63 @@ exact_next_action: >
   this exact commit. Per explicit instruction, this round does NOT merge, does NOT move to P1, does NOT declare
   P0 CLOSED, does NOT invoke Codex itself, and did NOT create a new branch — all work stayed on
   claude/ai-factory-baseline-v1-seawq7.
+
+  UPDATE (P0 FINAL CLOSURE REMEDIATION — SIX REPRODUCED EXISTING-P0 BLOCKERS round; see `p0_status`'s own final
+  paragraph for the complete narrative): a further independent review reproduced SIX CURRENT-P0 blockers (4 P1,
+  2 P2). All six are fixed, individually regression-tested, and individually bypass-verified: (1)
+  phase-closure.ts's shared-lock staleness check (assertGovernanceStateNotStale()) only ever validated the
+  Scope Lock file's freshness, never the Decision Ledger's — since the staged commit protocol persists the
+  ledger BEFORE the scope-lock, a crash between those two steps let a stale sibling closure's own
+  ledger.saveTo() silently overwrite a newer, already-persisted Founder decision; fixed by adding a structural
+  sibling check, assertLedgerStateNotStale(), always called alongside the existing scope-lock check in both
+  attemptPhaseClosure() and recoverPendingPhaseClosureLocked(); (2) the independent-review evidence gate
+  (evaluateClosureAttempt()) validated only the review's typed metadata shape and the evidence artifact's PATH
+  SHAPE, never the artifact's actual CONTENT — a caller could fabricate a plausible reviewId/reviewerIdentity
+  and point evidenceRef at any real, path-shape-matching file (including an unrelated *.test.ts source file)
+  with nothing inside it actually corroborating the claimed review; fixed by adding
+  isContentAuthenticatedIndependentReview(), which requires the evidenceRef to resolve to a genuine JSON
+  INDEPENDENT_REVIEW_RECORD whose reviewId/reviewerIdentity/reviewedCommitSha/reviewedBranch/reviewTimestamp/
+  outcome fields exactly match the caller's typed claim, plus a new reviewer-independence check rejecting a
+  reviewerIdentity identical to requestedBy; (3) orchestrator.ts's bootstrapProject() wrote genome.json,
+  organization.json, and state/bootstrap.json as three independent, non-atomic stateStore.write() calls — a
+  re-bootstrap of an existing project under a NEW genome whose organization write then failed could leave "new
+  genome + old organization + a stale prior bootstrap.json still claiming SUCCESS" on disk, a materially
+  contradictory authoritative state; fixed by writing an explicit BOOTSTRAP_IN_PROGRESS marker to
+  state/bootstrap.json FIRST (invalidating any prior SUCCESS record before genome/organization are ever
+  touched), and only overwriting it with a genuine BOOTSTRAP_COMPLETE record after both genome and organization
+  durably land — bootstrap.json now never claims completion for a generation it never confirmed; (4)
+  logger.ts's SECRET_ASSIGNMENT_PATTERN assumed a secret label is followed directly by its `:`/`=` separator, so
+  JSON's own `"password":"value"` property syntax (a quote closing the label BEFORE the separator) could never
+  match at all, leaving a JSON.stringify()'d password embedded in an otherwise-innocuous string field completely
+  unredacted; fixed by adding an optional label-closing-quote group to the pattern, preserved verbatim around
+  the redacted value in the replacement so the surrounding JSON syntax stays intact; (5) file-cache.ts's
+  negotiateComputeOwnership() "value" outcome unconditionally called this.set() to opportunistically heal the
+  main cache from a completed lease record — but it fired on EVERY cache hit, including the common case where
+  the value already came from the main cache itself (no healing needed), and since set() always recomputes
+  expiresAt from Date.now(), this silently converted the cache's documented absolute TTL semantics into a
+  sliding TTL: a value read once near expiry had its deadline pushed outward, so a value with TTL=100ms could
+  still report cached:true well past its original 100ms window; fixed by tagging the "value" outcome with its
+  source ("cache" vs "lease") and only running the heal-write when source is "lease" (main cache never already
+  held the value); (6) schemas/requirement.schema.json had no `type` field at all, so any record using the
+  documented BUSINESS/PRODUCT/FUNCTIONAL/NON_FUNCTIONAL/SECURITY/PERFORMANCE/ACCESSIBILITY/COMPLIANCE/
+  OPERATIONAL requirement-type taxonomy (baseline section 48) failed schema validation outright with
+  "must NOT have additional properties" — UASF-REQ-0012's own promised capability was never actually
+  implemented; fixed by adding an OPTIONAL `type` enum to the schema (backward-compatible — existing records
+  without it remain valid) mirrored as an exported RequirementType union + REQUIREMENT_TYPES const in
+  baseline-status.ts, the one authoritative loader every runtime consumer already goes through. Every changed
+  source file carries Turkish explanatory comments for the non-obvious invariant/failure-mode each fix protects
+  against, per this round's own repository-wide instruction. Full required verification sequence green: lint
+  (clean, after fixing two unused-destructuring lint errors this round's own test fixtures introduced),
+  typecheck, build, 1703/1703 tests across 53 files (up from 1625/1625 — net +78 new regression tests across
+  the six fixes plus the reviewer-independence/content-authentication coverage), validate:requirements (46
+  schema-valid records, unchanged in count), history-and-current-tree-aware secret-scan (PASS — required adding
+  `secret-scan:allow` markers to this round's own new fake-fixture-value test lines, same established
+  convention every prior round's synthetic-secret regression tests already use), Factory Doctor (READY), all 9
+  P0 proofs (13 assertions). Requirement registry updated with real evidence only (UASF-REQ-0012 raised to
+  UNIT_TESTED, with a real `type: FUNCTIONAL` field on its own record as the first genuine use of the newly
+  implemented taxonomy) — no requirement status raised beyond what this round's actual change supports. P0's
+  persisted Scope Lock state is UNCHANGED by this round (still LOCKED_FOR_CLOSURE from round 35) — this round
+  ran no phase-transition API call, since it supplied no new independent review result of its own to act on. P0
+  remains explicitly NOT CLOSED; the next step is an independent review of this exact commit. Per explicit
+  instruction, this round does NOT merge, does NOT move to P1, does NOT declare P0 CLOSED, does NOT invoke Codex
+  itself, and did NOT create a new branch — all work stayed on claude/ai-factory-baseline-v1-seawq7.

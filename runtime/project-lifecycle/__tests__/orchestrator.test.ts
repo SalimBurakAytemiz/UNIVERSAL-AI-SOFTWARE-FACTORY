@@ -3072,4 +3072,279 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       );
     }
   );
+
+  describe(
+    "P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 3, 'bootstrapProject() can persist contradictory " +
+      "authoritative state'): genome.json, organization.json and state/bootstrap.json can never be left " +
+      "claiming SUCCESS while representing incompatible generations — bootstrap.json is written first as an " +
+      "explicit BOOTSTRAP_IN_PROGRESS marker (invalidating any stale prior SUCCESS record) and only overwritten " +
+      "with BOOTSTRAP_COMPLETE after genome AND organization both durably land",
+    () => {
+      function readState(path: string): Record<string, unknown> | undefined {
+        return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) : undefined;
+      }
+
+      it("BLOCKER regression 1/6: genome write succeeds, organization write fails — bootstrap.json must never read SUCCESS/BOOTSTRAP_COMPLETE", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap3-org-fails-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+
+        const projectId = "proj-blocker3-org-fails";
+        const realStore = new FileStateStore();
+        const orgWritePath = join("organization", "organization.json");
+        const failingStore: StateStore = {
+          write: (path, data) => {
+            if (path.endsWith(orgWritePath)) throw new Error("simulated organization.json write failure");
+            realStore.write(path, data);
+          },
+          read: (path) => realStore.read(path),
+          exists: (path) => realStore.exists(path)
+        };
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            stateStore: failingStore
+          })
+        ).rejects.toThrow("simulated organization.json write failure");
+
+        const projectRoot = join(tempRoot, projectId);
+        expect(existsSync(join(projectRoot, "project-genome", "genome.json"))).toBe(true);
+        expect(existsSync(join(projectRoot, "organization", "organization.json"))).toBe(false);
+        const bootstrapState = readState(join(projectRoot, "state", "bootstrap.json"));
+        expect(bootstrapState?.status).toBe("BOOTSTRAP_IN_PROGRESS");
+        expect(bootstrapState?.status).not.toBe("BOOTSTRAP_COMPLETE");
+      });
+
+      it("BLOCKER regression 2/6: genome and organization writes both succeed, but the FINAL bootstrap.json write fails — never left claiming SUCCESS for a generation it never confirmed", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap3-final-fails-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+
+        const projectId = "proj-blocker3-final-fails";
+        const realStore = new FileStateStore();
+        const failingStore: StateStore = {
+          write: (path, data) => {
+            const record = data as { status?: string };
+            if (path.endsWith(join("state", "bootstrap.json")) && record.status === "BOOTSTRAP_COMPLETE") {
+              throw new Error("simulated final bootstrap.json write failure");
+            }
+            realStore.write(path, data);
+          },
+          read: (path) => realStore.read(path),
+          exists: (path) => realStore.exists(path)
+        };
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            stateStore: failingStore
+          })
+        ).rejects.toThrow("simulated final bootstrap.json write failure");
+
+        const projectRoot = join(tempRoot, projectId);
+        expect(existsSync(join(projectRoot, "project-genome", "genome.json"))).toBe(true);
+        expect(existsSync(join(projectRoot, "organization", "organization.json"))).toBe(true);
+        const bootstrapState = readState(join(projectRoot, "state", "bootstrap.json"));
+        expect(bootstrapState?.status).toBe("BOOTSTRAP_IN_PROGRESS");
+      });
+
+      it("no regression 3/6: a retry with a genuinely working store after a partial failure completes cleanly and reaches BOOTSTRAP_COMPLETE", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap3-retry-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+
+        const projectId = "proj-blocker3-retry";
+        const realStore = new FileStateStore();
+        const orgWritePath = join("organization", "organization.json");
+        let shouldFail = true;
+        const flakyStore: StateStore = {
+          write: (path, data) => {
+            if (shouldFail && path.endsWith(orgWritePath)) throw new Error("simulated transient failure");
+            realStore.write(path, data);
+          },
+          read: (path) => realStore.read(path),
+          exists: (path) => realStore.exists(path)
+        };
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            stateStore: flakyStore
+          })
+        ).rejects.toThrow("simulated transient failure");
+
+        shouldFail = false;
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome(projectId),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway,
+          stateStore: flakyStore
+        });
+
+        expect(result.genome.project.id).toBe(projectId);
+        const projectRoot = join(tempRoot, projectId);
+        const bootstrapState = readState(join(projectRoot, "state", "bootstrap.json"));
+        expect(bootstrapState?.status).toBe("BOOTSTRAP_COMPLETE");
+        expect(existsSync(join(projectRoot, "organization", "organization.json"))).toBe(true);
+      });
+
+      it("BLOCKER regression 4/6: exact reproduction — re-bootstrapping an EXISTING project under a NEW genome, with the organization write failing, must never leave 'new genome + old organization + SUCCESS'", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap3-rebootstrap-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+        const projectId = "proj-blocker3-rebootstrap";
+
+        // First, a genuine, fully successful WEB bootstrap.
+        await bootstrapProject({
+          genomeCandidate: { project: { id: projectId, name: "Test Project", family: "web" }, business: { capabilities: ["payments"] } },
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway
+        });
+        const projectRoot = join(tempRoot, projectId);
+        const originalOrganization = readState(join(projectRoot, "organization", "organization.json"));
+        expect(readState(join(projectRoot, "state", "bootstrap.json"))?.status).toBe("BOOTSTRAP_COMPLETE");
+
+        // Re-bootstrap the SAME project as GAME. The new genome write
+        // succeeds; the organization write for the NEW genome is forced to
+        // fail — the exact independent-review reproduction.
+        const realStore = new FileStateStore();
+        const orgWritePath = join("organization", "organization.json");
+        const failingStore: StateStore = {
+          write: (path, data) => {
+            if (path.endsWith(orgWritePath)) throw new Error("simulated organization.json write failure on re-bootstrap");
+            realStore.write(path, data);
+          },
+          read: (path) => realStore.read(path),
+          exists: (path) => realStore.exists(path)
+        };
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: { project: { id: projectId, name: "Test Project", family: "game" }, business: { capabilities: ["payments"] } },
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            stateStore: failingStore
+          })
+        ).rejects.toThrow("simulated organization.json write failure on re-bootstrap");
+
+        const newGenome = readState(join(projectRoot, "project-genome", "genome.json"));
+        const orgAfterFailure = readState(join(projectRoot, "organization", "organization.json"));
+        const bootstrapAfterFailure = readState(join(projectRoot, "state", "bootstrap.json"));
+
+        expect(newGenome?.project).toMatchObject({ family: "game" });
+        // The organization file is untouched — still the OLD (web) one.
+        expect(orgAfterFailure).toEqual(originalOrganization);
+        // The absolute requirement: bootstrap.json must NEVER claim
+        // BOOTSTRAP_COMPLETE/SUCCESS while genome (game) and organization
+        // (web) represent incompatible generations.
+        expect(bootstrapAfterFailure?.status).toBe("BOOTSTRAP_IN_PROGRESS");
+        expect(bootstrapAfterFailure?.status).not.toBe("BOOTSTRAP_COMPLETE");
+      });
+
+      it("BLOCKER regression 5/6: crash-equivalent — a failure between genome.json and organization.json writes leaves an explicitly incomplete, never falsely-successful state", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap3-crash-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+        const projectId = "proj-blocker3-crash";
+
+        const realStore = new FileStateStore();
+        const genomeWritePath = join("project-genome", "genome.json");
+        // Simulates a process crash immediately after the genome.json write
+        // lands durably on disk, before organization.json is ever attempted.
+        const crashingStore: StateStore = {
+          write: (path, data) => {
+            realStore.write(path, data);
+            if (path.endsWith(genomeWritePath)) throw new Error("simulated process crash after genome.json landed");
+          },
+          read: (path) => realStore.read(path),
+          exists: (path) => realStore.exists(path)
+        };
+
+        await expect(
+          bootstrapProject({
+            genomeCandidate: validGenome(projectId),
+            baseDir: tempRoot,
+            policy,
+            modelRegistry: createDefaultModelRegistry(),
+            modelGateway,
+            stateStore: crashingStore
+          })
+        ).rejects.toThrow("simulated process crash after genome.json landed");
+
+        const projectRoot = join(tempRoot, projectId);
+        expect(existsSync(join(projectRoot, "project-genome", "genome.json"))).toBe(true);
+        expect(existsSync(join(projectRoot, "organization", "organization.json"))).toBe(false);
+        const bootstrapState = readState(join(projectRoot, "state", "bootstrap.json"));
+        // Explicitly incomplete/recoverable — never interpretable as success.
+        expect(bootstrapState?.status).toBe("BOOTSTRAP_IN_PROGRESS");
+
+        // Recovery: a subsequent, genuinely working bootstrap for the SAME
+        // project reaches a real, consistent BOOTSTRAP_COMPLETE.
+        const recovered = await bootstrapProject({
+          genomeCandidate: validGenome(projectId),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway
+        });
+        expect(recovered.genome.project.id).toBe(projectId);
+        expect(readState(join(projectRoot, "state", "bootstrap.json"))?.status).toBe("BOOTSTRAP_COMPLETE");
+      });
+
+      it("no regression 6/6: a genuinely successful bootstrap reaches BOOTSTRAP_COMPLETE with a consistent generationId shared across the transition", async () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-bootstrap3-success-"));
+        const policy = new PolicyEngine();
+        policy.addRule(lowRiskAllowRule(2));
+        const modelGateway = new ModelGateway();
+        modelGateway.registerProvider(new MockProvider());
+        const projectId = "proj-blocker3-success";
+
+        const result = await bootstrapProject({
+          genomeCandidate: validGenome(projectId),
+          baseDir: tempRoot,
+          policy,
+          modelRegistry: createDefaultModelRegistry(),
+          modelGateway
+        });
+
+        expect(result.genome.project.id).toBe(projectId);
+        const projectRoot = join(tempRoot, projectId);
+        expect(existsSync(join(projectRoot, "project-genome", "genome.json"))).toBe(true);
+        expect(existsSync(join(projectRoot, "organization", "organization.json"))).toBe(true);
+        const bootstrapState = readState(join(projectRoot, "state", "bootstrap.json"));
+        expect(bootstrapState?.status).toBe("BOOTSTRAP_COMPLETE");
+        expect(typeof bootstrapState?.generationId).toBe("string");
+        expect((bootstrapState?.generationId as string).length).toBeGreaterThan(0);
+      });
+    }
+  );
 });

@@ -114,7 +114,7 @@ function isSensitiveKey(key: string): boolean {
  * this pattern's alternation did not yet recognize at all.
  */
 const SECRET_ASSIGNMENT_PATTERN =
-  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|token|secret|password|credential)(\s*[:=]\s*)(?:(["'])((?:(?!\3)[^\\]|\\.)*)\3|([^\s'",;]+))/gi;
+  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|token|secret|password|credential)(["']?)(\s*[:=]\s*)(?:(["'])((?:(?!\4)[^\\]|\\.)*)\4|([^\s'",;]+))/gi;
 const URL_USERINFO_PATTERN = /(:\/\/[^/\s:@]+):([^/\s:@]+)@/g;
 /**
  * P1 fix (29th independent review round, finding 4, "redact complete
@@ -210,6 +210,38 @@ const BARE_BEARER_TOKEN_PATTERN = /\bbearer\s+[A-Za-z0-9\-._~+/]+=*/gi;
 const BARE_PROVIDER_CREDENTIAL_PATTERN =
   /(?<![A-Za-z0-9])(?:sk-ant-[A-Za-z0-9_-]{20,}|sk-(?!ant-)[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16})/g;
 
+/**
+ * TR (BLOCKER 4 fix notu, "FINAL P0 CLOSURE REMEDIATION" — UASF-REQ-0038,
+ * baseline §124/§307): `SECRET_ASSIGNMENT_PATTERN`'in eski hâli, etiketten
+ * (ör. "password") HEMEN SONRA doğrudan ayırıcının (`:`/`=`) geldiğini
+ * varsayıyordu — `(\s*[:=]\s*)`. Bu, `key = value` veya `key: value` gibi
+ * DÜZ metin atamaları için doğrudur, ama bir `JSON.stringify()` çıktısında
+ * anahtar KENDİSİ de tırnaklıdır: `"password":"gizli"` — burada
+ * "password" kelimesinden hemen sonra gelen karakter `:` DEĞİL, anahtarı
+ * KAPATAN tırnak işaretidir (`"`). Eski desen bu tek karakteri hesaba
+ * katmadığı için `(\s*[:=]\s*)` bir eşleşme BULAMIYOR, tüm regex bu noktada
+ * BAŞARISIZ oluyor ve JSON-gömülü şifre TAMAMEN redaksiyonsuz kalıyordu —
+ * bağımsız incelemenin tam olarak gösterdiği açık budur.
+ *
+ * Çözüm: etiket ile ayırıcı arasına, JSON'ın kendi anahtar-kapama tırnağını
+ * (`"` veya `'`, İSTEĞE BAĞLI) tanıyan yeni bir grup eklenir —
+ * `(["']?)`. Bu, hem düz `password = x` (tırnaksız etiket) hem de JSON'ın
+ * `"password":x` (tırnaklı etiket) biçimini AYNI TEK regex ile yakalar;
+ * yakalanan tırnak, redaksiyon çıktısında ETİKETİN bir parçası olarak
+ * AYNEN korunur (bkz. `redactSecretsInString()`'ın değiştirme geri
+ * çağırması) — yalnızca DEĞER gizlenir, JSON'ın sözdizimsel şekli
+ * (tırnaklar, iki nokta üst üste) olduğu gibi kalır, böylece redakte
+ * edilmiş çıktı hâlâ (yeniden ayrıştırılabilir olması gerekmese de)
+ * okunabilir/anlaşılır kalır. Bu düzeltme, iç içe geçmiş JSON'da (nesne
+ * içinde nesne) veya bir dizi içindeki HER bir eşleşmede de aynı şekilde
+ * çalışır — regex, metnin TAMAMINI (derinlik farketmeksizin) tarar, tek
+ * bir JSON.parse çağrısına ya da yapının geçerli olmasına asla bağımlı
+ * değildir; bu yüzden bozuk/yarım kalmış JSON metninde bile "etiket:değer"
+ * şekli tanınabildiği sürece redaksiyon çalışmaya devam eder (fail-closed:
+ * ayrıştırılamayan girdiyi "güvenli" saymak yerine yine de desen taraması
+ * uygulanır).
+ */
+
 function redactSecretsInString(text: string): string {
   return text
     // "Authorization: <scheme> <value...>" — redacts the ENTIRE credential
@@ -224,14 +256,19 @@ function redactSecretsInString(text: string): string {
     .replace(COOKIE_HEADER_PATTERN, "$1[REDACTED]")
     // Common "key = value" / "key: value" secret assignment forms embedded
     // anywhere in a larger string (e.g. inside a logged command line, a
-    // dumped config snippet, or a raw request body excerpt). `quote` is
-    // only defined when the QUOTED branch matched (bkz. `SECRET_ASSIGNMENT_PATTERN`'in
-    // üstündeki fix notu) — the unquoted branch has no quote characters to
+    // dumped config snippet, or a raw request body excerpt) — including
+    // JSON's own `"key":"value"` shape, where `labelQuote` (bkz.
+    // `SECRET_ASSIGNMENT_PATTERN`'in BLOCKER 4 fix notu) captures the
+    // label's OWN closing quote so the JSON property syntax around it is
+    // preserved unchanged. `quote` is only defined when the QUOTED value
+    // branch matched — the unquoted branch has no quote characters to
     // preserve around `[REDACTED]`.
     .replace(
       SECRET_ASSIGNMENT_PATTERN,
-      (_match, label: string, sep: string, quote: string | undefined) =>
-        quote !== undefined ? `${label}${sep}${quote}[REDACTED]${quote}` : `${label}${sep}[REDACTED]`
+      (_match, label: string, labelQuote: string, sep: string, quote: string | undefined) =>
+        quote !== undefined
+          ? `${label}${labelQuote}${sep}${quote}[REDACTED]${quote}`
+          : `${label}${labelQuote}${sep}[REDACTED]`
     )
     // Credentials embedded in a URL's userinfo section
     // (`https://user:hunter2@host/...`) — the username is left visible

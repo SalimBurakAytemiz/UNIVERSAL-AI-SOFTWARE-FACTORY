@@ -567,12 +567,24 @@ export class FileCache<T = unknown> {
   private negotiateComputeOwnership(
     key: string,
     ownerId: string
-  ): { readonly kind: "value"; readonly value: T } | { readonly kind: "owner" } | { readonly kind: "busy" } {
+  ):
+    | { readonly kind: "value"; readonly value: T; readonly source: "cache" | "lease" }
+    | { readonly kind: "owner" }
+    | { readonly kind: "busy" } {
     const release = acquireFileLock(this.computeLockPath(key), this.lockOptions);
     try {
       const recheck = this.lookup(key);
       if (recheck.found) {
-        return { kind: "value", value: recheck.value as T };
+        // TR (BLOCKER 5 fix notu, "cache hit extends original TTL"): bu
+        // değer ZATEN ana önbellekte GEÇERLİ olarak bulundu — bkz.
+        // `source: "cache"`'in `#computeCrossProcess()`'teki kullanımı.
+        // Burada `this.set()` ÇAĞRILMAMALIDIR: `set()` her zaman
+        // `expiresAt`'ı `Date.now() + ttlMs` olarak YENİDEN hesaplar, bu da
+        // orijinal `computedAt`/`expiresAt`'ı SESSİZCE İLERİ ÖTELER —
+        // mutlak TTL semantiğini (bkz. UASF-REQ-0036, baseline §77) kaymalı
+        // (sliding) bir TTL'e dönüştürür. Bir önbellek OKUMASI, o girdinin
+        // GEÇERLİLİK SINIRINI ASLA uzatmamalıdır.
+        return { kind: "value", value: recheck.value as T, source: "cache" };
       }
       const now = Date.now();
       const existingLease = this.readComputeLease(key);
@@ -604,7 +616,13 @@ export class FileCache<T = unknown> {
       // computing right now).
       if (existingLease?.completed) {
         if (existingLease.cacheExpiresAt === undefined || existingLease.cacheExpiresAt > now) {
-          return { kind: "value", value: existingLease.value as T };
+          // TR: BU dal `source: "lease"` — değer henüz ANA önbellekte
+          // YANSITILMAMIŞ, yalnızca kalıcı lease kaydında mevcut. Bu
+          // durumda `#computeCrossProcess()`'in ana önbelleği "onarmak"
+          // (heal) için `this.set()` çağırması MEŞRUDUR — çünkü ana
+          // önbellekte bu anahtar için HENÜZ hiçbir girdi yok, dolayısıyla
+          // "uzatılacak" mevcut bir `expiresAt` de yoktur.
+          return { kind: "value", value: existingLease.value as T, source: "lease" };
         }
       } else if (existingLease && existingLease.expiresAt > now) {
         return { kind: "busy" };
@@ -659,10 +677,35 @@ export class FileCache<T = unknown> {
         // are fast and do not depend on the lease file forever; a failure
         // here is never fatal (the lease record remains the durable source
         // of truth until this eventually succeeds on some later call).
-        try {
-          this.set(key, outcome.value, ttlMs);
-        } catch {
-          // Best-effort heal only — see fix note above.
+        //
+        // TR (BLOCKER 5 fix notu, "FINAL P0 CLOSURE REMEDIATION" —
+        // UASF-REQ-0036, baseline §77, "cache-validity invariant"): bu
+        // `this.set()` çağrısı eskiden `outcome.kind === "value"` OLAN HER
+        // durumda KOŞULSUZ çalışıyordu — `outcome.source === "cache"` (yani
+        // değer zaten ana önbellekte GEÇERLİ olarak duruyordu, hiçbir
+        // "onarım" gerekmiyordu) durumunda bile. `set()` HER ZAMAN
+        // `expiresAt`'ı `Date.now() + ttlMs` olarak YENİDEN yazdığından, bu
+        // ana önbellekteki GEÇERLİ bir girdinin özgün `computedAt`/
+        // `expiresAt`'ını her okuma anında sessizce ileri ötelüyordu —
+        // mutlak (absolute) TTL semantiğini fiilen kaymalı (sliding) bir
+        // TTL'e dönüştürüyordu: TTL=100ms ile t=0'da yazılan bir değer,
+        // t=90'da okunduğunda (hâlâ geçerli) `set()` süresini t=190'a kadar
+        // uzatıyor, t=110'da (özgün pencereye göre süresi dolmuş olması
+        // gerekirken) HÂLÂ `cached: true` ile aynı bayat değeri
+        // döndürüyordu — tekrarlanan okumalar bayat bir sonucu SÜRESİZ
+        // canlı tutabiliyordu. Düzeltme: yalnızca `outcome.source ===
+        // "lease"` iken (değer HENÜZ ana önbellekte yoktu, gerçekten bir
+        // "onarım" yazımıdır — yeni bir `expiresAt` atamak burada zararsızdır
+        // çünkü uzatılacak ÖNCEKİ bir ana-önbellek süresi yoktur) `set()`
+        // çağrılır; `outcome.source === "cache"` iken ana önbellek OLDUĞU
+        // GİBİ bırakılır — bir OKUMA asla bir girdinin geçerlilik sınırını
+        // uzatmaz.
+        if (outcome.source === "lease") {
+          try {
+            this.set(key, outcome.value, ttlMs);
+          } catch {
+            // Best-effort heal only — see fix note above.
+          }
         }
         return { value: outcome.value, cached: true };
       }

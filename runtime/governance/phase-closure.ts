@@ -469,6 +469,175 @@ function describeEvidenceRef(ref: EvidenceRef): string {
 }
 
 /**
+ * TR (BLOCKER 2 fix notu, "FINAL P0 CLOSURE REMEDIATION" — UASF-REQ-0045,
+ * baseline §149/§303): Bu fonksiyon eklenmeden ÖNCE, `independentReview`
+ * alanının doğrulaması TAMAMEN çağıranın kendi tipli iddiasına (reviewId,
+ * reviewerIdentity, outcome vb.) ve `evidenceRef`'in yalnızca YOL ŞEKLİNE
+ * (bkz. `isAuthenticatedVerificationArtifact()`) dayanıyordu — dosyanın
+ * GERÇEK İÇERİĞİ hiçbir zaman okunmuyordu. Bağımsız inceleme, bunun tam
+ * olarak ne anlama geldiğini gösterdi: bir kapanış denemesi, GERÇEK bir
+ * inceleme hiç olmamışken, uydurulmuş `reviewId`/`reviewerIdentity` alanları
+ * VE depodaki rastgele, var olan herhangi bir `proofs/**\/*.test.ts`
+ * dosyasına işaret eden bir `evidenceRef` ile CLOSED durumuna ulaşabiliyordu
+ * — çünkü o dosya "proofs/" desenine uyuyordu ve var olduğu için
+ * `isAuthenticatedVerificationArtifact()` onu kabul ediyordu, ama dosyanın
+ * İÇİNDE iddia edilen incelemeyle ilgili TEK BİR SATIR bile yoktu.
+ *
+ * Kök neden: "kanıt referansı var olan bir dosyaya işaret ediyor" ile
+ * "o dosya, iddia edilen incelemeyi GERÇEKTEN kaydediyor" birbirine
+ * karıştırılmıştı (bölüm 303'ün "no claim without evidence" ilkesinin
+ * doğrudan ihlali — iddiayı destekleyen şey yine çağıranın kendi sözüydü).
+ *
+ * Çözüm (mevcut mimariyle uyumlu EN KÜÇÜK mekanizma — yeni bir imza/kriptografik
+ * zincir icat etmeden): bağımsız incelemenin `evidenceRef`'i artık
+ * (1) `type: "REVIEW_RESULT"` taşıyan yapılandırılmış bir referans olmalı
+ * (bir TEST_RESULT/PROOF_RESULT referansı asla inceleme kanıtı olarak kabul
+ * edilmez), (2) `isAuthenticatedVerificationArtifact()`'ın mevcut yol-şekli/
+ * `verificationSource` kontrolünden geçmeli, (3) GERÇEKTEN VAR OLAN bir
+ * `.json` dosyasına çözülmeli (bir `.test.ts` kaynak dosyası asla inceleme
+ * kanıtı olamaz — kaynak kodu, makine tarafından doğrulanabilir bir
+ * inceleme sonucu TAŞIMAZ), VE (4) o JSON dosyasının İÇERİĞİ, çağıranın
+ * `IndependentReviewEvidence` nesnesinde iddia ettiği reviewId/
+ * reviewerIdentity/reviewedCommitSha/reviewedBranch/reviewTimestamp/outcome
+ * alanlarının HER BİRİYLE TAM OLARAK EŞLEŞMELİDİR. Bu, sahte üstverinin tek
+ * başına yeterli olmasını engeller: bir çağıran artık hem tipli iddiayı HEM
+ * DE onu birebir doğrulayan kalıcı bir JSON kaydını üretmek zorundadır —
+ * biri diğeriyle tutarsızsa (ör. başka bir commit için yazılmış gerçek bir
+ * inceleme kaydına işaret edip reviewedCommitSha'yı değiştirerek), bu
+ * fonksiyon reddeder. Bu hâlâ kriptografik olarak sahteye karşı kanıtlanamaz
+ * bir mekanizma değildir, ama "var olan herhangi bir dosyaya işaret et,
+ * geri kalanını uydur" saldırısını kapatır — kapanmasını gereken tam sınıf.
+ */
+export interface IndependentReviewRecordFile {
+  readonly kind: "INDEPENDENT_REVIEW_RECORD";
+  readonly reviewId: string;
+  readonly reviewerIdentity: string;
+  readonly reviewedCommitSha: string;
+  readonly reviewedBranch?: string;
+  readonly reviewTimestamp: string;
+  readonly outcome: IndependentReviewResult;
+}
+
+function isGenuineIndependentReviewRecord(value: unknown): value is IndependentReviewRecordFile {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.kind === "INDEPENDENT_REVIEW_RECORD" &&
+    isNonBlankIdentity(v.reviewId) &&
+    isNonBlankIdentity(v.reviewerIdentity) &&
+    isNonBlankIdentity(v.reviewedCommitSha) &&
+    typeof v.reviewTimestamp === "string" &&
+    isCanonicalIsoTimestamp(v.reviewTimestamp) &&
+    (v.outcome === "CLEAN" || v.outcome === "PENDING" || v.outcome === "FOUND_ISSUES") &&
+    (v.reviewedBranch === undefined || typeof v.reviewedBranch === "string")
+  );
+}
+
+/**
+ * TR: BLOCKER 2'nin asıl doğrulama kapısı — bkz. yukarıdaki fix notu.
+ * Yalnızca `evaluateClosureAttempt()` tarafından çağrılır; hem taze bir
+ * `attemptPhaseClosure()` denemesi hem de kurtarılmış (`recoverPendingPhaseClosure()`)
+ * bir deneme AYNI bu fonksiyondan geçer — ikinci, farklı kapsamlı bir kopya
+ * asla oluşturulmaz (bu dosyanın genel tasarım ilkesi: "tek yetkili geçit").
+ */
+function isContentAuthenticatedIndependentReview(
+  review: IndependentReviewEvidence,
+  rootDir: string,
+  store: StateStore
+): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+  if (typeof review.evidenceRef === "string") {
+    return {
+      ok: false,
+      reason:
+        "independent review evidenceRef must be a structured REVIEW_RESULT reference (path/type/outcome/" +
+        "verificationSource) — a bare legacy path does not resolve to a genuine, recognized, trusted " +
+        "verification artifact and makes no verifiable claim about what it is"
+    };
+  }
+  if (review.evidenceRef.type !== "REVIEW_RESULT") {
+    return {
+      ok: false,
+      reason: `independent review evidenceRef must have type 'REVIEW_RESULT', got '${review.evidenceRef.type}'`
+    };
+  }
+  if (!isAuthenticatedVerificationArtifact(review.evidenceRef, rootDir)) {
+    return {
+      ok: false,
+      reason:
+        `independent review evidenceRef '${describeEvidenceRef(review.evidenceRef)}' does not resolve to a ` +
+        `genuine, recognized, trusted verification artifact`
+    };
+  }
+
+  let resolved: string;
+  try {
+    resolved = assertFilesystemConfinement(rootDir, review.evidenceRef.path);
+  } catch {
+    return { ok: false, reason: "independent review evidenceRef path could not be safely resolved within the repository root" };
+  }
+
+  // TR: Kaynak dosyaları (.test.ts vb.) "proofs/"/"__tests__/" desenine
+  // uyduğu için yol-şekli kontrolünü geçebilir, ama bunlar makine
+  // tarafından ayrıştırılabilir bir inceleme SONUCU taşımaz — yalnızca
+  // GERÇEK bir JSON kaydı, iddia edilen kimlik/sonuç alanlarını taşıyıp
+  // taşımadığı doğrulanabilecek bir içerik sunar.
+  if (!resolved.endsWith(".json")) {
+    return {
+      ok: false,
+      reason:
+        "independent review evidenceRef must reference a JSON evidence record whose content genuinely attests " +
+        "the claimed review (reviewId/reviewerIdentity/reviewedCommitSha/reviewTimestamp/outcome) — a source or " +
+        "test file's mere existence on disk proves nothing about what any review actually concluded"
+    };
+  }
+
+  // TR: `store.read()` (bkz. `file-store.ts`) malformed/geçersiz JSON için
+  // `JSON.parse`'ın kendi `SyntaxError`'ını YAKALAMADAN fırlatır — bir
+  // saldırgan (veya kazara bozulmuş) kanıt dosyası bu geçidi "kapalı
+  // başarısız olmak" yerine TÜM `attemptPhaseClosure()` çağrısını
+  // çökertmemelidir; bu yüzden okuma burada try/catch içine alınır ve
+  // ayrıştırma hatası da tıpkı "geçerli bir kayıt değil" gibi ele alınır.
+  let record: unknown;
+  try {
+    record = store.read<unknown>(resolved);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `independent review evidenceRef at '${review.evidenceRef.path}' could not be read as valid JSON: ${String(err)}`
+    };
+  }
+  if (!isGenuineIndependentReviewRecord(record)) {
+    return {
+      ok: false,
+      reason:
+        `independent review evidenceRef at '${review.evidenceRef.path}' does not contain a genuine, well-formed ` +
+        `INDEPENDENT_REVIEW_RECORD (kind/reviewId/reviewerIdentity/reviewedCommitSha/reviewTimestamp/outcome)`
+    };
+  }
+
+  const claimedBranch = review.reviewedBranch ?? undefined;
+  const recordedBranch = record.reviewedBranch ?? undefined;
+  if (
+    record.reviewId !== review.reviewId ||
+    record.reviewerIdentity !== review.reviewerIdentity ||
+    record.reviewedCommitSha !== review.reviewedCommitSha ||
+    record.reviewTimestamp !== review.reviewTimestamp ||
+    record.outcome !== review.outcome ||
+    claimedBranch !== recordedBranch
+  ) {
+    return {
+      ok: false,
+      reason:
+        `independent review evidenceRef content at '${review.evidenceRef.path}' does not match the claimed review ` +
+        `metadata — the durable evidence record must genuinely corroborate reviewId/reviewerIdentity/` +
+        `reviewedCommitSha/reviewedBranch/reviewTimestamp/outcome, never merely exist alongside an unrelated claim`
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
  * P1 fix (independent Codex review): the ONE authoritative gate — shared
  * verbatim by `attemptPhaseClosure()` (a fresh request) AND
  * `recoverPendingPhaseClosure()` (finding 6: re-validating a persisted,
@@ -487,6 +656,10 @@ function evaluateClosureAttempt(
     readonly invariantGuard: InvariantGuard;
     readonly requirementsDir: string;
     readonly rootDir: string;
+    // TR (BLOCKER 2 fix notu): `isContentAuthenticatedIndependentReview()`'in
+    // iddia edilen inceleme kaydının GERÇEK JSON içeriğini okuyabilmesi için
+    // gerekli — bkz. o fonksiyonun üstündeki fix notu.
+    readonly store: StateStore;
     readonly resolveHeadCommitSha?: (rootDir: string) => string;
   }
 ): { readonly rejectionReasons: string[]; readonly guardReport: InvariantGuardReport; readonly realityMatrix: RealityMatrixSummary } {
@@ -575,16 +748,30 @@ function evaluateClosureAttempt(
         "reviewTimestamp must be a canonical ISO-8601 timestamp (e.g. new Date().toISOString()); a bare outcome " +
         "string, a blank/whitespace identity, or an informal timestamp are never sufficient for phase closure"
     );
-  } else if (!isAuthenticatedVerificationArtifact(review.evidenceRef, deps.rootDir)) {
-    // P1 fix (independent Codex review, finding 4): bkz.
-    // `IndependentReviewEvidence.evidenceRef`'in fix notu — the review's
-    // OWN evidence artifact must be a genuine, recognized, trustworthy-
-    // sourced artifact, not merely a file that happens to exist.
+  } else if (isNonBlankIdentity(attempt.requestedBy) && review.reviewerIdentity.trim().toLowerCase() === attempt.requestedBy.trim().toLowerCase()) {
+    // TR (BLOCKER 2 fix notu, "reviewer independence requirements"): bir
+    // kapanışı İSTEYEN kişi/süreç, KENDİ isteğinin bağımsız incelemesini
+    // yapamaz — reviewerIdentity, requestedBy ile (baş/son boşluk ve büyük/
+    // küçük harf farkı yok sayılarak) AYNIYSA bu, tanım gereği bağımsız bir
+    // inceleme değildir (UASF-REQ-0045'in "independent" sözcüğünün kendisi).
     rejectionReasons.push(
-      `independent review evidenceRef '${describeEvidenceRef(review.evidenceRef)}' does not resolve to a ` +
-        `genuine, recognized, trusted verification artifact`
+      `independent review reviewerIdentity ('${review.reviewerIdentity}') is the same identity as ` +
+        `requestedBy ('${attempt.requestedBy}') — a closure requester can never also be its own independent ` +
+        `reviewer; independence requires a genuinely distinct reviewer identity`
     );
-  } else if (review.reviewedCommitSha !== attempt.closingCommitSha) {
+  } else {
+    const contentCheck = isContentAuthenticatedIndependentReview(review, deps.rootDir, deps.store);
+    if (!contentCheck.ok) {
+      // P1 fix (independent Codex review, finding 4) + BLOCKER 2 fix
+      // (bkz. `isContentAuthenticatedIndependentReview()`'in üstündeki fix
+      // notu): the review's OWN evidence artifact must be a genuine,
+      // recognized, trustworthy-sourced artifact whose ACTUAL CONTENT
+      // corroborates the claimed review — never merely a file that happens
+      // to exist and merely LOOKS shaped like evidence.
+      rejectionReasons.push(contentCheck.reason);
+    }
+  }
+  if (review.reviewedCommitSha !== attempt.closingCommitSha) {
     rejectionReasons.push(
       `independent review reviewed commit '${review.reviewedCommitSha}', but this attempt is closing commit ` +
         `'${attempt.closingCommitSha}' — a review of one commit must never close a different commit`
@@ -713,12 +900,13 @@ function governanceStateLockPath(scopeLockPath: string): string {
  * manifest-identity race (finding 8 of the prior closure round).
  */
 export class ConcurrentGovernanceStateChangedError extends Error {
-  constructor(phaseId: string) {
+  constructor(context: string) {
     super(
-      `Refusing to persist a governance-state transition for phase '${phaseId}': the durable Scope Lock file ` +
-        `has changed since this caller's own in-memory snapshot was loaded — a concurrent process has already ` +
-        `recorded a transition (for this phase or another) that this snapshot does not yet reflect. Reload the ` +
-        `latest authoritative ScopeLock/FounderDecisionLedger state and retry; never blindly overwrite it.`
+      `Refusing to persist a governance-state transition (${context}): a shared, durable governance file ` +
+        `(the Scope Lock OR the Founder Decision Ledger) has changed since this caller's own in-memory ` +
+        `snapshot was loaded — a concurrent process has already recorded a transition (for this phase/decision ` +
+        `or another) that this snapshot does not yet reflect. Reload the latest authoritative ` +
+        `ScopeLock/FounderDecisionLedger state and retry; never blindly overwrite it.`
     );
     this.name = "ConcurrentGovernanceStateChangedError";
   }
@@ -741,6 +929,15 @@ export class ConcurrentGovernanceStateChangedError extends Error {
  * authoritative file — this function throws rather than letting the
  * caller's eventual `saveTo()` silently discard that concurrently-
  * recorded transition.
+ *
+ * TR (bkz. blocker-1 fix notu, aşağısı `assertLedgerStateNotStale()`): bu
+ * fonksiyon YALNIZCA Scope Lock dosyasını kontrol eder — Decision Ledger'ı
+ * DEĞİL. Bu fonksiyonun TEK BAŞINA çağrılması, "kararlar sessizce
+ * kaybolabilir" (bkz. `assertLedgerStateNotStale`'ın kendi fix notu)
+ * açığını KAPATMAZ; her iki paylaşımlı dosya da her mutasyondan önce
+ * kontrol edilmelidir — bu yüzden bu fonksiyonun HER çağrı noktası artık
+ * `assertLedgerStateNotStale()` ile BİRLİKTE (ikisi de aynı paylaşımlı kilit
+ * içinde) çağrılır, asla tek başına değil.
  */
 function assertGovernanceStateNotStale(store: StateStore, scopeLockPath: string, scopeLock: ScopeLock, phaseId: string): void {
   const persisted = store.read<unknown[]>(scopeLockPath);
@@ -757,7 +954,61 @@ function assertGovernanceStateNotStale(store: StateStore, scopeLockPath: string,
     }
     const known = scopeLock.get(candidate.phaseId);
     if (!known || known.state !== candidate.state || known.decisionId !== candidate.decisionId) {
-      throw new ConcurrentGovernanceStateChangedError(phaseId);
+      throw new ConcurrentGovernanceStateChangedError(`scope-lock record for phase '${phaseId}'`);
+    }
+  }
+}
+
+/**
+ * P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 1, "phase closure can lose
+ * authoritative Founder decision history"): reproduced — `attemptPhaseClosure()`'ın
+ * ve `recoverPendingPhaseClosureLocked()`'ın staged commit protokolü, PAYLAŞIMLI
+ * `governanceStateLockPath()` kilidi İÇİNDE bile, mutasyondan hemen önce
+ * SADECE `assertGovernanceStateNotStale()`'ı (yalnızca Scope Lock dosyasını)
+ * çağırıyordu — Decision Ledger dosyasının kendisi HİÇ tazelik kontrolünden
+ * geçmiyordu. Somut kesişim senaryosu: Kapanış A, adım (3)'te
+ * `ledger.saveTo()`'yu BAŞARIYLA çalıştırır (kendi kararını kalıcı Ledger
+ * dosyasına yazar), ardından adım (4)'te `scopeLock.saveTo()`'dan ÖNCE
+ * çöker — Scope Lock dosyası hâlâ ESKİ (LOCKED_FOR_CLOSURE) durumu
+ * gösterir. Kapanış B (FARKLI bir phase için), A'nın Ledger yazmasından
+ * ÖNCE alınmış eski bir Ledger anlık görüntüsüyle başlar; Scope Lock dosyası
+ * A tarafından hiç değiştirilmediği için B'nin `assertGovernanceStateNotStale()`
+ * çağrısı SORUNSUZ geçer — oysa Ledger dosyası GERÇEKTEN A tarafından
+ * ilerletilmiştir. B daha sonra kendi `ledger.saveTo()`'sunu çalıştırdığında,
+ * kendi belleğindeki (A'nın kararını İÇERMEYEN) Ledger anlık görüntüsünü
+ * kalıcı dosyaya yazar — A'nın az önce eklediği yetkili Founder kararını
+ * SESSİZCE SİLER. Bu, UASF-REQ-0010/UASF-REQ-0044'ün (bölüm 46, karar
+ * geçmişinin korunması) doğrudan ihlalidir. Düzeltme: `assertGovernanceStateNotStale()`
+ * ile TAM OLARAK AYNI desende — kalıcı dosyadaki HER karar kaydı çağıranın
+ * kendi `ledger.get()` görünümüyle karşılaştırılır — yeni bir
+ * `assertLedgerStateNotStale()` eklendi. Artık kalıcı Ledger dosyasındaki HER
+ * `decisionId`, çağıranın kendi bellek-içi görünümüyle (`status`,
+ * `supersededBy`) BİREBİR eşleşmelidir; eşleşmezse (ya çağıranın hiç
+ * bilmediği YENİ bir karar, ya da durumu DEĞİŞMİŞ bir karar tespit edilirse)
+ * bu fonksiyon fail-closed olarak fırlatır — B'nin kendi `saveTo()`'su asla
+ * çalışmaz, A'nın kararı ASLA sessizce üzerine yazılmaz. Bu kontrol, HER İKİ
+ * mutasyon noktasında (`attemptPhaseClosure()` ve
+ * `recoverPendingPhaseClosureLocked()`) `assertGovernanceStateNotStale()` ile
+ * BİRLİKTE, aynı paylaşımlı `governanceStateLockPath()` kilidi içinde
+ * çağrılır — böylece hem Scope Lock hem Decision Ledger için tazelik garanti
+ * edilir, sadece biri için değil.
+ */
+function assertLedgerStateNotStale(store: StateStore, ledgerPath: string, ledger: FounderDecisionLedger): void {
+  const persisted = store.read<unknown[]>(ledgerPath);
+  if (!persisted) {
+    return;
+  }
+  for (const raw of persisted) {
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const candidate = raw as { decisionId?: unknown; status?: unknown; supersededBy?: unknown };
+    if (typeof candidate.decisionId !== "string") {
+      continue;
+    }
+    const known = ledger.get(candidate.decisionId);
+    if (!known || known.status !== candidate.status || known.supersededBy !== candidate.supersededBy) {
+      throw new ConcurrentGovernanceStateChangedError(`decision-ledger record '${candidate.decisionId}'`);
     }
   }
 }
@@ -927,6 +1178,16 @@ export function attemptPhaseClosure(
       // a stale attempt leaves no trace whatsoever and fails closed rather
       // than silently discarding a concurrently-recorded sibling transition.
       assertGovernanceStateNotStale(deps.store, deps.scopeLockPath, deps.scopeLock, attempt.phaseId);
+      // P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 1): `deps.ledger`'ın da
+      // AYNI şekilde tazelik kontrolünden geçmesi gerekir — bkz.
+      // `assertLedgerStateNotStale()`'ın üstündeki fix notu for the exact
+      // "Closure A persists its ledger entry, crashes before scope-lock
+      // persists, Closure B's stale ledger snapshot then silently overwrites
+      // A's decision" reproduction this closes. Checked here, in the SAME
+      // shared governance lock, BEFORE the staged commit protocol writes
+      // anything — a stale ledger snapshot fails closed exactly like a stale
+      // scope-lock snapshot does.
+      assertLedgerStateNotStale(deps.store, deps.ledgerPath, deps.ledger);
 
       // --- Staged, crash-recoverable commit protocol (willClose === true) ---
       const iPath = intentPath(deps.manifestDir, attempt.phaseId, manifestId);
@@ -1234,6 +1495,14 @@ function recoverPendingPhaseClosureLocked(
   // its own analogous mutation — bkz. `assertGovernanceStateNotStale()`'in
   // üstündeki fix notu.
   assertGovernanceStateNotStale(deps.store, deps.scopeLockPath, deps.scopeLock, phaseId);
+  // P1 fix (FINAL P0 CLOSURE REMEDIATION, blocker 1): recovery'nin de
+  // AYNI ledger tazelik kontrolünden geçmesi gerekir — bkz.
+  // `assertLedgerStateNotStale()`'ın üstündeki fix notu. Recovery, tıpkı
+  // `attemptPhaseClosure()` gibi, birazdan `deps.ledger.saveTo()` çağıracak
+  // (aşağısı) — bu kontrol olmadan, recovery de az önce tanımlanan
+  // "eski Ledger anlık görüntüsü, başka bir closure'ın YENİ kararını
+  // sessizce siler" açığına aynı şekilde açık kalırdı.
+  assertLedgerStateNotStale(deps.store, deps.ledgerPath, deps.ledger);
   if (deps.ledger.get(intent.decisionId)) {
     // Step (3) already durably ran in an earlier process, but step (4)
     // never captured it — reconcile from the ALREADY-existing ledger
