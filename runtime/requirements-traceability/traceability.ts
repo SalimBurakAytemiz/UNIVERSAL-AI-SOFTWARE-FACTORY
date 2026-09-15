@@ -5,7 +5,7 @@
 // "kanıtsız iddiaları" (orphan status claims) tespit eder — bölüm 294'teki
 // "no unsupported upgrades" kuralının denetlenebilir hâlidir.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { assertFilesystemConfinement } from "../sandbox/sandbox.js";
@@ -377,6 +377,29 @@ export function isCommittedToRepositoryHead(rootDir: string, relativePath: strin
   }
 }
 
+/**
+ * TR (blocker 2 fix notu, "iki anlık görüntü" (two-snapshot) modeliyle
+ * uyumlu — bkz. `phase-closure.ts`'in blocker-3 fix notu): bir execution
+ * evidence kaydının `commitSha`'sının, deponun güncel HEAD'iyle BİREBİR
+ * eşit olmasını ZORUNLU kılmak, kanıt dosyasının KENDİSİNİ test edilen kod
+ * commit'inden SONRAKİ, ayrı bir commit'te saklamayı İMKÂNSIZ kılar (bir
+ * commit kendi SHA'sını önceden içeremez). Bunun yerine, iddia edilen
+ * commit'in güncel HEAD'in KENDİSİ OLDUĞU YA DA onun bir ATASI olduğu
+ * doğrulanır — `git merge-base --is-ancestor`.
+ */
+function isAncestorOrSameCommit(rootDir: string, candidateSha: string, headSha: string): boolean {
+  if (candidateSha === headSha) return true;
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", candidateSha, headSha], {
+      cwd: rootDir,
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function isAuthenticatedVerificationArtifact(
   ref: EvidenceRef,
   rootDir: string,
@@ -416,6 +439,187 @@ function hasOutcomeVerifiedEvidence(
   isCommittedToHead: (rootDir: string, relativePath: string) => boolean
 ): boolean {
   return refs.some((ref) => isOutcomeVerifiedEvidenceRef(ref, rootDir, isCommittedToHead));
+}
+
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 2 — ikinci tur, UASF-REQ-0045,
+ * "evidence, not claims"): bağımsız inceleme, `isOutcomeVerifiedEvidenceRef()`'in
+ * hâlâ bir SORUN taşıdığını gösterdi: commit edilmiş bir test/kanıt KAYNAK
+ * dosyası (`.test.ts`/`.spec.ts`, `looksLikeRecognizedVerificationArtifact()`
+ * ile eşleşir) artı çağıranın kendi tipli `outcome: "PASS"`/`verificationSource`
+ * iddiası, dosyanın GERÇEKTEN çalıştırıldığına dair HİÇBİR ŞEY kanıtlamadan bu
+ * geçidi geçebiliyordu — bir kaynak dosyanın var olması yalnızca "bu test
+ * kaynağı mevcut" anlamına gelir, asla "çalıştırıldı ve geçti" anlamına gelmez.
+ *
+ * Çözüm (mevcut `phase-closure.ts`'in bağımsız inceleme kanıtı için ZATEN
+ * kullandığı AYNI birincil desen — bkz. `IndependentReviewRecordFile`'ın
+ * fix notu, phase-closure.ts): KAYNAK (source) ile ÇALIŞTIRMA KANITI
+ * (execution evidence) burada da ayrıştırılır. PASS iddiası artık GERÇEK,
+ * makine tarafından ayrıştırılabilir bir `EXECUTION_EVIDENCE_RECORD` JSON
+ * kaydı GEREKTİRİR — bu kayıt çalıştırılan KOMUTU, karşı çalıştırıldığı
+ * COMMIT'i ve SONUCU kendi İÇİNDE taşır (çağıranın registry'deki ayrı
+ * `outcome`/`verificationSource` alanları DEĞİL) ve deponun güvenilir HEAD'ine
+ * gerçekten commit edilmiş olmalıdır. Bir `.test.ts` kaynak dosyasının içeriği
+ * asla bu JSON şeklini taşımaz (TypeScript kaynak kodudur, `JSON.parse`
+ * başarısız olur) — bu, kaynak dosyaların yapısal olarak ASLA yeterli
+ * olamayacağı anlamına gelir, ayrı bir yol-deseni kara listesi icat etmeye
+ * gerek kalmadan.
+ *
+ * TR (kapsam notu — "tüm depoyu yeniden tarama/tasarlama" DEĞİL): mevcut
+ * `isOutcomeVerifiedEvidenceRef()`/`detectTraceabilityIssues()` KASITLI
+ * OLARAK değiştirilmedi — bunlar `invariant-guard.ts`/`reality-matrix.ts`
+ * üzerinden bu deponun TÜM tarihsel `specification/requirements/*.yml`
+ * kaydını (yüzlerce mevcut girdi) tarar; o kaydı bu turun kapsamı dışında
+ * yeniden yazmak "do not rescan/redesign the whole repository" talimatını
+ * ihlal eder. Bu yeni, DAHA SIKI fonksiyon yalnızca `phase-closure.ts`'in
+ * KENDİ kapanış-anı `verificationEvidenceRefs` kontrolüne bağlanır (bkz. o
+ * dosyadaki değişiklik) — kapanışın kendisi artık geçmiş kayıtların gevşek
+ * biçimine değil, bu sıkı kanıta tabidir.
+ */
+export interface ExecutionEvidenceRecordFile {
+  readonly kind: "EXECUTION_EVIDENCE_RECORD";
+  readonly command: string;
+  readonly commitSha: string;
+  readonly outcome: string;
+  readonly runTimestamp: string;
+}
+
+function isGenuineExecutionEvidenceRecord(value: unknown): value is ExecutionEvidenceRecordFile {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.kind === "EXECUTION_EVIDENCE_RECORD" &&
+    typeof v.command === "string" &&
+    v.command.trim().length > 0 &&
+    typeof v.commitSha === "string" &&
+    v.commitSha.trim().length > 0 &&
+    typeof v.outcome === "string" &&
+    typeof v.runTimestamp === "string" &&
+    v.runTimestamp.trim().length > 0
+  );
+}
+
+/**
+ * The authoritative gate for genuine, execution-backed evidence — see the
+ * fix note above `ExecutionEvidenceRecordFile` for the full rationale.
+ * `resolveHeadSha`/`isCommittedToHead` default to the real git primitives
+ * (bkz. `isCommittedToRepositoryHead()` yukarıda) so a real call site never
+ * needs to override them; tests without a real git checkout supply
+ * deterministic fakes.
+ */
+export function isAuthenticatedExecutionEvidence(
+  ref: EvidenceRef,
+  rootDir: string,
+  resolveHeadSha: (rootDir: string) => string,
+  isCommittedToHead: (rootDir: string, relativePath: string) => boolean = isCommittedToRepositoryHead
+): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+  if (typeof ref === "string") {
+    return {
+      ok: false,
+      reason:
+        "verification evidence reference must be a structured reference naming an outcome-bearing type " +
+        "(TEST_RESULT/PROOF_RESULT/SECURITY_RESULT), never a bare legacy path"
+    };
+  }
+  if (ref.type === "ARTIFACT_REFERENCE") {
+    return {
+      ok: false,
+      reason: "verification evidence reference must carry an outcome-bearing type, not a bare ARTIFACT_REFERENCE"
+    };
+  }
+  if (!isAuthenticatedVerificationArtifact(ref, rootDir)) {
+    return {
+      ok: false,
+      reason: `verification evidence reference '${ref.path}' does not resolve to a genuine, recognized, trusted verification artifact`
+    };
+  }
+
+  let resolved: string;
+  try {
+    resolved = assertFilesystemConfinement(rootDir, ref.path);
+  } catch {
+    return { ok: false, reason: "verification evidence reference path could not be safely resolved within the repository root" };
+  }
+
+  // TR: bkz. yukarıdaki `ExecutionEvidenceRecordFile`'ın fix notu — bir
+  // kaynak dosyası (.test.ts vb.) hiçbir zaman bu JSON şeklini taşıyamaz.
+  if (!resolved.endsWith(".json")) {
+    return {
+      ok: false,
+      reason:
+        `verification evidence reference '${ref.path}' must reference a JSON execution-evidence record whose ` +
+        `content genuinely proves a command ran (command/commitSha/outcome/runTimestamp) — a test/proof SOURCE ` +
+        `file's mere existence proves only that test source exists, never that it was actually executed`
+    };
+  }
+
+  let headSha: string;
+  try {
+    headSha = resolveHeadSha(rootDir);
+  } catch (err) {
+    return { ok: false, reason: `repository identity could not be independently verified from a trusted source: ${String(err)}` };
+  }
+
+  if (!isCommittedToHead(rootDir, ref.path)) {
+    return {
+      ok: false,
+      reason:
+        `verification evidence reference at '${ref.path}' is not committed to the repository's trusted HEAD ` +
+        `revision ('${headSha}') — an untracked or merely-written-to-disk file proves nothing about a genuine, ` +
+        `durable execution record`
+    };
+  }
+
+  let record: unknown;
+  try {
+    record = JSON.parse(readFileSync(resolved, "utf8"));
+  } catch (err) {
+    return { ok: false, reason: `verification evidence reference at '${ref.path}' could not be read as valid JSON: ${String(err)}` };
+  }
+  if (!isGenuineExecutionEvidenceRecord(record)) {
+    return {
+      ok: false,
+      reason:
+        `verification evidence reference at '${ref.path}' does not contain a genuine, well-formed ` +
+        `EXECUTION_EVIDENCE_RECORD (kind/command/commitSha/outcome/runTimestamp)`
+    };
+  }
+  if (!isTrustedVerificationSource(record.command)) {
+    return {
+      ok: false,
+      reason: `verification evidence record's command '${record.command}' is not one of this Factory's recognized verification commands`
+    };
+  }
+  // TR (P0 CLOSURE REMEDIATION fix notu, blocker 2 — blocker 3'ün "iki anlık
+  // görüntü" içgörüsüyle düzeltildi): `record.commitSha`'nın BİREBİR
+  // `headSha`'ya eşit olmasını ZORUNLU kılmak, kanıt dosyasının KENDİSİNİ
+  // (bu JSON dosyası) test edilen kod commit'inden SONRAKİ, ayrı bir
+  // commit'te saklamayı GERÇEK Git'te İMKÂNSIZ kılar — bir commit, kendi
+  // SHA'sını (içeriğine bağlı bir özet) kendi içeriğinde ÖNCEDEN taşıyamaz.
+  // Çözüm: `record.commitSha`, güncel HEAD'in KENDİSİ OLABİLİR (kanıt,
+  // test edilen commit'le AYNI commit'te saklanmışsa) YA DA o HEAD'in bir
+  // ATASI olabilir (testler commit X'e karşı çalıştırılmış, kanıt X'ten
+  // SONRAKİ bir Y commit'inde saklanmışsa — Y'nin KENDİSİ X ile birebir
+  // aynı uygulama koduna sahip olduğu `phase-closure.ts`'in ayrı
+  // "incelenmemiş değişiklik yok" kontrolüyle zaten doğrulanır). Divergent,
+  // gelecekteki veya tamamen ilgisiz bir commit HÂLÂ reddedilir.
+  if (record.commitSha !== headSha && !isAncestorOrSameCommit(rootDir, record.commitSha, headSha)) {
+    return {
+      ok: false,
+      reason:
+        `verification evidence record at '${ref.path}' was captured for commit '${record.commitSha}', which is ` +
+        `neither the current trusted HEAD ('${headSha}') nor an ancestor of it — execution evidence for another, ` +
+        `divergent, or unrelated commit/run can never satisfy this claim`
+    };
+  }
+  if (!EVIDENCE_SUCCESS_OUTCOMES.has(record.outcome)) {
+    return {
+      ok: false,
+      reason: `verification evidence record at '${ref.path}' recorded outcome '${record.outcome}', not a recognized success outcome`
+    };
+  }
+
+  return { ok: true };
 }
 
 /**

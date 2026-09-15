@@ -60,7 +60,7 @@ describe("CapabilityGateway", () => {
 
       function approvedGateway(id: string) {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor(id, action);
         approvals.approve(id, "founder@example.com");
         const gateway = new CapabilityGateway(policy, approvals);
@@ -79,7 +79,7 @@ describe("CapabilityGateway", () => {
 
       it("still blocks execution when the referenced approval is only PENDING", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor("dep-2", action);
         const gateway = new CapabilityGateway(policy, approvals);
         const execute = vi.fn(() => "should never run");
@@ -92,7 +92,7 @@ describe("CapabilityGateway", () => {
 
       it("still blocks execution when the referenced approval was REJECTED", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor("dep-3", action);
         approvals.reject("dep-3", "founder@example.com");
         const gateway = new CapabilityGateway(policy, approvals);
@@ -106,7 +106,7 @@ describe("CapabilityGateway", () => {
 
       it("still blocks execution when the referenced approval is REQUEST_CHANGES", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor("dep-4", action);
         approvals.requestChanges("dep-4", "founder@example.com", "needs a rollback plan");
         const gateway = new CapabilityGateway(policy, approvals);
@@ -120,7 +120,7 @@ describe("CapabilityGateway", () => {
 
       it("rejects an unknown approval id", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new CapabilityGateway(policy, approvals);
         const execute = vi.fn(() => "should never run");
 
@@ -133,7 +133,7 @@ describe("CapabilityGateway", () => {
       it("an explicit policy DENY is never overridden by approval evidence, however genuine", async () => {
         const policy = new PolicyEngine();
         policy.addRule({ name: "deny-everything", priority: 100, evaluate: () => "DENY" });
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor("dep-5", action);
         approvals.approve("dep-5", "founder@example.com");
         const gateway = new CapabilityGateway(policy, approvals);
@@ -151,7 +151,7 @@ describe("CapabilityGateway", () => {
             "authorize execution through a gateway wired to a DIFFERENT, authoritative workflow",
           async () => {
             const policy = new PolicyEngine();
-            const authoritativeApprovals = new ApprovalWorkflow();
+            const authoritativeApprovals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
             const gateway = new CapabilityGateway(policy, authoritativeApprovals);
 
             // A malicious/careless caller fabricates its OWN workflow and
@@ -159,7 +159,7 @@ describe("CapabilityGateway", () => {
             // constructed with THIS workflow, so it is structurally
             // unreachable: there is no longer any per-call parameter that
             // could even accept it.
-            const fakeApprovals = new ApprovalWorkflow();
+            const fakeApprovals = new ApprovalWorkflow(undefined, ["attacker@example.com"]);
             fakeApprovals.requestFor("dep-fake", action);
             fakeApprovals.approve("dep-fake", "attacker@example.com");
 
@@ -191,7 +191,7 @@ describe("CapabilityGateway", () => {
       describe("finding 2: approval must be bound to complete action identity", () => {
         it("an approval for production-deploy must not authorize a materially different secret-mutation action, even with a similar description/risk", async () => {
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const deployAction = { actionType: "production-deploy", risk: 5 as const, description: "sensitive change" };
           approvals.requestFor("dep-6", deployAction);
           approvals.approve("dep-6", "founder@example.com");
@@ -208,7 +208,7 @@ describe("CapabilityGateway", () => {
 
         it("an approval for one project cannot authorize the identical action for a different project", async () => {
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const actionForA = { actionType: "production-deploy", risk: 5 as const, description: "deploy", projectId: "proj-a" };
           approvals.requestFor("dep-7", actionForA);
           approvals.approve("dep-7", "founder@example.com");
@@ -225,7 +225,7 @@ describe("CapabilityGateway", () => {
 
         it("an approval for a different costUsd cannot authorize a more expensive action of the same type/description/risk", async () => {
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const cheapAction = { actionType: "model.invoke", risk: 5 as const, description: "invoke", costUsd: 0.1 };
           approvals.requestFor("dep-8", cheapAction);
           approvals.approve("dep-8", "founder@example.com");
@@ -242,7 +242,7 @@ describe("CapabilityGateway", () => {
 
         it("a legacy request() (no recorded actionType) can never satisfy the gateway's full-identity binding", async () => {
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           approvals.request("dep-9", action.description, action.risk); // legacy API — no actionType/costUsd/projectId recorded
           approvals.approve("dep-9", "founder@example.com");
           const gateway = new CapabilityGateway(policy, approvals);
@@ -312,7 +312,7 @@ describe("CapabilityGateway", () => {
     () => {
       it("neither the policy nor the approvals dependency is reachable as an ordinary JS property", () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new CapabilityGateway(policy, approvals);
 
         expect((gateway as unknown as Record<string, unknown>).policy).toBeUndefined();
@@ -320,7 +320,7 @@ describe("CapabilityGateway", () => {
       });
 
       it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private dependencies", () => {
-        const gateway = new CapabilityGateway(new PolicyEngine(), new ApprovalWorkflow());
+        const gateway = new CapabilityGateway(new PolicyEngine(), new ApprovalWorkflow(undefined, ["founder@example.com"]));
 
         expect(Object.getOwnPropertyNames(gateway)).toEqual([]);
         expect(Reflect.ownKeys(gateway)).toEqual([]);
@@ -357,9 +357,9 @@ describe("CapabilityGateway", () => {
           "property access",
         () => {
           const policy = new PolicyEngine();
-          const gateway = new CapabilityGateway(policy, new ApprovalWorkflow());
+          const gateway = new CapabilityGateway(policy, new ApprovalWorkflow(undefined, ["founder@example.com"]));
 
-          const forgedApprovals = new ApprovalWorkflow();
+          const forgedApprovals = new ApprovalWorkflow(undefined, ["attacker@example.com"]);
           const forgedAction = { actionType: "production-deploy", risk: 5 as const, description: "deploy" };
           forgedApprovals.requestFor("forged-1", forgedAction);
           forgedApprovals.approve("forged-1", "attacker@example.com");
@@ -396,7 +396,7 @@ describe("CapabilityGateway", () => {
             }
           };
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           // Bind the approval to risk 5 — the value policy.evaluate() saw.
           approvals.requestFor("gtr-1", { actionType: "production-deploy", risk: 5, description: "deploy to prod" });
           approvals.approve("gtr-1", "founder@example.com");
@@ -455,7 +455,7 @@ describe("CapabilityGateway", () => {
 
       function approvedGateway(id: string) {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor(id, action);
         approvals.approve(id, "founder@example.com");
         const gateway = new CapabilityGateway(policy, approvals);
@@ -571,7 +571,7 @@ describe("CapabilityGateway", () => {
           "check and a DIFFERENT approval B's id afterward must not let A authorize while B is silently consumed",
         async () => {
           const policy = new PolicyEngine(); // default-deny -> risk 5 -> APPROVAL_REQUIRED
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           approvals.requestFor("id-a", action);
           approvals.approve("id-a", "founder@example.com");
           // "id-b" is a COMPLETELY unrelated, also-APPROVED request that
@@ -609,7 +609,7 @@ describe("CapabilityGateway", () => {
 
       it("BLOCKER regression (failure path): the SAME captured id is used for failExecution() even if approvalId would answer differently by then", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor("id-a-fail", action);
         approvals.approve("id-a-fail", "founder@example.com");
         approvals.requestFor("id-b-fail", { actionType: "unrelated-action", risk: 5, description: "something else" });
@@ -637,7 +637,7 @@ describe("CapabilityGateway", () => {
 
       it("Proxy-wrapped ApprovalReference: approvalId is read at most once across the whole authorize() call", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         approvals.requestFor("id-proxy", action);
         approvals.approve("id-proxy", "founder@example.com");
         const gateway = new CapabilityGateway(policy, approvals);
@@ -658,7 +658,7 @@ describe("CapabilityGateway", () => {
 
       it("a mismatch error message still names the correct (single-read) approvalId, not a possibly-different later read", async () => {
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow(); // "id-unknown" never requested
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]); // "id-unknown" never requested
         const gateway = new CapabilityGateway(policy, approvals);
 
         let reads = 0;
@@ -703,7 +703,7 @@ describe("CapabilityGateway", () => {
           "risk-5 action that only succeeds because a genuine approval was consumed",
         async () => {
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new CapabilityGateway(policy, approvals);
           const action = { actionType: "risky.action", risk: 5 as const, description: "y" };
           approvals.requestFor("appr-1", action);
@@ -773,7 +773,7 @@ describe("CapabilityGateway", () => {
           "action into approval matching",
         async () => {
           const policy = new PolicyEngine();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new CapabilityGateway(policy, approvals);
           const action = { actionType: "risky.action", risk: 5 as const, description: "y" };
           approvals.requestFor("appr-1", action);

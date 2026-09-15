@@ -1812,7 +1812,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         const costEngine = new CostEngine();
 
         const projectId = "proj-risk5-approved";
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-risk5-1";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -1869,7 +1869,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         modelGateway.registerProvider(provider);
 
         const projectId = "proj-risk5-pending";
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-risk5-pending";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -1900,7 +1900,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-rejected-"));
         const policy = new PolicyEngine();
         const projectId = "proj-risk5-rejected";
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-risk5-rejected";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -1929,7 +1929,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-changes-"));
         const policy = new PolicyEngine();
         const projectId = "proj-risk5-changes";
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-risk5-changes";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -1989,7 +1989,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         // `ApprovalEvidenceMismatchError`, not the "no reference supplied
         // at all" `CapabilityApprovalRequiredError` — but the bootstrap is
         // blocked either way, which is the only thing that matters here.
-        const forgedApprovals = new ApprovalWorkflow();
+        const forgedApprovals = new ApprovalWorkflow(undefined, ["attacker@example.com"]);
         const forgedId = "forged-approval";
         forgedApprovals.requestFor(forgedId, {
           actionType: "project.scaffold",
@@ -2017,7 +2017,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
       it("an approval whose recorded identity does not exactly match the scaffold action (wrong projectId) cannot authorize a different project's bootstrap", async () => {
         tempRoot = mkdtempSync(join(tmpdir(), "uasf-orchestrator-risk5-mismatch-"));
         const policy = new PolicyEngine();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-for-other-project";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -2065,7 +2065,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
               evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
             });
             const projectId = "proj-cross-root-replay";
-            const approvals = new ApprovalWorkflow();
+            const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
             const approvalId = "approval-cross-root-replay";
             // Requested (and approved) with an identity digest bound to
             // root A's canonical destination — exactly what a genuine,
@@ -2145,7 +2145,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           evaluate: (a) => (a.actionType === "model.invoke" ? "ALLOW" : null)
         });
         const projectId = "proj-same-root-match";
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-same-root-match";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -2308,7 +2308,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           const costEngine = new CostEngine();
 
           const projectId = "proj-risk5-write-failure";
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const approvalId = "approval-risk5-write-failure";
           approvals.requestFor(approvalId, {
             actionType: "project.scaffold",
@@ -2398,7 +2398,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
         const costEngine = new CostEngine();
 
         const projectId = "proj-risk5-write-success";
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const approvalId = "approval-risk5-write-success";
         approvals.requestFor(approvalId, {
           actionType: "project.scaffold",
@@ -2450,7 +2450,7 @@ describe("bootstrapProject (P0 end-to-end orchestration)", () => {
           const costEngine = new CostEngine();
 
           const projectId = "proj-policy-outcome";
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const approvalId = "approval-policy-outcome";
           approvals.requestFor(approvalId, {
             actionType: "project.scaffold",

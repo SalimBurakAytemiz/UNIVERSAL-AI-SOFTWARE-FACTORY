@@ -181,6 +181,39 @@ export class SelfApprovalNotPermittedError extends Error {
   }
 }
 
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 1 — ikinci tur, UASF-REQ-0019,
+ * UASF-REQ-0020): bağımsız inceleme, bir önceki turdaki `authorizedApprovers`
+ * çözümünün risk-5 için hâlâ İSTEĞE BAĞLI (opt-in) olduğunu tespit etti —
+ * `ApprovalWorkflow` bu liste OLMADAN inşa edilirse, `#assertAuthorizedApprover`
+ * tamamen ATLANIR ve çağıranın kendi `decidedBy` dizesi (sahte bir "kurucu"
+ * adı dahil) risk-5 bir isteği APPROVED durumuna, oradan da EXECUTED'e
+ * taşıyabilir. Bölüm 120'nin değişmezi ("risk-5 bir işlem asla geçerli bir
+ * Kurucu onayı olmadan EXECUTED'e ulaşamaz") bir YAPILANDIRMA seçeneğine
+ * bağlı olamaz — risk-5 için bu FAIL-CLOSED (varsayılan red) olmalıdır.
+ *
+ * Çözüm: `#authorizedApprovers` yapılandırılMAmışken risk < 5 için önceki
+ * esnek (kontrolü atlayan) davranış AYNEN korunur (geriye dönük uyumluluk,
+ * sıfır etki alanı) — ama risk >= 5 için artık YAPILANDIRMA EKSİKLİĞİNİN
+ * KENDİSİ bir red nedenidir: yetkili bir Kurucu kimlik kaynağı hiç
+ * tanımlanmamışsa, "onaylandı" iddiasının GERÇEK bir Kurucu'dan geldiğini
+ * kanıtlayacak hiçbir temel yoktur, dolayısıyla iddia REDDEDİLİR (asla
+ * sessizce kabul edilmez).
+ */
+export class RiskFiveAuthorityRequiredError extends Error {
+  constructor(id: string, risk: number) {
+    super(
+      `Approval decision for request '${id}' (risk ${risk}) rejected: this workflow has no configured ` +
+        `authorizedApprovers, so there is no authoritative source of genuine Founder identity to validate ` +
+        `this decision against. A risk-5 action can never reach EXECUTED on a caller-controlled decidedBy ` +
+        `string alone (baseline section 120; UASF-REQ-0019, UASF-REQ-0020) — construct this ApprovalWorkflow ` +
+        `with a real, trusted authorizedApprovers set before deciding on any risk-5 request. This is a ` +
+        `fail-closed default: absence of authority configuration denies, it never bypasses.`
+    );
+    this.name = "RiskFiveAuthorityRequiredError";
+  }
+}
+
 function normalizeIdentity(identity: string): string {
   return identity.trim().toLowerCase();
 }
@@ -397,14 +430,24 @@ export class ApprovalWorkflow {
   }
 
   /**
-   * TR (blocker 1 fix notu): `#authorizedApprovers` yapılandırılmışsa,
-   * `decidedBy` bu kümenin bir üyesi olmalıdır — DEĞİLSE fail-closed
-   * (`UnauthorizedApproverError`). Yapılandırılmamışsa (undefined), bu
-   * kontrol tamamen atlanır (mevcut çağıranlar etkilenmez).
+   * TR (blocker 1 fix notu, P0 CLOSURE REMEDIATION ikinci tur):
+   * `#authorizedApprovers` yapılandırılmışsa, `decidedBy` bu kümenin bir
+   * üyesi olmalıdır — DEĞİLSE fail-closed (`UnauthorizedApproverError`).
+   * Yapılandırılmamışsa (undefined) VE `risk < 5` ise, önceki esnek
+   * davranış korunur (kontrol atlanır — mevcut çağıranlar etkilenmez).
+   * AMA `risk >= 5` ise, yapılandırma eksikliğinin KENDİSİ artık bir red
+   * nedenidir (`RiskFiveAuthorityRequiredError`, bkz. sınıf başı fix notu)
+   * — risk-5 için bu kontrol ASLA opsiyonel değildir.
    */
-  #assertAuthorizedApprover(decidedBy: string, id: string): void {
-    if (this.#authorizedApprovers && !this.#authorizedApprovers.has(normalizeIdentity(decidedBy))) {
-      throw new UnauthorizedApproverError(decidedBy, id);
+  #assertAuthorizedApprover(decidedBy: string, id: string, risk: number): void {
+    if (this.#authorizedApprovers) {
+      if (!this.#authorizedApprovers.has(normalizeIdentity(decidedBy))) {
+        throw new UnauthorizedApproverError(decidedBy, id);
+      }
+      return;
+    }
+    if (risk >= 5) {
+      throw new RiskFiveAuthorityRequiredError(id, risk);
     }
   }
 
@@ -420,7 +463,7 @@ export class ApprovalWorkflow {
     if (req.requestedBy !== undefined && normalizeIdentity(req.requestedBy) === normalizeIdentity(decidedBy)) {
       throw new SelfApprovalNotPermittedError(decidedBy, id);
     }
-    this.#assertAuthorizedApprover(decidedBy, id);
+    this.#assertAuthorizedApprover(decidedBy, id, req.risk);
     const next: MutableApprovalRequest = {
       ...req,
       status: "APPROVED",
@@ -437,7 +480,7 @@ export class ApprovalWorkflow {
     if (req.status !== "PENDING") {
       throw new Error(`Cannot reject request ${id}: status is ${req.status}, not PENDING`);
     }
-    this.#assertAuthorizedApprover(decidedBy, id);
+    this.#assertAuthorizedApprover(decidedBy, id, req.risk);
     const next: MutableApprovalRequest = {
       ...req,
       status: "REJECTED",
@@ -483,7 +526,7 @@ export class ApprovalWorkflow {
     if (req.status !== "PENDING") {
       throw new Error(`Cannot request changes on request ${id}: status is ${req.status}, not PENDING`);
     }
-    this.#assertAuthorizedApprover(decidedBy, id);
+    this.#assertAuthorizedApprover(decidedBy, id, req.risk);
     const next: MutableApprovalRequest = {
       ...req,
       status: "REQUEST_CHANGES",

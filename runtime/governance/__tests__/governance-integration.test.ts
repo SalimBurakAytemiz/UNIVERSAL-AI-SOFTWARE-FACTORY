@@ -117,8 +117,25 @@ describe("governance mechanisms: end-to-end integration (Part F/G)", () => {
     // 4): outcome-bearing evidence refs must now be structured and
     // authenticated (bkz. traceability.ts'in fix notu) — bare strings no
     // longer qualify.
+    // BLOCKER 2 fix (P0 CLOSURE REMEDIATION, round 2): verificationEvidenceRefs
+    // now goes through `isAuthenticatedExecutionEvidence()`, which requires
+    // the artifact's OWN CONTENT to be a genuine EXECUTION_EVIDENCE_RECORD
+    // JSON (bkz. traceability.ts'in fix notu) — the SAME `proof.test.ts`
+    // SOURCE file used above for the registry's own test_refs no longer
+    // qualifies as CLOSURE-time execution evidence.
+    mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+    writeFileSync(
+      join(tempRoot, "proofs", "execution-evidence.json"),
+      JSON.stringify({
+        kind: "EXECUTION_EVIDENCE_RECORD",
+        command: "npm test (vitest)",
+        commitSha: closingCommitSha,
+        outcome: "PASS",
+        runTimestamp: new Date().toISOString()
+      })
+    );
     const verificationEvidenceRefs = [
-      { path: "proof.test.ts", type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest)" }
+      { path: "proofs/execution-evidence.json", type: "TEST_RESULT" as const, outcome: "PASS", verificationSource: "npm test (vitest)" }
     ];
     // BLOCKER 2 fix (FINAL P0 CLOSURE REMEDIATION): a review's evidenceRef
     // must now resolve to a genuine JSON evidence record whose CONTENT

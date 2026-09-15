@@ -16,7 +16,7 @@ describe("Proof: Human approval gates Risk-5 actions", () => {
     });
     expect(decision.decision).toBe("APPROVAL_REQUIRED");
 
-    const approvals = new ApprovalWorkflow();
+    const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
     approvals.request("release-v1.2.0", "Deploy release v1.2.0 to production", 5);
 
     // No human decision yet -> execution is impossible.

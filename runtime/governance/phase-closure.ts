@@ -34,7 +34,7 @@
 // transition happens, never a second, parallel "closure" mechanism.
 
 import { execFileSync } from "node:child_process";
-import { isAuthenticatedVerificationArtifact, isOutcomeVerifiedEvidenceRef, type EvidenceRef } from "../requirements-traceability/traceability.js";
+import { isAuthenticatedVerificationArtifact, isAuthenticatedExecutionEvidence, type EvidenceRef } from "../requirements-traceability/traceability.js";
 import type { InvariantGuard, InvariantGuardReport } from "../invariants/invariant-guard.js";
 import type { InvariantViolation } from "../invariants/invariant-guard.js";
 import { ScopeLock, expectedLedgerSourceForPhaseState } from "./scope-lock.js";
@@ -178,6 +178,51 @@ export function resolveWorkingTreeIsClean(rootDir: string): boolean {
     encoding: "utf8"
   });
   return output.trim().length === 0;
+}
+
+/**
+ * TR (P0 CLOSURE REMEDIATION fix notu, blocker 3 — "iki anlık görüntü"
+ * (two-snapshot) modeli, UASF-REQ-0045): bağımsız incelenen kod anlık
+ * görüntüsü (`reviewedCommitSha`) ile kapanış anlık görüntüsü
+ * (`closingCommitSha`) artık BİREBİR AYNI olmak ZORUNDA değildir — inceleme
+ * kanıtının kendisi, incelenen commit'ten SONRAKİ, ayrı bir commit'te
+ * saklanabilir (kanıt dosyasını commit etmek, incelenen commit'i DEĞİL,
+ * YENİ bir commit oluşturur — bu yüzden ikisinin birebir eşit olmasını
+ * ZORUNLU kılmak gerçek Git'te İMKÂNSIZDIR). Bunun yerine, incelenen
+ * commit'in kapanış commit'inin bir ATASI (ancestor) olduğu doğrulanır —
+ * `git merge-base --is-ancestor`, tam olarak bu soruyu yanıtlayan Git'in
+ * kendi birincil (primitive) aracı.
+ */
+export function isAncestorCommit(rootDir: string, ancestorSha: string, descendantSha: string): boolean {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", ancestorSha, descendantSha], {
+      cwd: rootDir,
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * TR: yukarıdaki `isAncestorCommit()`'in fix notu — incelenen commit ile
+ * kapanış commit'i arasında GERÇEKTEN hangi dosyaların değiştiğini listeler
+ * (`git diff --name-only`), böylece çağıran bu farkın YALNIZCA izin verilen
+ * kapanış/kanıt metaverisinden (ör. yeni eklenen inceleme/çalıştırma kanıtı
+ * dosyaları) ibaret olduğunu, İNCELENMEMİŞ hiçbir kod değişikliği
+ * içermediğini doğrulayabilir.
+ */
+export function changedFilesBetweenCommits(rootDir: string, fromSha: string, toSha: string): readonly string[] {
+  if (fromSha === toSha) return [];
+  const output = execFileSync("git", ["diff", "--name-only", fromSha, toSha], {
+    cwd: rootDir,
+    encoding: "utf8"
+  });
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
 }
 
 export type IndependentReviewResult = "CLEAN" | "PENDING" | "FOUND_ISSUES";
@@ -356,6 +401,22 @@ export interface AttemptPhaseClosureDeps {
    * çağrı noktası bunu değiştirmemelidir.
    */
   readonly isWorkingTreeClean?: (rootDir: string) => boolean;
+  /**
+   * TR (blocker 3 fix notu, "iki anlık görüntü" modeli): bkz.
+   * `isAncestorCommit()`'in fix notu. Varsayılan: gerçek `git merge-base
+   * --is-ancestor`. Yalnızca testlerin gerçek bir git checkout'u olmayan
+   * geçici dizinlerde bu geçidi deterministik çalıştırabilmesi için
+   * override edilebilir; gerçek hiçbir çağrı noktası bunu değiştirmemelidir.
+   */
+  readonly isAncestorCommit?: (rootDir: string, ancestorSha: string, descendantSha: string) => boolean;
+  /**
+   * TR (blocker 3 fix notu): bkz. `changedFilesBetweenCommits()`'in fix
+   * notu. Varsayılan: gerçek `git diff --name-only`. Yalnızca testlerin
+   * gerçek bir git checkout'u olmayan geçici dizinlerde bu geçidi
+   * deterministik çalıştırabilmesi için override edilebilir; gerçek hiçbir
+   * çağrı noktası bunu değiştirmemelidir.
+   */
+  readonly changedFilesSinceReview?: (rootDir: string, fromSha: string, toSha: string) => readonly string[];
 }
 
 const SAFE_GOVERNANCE_IDENTIFIER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
@@ -766,6 +827,8 @@ function evaluateClosureAttempt(
     readonly resolveHeadCommitSha?: (rootDir: string) => string;
     readonly isEvidenceCommittedToHead?: (rootDir: string, headSha: string, relativePath: string) => boolean;
     readonly isWorkingTreeClean?: (rootDir: string) => boolean;
+    readonly isAncestorCommit?: (rootDir: string, ancestorSha: string, descendantSha: string) => boolean;
+    readonly changedFilesSinceReview?: (rootDir: string, fromSha: string, toSha: string) => readonly string[];
   }
 ): { readonly rejectionReasons: string[]; readonly guardReport: InvariantGuardReport; readonly realityMatrix: RealityMatrixSummary } {
   const rejectionReasons: string[] = [];
@@ -780,10 +843,8 @@ function evaluateClosureAttempt(
     // independent review must use verified outcome artifacts", finding
     // 4): `isVerifiedEvidenceRef()` (mere existence) is no longer
     // sufficient here — bkz. `IndependentReviewEvidence.evidenceRef`'in
-    // fix notu. Reuses the SAME, finding-3-hardened Evidence Gate every
-    // other outcome claim in this codebase now goes through.
-    // TR (blocker 3 fix notu): `isOutcomeVerifiedEvidenceRef()` artık
-    // KENDİSİ de bir git-commit doğrulaması yapıyor — bu fonksiyonun
+    // fix notu.
+    // TR (blocker 3 fix notu): `isCommittedToHeadAdapter`, bu fonksiyonun
     // ZATEN sahip olduğu `resolveHeadCommitSha`/`isEvidenceCommittedToHead`
     // mekanizmasına adapte edilir.
     const isCommittedToHeadAdapter = (candidateRootDir: string, relativePath: string): boolean => {
@@ -794,14 +855,21 @@ function evaluateClosureAttempt(
         return false;
       }
     };
-    const unresolved = attempt.verificationEvidenceRefs.filter(
-      (ref) => !isOutcomeVerifiedEvidenceRef(ref, deps.rootDir, isCommittedToHeadAdapter)
-    );
+    // TR (P0 CLOSURE REMEDIATION fix notu, blocker 2 — ikinci tur):
+    // `isOutcomeVerifiedEvidenceRef()` (traceability.ts'in genel, tarihsel
+    // registry için kullandığı DAHA GEVŞEK geçit) burada ARTIK
+    // KULLANILMIYOR — bkz. `isAuthenticatedExecutionEvidence()`'ın fix
+    // notu (traceability.ts). Kapanış anındaki kanıt, KAYNAK dosyanın
+    // varlığı + çağıranın kendi tipli iddiasıyla değil, GERÇEK bir
+    // `EXECUTION_EVIDENCE_RECORD` JSON kaydının İÇERİĞİYLE doğrulanır.
+    const unresolved = attempt.verificationEvidenceRefs
+      .map((ref) => ({ ref, check: isAuthenticatedExecutionEvidence(ref, deps.rootDir, deps.resolveHeadCommitSha ?? resolveTrustedRepositoryHeadSha, isCommittedToHeadAdapter) }))
+      .filter((entry): entry is { ref: EvidenceRef; check: { ok: false; reason: string } } => !entry.check.ok);
     if (unresolved.length > 0) {
       rejectionReasons.push(
-        `${unresolved.length} verification evidence reference(s) are not outcome-verified, trusted evidence ` +
-          `(a genuine, recognized verification artifact naming a trusted source and a successful outcome): ` +
-          unresolved.map(describeEvidenceRef).join(", ")
+        `${unresolved.length} verification evidence reference(s) are not genuine, authenticated execution ` +
+          `evidence: ` +
+          unresolved.map((entry) => `${describeEvidenceRef(entry.ref)} (${entry.check.reason})`).join("; ")
       );
     }
   }
@@ -896,12 +964,75 @@ function evaluateClosureAttempt(
       rejectionReasons.push(contentCheck.reason);
     }
   }
-  if (review.reviewedCommitSha !== attempt.closingCommitSha) {
-    rejectionReasons.push(
-      `independent review reviewed commit '${review.reviewedCommitSha}', but this attempt is closing commit ` +
-        `'${attempt.closingCommitSha}' — a review of one commit must never close a different commit`
-    );
-  } else if (review.outcome !== "CLEAN") {
+  // TR (P0 CLOSURE REMEDIATION fix notu, blocker 3 — "iki anlık görüntü"
+  // (two-snapshot) modeli, UASF-REQ-0045): bağımsız inceleme, ÖNCEKİ turun
+  // BİREBİR EŞİTLİK kontrolünün (`reviewedCommitSha === closingCommitSha`)
+  // GERÇEK Git'te İMKÂNSIZ olduğunu gösterdi — inceleme kanıtını commit
+  // etmek (bkz. `isContentAuthenticatedIndependentReview()`'in git-commit
+  // kontrolü) HEAD'i DEĞİŞTİRİR, bu yüzden kanıt dosyası GÜVENİLİR HEAD'e
+  // commit edilmiş OLMAK ZORUNDAYKEN, o AYNI HEAD asla incelenen commit'in
+  // KENDİSİ olamaz (kanıtı eklemek zaten yeni bir commit oluşturur).
+  //
+  // Çözüm: incelenen kod anlık görüntüsü (`reviewedCommitSha`) ile kapanış
+  // anlık görüntüsü (`closingCommitSha`) ARTIK birebir eşit olmak zorunda
+  // değildir — bunun yerine (1) `reviewedCommitSha`'nın `closingCommitSha`'nın
+  // bir ATASI (ancestor) olduğu (ya da onunla AYNI olduğu — kanıtın AYNI
+  // commit'te veya yetkili bir kanıt deposunda saklandığı basit durum hâlâ
+  // geçerlidir) doğrulanır, VE (2) ikisi arasında DEĞİŞEN dosyaların
+  // YALNIZCA bu denemenin KENDİ kanıt referanslarından (inceleme kanıtı +
+  // doğrulama kanıtları) veya `project-state/phase-closures/` altındaki
+  // kapanış belgelerinden ibaret olduğu doğrulanır — İNCELENMEMİŞ hiçbir
+  // kod değişikliği kapanışa asla sessizce sızamaz.
+  if (review.reviewedCommitSha === attempt.closingCommitSha) {
+    // TR: basit/eski durum — inceleme, tam olarak kapatılan commit'i
+    // incelemiş; kanıtın kendisi o commit'ten SONRA eklenmiş olabilir
+    // (bkz. `isContentAuthenticatedIndependentReview()`'in git-commit
+    // kontrolü, GÜVENİLİR HEAD'e göre çalışır, `reviewedCommitSha`'ya göre
+    // DEĞİL) — bu dal her zaman geçerlidir, ek bir kontrol gerekmez.
+  } else {
+    const isAncestor = deps.isAncestorCommit ?? isAncestorCommit;
+    let reviewedIsAncestor: boolean;
+    try {
+      reviewedIsAncestor = isAncestor(deps.rootDir, review.reviewedCommitSha, attempt.closingCommitSha);
+    } catch (err) {
+      reviewedIsAncestor = false;
+      rejectionReasons.push(
+        `repository ancestry between the reviewed commit and the closing commit could not be independently ` +
+          `verified: ${String(err)}`
+      );
+    }
+    if (!reviewedIsAncestor) {
+      rejectionReasons.push(
+        `independent review reviewed commit '${review.reviewedCommitSha}', which is not an ancestor of (or equal ` +
+          `to) the commit being closed ('${attempt.closingCommitSha}') — a review must have examined a snapshot ` +
+          `that genuinely precedes (or equals) what is being closed, never a divergent or later commit`
+      );
+    } else {
+      const changedFiles = (deps.changedFilesSinceReview ?? changedFilesBetweenCommits)(
+        deps.rootDir,
+        review.reviewedCommitSha,
+        attempt.closingCommitSha
+      );
+      const permittedEvidencePaths = new Set<string>(
+        [
+          typeof review.evidenceRef === "string" ? undefined : review.evidenceRef.path,
+          ...attempt.verificationEvidenceRefs.map((ref) => (typeof ref === "string" ? ref : ref.path))
+        ].filter((path): path is string => path !== undefined)
+      );
+      const unreviewedChanges = changedFiles.filter(
+        (file) => !permittedEvidencePaths.has(file) && !file.startsWith("project-state/phase-closures/")
+      );
+      if (unreviewedChanges.length > 0) {
+        rejectionReasons.push(
+          `the closing commit ('${attempt.closingCommitSha}') contains code changes since the reviewed commit ` +
+            `('${review.reviewedCommitSha}') that were never part of the independent review: ` +
+            `${unreviewedChanges.join(", ")} — only this attempt's own closure/evidence artifacts may differ ` +
+            `after the reviewed commit, never unreviewed source changes`
+        );
+      }
+    }
+  }
+  if (review.outcome !== "CLEAN") {
     rejectionReasons.push(
       `independent review outcome is '${review.outcome}', not CLEAN — a phase may only close after a LATER ` +
         `independent review of the exact closing commit explicitly returns CLEAN; a locally-run verification ` +
@@ -1474,6 +1605,10 @@ export interface RecoverPendingPhaseClosureDeps {
   readonly isEvidenceCommittedToHead?: (rootDir: string, headSha: string, relativePath: string) => boolean;
   /** TR (blocker 4 fix notu): bkz. `AttemptPhaseClosureDeps`'in AYNI alanının fix notu. */
   readonly isWorkingTreeClean?: (rootDir: string) => boolean;
+  /** TR (blocker 3 fix notu, "iki anlık görüntü" modeli): bkz. `AttemptPhaseClosureDeps`'in AYNI alanının fix notu. */
+  readonly isAncestorCommit?: (rootDir: string, ancestorSha: string, descendantSha: string) => boolean;
+  /** TR (blocker 3 fix notu): bkz. `AttemptPhaseClosureDeps`'in AYNI alanının fix notu. */
+  readonly changedFilesSinceReview?: (rootDir: string, fromSha: string, toSha: string) => readonly string[];
 }
 
 /**

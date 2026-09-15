@@ -653,20 +653,20 @@ describe("PolicyEngine", () => {
 
 describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)", () => {
   it("blocks execution of a risk-5 action that was never approved", () => {
-    const workflow = new ApprovalWorkflow();
+    const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
     workflow.request("deploy-1", "Deploy to production", 5);
     expect(() => workflow.execute("deploy-1")).toThrow(ApprovalRequiredError);
   });
 
   it("blocks execution of an action that was explicitly rejected", () => {
-    const workflow = new ApprovalWorkflow();
+    const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
     workflow.request("deploy-2", "Deploy to production", 5);
     workflow.reject("deploy-2", "founder@example.com");
     expect(() => workflow.execute("deploy-2")).toThrow(ApprovalRequiredError);
   });
 
   it("allows execution only after an explicit APPROVE by a human", () => {
-    const workflow = new ApprovalWorkflow();
+    const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
     workflow.request("deploy-3", "Deploy to production", 5);
     workflow.approve("deploy-3", "founder@example.com");
     const executed = workflow.execute("deploy-3");
@@ -674,7 +674,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
   });
 
   it("cannot execute the same approval twice (state machine forward-only)", () => {
-    const workflow = new ApprovalWorkflow();
+    const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
     workflow.request("deploy-4", "Deploy to production", 5);
     workflow.approve("deploy-4", "founder@example.com");
     workflow.execute("deploy-4");
@@ -683,7 +683,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
 
   describe("P1 fix: approval state is not directly mutable via a leaked reference", () => {
     it("mutating the object returned by request() cannot approve the action", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       const returned = workflow.request("deploy-5", "Deploy to production", 5);
 
       expect(() => {
@@ -694,7 +694,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("mutating objects returned by get()/list() cannot change internal state", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-6", "Deploy to production", 5);
 
       const got = workflow.get("deploy-6")!;
@@ -712,13 +712,13 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("a risk-5 action can never execute without an explicit approve() call", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-7", "Deploy to production", 5);
       expect(() => workflow.execute("deploy-7")).toThrow(ApprovalRequiredError);
     });
 
     it("an explicit REJECT still results in DENY-equivalent behavior: execution stays blocked", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-8", "Deploy to production", 5);
       workflow.reject("deploy-8", "founder@example.com");
       expect(workflow.get("deploy-8")!.status).toBe("REJECTED");
@@ -726,7 +726,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("approve()/reject() require a non-empty approver identity", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-9", "Deploy to production", 5);
       expect(() => workflow.approve("deploy-9", "")).toThrow(InvalidApprovalDecisionError);
       expect(() => workflow.approve("deploy-9", "   ")).toThrow(InvalidApprovalDecisionError);
@@ -736,7 +736,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("an already-EXECUTED approval cannot be reset back to PENDING/APPROVED via a leaked mutable reference", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-10", "Deploy to production", 5);
       workflow.approve("deploy-10", "founder@example.com");
       const executed = workflow.execute("deploy-10");
@@ -751,7 +751,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("a REJECTED approval cannot be changed externally back to APPROVED", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-11", "Deploy to production", 5);
       const rejected = workflow.reject("deploy-11", "founder@example.com");
 
@@ -765,7 +765,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
 
     it("every state transition (request/approve/reject/execute) is recorded to the audit log", () => {
       const auditLog = new AuditLog();
-      const workflow = new ApprovalWorkflow(auditLog);
+      const workflow = new ApprovalWorkflow(auditLog, ["founder@example.com"]);
       workflow.request("deploy-12", "Deploy to production", 5);
       workflow.approve("deploy-12", "founder@example.com", "evidence://ticket-42");
       workflow.execute("deploy-12");
@@ -784,7 +784,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("an invalid transition (approve twice, execute unapproved) fails closed and is never silently accepted", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("deploy-13", "Deploy to production", 5);
       workflow.approve("deploy-13", "founder@example.com");
       expect(() => workflow.approve("deploy-13", "someone-else@example.com")).toThrow();
@@ -794,14 +794,14 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
 
   describe("P2 regression (7th independent review round, 'duplicate approval IDs replace authoritative history')", () => {
     it("rejects a second request() with the same id while the first is still PENDING", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-1", "Deploy to production", 5);
       expect(() => workflow.request("dup-1", "A different action entirely", 5)).toThrow(DuplicateApprovalIdError);
       expect(workflow.get("dup-1")!.actionDescription).toBe("Deploy to production");
     });
 
     it("rejects a second request() with the same id after APPROVED, preserving the APPROVED record", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-2", "Deploy to production", 5);
       workflow.approve("dup-2", "founder@example.com", "evidence://ticket-1");
       expect(() => workflow.request("dup-2", "A sneaky replacement request", 5)).toThrow(DuplicateApprovalIdError);
@@ -812,7 +812,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("rejects a second request() with the same id after REJECTED, preserving the REJECTED record", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-3", "Deploy to production", 5);
       workflow.reject("dup-3", "founder@example.com");
       expect(() => workflow.request("dup-3", "A sneaky replacement request", 5)).toThrow(DuplicateApprovalIdError);
@@ -820,7 +820,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("BLOCKER regression: request() cannot silently erase an EXECUTED record's approver identity, decision timestamp, and evidence reference", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-4", "Deploy to production", 5);
       workflow.approve("dup-4", "founder@example.com", "evidence://ticket-42");
       const executed = workflow.execute("dup-4");
@@ -836,7 +836,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("a rejected duplicate request() never mutates the existing record's requestedAt timestamp", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       const original = workflow.request("dup-5", "Deploy to production", 5);
       expect(() => workflow.request("dup-5", "Different action", 3)).toThrow(DuplicateApprovalIdError);
       expect(workflow.get("dup-5")!.requestedAt).toBe(original.requestedAt);
@@ -845,7 +845,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
 
     it("a rejected duplicate request() does not append a spurious APPROVAL_REQUESTED audit entry", () => {
       const auditLog = new AuditLog();
-      const workflow = new ApprovalWorkflow(auditLog);
+      const workflow = new ApprovalWorkflow(auditLog, ["founder@example.com"]);
       workflow.request("dup-6", "Deploy to production", 5);
       expect(() => workflow.request("dup-6", "Different action", 5)).toThrow(DuplicateApprovalIdError);
 
@@ -854,7 +854,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("distinct ids remain completely independent — no cross-contamination from the duplicate-id guard", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-7-a", "Action A", 5);
       workflow.request("dup-7-b", "Action B", 5);
       expect(workflow.get("dup-7-a")!.actionDescription).toBe("Action A");
@@ -862,14 +862,14 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("after a duplicate is rejected, execute() still fails for a never-approved original request (no partial state corruption)", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-8", "Deploy to production", 5);
       expect(() => workflow.request("dup-8", "Different action", 5)).toThrow(DuplicateApprovalIdError);
       expect(() => workflow.execute("dup-8")).toThrow(ApprovalRequiredError);
     });
 
     it("the DuplicateApprovalIdError message names the offending id", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("dup-9", "Deploy to production", 5);
       try {
         workflow.request("dup-9", "Different action", 5);
@@ -886,7 +886,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       "reviewer outcome, distinct from REJECT, with its own state, evidence, and transitions",
     () => {
       it("PENDING -> REQUEST_CHANGES: requestChanges() records the new status, reviewer identity, and reason", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-1", "Deploy to production", 5);
         const result = workflow.requestChanges("rc-1", "founder@example.com", "Add a rollback plan first");
 
@@ -897,7 +897,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("REQUEST_CHANGES is NOT the same as REJECTED — they are distinct status values", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-2a", "Deploy to production", 5);
         workflow.request("rc-2b", "Deploy to production", 5);
         workflow.requestChanges("rc-2a", "founder@example.com", "Needs more tests");
@@ -909,7 +909,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("requestChanges() requires a non-empty reviewer identity (same rule as approve()/reject())", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-3", "Deploy to production", 5);
         expect(() => workflow.requestChanges("rc-3", "", "some reason")).toThrow(InvalidApprovalDecisionError);
         expect(() => workflow.requestChanges("rc-3", "   ", "some reason")).toThrow(InvalidApprovalDecisionError);
@@ -917,7 +917,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("requestChanges() requires a non-empty reason — without one it would be indistinguishable from an unexplained REJECT", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-4", "Deploy to production", 5);
         expect(() => workflow.requestChanges("rc-4", "founder@example.com", "")).toThrow(
           InvalidApprovalDecisionError
@@ -929,7 +929,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("REQUEST_CHANGES is terminal for this request id: it cannot subsequently be approve()d, reject()ed, or requestChanges()d again", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-5", "Deploy to production", 5);
         workflow.requestChanges("rc-5", "founder@example.com", "Needs a security review");
 
@@ -940,14 +940,14 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("a request in REQUEST_CHANGES can never reach EXECUTED", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-6", "Deploy to production", 5);
         workflow.requestChanges("rc-6", "founder@example.com", "Needs load testing");
         expect(() => workflow.execute("rc-6")).toThrow(ApprovalRequiredError);
       });
 
       it("all invalid transitions into/out of REQUEST_CHANGES are covered: cannot request changes on an already-APPROVED/REJECTED/EXECUTED request", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-7-approved", "Deploy to production", 5);
         workflow.approve("rc-7-approved", "founder@example.com");
         expect(() => workflow.requestChanges("rc-7-approved", "founder@example.com", "x")).toThrow();
@@ -963,7 +963,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("a revised action after REQUEST_CHANGES requires a fresh, distinct approval id (permanent-identity philosophy, consistent with DuplicateApprovalIdError)", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-8-v1", "Deploy to production (v1)", 5);
         workflow.requestChanges("rc-8-v1", "founder@example.com", "Add a rollback plan");
 
@@ -978,7 +978,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("REQUEST_CHANGES with an evidenceRef records it alongside the reason", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-9", "Deploy to production", 5);
         const result = workflow.requestChanges(
           "rc-9",
@@ -992,7 +992,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
 
       it("REQUEST_CHANGES is recorded to the audit log as its own distinct event type, not as APPROVAL_REJECTED", () => {
         const auditLog = new AuditLog();
-        const workflow = new ApprovalWorkflow(auditLog);
+        const workflow = new ApprovalWorkflow(auditLog, ["founder@example.com"]);
         workflow.request("rc-10", "Deploy to production", 5);
         workflow.requestChanges("rc-10", "founder@example.com", "Needs more tests");
 
@@ -1003,7 +1003,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("mutating an object returned by requestChanges() cannot change internal state (frozen snapshot, same invariant as approve()/reject())", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("rc-11", "Deploy to production", 5);
         const result = workflow.requestChanges("rc-11", "founder@example.com", "Needs a design doc");
 
@@ -1018,7 +1018,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
 
   describe("P1 fix (24th independent review round, 'approval state must be runtime-private')", () => {
     it("the internal request map is not reachable as an ordinary JS property (real encapsulation, not just TS `private`)", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("priv-1", "Deploy to production", 5);
 
       // `as any` still cannot reach it — a genuine ECMAScript private field
@@ -1028,7 +1028,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("no reflection API (Object.getOwnPropertyNames / Reflect.ownKeys) exposes the private request map", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("priv-2", "Deploy to production", 5);
 
       expect(Object.getOwnPropertyNames(workflow)).not.toContain("requests");
@@ -1036,7 +1036,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     });
 
     it("mutating a returned record cannot reach or change the authoritative internal state (frozen + detached, and the map itself is unreachable)", () => {
-      const workflow = new ApprovalWorkflow();
+      const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       workflow.request("priv-3", "Deploy to production", 5);
       const req = workflow.get("priv-3")!;
 
@@ -1059,7 +1059,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       "`private`",
     () => {
       it("mustGet is not reachable as an ordinary JS property/method (BLOCKER regression)", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("mg-1", "Deploy to production", 5);
 
         const asAny = workflow as unknown as { mustGet?: (id: string) => { status: string } };
@@ -1074,7 +1074,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("no reflection API exposes mustGet", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         expect(Object.getOwnPropertyNames(workflow)).not.toContain("mustGet");
         expect(Reflect.ownKeys(workflow).map(String)).not.toContain("mustGet");
         const proto = Object.getPrototypeOf(workflow) as object;
@@ -1082,7 +1082,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
       });
 
       it("a request genuinely stays PENDING (never silently APPROVED) since the mutable-record escape hatch no longer exists", () => {
-        const workflow = new ApprovalWorkflow();
+        const workflow = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         workflow.request("mg-2", "Deploy to production", 5);
 
         // Simulates the exact pre-fix attack this finding describes:
@@ -1105,7 +1105,7 @@ describe("ApprovalWorkflow (Human Approval invariant, baseline section 120/146)"
     () => {
       it("auditLog is not reachable as an ordinary JS property, and a forged replacement never suppresses the real audit trail", () => {
         const realAuditLog = new AuditLog();
-        const workflow = new ApprovalWorkflow(realAuditLog);
+        const workflow = new ApprovalWorkflow(realAuditLog, ["founder@example.com"]);
         const asRecord = workflow as unknown as Record<string, unknown>;
         expect(asRecord.auditLog).toBeUndefined();
 

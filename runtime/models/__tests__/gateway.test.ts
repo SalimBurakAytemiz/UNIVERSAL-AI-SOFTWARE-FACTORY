@@ -1217,7 +1217,7 @@ describe("ModelGateway + MockProvider", () => {
       "reviewer-granted approval can reach a risk-5 invocation",
     () => {
       it("BLOCKER regression, exact reproduction: a risk-5 invocation with a valid, matching approval succeeds exactly once", async () => {
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
@@ -1263,7 +1263,7 @@ describe("ModelGateway + MockProvider", () => {
       });
 
       it("without approvalId, a risk-5 invocation remains blocked exactly as before — no default bypass was introduced", async () => {
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
@@ -1280,7 +1280,7 @@ describe("ModelGateway + MockProvider", () => {
       });
 
       it("reusing the SAME approvalId for a second invocation is rejected — an approval authorizes exactly one execution", async () => {
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
@@ -1323,7 +1323,7 @@ describe("ModelGateway + MockProvider", () => {
       });
 
       it("an approval bound to a DIFFERENT action identity (different costUsd) does not authorize this invocation", async () => {
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
@@ -1353,7 +1353,7 @@ describe("ModelGateway + MockProvider", () => {
       });
 
       it("an approval registered in a DIFFERENT ModelGateway's own approvals store is invisible to this gateway", async () => {
-        const otherGatewaysApprovals = new ApprovalWorkflow();
+        const otherGatewaysApprovals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         otherGatewaysApprovals.requestFor("appr-elsewhere", {
           actionType: "model.invoke",
           description: "elsewhere",
@@ -1363,7 +1363,7 @@ describe("ModelGateway + MockProvider", () => {
         otherGatewaysApprovals.approve("appr-elsewhere", "founder@example.com");
 
         // This gateway was constructed with its OWN, separate, empty store.
-        const gateway = new ModelGateway(new ApprovalWorkflow());
+        const gateway = new ModelGateway(new ApprovalWorkflow(undefined, ["founder@example.com"]));
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
 
@@ -1391,7 +1391,7 @@ describe("ModelGateway + MockProvider", () => {
         "BLOCKER regression, exact reproduction: approval for prompt/model/run A -> cannot authorize a " +
           "materially different prompt B under the SAME description/risk/cost/project",
         async () => {
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals);
           const provider = new ControllableProvider();
           gateway.registerProvider(provider);
@@ -1430,7 +1430,7 @@ describe("ModelGateway + MockProvider", () => {
       );
 
       it("BLOCKER regression: an approval for one runId cannot authorize the SAME prompt/model under a DIFFERENT run", async () => {
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
@@ -1465,7 +1465,7 @@ describe("ModelGateway + MockProvider", () => {
       });
 
       it("no regression: an approval whose digest genuinely matches the exact taskId/runId/agentId/provider/modelId/prompt succeeds", async () => {
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         const provider = new ControllableProvider();
         gateway.registerProvider(provider);
@@ -1555,7 +1555,7 @@ describe("ModelGateway + MockProvider", () => {
 
       it("replaceProvider() performs the swap explicitly and records an audited event", async () => {
         const auditLog = new AuditLog();
-        const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
+        const gateway = new ModelGateway(new ApprovalWorkflow(undefined, ["founder@example.com"]), auditLog);
         gateway.registerProvider(new MockProvider());
 
         const replacement: ModelProvider = {
@@ -1572,7 +1572,7 @@ describe("ModelGateway + MockProvider", () => {
       });
 
       it("replaceProvider() rejects replacing an id that was never registered (it is not a disguised register())", async () => {
-        const gateway = new ModelGateway(new ApprovalWorkflow(), new AuditLog());
+        const gateway = new ModelGateway(new ApprovalWorkflow(undefined, ["founder@example.com"]), new AuditLog());
         await expect(
           gateway.replaceProvider(new MockProvider(), { policy: permissivePolicy(), risk: 0 })
         ).rejects.toThrow(UnknownProviderError);
@@ -1644,7 +1644,7 @@ describe("ModelGateway + MockProvider", () => {
           "and the actual swap disagree on which id was replaced",
         async () => {
           const auditLog = new AuditLog();
-          const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
+          const gateway = new ModelGateway(new ApprovalWorkflow(undefined, ["founder@example.com"]), auditLog);
           gateway.registerProvider(new MockProvider());
 
           let readCount = 0;
@@ -1713,7 +1713,7 @@ describe("ModelGateway + MockProvider", () => {
           }
 
           const auditLog = new AuditLog();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals, auditLog);
           gateway.registerProvider(new MockProvider());
 
@@ -1777,7 +1777,7 @@ describe("ModelGateway + MockProvider", () => {
           }
         }
         const auditLog = new AuditLog();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals, auditLog);
         gateway.registerProvider(new MockProvider());
 
@@ -1911,7 +1911,7 @@ describe("ModelGateway + MockProvider", () => {
             }
           }
           const auditLog = new AuditLog();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals, auditLog);
           gateway.registerProvider(new MockProvider());
 
@@ -2369,7 +2369,7 @@ describe("ModelGateway + MockProvider", () => {
 
       it("BLOCKER regression: a policy DENY blocks provider replacement entirely, and the ORIGINAL adapter keeps serving invocations", async () => {
         const auditLog = new AuditLog();
-        const gateway = new ModelGateway(new ApprovalWorkflow(), auditLog);
+        const gateway = new ModelGateway(new ApprovalWorkflow(undefined, ["founder@example.com"]), auditLog);
         gateway.registerProvider(new MockProvider());
 
         const denyPolicy = new PolicyEngine();
@@ -2397,7 +2397,7 @@ describe("ModelGateway + MockProvider", () => {
 
       it("a risk-5 replacement is unconditionally APPROVAL_REQUIRED, even under an otherwise fully-permissive policy", async () => {
         const auditLog = new AuditLog();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals, auditLog);
         gateway.registerProvider(new MockProvider());
 
@@ -2409,7 +2409,7 @@ describe("ModelGateway + MockProvider", () => {
 
       it("a risk-5 replacement succeeds once a genuine, matching approval is granted, and the audit event names both implementations", async () => {
         const auditLog = new AuditLog();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals, auditLog);
         gateway.registerProvider(new MockProvider());
 
@@ -2461,7 +2461,7 @@ describe("ModelGateway + MockProvider", () => {
           "implementation X -> attempt installation of Y with the SAME provider id/description -> FAIL, X remains authoritative",
         async () => {
           const auditLog = new AuditLog();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals, auditLog);
           gateway.registerProvider(new MockProvider());
 
@@ -2510,11 +2510,11 @@ describe("ModelGateway + MockProvider", () => {
       );
 
       it("an approval registered in a DIFFERENT ModelGateway's own approvals store cannot authorize this gateway's replacement", async () => {
-        const elsewhere = new ApprovalWorkflow();
+        const elsewhere = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         elsewhere.requestFor("appr-elsewhere", { actionType: "model.provider.replace", description: "d", risk: 5 });
         elsewhere.approve("appr-elsewhere", "founder@example.com");
 
-        const gateway = new ModelGateway(new ApprovalWorkflow(), new AuditLog());
+        const gateway = new ModelGateway(new ApprovalWorkflow(undefined, ["founder@example.com"]), new AuditLog());
         gateway.registerProvider(new MockProvider());
 
         await expect(
@@ -2554,7 +2554,7 @@ describe("ModelGateway + MockProvider", () => {
           "record, and the ORIGINAL provider remains authoritative",
         async () => {
           const auditLog = new AuditLog();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals, auditLog);
           gateway.registerProvider(new MockProvider());
 
@@ -2976,7 +2976,7 @@ describe("ModelGateway + MockProvider", () => {
           "installing a DIFFERENT endpoint configuration under the same provider id",
         async () => {
           const auditLog = new AuditLog();
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals, auditLog);
           gateway.registerProvider(new MockProvider());
 
@@ -3005,7 +3005,7 @@ describe("ModelGateway + MockProvider", () => {
 
       it("no regression: an approval matching the EXACT candidate configuration still succeeds", async () => {
         const auditLog = new AuditLog();
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals, auditLog);
         gateway.registerProvider(new MockProvider());
 
@@ -3035,7 +3035,7 @@ describe("ModelGateway + MockProvider", () => {
         async () => {
           const registry = createDefaultModelRegistry();
           const model = registry.all().find((m) => m.tier === "PREMIUM")!;
-          const approvals = new ApprovalWorkflow();
+          const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
           const gateway = new ModelGateway(approvals);
 
           approvals.requestFor("appr-1", {
@@ -3066,7 +3066,7 @@ describe("ModelGateway + MockProvider", () => {
       it("no regression: an approval matching the EXACT taskType still authorizes the invocation", async () => {
         const registry = createDefaultModelRegistry();
         const model = registry.all().find((m) => m.tier === "PREMIUM")!;
-        const approvals = new ApprovalWorkflow();
+        const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
         const gateway = new ModelGateway(approvals);
         gateway.registerProvider(new MockProvider());
 

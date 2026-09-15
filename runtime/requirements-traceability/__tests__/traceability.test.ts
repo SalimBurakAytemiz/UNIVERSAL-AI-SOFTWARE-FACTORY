@@ -3,7 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { detectTraceabilityIssues, isOutcomeVerifiedEvidenceRef, isCommittedToRepositoryHead } from "../traceability.js";
+import {
+  detectTraceabilityIssues,
+  isOutcomeVerifiedEvidenceRef,
+  isCommittedToRepositoryHead,
+  isAuthenticatedExecutionEvidence
+} from "../traceability.js";
 import { traceRequirements } from "../../cli/commands/trace-requirement.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -723,6 +728,153 @@ describe(
       };
       expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot, () => true)).toBe(true);
       expect(isOutcomeVerifiedEvidenceRef(ref, repoRoot, () => false)).toBe(false);
+    });
+  }
+);
+
+describe(
+  "P0 CLOSURE REMEDIATION, blocker 2, round 2 (UASF-REQ-0045, 'committed source files are still accepted " +
+    "as execution evidence'): isAuthenticatedExecutionEvidence() separates SOURCE ARTIFACT from EXECUTION " +
+    "EVIDENCE — a committed test/proof source file proves only that test source exists, never that it ran",
+  () => {
+    let tempRoot: string;
+
+    afterEach(() => {
+      if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    const HEAD_SHA = "deadbeefcafef00d";
+    const resolveHead = (): string => HEAD_SHA;
+    const alwaysCommitted = (): boolean => true;
+
+    it(
+      "BLOCKER regression, exact reproduction: a committed test SOURCE file plus caller-supplied " +
+        "outcome:'PASS'/type:'TEST_RESULT'/verificationSource is REJECTED — source existence proves only " +
+        "that test source exists, never that it was executed",
+      () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker2-"));
+        mkdirSync(join(tempRoot, "__tests__"), { recursive: true });
+        writeFileSync(join(tempRoot, "__tests__", "fabricated.test.ts"), "// never actually executed by anything");
+        const ref = {
+          path: "__tests__/fabricated.test.ts",
+          type: "TEST_RESULT" as const,
+          outcome: "PASS",
+          verificationSource: "npm test (vitest)"
+        };
+        const result = isAuthenticatedExecutionEvidence(ref, tempRoot, resolveHead, alwaysCommitted);
+        expect(result.ok).toBe(false);
+      }
+    );
+
+    it(
+      "BLOCKER regression, exact reproduction: a committed test SOURCE file with a fake, caller-invented " +
+        "command claim embedded in verificationSource is STILL rejected — only the artifact's OWN content, " +
+        "never a caller's free-text claim, can prove a command ran",
+      () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker2-"));
+        mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+        writeFileSync(join(tempRoot, "proofs", "fabricated.test.ts"), "// never actually executed by anything");
+        const ref = {
+          path: "proofs/fabricated.test.ts",
+          type: "PROOF_RESULT" as const,
+          outcome: "PASS",
+          verificationSource: "ran command 'npm test (vitest)' successfully, trust me"
+        };
+        const result = isAuthenticatedExecutionEvidence(ref, tempRoot, resolveHead, alwaysCommitted);
+        expect(result.ok).toBe(false);
+      }
+    );
+
+    it("BLOCKER regression: a missing execution result (bare ARTIFACT_REFERENCE / legacy string ref) is REJECTED, never treated as sufficient", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker2-"));
+      mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+      writeFileSync(join(tempRoot, "proofs", "execution-evidence.json"), "not read — the ref below never names it");
+      expect(isAuthenticatedExecutionEvidence("proofs/execution-evidence.json", tempRoot, resolveHead, alwaysCommitted).ok).toBe(false);
+      expect(
+        isAuthenticatedExecutionEvidence(
+          { path: "proofs/execution-evidence.json", type: "ARTIFACT_REFERENCE" as const },
+          tempRoot,
+          resolveHead,
+          alwaysCommitted
+        ).ok
+      ).toBe(false);
+    });
+
+    it(
+      "BLOCKER regression, exact reproduction: a genuine EXECUTION_EVIDENCE_RECORD captured for a DIFFERENT " +
+        "commit/run than the current trusted HEAD is REJECTED — stale or replayed execution evidence can " +
+        "never satisfy a claim about the current commit",
+      () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker2-"));
+        mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+        writeFileSync(
+          join(tempRoot, "proofs", "execution-evidence.json"),
+          JSON.stringify({
+            kind: "EXECUTION_EVIDENCE_RECORD",
+            command: "npm test (vitest)",
+            commitSha: "some-other-commit-entirely",
+            outcome: "PASS",
+            runTimestamp: new Date().toISOString()
+          })
+        );
+        const ref = {
+          path: "proofs/execution-evidence.json",
+          type: "TEST_RESULT" as const,
+          outcome: "PASS",
+          verificationSource: "npm test (vitest)"
+        };
+        const result = isAuthenticatedExecutionEvidence(ref, tempRoot, resolveHead, alwaysCommitted);
+        expect(result.ok).toBe(false);
+      }
+    );
+
+    it(
+      "fix verification, positive: a genuine EXECUTION_EVIDENCE_RECORD captured for the CURRENT trusted HEAD, " +
+        "naming a recognized command and a success outcome, IS accepted as authentic execution evidence",
+      () => {
+        tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker2-"));
+        mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+        writeFileSync(
+          join(tempRoot, "proofs", "execution-evidence.json"),
+          JSON.stringify({
+            kind: "EXECUTION_EVIDENCE_RECORD",
+            command: "npm test (vitest)",
+            commitSha: HEAD_SHA,
+            outcome: "PASS",
+            runTimestamp: new Date().toISOString()
+          })
+        );
+        const ref = {
+          path: "proofs/execution-evidence.json",
+          type: "TEST_RESULT" as const,
+          outcome: "PASS",
+          verificationSource: "npm test (vitest)"
+        };
+        const result = isAuthenticatedExecutionEvidence(ref, tempRoot, resolveHead, alwaysCommitted);
+        expect(result.ok).toBe(true);
+      }
+    );
+
+    it("no regression: an execution-evidence record that is not actually committed to the trusted HEAD is rejected", () => {
+      tempRoot = mkdtempSync(join(tmpdir(), "uasf-traceability-blocker2-"));
+      mkdirSync(join(tempRoot, "proofs"), { recursive: true });
+      writeFileSync(
+        join(tempRoot, "proofs", "execution-evidence.json"),
+        JSON.stringify({
+          kind: "EXECUTION_EVIDENCE_RECORD",
+          command: "npm test (vitest)",
+          commitSha: HEAD_SHA,
+          outcome: "PASS",
+          runTimestamp: new Date().toISOString()
+        })
+      );
+      const ref = {
+        path: "proofs/execution-evidence.json",
+        type: "TEST_RESULT" as const,
+        outcome: "PASS",
+        verificationSource: "npm test (vitest)"
+      };
+      expect(isAuthenticatedExecutionEvidence(ref, tempRoot, resolveHead, () => false).ok).toBe(false);
     });
   }
 );

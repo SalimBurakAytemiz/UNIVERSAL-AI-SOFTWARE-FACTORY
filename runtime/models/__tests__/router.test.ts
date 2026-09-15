@@ -594,7 +594,7 @@ describe(
         capabilities: ["escalation-capability"],
         status: "ACTIVE"
       });
-      const approvals = new ApprovalWorkflow();
+      const approvals = new ApprovalWorkflow(undefined, ["founder@example.com"]);
       const gateway = new ModelGateway(approvals);
       gateway.registerProvider(new MockProvider());
       const router = new CheapestCapableModelRouter(registry);
