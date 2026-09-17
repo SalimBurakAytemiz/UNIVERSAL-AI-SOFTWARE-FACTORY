@@ -55,11 +55,8 @@ for (const requirement of requirementRegistry.requirements) {
   }
 }
 
-// Her kayit matrisinin (traceability ve reality) girisleri bilinen gereksinimlere atifta bulunmali
+// Traceability matrisindeki her girisin bilinen bir invariant'a atifta bulunmasi gerekir.
 for (const entry of traceabilityMatrix.entries) {
-  if (!requirementIds.has(entry.requirementId)) {
-    fail(`traceability matrix references unknown requirement id "${entry.requirementId}"`);
-  }
   for (const invariantId of entry.invariantIds ?? []) {
     if (!invariantIds.has(invariantId)) {
       fail(`traceability matrix references unknown invariant id "${invariantId}"`);
@@ -67,33 +64,32 @@ for (const entry of traceabilityMatrix.entries) {
   }
 }
 
-for (const entry of realityMatrix.entries) {
-  if (!requirementIds.has(entry.requirementId)) {
-    fail(`implementation reality matrix references unknown requirement id "${entry.requirementId}"`);
+// Her kanonik gereksinim, traceability ve reality matrislerinde tam olarak bir kez yer almalidir.
+// Sadece Set boyutunu karsilastirmak yeterli degildir: fazladan eklenen bir yinelenen giris,
+// mevcut girislerle ayni boyutta bir Set uretebilir ve kapsamin aslinda tekil olmadigini gizleyebilir.
+// Bu yuzden her giris tek tek islenip zaten gorulmus bir requirementId acikca reddedilir (P1 duzeltme).
+function checkExactRequirementCoverage(entries, label) {
+  const seenRequirementIds = new Set();
+  for (const entry of entries) {
+    if (!requirementIds.has(entry.requirementId)) {
+      fail(`${label} references unknown requirement id "${entry.requirementId}"`);
+      continue;
+    }
+    if (seenRequirementIds.has(entry.requirementId)) {
+      fail(`${label} has a duplicate entry for requirement "${entry.requirementId}"`);
+      continue;
+    }
+    seenRequirementIds.add(entry.requirementId);
+  }
+  for (const reqId of requirementIds) {
+    if (!seenRequirementIds.has(reqId)) {
+      fail(`${label} is missing entry for requirement "${reqId}"`);
+    }
   }
 }
 
-// Yeni: Her kanonik gereksinim hem traceability hem de reality matrisinde tam olarak bir kez yer almalidir.
-// Bu, gereksinim kaplamasinin sessizce kaybolmasini onler (P1 duzeltme).
-const traceabilityRequirementIds = new Set(traceabilityMatrix.entries.map(e => e.requirementId));
-for (const reqId of requirementIds) {
-  if (!traceabilityRequirementIds.has(reqId)) {
-    fail(`traceability matrix is missing entry for requirement "${reqId}"`);
-  }
-}
-if (traceabilityRequirementIds.size !== requirementIds.size) {
-  fail(`traceability matrix has ${traceabilityRequirementIds.size} entries but requirement registry has ${requirementIds.size} requirements`);
-}
-
-const realityRequirementIds = new Set(realityMatrix.entries.map(e => e.requirementId));
-for (const reqId of requirementIds) {
-  if (!realityRequirementIds.has(reqId)) {
-    fail(`implementation reality matrix is missing entry for requirement "${reqId}"`);
-  }
-}
-if (realityRequirementIds.size !== requirementIds.size) {
-  fail(`implementation reality matrix has ${realityRequirementIds.size} entries but requirement registry has ${requirementIds.size} requirements`);
-}
+checkExactRequirementCoverage(traceabilityMatrix.entries, 'traceability matrix');
+checkExactRequirementCoverage(realityMatrix.entries, 'implementation reality matrix');
 
 if (!/^\d+\.\d+\.\d+$/.test(baseline.currentBaselineVersion)) {
   fail(`baseline currentBaselineVersion "${baseline.currentBaselineVersion}" is not a valid semantic version`);
