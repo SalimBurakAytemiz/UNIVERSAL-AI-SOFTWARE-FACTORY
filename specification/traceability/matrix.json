@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1.0.0",
+  "entries": [
+    { "requirementId": "UASF-REQ-0001", "invariantIds": ["UASF-INV-0006", "UASF-INV-0015"], "validatedBy": ["specification/validate-registries.mjs"] },
+    { "requirementId": "UASF-REQ-0002", "invariantIds": ["UASF-INV-0006", "UASF-INV-0015"], "validatedBy": ["specification/validate-registries.mjs"] },
+    { "requirementId": "UASF-REQ-0003", "invariantIds": ["UASF-INV-0006"], "validatedBy": ["specification/validate-registries.mjs"] },
+    { "requirementId": "UASF-REQ-0004", "invariantIds": ["UASF-INV-0006"], "validatedBy": ["specification/validate-registries.mjs"] },
+    { "requirementId": "UASF-REQ-0005", "invariantIds": ["UASF-INV-0006", "UASF-INV-0007"], "validatedBy": ["specification/validate-registries.mjs"] },
+    { "requirementId": "UASF-REQ-0006", "invariantIds": ["UASF-INV-0006"], "validatedBy": ["specification/validate-registries.mjs"] },
+    { "requirementId": "UASF-REQ-0007", "invariantIds": ["UASF-INV-0007", "UASF-INV-0015"], "validatedBy": ["specification/validate-registries.mjs"] }
+  ]
+}

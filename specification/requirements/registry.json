@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "1.0.0",
+  "requirements": [
+    {
+      "id": "UASF-REQ-0001",
+      "title": "Canonical requirement registry",
+      "description": "The Factory maintains a single canonical requirement registry with stable, never-reused identifiers and an explicit status lifecycle, so a new AI session can resume from repository state without rereading chat history.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#5",
+      "relatedInvariants": ["UASF-INV-0006", "UASF-INV-0015"],
+      "relatedFiles": ["specification/requirements/registry.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    },
+    {
+      "id": "UASF-REQ-0002",
+      "title": "Canonical invariant registry",
+      "description": "The Factory maintains a canonical invariant registry that gives each immutable trust rule a stable identifier so it can be traced from requirements to tests and proofs.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#5",
+      "relatedInvariants": ["UASF-INV-0006", "UASF-INV-0015"],
+      "relatedFiles": ["specification/invariants/registry.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    },
+    {
+      "id": "UASF-REQ-0003",
+      "title": "Canonical policy registry",
+      "description": "The Factory maintains a canonical policy registry recording active operational policies (model routing, Git automation safety, secrets, review lifecycle, scope discipline, evidence) with pointers to their source document and related invariants.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#5",
+      "relatedInvariants": ["UASF-INV-0006"],
+      "relatedFiles": ["specification/policies/registry.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    },
+    {
+      "id": "UASF-REQ-0004",
+      "title": "Architecture Decision Record log",
+      "description": "The Factory maintains a canonical ADR log with stable identifiers, status and linkage to the requirements each decision affects.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#5",
+      "relatedInvariants": ["UASF-INV-0006"],
+      "relatedFiles": ["specification/ADR/registry.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    },
+    {
+      "id": "UASF-REQ-0005",
+      "title": "Requirement/invariant traceability matrix",
+      "description": "The Factory maintains a traceability matrix mapping each requirement to the invariants it protects and the deterministic checks that validate it, so requirement status claims are not unverifiable prose.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#5",
+      "relatedInvariants": ["UASF-INV-0006", "UASF-INV-0007"],
+      "relatedFiles": ["specification/traceability/matrix.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    },
+    {
+      "id": "UASF-REQ-0006",
+      "title": "Canonical specification baseline versioning",
+      "description": "The Factory records the current specification baseline version and its history so specification drift across phases is explicit and reviewable.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#5",
+      "relatedInvariants": ["UASF-INV-0006"],
+      "relatedFiles": ["specification/baseline/version.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    },
+    {
+      "id": "UASF-REQ-0007",
+      "title": "Implementation Reality Matrix",
+      "description": "The Factory maintains an Implementation Reality Matrix distinguishing specification, implementation, test and evidence status per requirement, so a registry entry or folder is never treated as proof of implementation.",
+      "category": "governance",
+      "status": "IMPLEMENTED",
+      "phase": 1,
+      "milestone": "1.1",
+      "source": "ARCHITECTURE-CONSTITUTION.md#31",
+      "relatedInvariants": ["UASF-INV-0007", "UASF-INV-0015"],
+      "relatedFiles": ["specification/implementation-reality/matrix.json", "specification/validate-registries.mjs"],
+      "validatedBy": "specification/validate-registries.mjs"
+    }
+  ]
+}

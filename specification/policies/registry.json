@@ -1,0 +1,53 @@
+{
+  "schemaVersion": "1.0.0",
+  "policies": [
+    {
+      "id": "UASF-POL-0001",
+      "title": "Cheapest capable model first, no silent premium fallback",
+      "status": "ACTIVE",
+      "description": "Model selection uses the cheapest model tier capable of the task. AUTO_PREMIUM_FALLBACK is false; escalation to a higher tier requires explicit policy/budget authorization.",
+      "source": "ARCHITECTURE-CONSTITUTION.md#21",
+      "relatedInvariants": ["UASF-INV-0008"]
+    },
+    {
+      "id": "UASF-POL-0002",
+      "title": "Git automation safety",
+      "status": "ACTIVE",
+      "description": "Automated Git transport may perform safe fetch, fast-forward-only sync, commit verification, push and remote SHA verification. Force push, hard reset, automatic rebase and silent history rewrite are forbidden; local/remote divergence fails closed.",
+      "source": "GIT-AUTOMATION.md",
+      "relatedInvariants": ["UASF-INV-0001", "UASF-INV-0010"]
+    },
+    {
+      "id": "UASF-POL-0003",
+      "title": "No real secrets in the repository",
+      "status": "ACTIVE",
+      "description": "No real secret is committed. .env.example contains placeholders only; a historically exposed secret must be revoked, rotated and replaced.",
+      "source": "ARCHITECTURE-CONSTITUTION.md#11",
+      "relatedInvariants": ["UASF-INV-0001"]
+    },
+    {
+      "id": "UASF-POL-0004",
+      "title": "Two-snapshot independent review lifecycle",
+      "status": "ACTIVE",
+      "description": "Independent review targets a stable reviewed commit that is not modified during review. Closure requires authentic independent evidence rather than the builder's own assertion.",
+      "source": "ARCHITECTURE-CONSTITUTION.md#8",
+      "relatedInvariants": ["UASF-INV-0013", "UASF-INV-0014"]
+    },
+    {
+      "id": "UASF-POL-0005",
+      "title": "Scope discipline: one phase/milestone contract at a time",
+      "status": "ACTIVE",
+      "description": "Implementation stays inside the current milestone contract. Future phases are not implemented early merely because their folders exist, and unrelated ideas are routed to backlog.",
+      "source": "BUILD-RULES.md#1",
+      "relatedInvariants": ["UASF-INV-0017"]
+    },
+    {
+      "id": "UASF-POL-0006",
+      "title": "Evidence over claim",
+      "status": "ACTIVE",
+      "description": "PASS, CLEAN, Founder-approved or review-complete statuses cannot become true merely because a caller writes those strings into a file; execution and review evidence must carry trustworthy provenance.",
+      "source": "ARCHITECTURE-CONSTITUTION.md#7",
+      "relatedInvariants": ["UASF-INV-0007", "UASF-INV-0013", "UASF-INV-0014", "UASF-INV-0015"]
+    }
+  ]
+}

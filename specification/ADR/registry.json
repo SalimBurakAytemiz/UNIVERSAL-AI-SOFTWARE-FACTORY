@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "1.0.0",
+  "decisions": [
+    {
+      "id": "ADR-0001",
+      "title": "Adopt TypeScript/Node/Vitest/ESLint/npm workspaces as the canonical Factory stack",
+      "status": "ACCEPTED",
+      "decidedAt": "2026-09-17",
+      "context": "Phase 0 required a concrete, boring, well-supported toolchain for the clean-slate repository foundation.",
+      "decision": "Use TypeScript on Node.js with npm workspaces, Vitest for tests and ESLint for linting, per TECH-STACK.md.",
+      "consequences": "All canonical packages under packages/* follow this stack unless a future ADR supersedes it.",
+      "relatedRequirements": []
+    },
+    {
+      "id": "ADR-0002",
+      "title": "Represent requirement/invariant/policy registries as canonical JSON files under specification/",
+      "status": "ACCEPTED",
+      "decidedAt": "2026-09-17",
+      "context": "Phase 1 requires machine-readable, Git-tracked registries that a new AI session can resume from without rereading chat history, per ARCHITECTURE-CONSTITUTION.md#3 and #5.",
+      "decision": "Store the requirement registry, invariant registry, policy registry, ADR log, traceability matrix, baseline version and Implementation Reality Matrix as JSON files under specification/, validated by a deterministic Node script (specification/validate-registries.mjs) rather than embedding this data only in TypeScript source or documentation prose.",
+      "consequences": "Registries are diffable, greppable and validated independently of any single AI agent's assertions; later governance/runtime phases (Phase 2+) can read the same files instead of re-deriving them.",
+      "relatedRequirements": ["UASF-REQ-0001", "UASF-REQ-0002", "UASF-REQ-0003", "UASF-REQ-0004", "UASF-REQ-0005", "UASF-REQ-0006", "UASF-REQ-0007"]
+    }
+  ]
+}

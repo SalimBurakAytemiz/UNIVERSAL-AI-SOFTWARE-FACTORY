@@ -13,7 +13,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "validate:specification": "node specification/validate-registries.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",

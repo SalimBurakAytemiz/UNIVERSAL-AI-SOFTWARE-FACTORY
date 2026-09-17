@@ -8,7 +8,7 @@ export default tseslint.config(
     ignores: ['dist/**', 'node_modules/**', 'automation/**']
   },
   {
-    files: ['scripts/**/*.mjs'],
+    files: ['scripts/**/*.mjs', 'specification/**/*.mjs'],
     languageOptions: {
       globals: {
         process: 'readonly',

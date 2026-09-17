@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "1.0.0",
+  "currentBaselineVersion": "1.1.0",
+  "history": [
+    {
+      "baselineVersion": "1.0.0",
+      "phase": 0,
+      "milestone": "0.1",
+      "description": "Clean repository foundation: TypeScript/Node/Vitest/ESLint/npm workspaces, GitHub CI, canonical folders and .ai state.",
+      "recordedAt": "2026-09-17"
+    },
+    {
+      "baselineVersion": "1.1.0",
+      "phase": 1,
+      "milestone": "1.1",
+      "description": "Establish requirement, invariant and policy registries with traceability, ADR log, baseline versioning and Implementation Reality Matrix.",
+      "recordedAt": "2026-09-17"
+    }
+  ]
+}

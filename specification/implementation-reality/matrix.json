@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1.0.0",
+  "entries": [
+    { "requirementId": "UASF-REQ-0001", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null },
+    { "requirementId": "UASF-REQ-0002", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null },
+    { "requirementId": "UASF-REQ-0003", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null },
+    { "requirementId": "UASF-REQ-0004", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null },
+    { "requirementId": "UASF-REQ-0005", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null },
+    { "requirementId": "UASF-REQ-0006", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null },
+    { "requirementId": "UASF-REQ-0007", "specificationStatus": "DEFINED", "implementationStatus": "IMPLEMENTED", "testStatus": "NOT_YET_TESTED", "evidenceStatus": "NO_EVIDENCE_YET", "blockers": [], "lastVerifiedCommit": null }
+  ]
+}
