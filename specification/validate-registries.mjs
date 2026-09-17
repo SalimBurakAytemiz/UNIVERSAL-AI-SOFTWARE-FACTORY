@@ -4,7 +4,7 @@ import path from 'node:path';
 
 // Bu betik AI'nin kendi kendine "gecti" dememesini onlemek icin degil,
 // kayitlarin (registry) yapisal butunlugunu deterministik olarak dogrulamak icindir.
-const repoRoot = path.dirname(fileURLToPath(new URL('.', import.meta.url)));
+const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
 function readJson(relativePath) {
   const fullPath = path.join(repoRoot, relativePath);
@@ -54,6 +54,22 @@ for (const requirement of requirementRegistry.requirements) {
     fail(`requirement ${requirement.id} has unknown status "${requirement.status}"`);
   }
 }
+
+// Bağlantı alanları dizi olmalı ve yalnız mevcut kanonik kimliklere başvurmalıdır.
+function checkReferences(items, field, ids, label) {
+  for (const item of items) {
+    if (!Array.isArray(item[field])) {
+      fail(label + ' ' + item.id + ' requires array field ' + field);
+      continue;
+    }
+    for (const id of item[field]) {
+      if (typeof id !== 'string' || !ids.has(id)) fail(label + ' ' + item.id + ' references unknown id ' + JSON.stringify(id));
+    }
+  }
+}
+checkReferences(requirementRegistry.requirements, 'relatedInvariants', invariantIds, 'requirement');
+checkReferences(policyRegistry.policies, 'relatedInvariants', invariantIds, 'policy');
+checkReferences(adrRegistry.decisions, 'relatedRequirements', requirementIds, 'ADR');
 
 // Traceability matrisindeki her girisin bilinen bir invariant'a atifta bulunmasi gerekir.
 for (const entry of traceabilityMatrix.entries) {

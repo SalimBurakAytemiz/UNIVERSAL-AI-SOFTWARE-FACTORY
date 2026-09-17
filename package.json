@@ -12,7 +12,7 @@
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node --test specification/validate-registries.test.mjs && vitest run",
     "build": "tsc -p tsconfig.json",
     "validate:specification": "node specification/validate-registries.mjs"
   },
