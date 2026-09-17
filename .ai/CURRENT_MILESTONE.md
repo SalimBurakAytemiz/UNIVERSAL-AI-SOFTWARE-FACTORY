@@ -1,3 +1,3 @@
 # Current Milestone
 
-Milestone 0.1 — Bootstrap repository foundation
+Milestone 1.1 — Establish requirement, invariant and policy registries with traceability

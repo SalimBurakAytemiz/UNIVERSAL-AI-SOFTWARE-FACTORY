@@ -1,3 +1,3 @@
 # Current Phase
 
-Phase 0 — Clean Repository Foundation
+Phase 1 — Canonical Specification & Architecture Constitution
