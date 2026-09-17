@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1.0.0",
+  "evaluatedAt": "2026-09-17",
+  "models": [
+    { "id": "claude-primary", "adapter": "claude", "provider": "anthropic", "model": "sonnet", "family": "anthropic-claude", "cost": "existing-subscription", "enabled": true, "priority": 0, "roles": ["builder", "planner"] },
+    { "id": "codex-primary", "adapter": "codex", "provider": "openai", "model": "gpt-5.6-sol", "family": "openai-gpt", "cost": "existing-subscription", "enabled": true, "priority": 0, "roles": ["reviewer"] },
+    { "id": "opencode-union-alpha", "adapter": "opencode", "provider": "opencode", "model": "opencode/union-alpha", "family": "union-alpha", "identity": "public-model-id; underlying vendor undisclosed", "cost": "free", "enabled": true, "priority": 10, "roles": ["builder", "planner"], "source": "https://opencode.ai/docs/zen/", "evidence": "Founder verified OPENCODE_RUN_OK; no reviewer eligibility" },
+    { "id": "opencode-mimo", "adapter": "opencode", "provider": "opencode", "model": "opencode/mimo-v2.5-free", "family": "xiaomi-mimo", "cost": "free", "enabled": true, "priority": 20, "roles": ["builder", "planner", "reviewer"], "source": "https://opencode.ai/docs/zen/" },
+    { "id": "opencode-nemotron", "adapter": "opencode", "provider": "opencode", "model": "opencode/nemotron-3-ultra-free", "family": "nvidia-nemotron", "cost": "free", "enabled": true, "priority": 30, "roles": ["builder", "planner", "reviewer"], "source": "https://opencode.ai/docs/zen/" },
+    { "id": "nim-deepseek", "adapter": "omniroute", "provider": "nvidia", "model": "deepseek-ai/deepseek-v3.1", "family": "deepseek", "cost": "free", "enabled": true, "priority": 40, "roles": ["builder", "planner", "reviewer"], "registration": "REGISTERED", "initialAvailability": "INACTIVE", "reason": "NO_CREDENTIAL", "source": "https://docs.api.nvidia.com/nim/docs/api-quickstart" },
+    { "id": "openrouter-nemotron", "adapter": "omniroute", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free", "family": "nvidia-nemotron", "cost": "free", "enabled": true, "priority": 50, "roles": ["builder", "planner", "reviewer"], "registration": "REGISTERED", "initialAvailability": "INACTIVE", "reason": "NO_CREDENTIAL", "source": "https://openrouter.ai/api/v1/models" },
+    { "id": "kiro-registered", "adapter": "omniroute", "provider": "kiro", "model": null, "family": "unknown", "cost": "unverified", "enabled": false, "roles": [], "registration": "REGISTERED", "reason": "INACTIVE: native-interface requirement; no approved OmniRoute route or credential", "source": "https://kiro.dev/pricing/" },
+    { "id": "pollinations-registered", "adapter": "omniroute", "provider": "pollinations", "model": null, "family": "unknown", "cost": "unverified", "enabled": false, "roles": [], "registration": "REGISTERED", "reason": "INACTIVE: NO_CREDENTIAL; Pollen billing/zero-cost coding identity not verified", "source": "https://github.com/pollinations/pollinations/blob/main/APIDOCS.md" }
+  ]
+}

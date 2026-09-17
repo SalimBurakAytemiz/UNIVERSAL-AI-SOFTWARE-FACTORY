@@ -1,0 +1,57 @@
+# Pack Manifest
+
+Total files: 53
+
+- `.ai/AUTOMATION_STATE.json`
+- `.ai/CONTEXT_BUDGET.md`
+- `.ai/CURRENT_MILESTONE.md`
+- `.ai/CURRENT_PHASE.md`
+- `.ai/DECISIONS.md`
+- `.ai/KNOWN_ISSUES.md`
+- `.ai/MASTER_STATE.json`
+- `.ai/NEXT_ACTIONS.md`
+- `.ai/REVIEW_STATUS.md`
+- `.ai/TEST_STATUS.md`
+- `.ai/automation/.gitkeep`
+- `.ai/git/.gitkeep`
+- `.ai/reviews/.gitkeep`
+- `.claude/settings.json`
+- `.env.example`
+- `.gitignore`
+- `AGENT-CATALOG.md`
+- `AGENTS.md`
+- `AI-SESSION-RULES.md`
+- `ARCHITECTURE-CONSTITUTION.md`
+- `AUTOMATED-REVIEW-ORCHESTRATOR.md`
+- `BOOTSTRAP-AUTOMATION.md`
+- `BUILD-RULES.md`
+- `CLAUDE.md`
+- `CODEX.md`
+- `CONTRIBUTING.md`
+- `CONTROL-TOWER-SPEC.md`
+- `DEFINITION-OF-DONE.md`
+- `ERROR-AND-PROBLEM-STANDARD.md`
+- `GIT-AUTOMATION.md`
+- `MASTER-BLUEPRINT.md`
+- `PACK-MANIFEST.md`
+- `PACKAGE-VALIDATION.md`
+- `README.md`
+- `REPOSITORY-TREE.md`
+- `ROADMAP.md`
+- `SECURITY.md`
+- `SETUP-ONCE-WINDOWS.md`
+- `START-HERE.md`
+- `TECH-STACK.md`
+- `VERSION.md`
+- `automation/config.json`
+- `automation/factory-supervisor.mjs`
+- `docs/tr/how-the-automation-works.md`
+- `docs/tr/project-overview.md`
+- `prompts/CLAUDE-AUTO-BUILDER.md`
+- `prompts/CLAUDE-AUTO-NEXT.md`
+- `prompts/CLAUDE-AUTO-REMEDIATION.md`
+- `prompts/CODEX-AUTO-REVIEW.md`
+- `prompts/CODEX-PHASE-CLOSURE.md`
+- `scripts/check-prereqs.ps1`
+- `scripts/start-full-auto.ps1`
+- `scripts/status.ps1`

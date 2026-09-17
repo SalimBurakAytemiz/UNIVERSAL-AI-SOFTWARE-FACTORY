@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1.0.0",
+  "factory": "UNIVERSAL-AI-SOFTWARE-FACTORY",
+  "owner": "@SalimBurakAytemiz",
+  "state": "CLEAN_SLATE_INITIALIZED",
+  "automationMode": "DAY_ZERO_FULL_AUTO_GIT",
+  "currentPhase": 0,
+  "currentPhaseName": "Clean Repository Foundation",
+  "currentMilestone": "0.1",
+  "currentMilestoneName": "Bootstrap repository foundation",
+  "lastCompletedMilestone": null,
+  "lastVerifiedCommit": null,
+  "knownBlockers": [],
+  "nextAction": "Run scripts/start-full-auto.ps1",
+  "sourceOfTruth": "repository+git+.ai",
+  "gameStudioActivationAllowed": false
+}

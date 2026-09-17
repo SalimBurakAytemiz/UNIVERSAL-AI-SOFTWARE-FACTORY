@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "1.0.0",
+  "status": "READY",
+  "mode": "automatic",
+  "currentMilestone": "0.1",
+  "currentReviewedCommit": null,
+  "lastBuilderCommit": null,
+  "reviewCycle": 0,
+  "completedMilestonesThisRun": 0,
+  "lastReviewResult": null,
+  "lastFindingsFile": null,
+  "founderAttentionRequired": false,
+  "stopReason": null,
+  "git": {
+    "remote": "origin",
+    "branch": "factory/development",
+    "lastPushedSha": null,
+    "lastVerifiedRemoteSha": null
+  }
+}

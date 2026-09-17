@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "2.0.0",
+  "mode": "automatic",
+  "git": {
+    "remote": "origin",
+    "mainBranch": "main",
+    "workBranch": "factory/development",
+    "autoInitializeEmptyRepo": true,
+    "autoFetch": true,
+    "autoPullFastForwardOnly": true,
+    "autoPush": true,
+    "verifyRemoteSha": true,
+    "forbidForcePush": true,
+    "forbidHardReset": true,
+    "forbidRebase": true
+  },
+  "review": {
+    "maxCyclesPerMilestone": 3,
+    "maxMilestonesPerRun": 10,
+    "doNotReviewSameBlockedCommitTwice": true,
+    "maxRemediationsPerMilestone": 3
+  },
+  "policy": {
+    "allowPaid": false,
+    "allowProduction": false,
+    "allowRisk5": false,
+    "allowIrreversibleMigration": false
+  },
+  "commands": {
+    "claude": "claude",
+    "codex": "codex",
+    "opencode": "opencode"
+  },
+  "omniroute": {
+    "baseUrl": "http://127.0.0.1:20128/v1",
+    "apiKeyEnv": "FACTORY_OMNIROUTE_API_KEY"
+  },
+  "health": {
+    "ttlMs": 300000,
+    "probeTimeoutMs": 60000,
+    "cooldownMs": 60000,
+    "unavailableCooldownMs": 300000,
+    "maxCooldownMs": 1800000,
+    "maxAttemptsPerTask": 2,
+    "maxRecoveryWaitMs": 3600000
+  },
+  "execution": {
+    "modelTimeoutMs": 900000,
+    "validationTimeoutMs": 600000,
+    "maxOutputTokens": 16384,
+    "maxContextChars": 300000,
+    "maxContextRounds": 6
+  }
+}
