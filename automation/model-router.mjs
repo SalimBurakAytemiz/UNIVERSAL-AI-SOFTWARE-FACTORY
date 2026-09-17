@@ -83,6 +83,11 @@ export class ModelRouter {
           this.state.blockedTasks[taskKey] = reason;
           await this.save(); throw new Stop(reason);
         }
+        // Persist safe diagnostic metadata before validation; never store proposed secret contents.
+        this.state.lastProposal = { taskKey, role, model: model.id, status: output.status,
+          riskLevel: output.riskLevel ?? null, requiresFounderApproval: output.requiresFounderApproval ?? null,
+          paths: Array.isArray(output.files) ? output.files.map(f => f.path) : [], timestamp: this.now() };
+        await this.save();
         const accepted = await accept(output, model);
         this.state.attempts[key].status = "SUCCESS";
         if (accepted.status === "NEED_CONTEXT") this.state.attempts[key].response = accepted;
@@ -90,6 +95,12 @@ export class ModelRouter {
         await this.save();
         return { output: accepted, model };
       } catch (error) {
+        if (error instanceof Stop) {
+          this.state.attempts[key].status = "BLOCKED";
+          this.state.blockedTasks[taskKey] = error.message;
+          await this.save();
+          throw error;
+        }
         if (!(error instanceof ProviderError)) throw error;
         this.state.attempts[key].status = "FAILED";
         this.state.attempts[key].permanent = ["INVALID_RESPONSE", "MODEL_MISMATCH", "OUTPUT_LIMIT"].includes(error.kind);

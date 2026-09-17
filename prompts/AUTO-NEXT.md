@@ -7,3 +7,7 @@ Advance exactly one coherent milestone. lastCompletedMilestone must equal the ol
 Preserve owner, authority, evidence, Game Studio activation and all other master fields. Never claim a new review, phase closure or test that did not run.
 Use status NEED_CONTEXT with readPaths if needed. If the next milestone/phase requires Founder approval or the roadmap is ambiguous, return FOUNDER_APPROVAL_REQUIRED or BLOCKED; do not invent permission.
 No tools, shell commands, Git operations, paid models, production actions or irreversible migrations.
+
+READY schema example (riskLevel must be a JSON integer, not a string):
+{"taskId":"supplied taskId","status":"READY","baseCommit":"supplied commit","riskLevel":1,"requiresFounderApproval":false,"files":[{"path":".ai/MASTER_STATE.json","baseSha256":"supplied hash","content":"entire JSON file as a string"}]}
+Routine local checkpoint progression is already authorized. Critical actions still require approval. Assess only the proposed checkpoint change, not hypothetical risks of future implementation.

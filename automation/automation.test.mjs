@@ -303,3 +303,20 @@ test('full mocked milestone: review block, remediation, clean, planner fallback 
   assert.equal(reviews,2);assert.equal(calls.includes('planner:opencode-union-alpha'),true);
   assert.equal(calls.filter(x=>x==='push').length,3);
 });
+
+
+test('malformed risk metadata is invalid response; explicit authority signals stop', async () => {
+  const { validateProposalRisk } = await import('./repository.mjs');
+  for (const proposal of [{}, { riskLevel: '1', requiresFounderApproval: false }, { riskLevel: 1 }]) assert.throws(() => validateProposalRisk(proposal), ProviderError);
+  for (const proposal of [{ riskLevel: 5, requiresFounderApproval: false }, { requiresFounderApproval: true }]) assert.throws(() => validateProposalRisk(proposal), Stop);
+  assert.doesNotThrow(() => validateProposalRisk({ riskLevel: 1, requiresFounderApproval: false }));
+});
+test('acceptance safety stop is persisted and cannot be bypassed on restart', async () => {
+  const f = fixture();
+  await assert.rejects(f.execute({ accept: async () => { throw new Stop('protected proposal'); } }), Stop);
+  assert.equal(f.state.lastProposal.model, 'claude-primary');
+  assert.equal(f.state.attempts['commit-a:builder:claude-primary'].status, 'BLOCKED');
+  const restored = fixture({ state: JSON.parse(JSON.stringify(f.state)) });
+  await assert.rejects(restored.execute(), Stop);
+  assert.equal(restored.calls.length, 0);
+});

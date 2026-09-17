@@ -7,6 +7,10 @@ export const canonical = ["AGENTS.md", "CODEX.md", "CLAUDE.md", "ARCHITECTURE-CO
 export const checkpoints = [".ai/MASTER_STATE.json", ".ai/CURRENT_PHASE.md", ".ai/CURRENT_MILESTONE.md", ".ai/NEXT_ACTIONS.md", ".ai/TEST_STATUS.md", ".ai/REVIEW_STATUS.md"];
 const forbidden = /(^|\/)(\.git|node_modules|\.env(?!\.example$)(?:\..*)?|credentials?|secrets?|\.ssh|\.aws|\.codex|\.claude|\.opencode)(\/|$)|\.(pem|key|p12|pfx)$/i;
 const protectedWrite = /^(automation\/|scripts\/|prompts\/|\.ai\/automation\/|\.ai\/(AUTOMATION_STATE\.json|REVIEW_STATUS\.md|TEST_STATUS\.md)$|\.gitignore$|\.npmrc$)|(^|\/)(migrations?|deploy(?:ment)?|production|terraform|infrastructure)(\/|\.)/i;
+export function validateProposalRisk(proposal) {
+  if (proposal.requiresFounderApproval === true || (Number.isInteger(proposal.riskLevel) && proposal.riskLevel >= 5)) throw new Stop("Founder approval required: explicit approval flag or Risk-5 proposal.");
+  if (proposal.requiresFounderApproval !== false || !Number.isInteger(proposal.riskLevel) || proposal.riskLevel < 0) throw new ProviderError("INVALID_RESPONSE");
+}
 export function safeName(name) {
   if (typeof name !== "string" || !name || name.includes("\\") || name.includes(":") || name.includes("\0") || path.posix.isAbsolute(name) || name.split("/").some(p => !p || p === "." || p === ".." || /[. ]$/.test(p) || /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i.test(p)) || forbidden.test(name)) throw new Stop("Unsafe/secret repository path.");
   return name;
@@ -114,7 +118,7 @@ export class Repository {
     if (await this.head() !== expectedHead) throw new Stop("Proposal target HEAD changed.");
     await this.clean();
     if (proposal.baseCommit !== expectedHead || !Array.isArray(proposal.files) || !proposal.files.length || proposal.files.length > 40) throw new ProviderError("INVALID_RESPONSE");
-    if (proposal.requiresFounderApproval !== false || !Number.isInteger(proposal.riskLevel) || proposal.riskLevel < 0 || proposal.riskLevel >= 5) throw new Stop("Founder approval required for proposed work.");
+    validateProposalRisk(proposal);
     const names = new Set(), prepared = [];
     for (const entry of proposal.files) {
       const name = safeName(entry.path);

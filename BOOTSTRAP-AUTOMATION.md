@@ -137,3 +137,6 @@ Tek supervisor kilidi vardır. Zorla kapatma sonrası kilit kalırsa önce kayı
 - [Kiro ücretsiz planı ve native interface koşulları](https://kiro.dev/pricing/)
 - [Pollinations resmi API ve Pollen maliyet alanları](https://github.com/pollinations/pollinations/blob/main/APIDOCS.md)
 - [Codex non-interactive kullanım](https://developers.openai.com/codex/noninteractive/)
+
+## Checkpoint hata ayrımı
+Eksik/geçersiz risk metadatası INVALID_RESPONSE olarak reddedilir; açık onay talebi veya Risk-5 güvenli biçimde durur. Son önerinin model, görev, risk ve dosya yolları runtime state içindeki lastProposal alanında tutulur. Güvenlik duruşları yeniden başlatmayla aşılmaz. Terminal aktif adımı ve review sayısını gösterir.

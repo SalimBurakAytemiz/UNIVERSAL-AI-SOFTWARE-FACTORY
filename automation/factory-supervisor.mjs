@@ -54,8 +54,8 @@ export class Supervisor {
           }
           if (output.status !== "READY") throw new ProviderError("INVALID_RESPONSE");
           const contributor = { id: model.id, model: model.model, family: model.family };
-          if (!this.state.contributors.some(c => c.id === model.id)) this.state.contributors.push(contributor);
           const commit = await this.repo.apply(output, role, head, this.state, this.save);
+          if (!this.state.contributors.some(c => c.id === model.id)) this.state.contributors.push(contributor);
           await this.transition(role === "planner" ? "ADVANCED" : "VALIDATE", { lastBuilderCommit: commit, expectedHead: commit, activeBuilder: model.id });
           return output;
         } });
@@ -116,6 +116,10 @@ export class Supervisor {
     let waitingSince = null;
     while ((this.state.completedMilestonesThisRun || 0) < this.config.review.maxMilestonesPerRun) {
       try {
+        this.state.status = "RUNNING";
+        this.state.updatedAt = new Date(this.now()).toISOString();
+        await this.save();
+        console.log('[Factory] ' + this.state.step + ' | review ' + this.state.reviewCycle + '/3');
         await this.step(); waitingSince = null;
         this.state.status = "RUNNING"; this.state.founderAttentionRequired = false; this.state.stopReason = null;
         await this.save();
