@@ -55,6 +55,7 @@ for (const requirement of requirementRegistry.requirements) {
   }
 }
 
+// Her kayit matrisinin (traceability ve reality) girisleri bilinen gereksinimlere atifta bulunmali
 for (const entry of traceabilityMatrix.entries) {
   if (!requirementIds.has(entry.requirementId)) {
     fail(`traceability matrix references unknown requirement id "${entry.requirementId}"`);
@@ -70,6 +71,28 @@ for (const entry of realityMatrix.entries) {
   if (!requirementIds.has(entry.requirementId)) {
     fail(`implementation reality matrix references unknown requirement id "${entry.requirementId}"`);
   }
+}
+
+// Yeni: Her kanonik gereksinim hem traceability hem de reality matrisinde tam olarak bir kez yer almalidir.
+// Bu, gereksinim kaplamasinin sessizce kaybolmasini onler (P1 duzeltme).
+const traceabilityRequirementIds = new Set(traceabilityMatrix.entries.map(e => e.requirementId));
+for (const reqId of requirementIds) {
+  if (!traceabilityRequirementIds.has(reqId)) {
+    fail(`traceability matrix is missing entry for requirement "${reqId}"`);
+  }
+}
+if (traceabilityRequirementIds.size !== requirementIds.size) {
+  fail(`traceability matrix has ${traceabilityRequirementIds.size} entries but requirement registry has ${requirementIds.size} requirements`);
+}
+
+const realityRequirementIds = new Set(realityMatrix.entries.map(e => e.requirementId));
+for (const reqId of requirementIds) {
+  if (!realityRequirementIds.has(reqId)) {
+    fail(`implementation reality matrix is missing entry for requirement "${reqId}"`);
+  }
+}
+if (realityRequirementIds.size !== requirementIds.size) {
+  fail(`implementation reality matrix has ${realityRequirementIds.size} entries but requirement registry has ${requirementIds.size} requirements`);
 }
 
 if (!/^\d+\.\d+\.\d+$/.test(baseline.currentBaselineVersion)) {
