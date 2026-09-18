@@ -439,7 +439,7 @@ for (const scenario of ['primary', 'nemotron', 'fallback', 'same-family', 'unava
         repo:{...f.supervisor.repo, context:async()=>({head:f.head,tree:[],files:[]})},
         adapter:{probe:async m=>{
           probes.push(m.id);
-          if (scenario === 'unavailable' || (scenario === 'fallback' && m.id === 'opencode-nemotron')) throw new ProviderError('AUTH');
+          if (scenario === 'unavailable' || (scenario === 'fallback' && ['nim-nemotron-super','opencode-nemotron'].includes(m.id))) throw new ProviderError('AUTH');
           return {probe:'authenticated-inference',model:m.model};
         }, invoke:async (m, raw)=>{
           calls.push(m.id);
@@ -454,7 +454,7 @@ for (const scenario of ['primary', 'nemotron', 'fallback', 'same-family', 'unava
         assert.deepEqual(calls,[]);
       } else {
         const result=await recoverReview(s,{head:f.head,authorized:true});
-        const expected=scenario === 'primary' ? 'codex-primary' : ['fallback','same-family'].includes(scenario) ? 'nim-deepseek' : 'opencode-nemotron';
+        const expected=scenario === 'primary' ? 'codex-primary' : ['fallback','same-family'].includes(scenario) ? 'nim-deepseek' : 'nim-nemotron-super';
         assert.deepEqual(calls,[expected]);
         assert.equal(result.reviewerId,expected);
         assert.equal(result.reviewerFamily,model(expected).family);
@@ -500,4 +500,143 @@ for (const kind of ['family','model','health','contributors']) test('recovery re
     assert.equal(f.state.status,'FOUNDER_ATTENTION_REQUIRED');
     assert.equal(f.state.reviewCycle,3);
   } finally {await rm(f.dir,{recursive:true,force:true});}
+});
+
+async function failedInfrastructureRecovery() {
+  const f = await recoveryFixture();
+  const request = f.supervisor.request;
+  for (const m of registry.models) f.state.providers[m.id] = { ...f.state.providers[m.id], lastFailure:'NO_CREDENTIAL' };
+  f.supervisor.request = async () => { throw new Unavailable('All reviewer candidates are quarantined or unavailable.',Date.now()+1000); };
+  await assert.rejects(f.run(),Unavailable);
+  assert.equal(f.state.reviewRecoveries[f.head].failureCategory,'INFRASTRUCTURE_ONLY');
+  f.supervisor.request = request;
+  return f;
+}
+
+test('one explicitly authorized infrastructure retry preserves original audit, contributors and cycles', async () => {
+  const f=await failedInfrastructureRecovery();
+  try {
+    const previous=structuredClone(f.state.reviewRecoveries[f.head]);
+    const auditPath=path.join(f.dir,'.ai/automation/recoveries',f.head+'.json');
+    const auditBefore=await readFile(auditPath,'utf8');
+    await assert.rejects(f.run(),/explicit one-time/);
+    await assert.rejects(f.run({retryPreviousAttempt:previous.id,authorized:false}),/authorization/);
+    await assert.rejects(f.run({retryPreviousAttempt:'wrong'}),/explicit one-time/);
+    const result=await f.run({retryPreviousAttempt:previous.id});
+    assert.equal(result.status,'CLEAN');
+    assert.equal(result.previousRecoveryAttempt,previous.id);
+    assert.equal(result.targetHead,f.head);
+    assert.equal(result.founderAuthorization.targetHead,f.head);
+    assert.notEqual(result.id,previous.id);
+    assert.notEqual(result.founderAuthorization.id,previous.founderAuthorization.id);
+    assert.equal(await readFile(auditPath,'utf8'),auditBefore);
+    assert.deepEqual(f.state.reviewRecoveries[f.head],previous);
+    assert.deepEqual(f.state.contributors,previous.contributors);
+    assert.equal(f.state.reviewCycle,3); assert.equal(f.state.remediationCount,3);
+    assert.equal((await readJson(path.join(f.dir,'.ai/automation/recoveries',f.head+'.'+result.id+'.json'))).previousRecoveryAttempt,previous.id);
+  } finally { await rm(f.dir,{recursive:true,force:true}); }
+});
+
+test('infrastructure retry is consumed even if infrastructure fails again', async () => {
+  const f=await failedInfrastructureRecovery();
+  try {
+    const previous=f.state.reviewRecoveries[f.head];
+    f.supervisor.request=async()=>{throw new Unavailable('All reviewer candidates are quarantined or unavailable.');};
+    await assert.rejects(f.run({retryPreviousAttempt:previous.id}),Unavailable);
+    await assert.rejects(f.run({retryPreviousAttempt:previous.id}),/explicit one-time/);
+    assert.equal(f.state.reviewCycle,3);
+  } finally {await rm(f.dir,{recursive:true,force:true});}
+});
+
+for(const status of ['CLEAN','BLOCKED','STARTED']) test('prior '+status+' permanently prohibits infrastructure retry',async()=>{
+  const f=await failedInfrastructureRecovery();
+  try {
+    const p=f.state.reviewRecoveries[f.head]; p.status=status;
+    await atomicJson(path.join(f.dir,'.ai/automation/recoveries',f.head+'.json'),p);
+    await assert.rejects(f.run({retryPreviousAttempt:p.id}),/not an infrastructure/);
+  } finally {await rm(f.dir,{recursive:true,force:true});}
+});
+
+test('legacy infrastructure failure requires no reviewer invocation and matching prior artifact', async()=>{
+  const {infrastructureRetryAllowed}=await import('./review-recovery.mjs');
+  const p={status:'FAILED',head:'a'.repeat(40),authorizedAt:'2026-09-18T01:00:00Z',finishedAt:'2026-09-18T01:01:00Z',reason:'All reviewer candidates are quarantined or unavailable.'};
+  assert.equal(infrastructureRetryAllowed(p,{}),true);
+  assert.equal(infrastructureRetryAllowed({...p,reason:'INVALID_RESPONSE'},{}),false);
+  assert.equal(infrastructureRetryAllowed(p,{attempts:{'task:reviewer:id':{startedAt:Date.parse('2026-09-18T01:00:30Z'),status:'FAILED'}}}),false);
+  assert.equal(infrastructureRetryAllowed(p,{reviewerDecisions:[{targetHead:p.head,status:'BLOCKED'}]}),false);
+  const f=await failedInfrastructureRecovery();
+  try {
+    await atomicJson(path.join(f.dir,'.ai/automation/recoveries',f.head+'.json'),{...f.state.reviewRecoveries[f.head],reason:'tampered'});
+    await assert.rejects(f.run({retryPreviousAttempt:f.state.reviewRecoveries[f.head].id}),/not an infrastructure/);
+  } finally {await rm(f.dir,{recursive:true,force:true});}
+});
+
+test('received reviewer decision is persisted before invalid output acceptance and forbids retry',async()=>{
+  const f=fixture({invoke:async()=>({status:'CLEAN',reviewedCommit:'wrong',findings:[]})});
+  await assert.rejects(f.execute({role:'reviewer',request:JSON.stringify({reviewedCommit:'target'}),contributors:[{family:'anthropic-claude',model:'sonnet'}],accept:async()=>{throw new Stop('Malformed evidence');}}),Stop);
+  assert.equal(f.state.reviewerDecisions[0].targetHead,'target');
+  assert.equal(f.state.reviewerDecisions[0].status,'CLEAN');
+  const {infrastructureRetryAllowed}=await import('./review-recovery.mjs');
+  assert.equal(infrastructureRetryAllowed({head:'target',status:'FAILED',failureCategory:'INFRASTRUCTURE_ONLY'},f.state),false);
+});
+
+test('NIM credentials stay in original root; free-tier opt-in required and OpenRouter fields omitted',async()=>{
+  const temp=await mkdtemp(path.join(os.tmpdir(),'uasf-nim-'));
+  try {
+    const credentialRoot=path.join(temp,'original'),snapshot=path.join(temp,'snapshot');
+    await mkdir(snapshot);
+    let body;
+    const adapter=createAdapters(cfg,{root:snapshot,credentialRoot,env:{},routeResolver:async(_p,_g,env)=>{
+      assert.equal(env.FACTORY_OMNIROUTE_API_KEY,'fixture-only');
+      return {apiKey:'fixture-only',connectionId:'one',baseUrl:'http://127.0.0.1:20128/v1'};
+    },fetcher:async(_url,options)=>{body=JSON.parse(options.body);return new Response(JSON.stringify({model:'nvidia/nemotron-3-super-120b-a12b',choices:[{finish_reason:'stop',message:{content:'{"status":"READY"}'}}]}));}});
+    await atomicJson(path.join(credentialRoot,'.ai/automation/credentials.json'),{omnirouteApiKey:'fixture-only'});
+    await assert.rejects(adapter.invoke(model('nim-nemotron-super'),'{}'),e=>e.kind==='NO_CREDENTIAL');
+    assert.equal(body,undefined);
+    await atomicJson(path.join(credentialRoot,'.ai/automation/credentials.json'),{omnirouteApiKey:'fixture-only',nimFreeTier:true});
+    assert.equal((await adapter.invoke(model('nim-nemotron-super'),'{}')).status,'READY');
+    assert.equal(body.model,'nvidia/nvidia/nemotron-3-super-120b-a12b');
+    assert.equal(body.provider,undefined);
+  } finally {await rm(temp,{recursive:true,force:true});}
+});
+
+test('unrelated exact aliases cannot block pinned route; target, wildcard, settings aliases and combos do',async()=>{
+  const {DatabaseSync}=await import('node:sqlite');
+  const temp=await mkdtemp(path.join(os.tmpdir(),'uasf-route-'));
+  const dbPath=path.join(temp,'route.sqlite'),db=new DatabaseSync(dbPath);
+  try {
+    db.exec('CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT); CREATE TABLE combos(name TEXT); CREATE TABLE provider_nodes(id TEXT,prefix TEXT); CREATE TABLE provider_connections(id TEXT,provider TEXT,is_active INTEGER,provider_specific_data TEXT);');
+    db.prepare('INSERT INTO provider_connections VALUES(?,?,?,?)').run('only','nvidia',1,'{}');
+    db.prepare('INSERT INTO key_value VALUES(?,?,?)').run('modelAliases','unrelated-claude','"anthropic/other"');
+    const env={FACTORY_OMNIROUTE_API_KEY:'fixture-only',FACTORY_OMNIROUTE_DB:dbPath};
+    const route=()=>localRoute('nvidia',cfg.omniroute,env,'nvidia/nemotron-3-super-120b-a12b');
+    assert.equal((await route()).connectionId,'only');
+    for(const [namespace,key,value] of [['modelAliases','nvidia/nvidia/nemotron-3-super-120b-a12b','"other"'],['modelAliases','nemotron-3-super-120b-a12b','"other"'],['modelAliases','claude-*','"other"'],['settings','wildcardAliases','[{"pattern":"*","target":"paid/model"}]'],['providerAliases','nvidia','"other"']]) {
+      db.prepare('INSERT INTO key_value VALUES(?,?,?)').run(namespace,key,value);
+      await assert.rejects(route(),e=>e.kind==='CONFIG');
+      db.prepare('DELETE FROM key_value WHERE namespace=? AND key=?').run(namespace,key);
+    }
+    db.prepare('INSERT INTO combos VALUES(?)').run('nvidia/nvidia/nemotron-3-super-120b-a12b');
+    await assert.rejects(route(),e=>e.kind==='CONFIG');
+  } finally {db.close();await rm(temp,{recursive:true,force:true});}
+});
+
+test('milestone advancement preserves lifetime counters/contributors and starts a separate budget',async()=>{
+  const dir=await mkdtemp(path.join(os.tmpdir(),'uasf-budget-'));
+  try {
+    await atomicJson(path.join(dir,'.ai/MASTER_STATE.json'),{currentMilestone:'1.2'});
+    const state={step:'ADVANCED',reviewCycle:3,remediationCount:3,currentMilestone:'1.1',currentReviewedCommit:'reviewed',contributors:[{model:'builder',family:'openai-gpt'}],reviews:{reviewed:{artifactDigest:'digest'}}};
+    const s=new Supervisor({root:dir,config:cfg,registry,state,save:async()=>{},repo:{push:async()=>'closure'},adapter:{}});
+    await s.step();
+    assert.equal(state.reviewCycle,3); assert.equal(state.remediationCount,3);
+    assert.deepEqual(state.contributors,[{model:'builder',family:'openai-gpt'}]);
+    assert.equal(state.milestoneHistory.reviewed.reviewCycle,3);
+    assert.equal(state.currentMilestone,'1.2');
+    assert.equal(state.step,'BUILD'); assert.equal(state.expectedHead,'closure');
+    assert.equal(s.milestoneCount('reviewCycle','milestoneReviewCycleBase'),0);
+    state.reviewCycle=6;
+    assert.equal(s.milestoneCount('reviewCycle','milestoneReviewCycleBase'),3);
+    state.milestoneReviewCycleBase=7;
+    assert.throws(()=>s.milestoneCount('reviewCycle','milestoneReviewCycleBase'),/Invalid historical/);
+  } finally {await rm(dir,{recursive:true,force:true});}
 });

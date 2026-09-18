@@ -24,3 +24,7 @@ The Founder explicitly authorized independent HEALTHY free fallback when Codex i
 - Milestone 1.1 remains open; Milestone 1.2 has not begun. Full-auto continuation was tested on a copy of real runtime and stopped at the exhausted review/remediation guard without writes or model calls.
 
 Türkçe: Bu sonuç sağlayıcı erişim engelidir; bağımsız reviewer BLOCKED kararı değildir. CLEAN olmadan milestone kapatılmaz. Bu sonuç kaydı bir checkpoint commit'idir ve bağımsız review edilmiş kod olarak sunulmaz.
+
+## Infrastructure retry implementation — 2026-09-18
+
+Founder authorized a one-time infrastructure-only retry with a separate fresh authorization and immutable link to the previous attempt. Credential-ready NVIDIA Nemotron passed an actual authenticated-inference nonce probe through pinned OmniRoute. That health result is not independent code review. The new code snapshot still awaits commit, remote verification and real review. Existing contributor and recovery history is retained.

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, readJson, Stop, digest } from './runtime.mjs';
+import { atomicJson, readJson, Stop, Unavailable, digest } from './runtime.mjs';
 import { Supervisor, validateReview } from './factory-supervisor.mjs';
 import { Repository } from './repository.mjs';
 import { createAdapters } from './adapters.mjs';
@@ -8,7 +8,7 @@ import { independent } from './model-router.mjs';
 
 export function recoveryRegistry(registry, contributors) {
   // Önce bağımsız Codex, sonra ücretsiz Nemotron; katkı veren aileler asla aday değildir.
-  const rank = m => m.id === 'codex-primary' ? 0 : m.id === 'opencode-nemotron' ? 1 : 2;
+  const rank = m => m.id === 'codex-primary' ? 0 : m.id === 'nim-nemotron-super' ? 1 : m.id === 'opencode-nemotron' ? 2 : 3;
   const models = registry.models.filter(m => m.enabled && m.roles.includes('reviewer') && independent(m, contributors) &&
     (m.cost === 'free' || (m.id === 'codex-primary' && m.adapter === 'codex' && m.cost === 'existing-subscription')))
     .sort((a, b) => rank(a) - rank(b) || a.priority - b.priority)
@@ -16,8 +16,20 @@ export function recoveryRegistry(registry, contributors) {
   return { ...registry, models };
 }
 
+const infrastructureKinds = new Set(['NO_CREDENTIAL', 'UNAVAILABLE', 'AUTH', 'TIMEOUT', 'TRANSIENT', 'RATE_LIMIT']);
+export function infrastructureRetryAllowed(previous, state) {
+  if (previous.status !== 'FAILED' || previous.reviewerDecisionReceived || state.reviews?.[previous.head] ||
+      state.reviewerDecisions?.some(d => d.targetHead === previous.head)) return false;
+  if (previous.failureCategory !== undefined) return previous.failureCategory === 'INFRASTRUCTURE_ONLY';
+  // Eski kayıtlarda yalnız hiç reviewer çağrısı başlamamış, bilinen availability hatası kabul edilir.
+  const start = Date.parse(previous.authorizedAt), end = Date.parse(previous.finishedAt);
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start &&
+    previous.reason === 'All reviewer candidates are quarantined or unavailable.' &&
+    !Object.entries(state.attempts || {}).some(([key, attempt]) => key.includes(':reviewer:') && attempt.startedAt >= start && attempt.startedAt <= end);
+}
+
 // Yerel operatörün açık isteğidir; kriptografik Founder kimlik doğrulaması değildir.
-export async function recoverReview(supervisor, { head, authorized, source = 'explicit-local-cli' }) {
+export async function recoverReview(supervisor, { head, authorized, retryPreviousAttempt = null, source = 'explicit-local-cli' }) {
   const { state, repo, registry, root } = supervisor;
   if (!authorized || !/^[a-f0-9]{40}$/.test(head || '')) throw new Stop('Explicit Founder authorization and full target SHA required.');
   if (state.reviewCycle !== 3 || state.pendingApply) throw new Stop('Recovery requires three preserved cycles and no interrupted transaction.');
@@ -25,12 +37,26 @@ export async function recoverReview(supervisor, { head, authorized, source = 'ex
   await repo.clean();
   if (await repo.head() !== head || await repo.remoteSha(supervisor.config.git.workBranch) !== head) throw new Stop('Recovery target does not match local and remote HEAD.');
   state.reviewRecoveries ||= {};
-  if (state.currentReviewedCommit === head || state.reviews[head] || state.reviewRecoveries[head]) throw new Stop('Target already reviewed or recovery already consumed; no replay.');
+  if (state.currentReviewedCommit === head || state.reviews[head] || state.reviewerDecisions?.some(d => d.targetHead === head) ||
+      await readJson(path.join(root, '.ai/automation/reviews', head + '.json'), null)) throw new Stop('Target already reviewed; no replay.');
+  const previous = state.reviewRecoveries[head];
+  if (previous) {
+    if (!retryPreviousAttempt || retryPreviousAttempt !== previous.id || state.reviewRecoveryRetries?.[head]) throw new Stop('Recovery already consumed; explicit one-time infrastructure retry required.');
+    const priorAudit = await readJson(path.join(root, '.ai/automation/recoveries', head + '.json'));
+    if (digest(JSON.stringify(priorAudit)) !== digest(JSON.stringify(previous)) || !infrastructureRetryAllowed(previous, state)) throw new Stop('Prior recovery is not an infrastructure-only failure without a reviewer decision.');
+  } else if (retryPreviousAttempt) throw new Stop('Previous recovery attempt does not exist for target HEAD.');
+  const timestamp = new Date().toISOString();
   const record = { id: randomUUID(), head, authorizationSource: source, authorizedAt: new Date().toISOString(),
+    targetHead: head, timestamp, previousRecoveryAttempt: previous?.id || null,
+    reason: previous ? 'Founder-authorized infrastructure-only retry after ' + previous.reason : 'Founder-authorized fresh independent review',
+    founderAuthorization: { id: randomUUID(), source, timestamp, targetHead: head, previousRecoveryAttempt: previous?.id || null },
     automaticCyclesPreserved: 3, remediationCountPreserved: state.remediationCount,
     previousReviewedCommit: state.currentReviewedCommit, contributors: structuredClone(state.contributors), status: 'STARTED' };
-  state.reviewRecoveries[head] = record;
-  const audit = () => atomicJson(path.join(root, '.ai/automation/recoveries', head + '.json'), record);
+  // Önceki deneme ve audit dosyası değişmez; retry ayrı bir kayıt olarak eklenir.
+  if (previous) { state.reviewRecoveryRetries ||= {}; state.reviewRecoveryRetries[head] = record; }
+  else state.reviewRecoveries[head] = record;
+  const audit = () => atomicJson(path.join(root, '.ai/automation/recoveries', head + (previous ? '.' + record.id : '') + '.json'), record);
+  const attemptsBefore = structuredClone(state.attempts || {});
   await supervisor.save(); await audit();
   try {
     supervisor.router.registry = recoveryRegistry(registry, record.contributors);
@@ -42,7 +68,7 @@ export async function recoverReview(supervisor, { head, authorized, source = 'ex
     // Eski commit'e ait test çıktısı yeni HEAD'in kanıtı olarak sunulmaz.
     state.validation = null;
     await supervisor.save();
-    await supervisor.request('reviewer', 'Founder-authorized fresh independent recovery review of exact commit ' + head + '. Review the complete current milestone contract; automatic cycles remain 3.');
+    await supervisor.request('reviewer', 'Founder-authorized recovery attempt ' + record.id + ' of exact commit ' + head + '. Review the complete current milestone contract; automatic cycles remain 3.');
     const review = state.reviews[head];
     if (!review) throw new Stop('Missing exact-HEAD review artifact.');
     validateReview(review.result, head);
@@ -69,6 +95,11 @@ export async function recoverReview(supervisor, { head, authorized, source = 'ex
     state.stopReason = record.status === 'CLEAN' ? null : 'Recovery review BLOCKED; automatic cycles remain exhausted.';
     state.step = record.status === 'CLEAN' ? 'ADVANCE' : 'REMEDIATE';
   } catch (error) {
+    record.reviewerDecisionReceived = Boolean(state.reviews[head] || state.reviewerDecisions?.some(d => d.targetHead === head));
+    record.providerFailures = (record.eligibleReviewers || []).map(m => ({ reviewerId: m.id, kind: state.providers?.[m.id]?.lastFailure || 'UNKNOWN' }));
+    const changedAttempts = Object.entries(state.attempts || {}).filter(([key, a]) => key.includes(':reviewer:') && JSON.stringify(a) !== JSON.stringify(attemptsBefore[key])).map(([, a]) => a);
+    record.failureCategory = error instanceof Unavailable && !record.reviewerDecisionReceived && record.providerFailures.length &&
+      record.providerFailures.every(f => infrastructureKinds.has(f.kind)) && changedAttempts.every(a => a.status === 'FAILED' && infrastructureKinds.has(a.failureKind)) ? 'INFRASTRUCTURE_ONLY' : 'NON_RETRYABLE';
     record.status = 'FAILED'; record.reason = error.message;
     state.status = 'FOUNDER_ATTENTION_REQUIRED'; state.founderAttentionRequired = true;
     state.stopReason = error.message; state.step = 'REMEDIATE';
@@ -81,7 +112,7 @@ export async function recoverReview(supervisor, { head, authorized, source = 'ex
   return record;
 }
 
-export async function runRecovery({ root, config, registry, state, save, head, authorized }) {
+export async function runRecovery({ root, config, registry, state, save, head, authorized, retryPreviousAttempt = null }) {
   if (!authorized || !/^[a-f0-9]{40}$/.test(head || '')) throw new Stop('Use --recover-review <full SHA> --founder-authorized.');
   const original = new Repository(root, config);
   const assertTarget = async () => {
@@ -95,8 +126,8 @@ export async function runRecovery({ root, config, registry, state, save, head, a
     const repo = new Repository(snapshot, config);
     const clean = repo.clean.bind(repo);
     repo.clean = async () => { await clean(); await assertTarget(); };
-    const supervisor = new Supervisor({ root, config, registry, state, save, repo, adapter: createAdapters(config, { root: snapshot }) });
-    return await recoverReview(supervisor, { head, authorized });
+    const supervisor = new Supervisor({ root, config, registry, state, save, repo, adapter: createAdapters(config, { root: snapshot, credentialRoot: root }) });
+    return await recoverReview(supervisor, { head, authorized, retryPreviousAttempt });
   } finally {
     // --force kullanılmaz; beklenmeyen değişiklik varsa snapshot korunur.
     await original.git('worktree', 'remove', snapshot);

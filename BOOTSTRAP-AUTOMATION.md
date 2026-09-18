@@ -155,3 +155,19 @@ Her hedef için tek recovery kaydı `.ai/automation/recoveries/<SHA>.json` ve ru
 Founder tarafından yetkilendirilen recovery, bağımsız ise Codex primary reviewer kullanır. Codex bağımsız değilse aday listesinden çıkarılır. Öncelikli ücretsiz fallback opencode-nemotron (nvidia-nemotron) olur; kullanılamazsa contributor ailelerinin hiçbirine ait olmayan diğer ücretsiz reviewer adayları değerlendirilir. ModelRouter yalnız başarılı authenticated-inference health kontrolünden geçen HEALTHY modeli çağırır; cooldown ve deneme sınırları korunur. Contributor kayıtları silinmez veya yeniden yazılmaz. CLEAN sadece tam hedef SHA, boş findings ve doğrulanmış bağımsız artifact ile kabul edilir. BLOCKED/hata Founder attention durumunda kalır. CLEAN sonrası komut otomatik milestone ilerletmez; değişen araç dosyalarının review edildiği iddia edilmez. Araç değişiklikleri commit edildiğinde yeni HEAD için ayrı review gerekir. Runtime audit kayıtları Git dışında yereldir; makine sahibi tarafından değiştirilemeyecek bir attestation sistemi oldukları iddia edilmez.
 
 2026-09-18 Founder talebi: bağımsız ücretsiz fallback açıkça yetkilendirildi. Önceki `232d7ff585ae8b9e92ee2c0868239bf576a25f88` FAILED recovery kaydı korunur ve tekrarlanmaz. Yeni, commit edilmiş ve remote SHA doğrulanmış HEAD için tek fresh recovery yapılır. HEALTHY reviewer bulunamazsa FAILED ve FOUNDER_ATTENTION_REQUIRED; gerçek BLOCKED sonucu da FOUNDER_ATTENTION_REQUIRED üretir. CLEAN dışında milestone kapanışı veya 1.2 geçişi yoktur. Aday listesi, gerçek reviewer model/aile/health kanıtı ve artifact digest audit kaydına yazılır. Bootstrap kayıtları yerel güven sınırındadır; Phase 6 attestation değildir.
+
+## Infrastructure-only one-time retry — 2026-09-18
+
+Founder yalnız reviewer kararı alınmamış altyapı hatası için aynı HEAD'e bir ek deneme yetkilendirebilir:
+
+```powershell
+.\scripts\start-full-auto.ps1 -RecoverReview (git rev-parse HEAD) -FounderAuthorized -RetryRecovery <previous-attempt-UUID>
+```
+
+Eski audit kaydı ve runtime reviewRecoveries girdisi değiştirilmez. Yeni kayıt reviewRecoveryRetries altında ve ayrı SHA.attempt-UUID.json dosyasında tutulur; previousRecoveryAttempt, reason, timestamp, targetHead ve yeni founderAuthorization içerir. Aynı HEAD'e ikinci retry yasaktır. CLEAN/BLOCKED alınmışsa, artifact doğrulaması sonradan başarısız olsa da replay yasaktır. Belirsiz/yarım kalmış deneme, INVALID_RESPONSE, CONFIG veya görev/security hatası retry izni değildir. Eski formatta yalnız bilinen availability hatası ve deneme zaman aralığında hiçbir reviewer invocation olmaması kabul edilir. Bu, yerel operatör yetkilendirmesidir; Phase 2 kriptografik Founder kimliği iddiası değildir.
+
+NVIDIA reviewer: nim-nemotron-super; family nvidia-nemotron; upstream model nvidia/nemotron-3-super-120b-a12b; OmniRoute route nvidia/nvidia/nemotron-3-super-120b-a12b. Bağımsız Codex birinci adaydır; bu milestone'da OpenAI contributor olduğu için seçilmez. Credential-ready NIM Nemotron ücretsiz fallback sıralamasında önce gelir. NIM için mevcut ücretsiz geliştirme-preview izni zorunludur; paid yetkisi açılmaz. Snapshot, credentials dosyasını context'e veya Git'e kopyalamadan asıl repo'nun yerel credential yapılandırmasını kullanır. Kullanıcı env credential değeri girişte process env'e alınır, yazdırılmaz.
+
+OmniRoute'da ilgisiz exact alias'lar route'u etkilemez; hedef/bare-model alias'ları, wildcard'lar, provider alias'ları, settings alias'ları, combo ve custom provider yönlendirmeleri reddedilir. OpenRouter'ın provider/max_price alanı yalnız OpenRouter'a gönderilir; NIM kendi ücretsiz preview kontrolüyle sınırlıdır.
+
+CLEAN sonrası milestone geçişi lifetime reviewCycle/remediationCount ve contributor listesini silmez. milestoneHistory önceki sayaçları, reviewer artifact digest'ini ve checkpoint HEAD'ini korur; milestoneReviewCycleBase/milestoneRemediationBase yeni milestone bütçesini başlatır. Önceki 3/3 geçmişi ve automaticCyclesPreserved=3 değişmez.

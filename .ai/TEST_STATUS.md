@@ -41,3 +41,17 @@ Executed locally before the fallback commit:
 Tests cover independent Codex, OpenAI exclusion, preferred Nemotron, healthy alternative after Nemotron failure, cross-provider family exclusion, unavailable candidates, BLOCKED, provenance tampering, replay rejection and preserved 3/3 counters. Mock review results are tests only; live review remains separate.
 
 Live recovery follow-up: PASS read-only regression on a copy of actual runtime proves unchanged contributors, prior recovery records, review records and 3/3 counters. Full-auto stops at the exhausted-cycle guard without writes or model calls. Live review did not complete; see REVIEW_STATUS.md.
+
+## Infrastructure-only retry and NVIDIA NIM — 2026-09-18
+
+Executed on the pre-commit working tree:
+- node scripts/validate-automation.mjs: PASS, 75 deterministic tests plus syntax/config/policy/JSON validation.
+- npm run validate:specification: PASS.
+- npm run lint: PASS.
+- npm run typecheck: PASS.
+- npm test: PASS, 14 registry + 1 foundation test.
+- npm run build: PASS.
+- Repository.scanSecrets(): PASS.
+- Actual pinned OmniRoute NVIDIA Nemotron health inference: PASS; model nvidia/nemotron-3-super-120b-a12b. This is availability evidence only.
+
+Tests cover immutable previous-attempt audit, explicit retry authorization, one retry maximum, CLEAN/BLOCKED/STARTED denial, legacy no-invocation gate, decision receipt before acceptance, NIM free-tier opt-in, credential isolation, exact/wildcard alias protection and preserved lifetime counters after milestone advancement.

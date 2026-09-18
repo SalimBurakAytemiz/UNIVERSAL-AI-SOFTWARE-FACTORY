@@ -26,6 +26,11 @@ export class Supervisor {
     state.remediationCount ||= 0;
   }
   async transition(step, patch = {}) { Object.assign(this.state, patch, { step, updatedAt: new Date(this.now()).toISOString() }); await this.save(); }
+  milestoneCount(counter, baseline) {
+    const value = this.state[counter], base = this.state[baseline] || 0;
+    if (!Number.isSafeInteger(value) || !Number.isSafeInteger(base) || base < 0 || base > value) throw new Stop('Invalid historical milestone counter.');
+    return value - base;
+  }
   async request(role, task) {
     const head = await this.repo.head();
     const extraPaths = [];
@@ -83,14 +88,14 @@ export class Supervisor {
       await this.transition("REVIEW", { expectedHead: head, git: { ...this.state.git, lastPushedSha: head, lastVerifiedRemoteSha: head } }); return;
     }
     if (this.state.step === "REVIEW") {
-      if (this.state.reviewCycle >= this.config.review.maxCyclesPerMilestone) throw new Stop("Maximum three automatic review cycles reached.");
+      if (this.milestoneCount('reviewCycle', 'milestoneReviewCycleBase') >= this.config.review.maxCyclesPerMilestone) throw new Stop("Maximum three automatic review cycles reached.");
       const head = await this.repo.head();
       if (this.state.reviews[head]) throw new Stop("The same commit already has a review; create a new remediation commit.");
       await this.transition("REVIEW_PENDING", { reviewCycle: this.state.reviewCycle + 1, currentReviewedCommit: head });
     }
     if (this.state.step === "REVIEW_PENDING") return this.request("reviewer", "Independently review this exact commit and current milestone contract.");
     if (this.state.step === "REMEDIATE") {
-      if (this.state.reviewCycle >= this.config.review.maxCyclesPerMilestone || this.state.remediationCount >= this.config.review.maxRemediationsPerMilestone) throw new Stop("Review/remediation cycle limit reached.");
+      if (this.milestoneCount('reviewCycle', 'milestoneReviewCycleBase') >= this.config.review.maxCyclesPerMilestone || this.milestoneCount('remediationCount', 'milestoneRemediationBase') >= this.config.review.maxRemediationsPerMilestone) throw new Stop("Review/remediation cycle limit reached.");
       await this.transition("REMEDIATE_PENDING", { remediationCount: this.state.remediationCount + 1 });
     }
     if (this.state.step === "REMEDIATE_PENDING") return this.request("builder", "Remediate only the supplied deterministic validation failures and confirmed current review findings.");
@@ -100,14 +105,23 @@ export class Supervisor {
       if (!record) throw new Stop("CLEAN has no persisted review artifact.");
       const artifact = await readJson(path.join(this.root, ".ai/automation/reviews", `${this.state.currentReviewedCommit}.json`));
       const reviewer = this.registry.models.find(m => m.id === artifact.reviewerId);
+      validateReview(artifact.result, this.state.currentReviewedCommit);
       if (digest(JSON.stringify(artifact)) !== record.artifactDigest || artifact.result.status !== "CLEAN" || artifact.reviewedCommit !== this.state.currentReviewedCommit || !reviewer || !independent(reviewer, this.state.contributors)) throw new Stop("Review artifact integrity or independence check failed.");
       return this.request("planner", "Advance the canonical checkpoint to the next coherent milestone only; do not claim implementation or review of the next milestone.");
     }
     if (this.state.step === "ADVANCED") {
       const advancedHead = await this.repo.push();
       const completed = (this.state.completedMilestonesThisRun || 0) + 1;
-      await this.transition("BUILD", { completedMilestonesThisRun: completed, reviewCycle: 0, remediationCount: 0,
-        contributors: [], baseCommit: null, expectedHead: null, lastFindings: [], validation: null, lastReviewResult: null,
+      // Geçmiş sayaçlar ve contributor listesi silinmez; yeni milestone yalnız kendi bütçe başlangıcını alır.
+      this.state.milestoneHistory ||= {};
+      const reviewed = this.state.currentReviewedCommit;
+      if (this.state.milestoneHistory[reviewed]) throw new Stop('Milestone advancement already recorded.');
+      this.state.milestoneHistory[reviewed] = { milestone: this.state.currentMilestone || null, reviewedHead: reviewed, checkpointHead: advancedHead,
+        reviewCycle: this.state.reviewCycle, remediationCount: this.state.remediationCount, contributors: structuredClone(this.state.contributors),
+        reviewArtifactDigest: this.state.reviews[reviewed]?.artifactDigest, timestamp: new Date(this.now()).toISOString() };
+      const checkpoint = await readJson(path.join(this.root, '.ai/MASTER_STATE.json'), {});
+      await this.transition("BUILD", { completedMilestonesThisRun: completed, milestoneReviewCycleBase: this.state.reviewCycle, milestoneRemediationBase: this.state.remediationCount,
+        currentMilestone: checkpoint.currentMilestone || this.state.currentMilestone, baseCommit: advancedHead, expectedHead: advancedHead, lastFindings: [], validation: null, lastReviewResult: null,
         git: { ...this.state.git, lastPushedSha: advancedHead, lastVerifiedRemoteSha: advancedHead } }); return;
     }
     if (!["BUILD", "VALIDATE", "PUSH", "REVIEW", "REVIEW_PENDING", "REMEDIATE", "REMEDIATE_PENDING", "ADVANCE", "ADVANCED"].includes(this.state.step)) throw new Stop("Unknown persisted step.");
@@ -151,7 +165,9 @@ export async function main(root = path.resolve(path.dirname(fileURLToPath(import
     const save = () => atomicJson(stateFile, state);
     const supervisor = new Supervisor({ root, config, registry, state, save, repo: new Repository(root, config), adapter: createAdapters(config, { root }) });
     if (mode === "--recover-review") {
-      const result = await runRecovery({ root, config, registry, state, save, head: process.argv[3], authorized: process.argv.includes("--founder-authorized") });
+      const retryIndex = process.argv.indexOf("--retry-recovery");
+      if (retryIndex >= 0 && !/^[a-f0-9-]{36}$/.test(process.argv[retryIndex + 1] || '')) throw new Stop('Explicit previous recovery attempt UUID required.');
+      const result = await runRecovery({ root, config, registry, state, save, head: process.argv[3], authorized: process.argv.includes("--founder-authorized"), retryPreviousAttempt: retryIndex >= 0 ? process.argv[retryIndex + 1] : null });
       console.log(JSON.stringify(result, null, 2));
       if (result.status !== "CLEAN") process.exitCode = 2;
     } else if (mode === "--check") {

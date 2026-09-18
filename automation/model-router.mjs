@@ -1,4 +1,4 @@
-import { ProviderError, Stop, Unavailable } from "./runtime.mjs";
+import { ProviderError, Stop, Unavailable, digest } from "./runtime.mjs";
 
 export function validateConfig(cfg, registry) {
   if (cfg.policy.allowPaid !== false || cfg.policy.allowProduction !== false || cfg.policy.allowRisk5 !== false || cfg.policy.allowIrreversibleMigration !== false) throw new Stop("Founder approval required: forbidden authority configuration.");
@@ -78,6 +78,13 @@ export class ModelRouter {
       await this.save();
       try {
         const output = await this.adapter.invoke(model, request);
+        if (role === "reviewer" && ["CLEAN", "BLOCKED"].includes(output.status)) {
+          // Doğrulamadan önce kararı kaydet: hatalı artifact bile infrastructure retry bahanesi olamaz.
+          this.state.reviewerDecisions ||= [];
+          this.state.reviewerDecisions.push({ targetHead: JSON.parse(request).reviewedCommit, taskKey, reviewerId: model.id,
+            status: output.status, responseDigest: digest(JSON.stringify(output)), timestamp: this.now() });
+          await this.save();
+        }
         if (output.status === "FOUNDER_APPROVAL_REQUIRED" || (output.status === "BLOCKED" && role !== "reviewer")) {
           const reason = output.status === "FOUNDER_APPROVAL_REQUIRED" ? "Founder approval required by model; no fallback or restart may bypass it." : `Task blocked by ${model.id}; no availability fallback for a task blocker.`;
           this.state.blockedTasks[taskKey] = reason;
@@ -103,6 +110,7 @@ export class ModelRouter {
         }
         if (!(error instanceof ProviderError)) throw error;
         this.state.attempts[key].status = "FAILED";
+        this.state.attempts[key].failureKind = error.kind;
         this.state.attempts[key].permanent = ["INVALID_RESPONSE", "MODEL_MISMATCH", "OUTPUT_LIMIT"].includes(error.kind);
         await this.failure(model, error);
       }
