@@ -140,3 +140,18 @@ Tek supervisor kilidi vardır. Zorla kapatma sonrası kilit kalırsa önce kayı
 
 ## Checkpoint hata ayrımı
 Eksik/geçersiz risk metadatası INVALID_RESPONSE olarak reddedilir; açık onay talebi veya Risk-5 güvenli biçimde durur. Son önerinin model, görev, risk ve dosya yolları runtime state içindeki lastProposal alanında tutulur. Güvenlik duruşları yeniden başlatmayla aşılmaz. Terminal aktif adımı ve review sayısını gösterir.
+
+## Founder-authorized fresh review recovery
+
+Yalnız açık yerel operatör isteği ile çalışır; bu kayıt kriptografik Founder kimlik doğrulaması veya production yetkisi değildir. Otomatik review/remediation sayaçları sıfırlanmaz. Tam SHA yerel HEAD ve uzak dal ile eşleşmelidir. İnceleme izole detached worktree üzerinden yapılır; recovery aracındaki kaydedilmemiş değişiklikler hedef commit'in parçası sayılmaz.
+
+```powershell
+$reviewHead = git rev-parse HEAD
+.\scripts\start-full-auto.ps1 -RecoverReview $reviewHead -FounderAuthorized
+```
+
+Her hedef için tek recovery kaydı `.ai/automation/recoveries/<SHA>.json` ve runtime `reviewRecoveries` içinde saklanır. Kayıt SHA, zaman, açık yerel yetkilendirme kaynağı, contributor aileleri, `automaticCyclesPreserved=3`, reviewer ve artifact digest içerir. Aynı hedef için tekrar inceleme reddedilir; hatalı veya kesilmiş girişimler de otomatik tekrarlanmaz.
+
+Recovery yalnız Codex primary reviewer kullanır. OpenAI ailesi contributor ise akış FOUNDER_ATTENTION_REQUIRED durumunda durur; başka reviewer ile bu koşul aşılmaz. Contributor kayıtları silinmez. CLEAN sadece tam hedef SHA, boş findings ve doğrulanmış bağımsız artifact ile kabul edilir. BLOCKED/hata Founder attention durumunda kalır. CLEAN sonrası komut otomatik milestone ilerletmez; değişen araç dosyalarının review edildiği iddia edilmez. Araç değişiklikleri commit edildiğinde yeni HEAD için ayrı review gerekir. Runtime audit kayıtları Git dışında yereldir; makine sahibi tarafından değiştirilemeyecek bir attestation sistemi oldukları iddia edilmez.
+
+2026-09-18 doğrulaması: `232d7ff585ae8b9e92ee2c0868239bf576a25f88` için önceki FAILED recovery kaydı vardır; yukarıdaki komut bu hedefte tekrar çalıştırılmamalıdır. Yeni, push edilmiş HEAD gerekir. Ayrıca mevcut OpenAI contributor kaydı nedeniyle Codex bağımsızlığı sağlanmıyor; yeni commit tek başına bu engeli kaldırmaz. Founder tarafından bağımsız builder ile yeniden üretim veya reviewer şartının açıkça değiştirilmesi gerekir. Bu oturumda canlı review çalıştırılmadı.

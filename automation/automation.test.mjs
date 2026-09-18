@@ -320,3 +320,105 @@ test('acceptance safety stop is persisted and cannot be bypassed on restart', as
   await assert.rejects(restored.execute(), Stop);
   assert.equal(restored.calls.length, 0);
 });
+
+async function recoveryFixture(status = 'CLEAN') {
+  const { recoverReview } = await import('./review-recovery.mjs');
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'uasf-recovery-'));
+  const head = 'a'.repeat(40);
+  const state = { status: 'FOUNDER_ATTENTION_REQUIRED', reviewCycle: 3, remediationCount: 3, reviews: {}, contributors: [{ model: 'sonnet', family: 'anthropic-claude' }], currentReviewedCommit: 'b'.repeat(40) };
+  const supervisor = { root: dir, config: cfg, registry, router: { registry }, state, save: async () => {},
+    repo: { clean: async () => {}, head: async () => head, remoteSha: async () => head },
+    request: async () => {
+      const artifact = { reviewerId: 'codex-primary', reviewedCommit: head, result: { status, reviewedCommit: head, findings: status === 'CLEAN' ? [] : [{ severity:'P1', file:'x', reproduction:'x', requirement:'x', reason:'x' }] } };
+      await atomicJson(path.join(dir, '.ai/automation/reviews', head + '.json'), artifact);
+      state.reviews[head] = { ...artifact, artifactDigest: digest(JSON.stringify(artifact)) };
+    } };
+  return { dir, head, state, supervisor, run: options => recoverReview(supervisor, { head, authorized: true, ...options }) };
+}
+for (const status of ['CLEAN', 'BLOCKED']) test('authorized recovery ' + status + ' preserves cycles and rejects replay', async () => {
+  const f = await recoveryFixture(status);
+  try {
+    const result = await f.run();
+    assert.equal(result.automaticCyclesPreserved, 3);
+    assert.equal(f.state.reviewCycle, 3); assert.equal(f.state.remediationCount, 3);
+    assert.equal(f.state.status, status === 'CLEAN' ? 'RECOVERY_CLEAN' : 'FOUNDER_ATTENTION_REQUIRED');
+    assert.equal((await readJson(path.join(f.dir,'.ai/automation/recoveries',f.head+'.json'))).status,status);
+    await assert.rejects(f.run(), /already reviewed|Founder attention/);
+  } finally { await rm(f.dir,{recursive:true,force:true}); }
+});
+test('recovery rejects missing authorization, old SHA, remote mismatch and interrupted apply', async () => {
+  const f = await recoveryFixture();
+  try {
+    await assert.rejects(f.run({authorized:false}), /authorization/);
+    await assert.rejects(f.run({head:'b'.repeat(40)}), /target/);
+    f.supervisor.repo.remoteSha=async () => 'c'.repeat(40);
+    await assert.rejects(f.run(), /target/);
+    f.state.pendingApply={}; await assert.rejects(f.run(), /interrupted/);
+    assert.equal(f.state.reviewRecoveries,undefined);
+  } finally {await rm(f.dir,{recursive:true,force:true});}
+});
+test('recovery rejects builder-family reviewer and consumes failed recovery', async () => {
+  const f=await recoveryFixture();
+  try {
+    f.state.contributors.push({model:'codex-session',family:'openai-gpt'});
+    await assert.rejects(f.run(),/not independent/);
+    assert.equal(f.state.status,'FOUNDER_ATTENTION_REQUIRED');
+    await assert.rejects(f.run(),/already reviewed/);
+  } finally {await rm(f.dir,{recursive:true,force:true});}
+});
+test('recovery never accepts wrong SHA or CLEAN with findings', async () => {
+  for(const kind of ['sha','findings']) {
+    const f=await recoveryFixture();
+    try {
+      const request=f.supervisor.request;
+      f.supervisor.request=async()=>{await request(); const r=f.state.reviews[f.head].result; if(kind==='sha')r.reviewedCommit='b'.repeat(40); else r.findings=[{}];};
+      await assert.rejects(f.run(),ProviderError);
+      assert.equal(f.state.status,'FOUNDER_ATTENTION_REQUIRED');
+      assert.equal(f.state.reviewCycle,3);
+    } finally {await rm(f.dir,{recursive:true,force:true});}
+  }
+});
+
+test('real CLI recovery dispatch exits normally and releases lock on invalid authorization', async () => {
+  const { cp } = await import('node:fs/promises');
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'uasf-cli-recovery-'));
+  try {
+    await cp(path.join(root,'automation'), path.join(dir,'automation'), {recursive:true});
+    const result = await run(process.execPath, [path.join(dir,'automation/factory-supervisor.mjs'),'--recover-review','invalid'], {cwd:dir});
+    assert.equal(result.code,2);
+    assert.match(result.stderr,/full SHA/);
+    assert.doesNotMatch(result.stderr,/unsettled top-level await/);
+    assert.equal(await readJson(path.join(dir,'.ai/automation/state.json')).then(s=>s.status),'FOUNDER_ATTENTION_REQUIRED');
+    const release = await lock(path.join(dir,'.ai/automation/supervisor.lock')); await release();
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('recovery rejects old target even without indexed review and rejects non-attention state', async () => {
+  const f = await recoveryFixture();
+  try {
+    f.state.currentReviewedCommit = f.head;
+    await assert.rejects(f.run(), /already reviewed/);
+    f.state.status = 'RUNNING';
+    await assert.rejects(f.run(), /Founder attention/);
+  } finally { await rm(f.dir, {recursive:true, force:true}); }
+});
+
+test('recovery pins Codex and validates persisted artifact binding', async () => {
+  const f = await recoveryFixture();
+  try {
+    const request = f.supervisor.request;
+    f.supervisor.request = async () => {
+      assert.deepEqual(f.supervisor.router.registry.models.map(m => m.id), ['codex-primary']);
+      await request();
+      const record = f.state.reviews[f.head];
+      const artifact = await readJson(path.join(f.dir, '.ai/automation/reviews', f.head + '.json'));
+      artifact.reviewedCommit = 'c'.repeat(40);
+      await atomicJson(path.join(f.dir, '.ai/automation/reviews', f.head + '.json'), artifact);
+      record.artifactDigest = digest(JSON.stringify(artifact));
+    };
+    await assert.rejects(f.run(), /binding mismatch/);
+    assert.equal(f.state.status, 'FOUNDER_ATTENTION_REQUIRED');
+    assert.equal(f.state.reviewCycle, 3);
+    assert.equal(f.supervisor.router.registry, registry);
+  } finally { await rm(f.dir, {recursive:true, force:true}); }
+});

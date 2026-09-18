@@ -1,4 +1,4 @@
-param([switch]$Check, [switch]$ValidateOnly, [switch]$Status)
+param([switch]$Check, [switch]$ValidateOnly, [switch]$Status, [string]$RecoverReview, [switch]$FounderAuthorized)
 $ErrorActionPreference = 'Stop'
 $taskRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location -LiteralPath $taskRoot
@@ -17,7 +17,11 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host 'Factory: Claude -> OpenCode Free -> credential-ready OmniRoute Free' -ForegroundColor Cyan
     Write-Host 'Codex independent review; paid/production/Risk-5 actions disabled.'
-    if ($Check) { node (Join-Path $taskRoot 'automation\factory-supervisor.mjs') --check }
+    if ($RecoverReview) {
+        if (-not $FounderAuthorized -or $RecoverReview -notmatch '^[a-f0-9]{40}$') { throw 'Recovery requires a full SHA and -FounderAuthorized' }
+        node (Join-Path $taskRoot 'automation\factory-supervisor.mjs') --recover-review $RecoverReview --founder-authorized
+    }
+    elseif ($Check) { node (Join-Path $taskRoot 'automation\factory-supervisor.mjs') --check }
     else { node (Join-Path $taskRoot 'automation\factory-supervisor.mjs') }
     exit $LASTEXITCODE
 } finally { Pop-Location }

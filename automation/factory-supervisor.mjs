@@ -1,4 +1,5 @@
 import path from "node:path";
+import { runRecovery } from "./review-recovery.mjs";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -149,7 +150,11 @@ export async function main(root = path.resolve(path.dirname(fileURLToPath(import
     state = await readJson(stateFile, { ...legacy, schemaVersion: "2.0.0", runId: randomUUID(), step: "BUILD" });
     const save = () => atomicJson(stateFile, state);
     const supervisor = new Supervisor({ root, config, registry, state, save, repo: new Repository(root, config), adapter: createAdapters(config, { root }) });
-    if (mode === "--check") {
+    if (mode === "--recover-review") {
+      const result = await runRecovery({ root, config, registry, state, save, head: process.argv[3], authorized: process.argv.includes("--founder-authorized") });
+      console.log(JSON.stringify(result, null, 2));
+      if (result.status !== "CLEAN") process.exitCode = 2;
+    } else if (mode === "--check") {
       await supervisor.router.healthCheck();
       console.log(JSON.stringify({ providers: state.providers, note: "Missing credentials stay inactive and do not block other providers." }, null, 2));
     } else {
