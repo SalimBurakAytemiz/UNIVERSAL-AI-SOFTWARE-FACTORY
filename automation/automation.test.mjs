@@ -325,11 +325,11 @@ async function recoveryFixture(status = 'CLEAN') {
   const { recoverReview } = await import('./review-recovery.mjs');
   const dir = await mkdtemp(path.join(os.tmpdir(), 'uasf-recovery-'));
   const head = 'a'.repeat(40);
-  const state = { status: 'FOUNDER_ATTENTION_REQUIRED', reviewCycle: 3, remediationCount: 3, reviews: {}, contributors: [{ model: 'sonnet', family: 'anthropic-claude' }], currentReviewedCommit: 'b'.repeat(40) };
+  const state = { status: 'FOUNDER_ATTENTION_REQUIRED', reviewCycle: 3, remediationCount: 3, reviews: {}, providers: { 'codex-primary': { availability: 'HEALTHY', evidence: { probe: 'authenticated-inference', model: model('codex-primary').model } } }, contributors: [{ model: 'sonnet', family: 'anthropic-claude' }], currentReviewedCommit: 'b'.repeat(40) };
   const supervisor = { root: dir, config: cfg, registry, router: { registry }, state, save: async () => {},
     repo: { clean: async () => {}, head: async () => head, remoteSha: async () => head },
     request: async () => {
-      const artifact = { reviewerId: 'codex-primary', reviewedCommit: head, result: { status, reviewedCommit: head, findings: status === 'CLEAN' ? [] : [{ severity:'P1', file:'x', reproduction:'x', requirement:'x', reason:'x' }] } };
+      const artifact = { reviewerId: 'codex-primary', family: model('codex-primary').family, model: model('codex-primary').model, reviewedCommit: head, result: { status, reviewedCommit: head, findings: status === 'CLEAN' ? [] : [{ severity:'P1', file:'x', reproduction:'x', requirement:'x', reason:'x' }] } };
       await atomicJson(path.join(dir, '.ai/automation/reviews', head + '.json'), artifact);
       state.reviews[head] = { ...artifact, artifactDigest: digest(JSON.stringify(artifact)) };
     } };
@@ -403,12 +403,12 @@ test('recovery rejects old target even without indexed review and rejects non-at
   } finally { await rm(f.dir, {recursive:true, force:true}); }
 });
 
-test('recovery pins Codex and validates persisted artifact binding', async () => {
+test('recovery prefers Codex and validates persisted artifact binding', async () => {
   const f = await recoveryFixture();
   try {
     const request = f.supervisor.request;
     f.supervisor.request = async () => {
-      assert.deepEqual(f.supervisor.router.registry.models.map(m => m.id), ['codex-primary']);
+      assert.equal(f.supervisor.router.registry.models[0].id, 'codex-primary');
       await request();
       const record = f.state.reviews[f.head];
       const artifact = await readJson(path.join(f.dir, '.ai/automation/reviews', f.head + '.json'));
@@ -421,4 +421,83 @@ test('recovery pins Codex and validates persisted artifact binding', async () =>
     assert.equal(f.state.reviewCycle, 3);
     assert.equal(f.supervisor.router.registry, registry);
   } finally { await rm(f.dir, {recursive:true, force:true}); }
+});
+
+for (const scenario of ['primary', 'nemotron', 'fallback', 'same-family', 'unavailable', 'blocked']) {
+  test('real supervisor recovery routing: ' + scenario, async () => {
+    const { recoverReview } = await import('./review-recovery.mjs');
+    const f = await recoveryFixture();
+    const calls = [], probes = [];
+    try {
+      await mkdir(path.join(f.dir, 'prompts'));
+      await writeFile(path.join(f.dir, 'prompts/AUTO-REVIEW.md'), await readFile(path.join(root, 'prompts/AUTO-REVIEW.md')));
+      if (scenario !== 'primary') f.state.contributors.push({model:'codex-session', family:'openai-gpt'});
+      f.state.contributors.push({model:'opencode/mimo-v2.5-free', family:'xiaomi-mimo'});
+      if (scenario === 'same-family') f.state.contributors.push({model:'nemotron-builder', family:'nvidia-nemotron'});
+      const originalContributors = structuredClone(f.state.contributors);
+      const s = new Supervisor({root:f.dir, config:cfg, registry, state:f.state, save:async()=>{},
+        repo:{...f.supervisor.repo, context:async()=>({head:f.head,tree:[],files:[]})},
+        adapter:{probe:async m=>{
+          probes.push(m.id);
+          if (scenario === 'unavailable' || (scenario === 'fallback' && m.id === 'opencode-nemotron')) throw new ProviderError('AUTH');
+          return {probe:'authenticated-inference',model:m.model};
+        }, invoke:async (m, raw)=>{
+          calls.push(m.id);
+          assert.equal(independent(m, originalContributors),true);
+          assert.equal(f.state.providers[m.id].availability,'HEALTHY');
+          const request=JSON.parse(raw);
+          return {taskId:request.taskId,reviewedCommit:request.reviewedCommit,status:scenario === 'blocked' ? 'BLOCKED' : 'CLEAN', findings:scenario === 'blocked' ? [{severity:'P1',file:'x',reproduction:'x',requirement:'x',reason:'x'}] : []};
+        }}});
+      if (scenario === 'unavailable') {
+        await assert.rejects(recoverReview(s,{head:f.head,authorized:true}),Unavailable);
+        assert.equal(f.state.status,'FOUNDER_ATTENTION_REQUIRED');
+        assert.deepEqual(calls,[]);
+      } else {
+        const result=await recoverReview(s,{head:f.head,authorized:true});
+        const expected=scenario === 'primary' ? 'codex-primary' : ['fallback','same-family'].includes(scenario) ? 'nim-deepseek' : 'opencode-nemotron';
+        assert.deepEqual(calls,[expected]);
+        assert.equal(result.reviewerId,expected);
+        assert.equal(result.reviewerFamily,model(expected).family);
+        assert.equal(result.reviewerHealth.availability,'HEALTHY');
+        assert.equal(result.automaticCyclesPreserved,3);
+        assert.equal(result.status,scenario === 'blocked' ? 'BLOCKED' : 'CLEAN');
+        assert.equal(f.state.status,scenario === 'blocked' ? 'FOUNDER_ATTENTION_REQUIRED' : 'RECOVERY_CLEAN');
+      }
+      assert.deepEqual(f.state.contributors,originalContributors);
+      assert.equal(f.state.reviewCycle,3);
+      assert.equal(f.state.remediationCount,3);
+      if (scenario !== 'primary') assert.equal(probes.includes('codex-primary'),false);
+      if (scenario === 'same-family') assert.equal(probes.includes('opencode-nemotron') || probes.includes('openrouter-nemotron'),false);
+    } finally { await rm(f.dir,{recursive:true,force:true}); }
+  });
+}
+
+test('recovery selection excludes paid, disabled, unknown and all contributor families', async () => {
+  const { recoveryRegistry } = await import('./review-recovery.mjs');
+  const contributors = [{family:'openai-gpt',model:'codex-session'},{family:'nvidia-nemotron',model:'other-nemotron'}];
+  const input={models:[...registry.models,{...model('opencode-mimo'),id:'paid',cost:'paid'},{...model('opencode-mimo'),id:'unknown',family:'unknown'}]};
+  const selected=recoveryRegistry(input,contributors).models;
+  assert.equal(selected.some(m=>['codex-primary','opencode-nemotron','openrouter-nemotron','paid','unknown'].includes(m.id)),false);
+  assert.equal(selected.every(m=>m.cost==='free' && independent(m,contributors)),true);
+});
+
+for (const kind of ['family','model','health','contributors']) test('recovery rejects altered provenance: ' + kind, async () => {
+  const f=await recoveryFixture();
+  try {
+    const request=f.supervisor.request;
+    f.supervisor.request=async()=>{
+      await request();
+      if(kind==='health') f.state.providers['codex-primary'].availability='QUARANTINED';
+      else if(kind==='contributors') f.state.contributors.push({family:'new-family',model:'other'});
+      else {
+        const artifact=await readJson(path.join(f.dir,'.ai/automation/reviews',f.head+'.json'));
+        artifact[kind]='forged';
+        await atomicJson(path.join(f.dir,'.ai/automation/reviews',f.head+'.json'),artifact);
+        f.state.reviews[f.head].artifactDigest=digest(JSON.stringify(artifact));
+      }
+    };
+    await assert.rejects(f.run(),/provenance|history changed/);
+    assert.equal(f.state.status,'FOUNDER_ATTENTION_REQUIRED');
+    assert.equal(f.state.reviewCycle,3);
+  } finally {await rm(f.dir,{recursive:true,force:true});}
 });

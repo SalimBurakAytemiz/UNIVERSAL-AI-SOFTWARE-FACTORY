@@ -7,3 +7,7 @@ Local HEAD and GitHub factory/development were verified as 232d7ff585ae8b9e92ee2
 Codex/OpenAI is recorded as a contributor. Mandatory Codex primary review and family independence therefore conflict; recovery fails closed. Recovery code changes are implementation work by Codex and are not independent CLEAN evidence. No live review or milestone closure occurred in this session.
 
 Türkçe: Geçmiş deneme ve contributor kayıtları korunmuştur; bağımsızlık engeli Founder çözümü gerektirir.
+
+## Founder-authorized fallback update — 2026-09-18
+
+The Founder explicitly authorized independent HEALTHY free fallback when Codex is not independent. OpenAI remains a contributor and is excluded for this snapshot. Nemotron is preferred among eligible free fallbacks. This resolves the selection-policy conflict, not provider availability. A new committed, pushed snapshot must receive a real independent review; no CLEAN or closure is asserted here.

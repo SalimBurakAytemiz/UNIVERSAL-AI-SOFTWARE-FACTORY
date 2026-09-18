@@ -26,3 +26,16 @@ Executed on the local working tree based on 232d7ff585ae8b9e92ee2c0868239bf576a2
 - npm run build: PASS.
 
 Initial sandbox test process failed to spawn (EPERM); authorized execution outside the sandbox passed. These results are local execution observations, not independent review attestations. Runtime counters and previous audit were not modified.
+
+## Independent HEALTHY fallback — 2026-09-18
+
+Executed locally before the fallback commit:
+- node scripts/validate-automation.mjs: PASS, 65 deterministic tests, syntax/config/policy/JSON validation.
+- npm run validate:specification: PASS.
+- npm run lint: PASS.
+- npm run typecheck: PASS.
+- npm test: PASS, 14 registry tests and 1 foundation test.
+- npm run build: PASS.
+- Repository.scanSecrets(): PASS.
+
+Tests cover independent Codex, OpenAI exclusion, preferred Nemotron, healthy alternative after Nemotron failure, cross-provider family exclusion, unavailable candidates, BLOCKED, provenance tampering, replay rejection and preserved 3/3 counters. Mock review results are tests only; live review remains separate.

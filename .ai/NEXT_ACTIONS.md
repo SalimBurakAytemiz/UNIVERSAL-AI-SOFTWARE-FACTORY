@@ -1,10 +1,11 @@
 # Next Actions
 
-Milestone 1.1 remains open.
+Milestone 1.1 remains open pending a fresh independent review.
 
-1. Preserve existing runtime counters (3/3), contributors and FAILED recovery audit; do not re-review 232d7ff585ae8b9e92ee2c0868239bf576a25f88.
-2. Founder must resolve Codex/OpenAI contributor conflict with mandatory Codex independent reviewer. No contributor erasure or fabricated independence.
-3. Commit and push the recovery changes as a new snapshot; verify remote SHA. No force push, reset, rebase or history rewrite.
-4. Only after independence is resolved, use the fresh-HEAD command in BOOTSTRAP-AUTOMATION.md. Paid, production, Risk-5 and irreversible migration remain disabled.
+1. Preserve runtime reviewCycle=3, remediationCount=3, contributor history and previous FAILED recovery.
+2. Validate, commit, push and verify the new HEAD before recovery.
+3. Founder explicitly authorizes independent HEALTHY fallback: Codex if independent, otherwise free opencode-nemotron first, then other independent free candidates.
+4. Accept CLEAN only for exact HEAD, empty findings and verified reviewer provenance. On BLOCKED/failure retain FOUNDER_ATTENTION_REQUIRED.
+5. Only after CLEAN, close Milestone 1.1 in canonical checkpoints and advance to Milestone 1.2 without erasing previous counters or contributors.
 
-Türkçe: Yeni commit tek başına aile bağımsızlığı sağlamaz. Mevcut engel çözülmeden canlı recovery başlatılmamalıdır.
+Türkçe: Ücretli modeller, production, Risk-5 ve geri döndürülemez migration kapalıdır. HEALTHY olmayan reviewer ile başarı üretilmez.

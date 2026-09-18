@@ -11,10 +11,9 @@
   "lastCompletedMilestone": "0.1",
   "lastVerifiedCommit": null,
   "knownBlockers": [
-    "Recovery for 232d7ff585ae8b9e92ee2c0868239bf576a25f88 already consumed (FAILED). Do not replay.",
-    "Codex/OpenAI is a recorded contributor; Codex primary independent review cannot be satisfied for this lineage. Founder resolution required."
+    "Milestone 1.1 awaits a fresh exact-HEAD independent recovery review. Prior FAILED recovery and all contributor/cycle history must remain preserved."
   ],
-  "nextAction": "Preserve runtime reviewCycle/remediationCount=3 and recovery audit. Resolve reviewer/builder independence before reviewing a new committed and remote-verified HEAD. Recovery implementation is locally validated, not independently reviewed.",
+  "nextAction": "Validate and push the Founder-authorized independent HEALTHY reviewer fallback change, verify remote SHA, then run one fresh recovery review of the new HEAD. Close 1.1 and advance to 1.2 only on authentic independent CLEAN.",
   "sourceOfTruth": "repository+git+.ai",
   "gameStudioActivationAllowed": false
 }
