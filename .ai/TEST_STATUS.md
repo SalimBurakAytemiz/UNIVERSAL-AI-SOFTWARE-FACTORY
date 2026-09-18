@@ -55,3 +55,7 @@ Executed on the pre-commit working tree:
 - Actual pinned OmniRoute NVIDIA Nemotron health inference: PASS; model nvidia/nemotron-3-super-120b-a12b. This is availability evidence only.
 
 Tests cover immutable previous-attempt audit, explicit retry authorization, one retry maximum, CLEAN/BLOCKED/STARTED denial, legacy no-invocation gate, decision receipt before acceptance, NIM free-tier opt-in, credential isolation, exact/wildcard alias protection and preserved lifetime counters after milestone advancement.
+
+## NIM JSON response regression — 2026-09-18
+Automation tests: 76 PASS. Registry validation and 14 registry tests: PASS. Foundation test: 1 PASS. Lint, typecheck, build and secret scan: PASS. Actual NIM JSON-mode nonce health: PASS. Malformed JSON and incorrect nonce remain rejected. Prior recovery and retry audits were not modified.
+

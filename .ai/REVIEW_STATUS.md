@@ -28,3 +28,9 @@ Türkçe: Bu sonuç sağlayıcı erişim engelidir; bağımsız reviewer BLOCKED
 ## Infrastructure retry implementation — 2026-09-18
 
 Founder authorized a one-time infrastructure-only retry with a separate fresh authorization and immutable link to the previous attempt. Credential-ready NVIDIA Nemotron passed an actual authenticated-inference nonce probe through pinned OmniRoute. That health result is not independent code review. The new code snapshot still awaits commit, remote verification and real review. Existing contributor and recovery history is retained.
+
+## NIM transport follow-up — 2026-09-18
+
+Recovery 224fd69f-ce34-418c-b946-4bf5aee2b33e for 7a47bb09aab7d51a38d710bcb3c7dd0835b78c9b failed with NVIDIA HTTP 503 Service temporarily overloaded. A later locally recorded retry 405bd541-89c0-44a6-a1bb-a9f904a0fb21 failed NON_RETRYABLE with INVALID_RESPONSE. Gateway response inspection proved malformed JSON in the health reply; no reviewer decision was received. Both audit records remain unchanged and that HEAD cannot be retried again.
+
+NIM requests now explicitly use JSON response mode and temperature 0 while retaining strict parsing, nonce, model, independence and exact-HEAD checks. Actual health inference with these parameters passed. The adapter fix requires a new committed/pushed snapshot and its own fresh independent review.

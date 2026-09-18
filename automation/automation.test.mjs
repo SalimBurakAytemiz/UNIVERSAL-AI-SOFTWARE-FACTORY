@@ -597,6 +597,8 @@ test('NIM credentials stay in original root; free-tier opt-in required and OpenR
     assert.equal((await adapter.invoke(model('nim-nemotron-super'),'{}')).status,'READY');
     assert.equal(body.model,'nvidia/nvidia/nemotron-3-super-120b-a12b');
     assert.equal(body.provider,undefined);
+    assert.deepEqual(body.response_format,{type:'json_object'});
+    assert.equal(body.temperature,0);
   } finally {await rm(temp,{recursive:true,force:true});}
 });
 
@@ -639,4 +641,19 @@ test('milestone advancement preserves lifetime counters/contributors and starts 
     state.milestoneReviewCycleBase=7;
     assert.throws(()=>s.milestoneCount('reviewCycle','milestoneReviewCycleBase'),/Invalid historical/);
   } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('NIM JSON mode still rejects malformed JSON and incorrect health nonce',async()=>{
+  for(const malformed of [true,false]) {
+    const target=model('nim-nemotron-super');
+    const adapter=createAdapters(cfg,{root,env:{FACTORY_OMNIROUTE_API_KEY:'fixture-only',FACTORY_NIM_FREE_TIER:'1'},
+      routeResolver:async()=>({apiKey:'fixture-only',connectionId:'only',baseUrl:'http://127.0.0.1:20128/v1'}),
+      fetcher:async(url,options)=>{
+        if(url.endsWith('/models'))return new Response(JSON.stringify({data:[{id:'nvidia/'+target.model}]}));
+        const body=JSON.parse(options.body); assert.deepEqual(body.response_format,{type:'json_object'}); assert.equal(body.temperature,0);
+        const content=malformed ? '{"status":"HEALTHY","nonce":"broken":"twice"}' : '{"status":"HEALTHY","nonce":"wrong"}';
+        return new Response(JSON.stringify({model:target.model,choices:[{finish_reason:'stop',message:{content}}]}));
+      }});
+    await assert.rejects(adapter.probe(target),e=>e.kind==='INVALID_RESPONSE');
+  }
 });
