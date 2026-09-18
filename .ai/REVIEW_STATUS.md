@@ -11,3 +11,16 @@ Türkçe: Geçmiş deneme ve contributor kayıtları korunmuştur; bağımsızl�
 ## Founder-authorized fallback update — 2026-09-18
 
 The Founder explicitly authorized independent HEALTHY free fallback when Codex is not independent. OpenAI remains a contributor and is excluded for this snapshot. Nemotron is preferred among eligible free fallbacks. This resolves the selection-policy conflict, not provider availability. A new committed, pushed snapshot must receive a real independent review; no CLEAN or closure is asserted here.
+
+## Actual recovery outcome — 2026-09-18
+
+- Target (not successfully reviewed): cd9b08b7788a6980b692157ed5e88a1505beb6da. Local and origin/factory/development SHA matched before invocation.
+- Recovery ID: dee2f8e8-edc1-42af-a98f-aa0985c81590; status FAILED; completed 2026-09-18T06:21:43.316Z.
+- Local audit: .ai/automation/recoveries/cd9b08b7788a6980b692157ed5e88a1505beb6da.json; canonical JSON SHA-256: 097bcd7d4a7be211d8623f9b9bd912687cb3d45a41a4529fc9d56db809261f5d.
+- Eligible candidates, in order: opencode-nemotron / nvidia-nemotron; nim-deepseek / deepseek; openrouter-nemotron / nvidia-nemotron. Codex/OpenAI and MiMo were excluded as contributor families.
+- opencode-nemotron health failed AUTH, provider HTTP 403: OpenCode's free tier can only be used from within OpenCode. The two other candidates were INACTIVE / NO_CREDENTIAL and in cooldown. No model review response was accepted or fabricated.
+- CLEAN/BLOCKED reviewer verdict: NONE. Operational state: FOUNDER_ATTENTION_REQUIRED, step REMEDIATE.
+- reviewCycle=3, remediationCount=3, automaticCyclesPreserved=3. Contributor list, existing reviews and earlier recovery records compare equal to the pre-run snapshot.
+- Milestone 1.1 remains open; Milestone 1.2 has not begun. Full-auto continuation was tested on a copy of real runtime and stopped at the exhausted review/remediation guard without writes or model calls.
+
+Türkçe: Bu sonuç sağlayıcı erişim engelidir; bağımsız reviewer BLOCKED kararı değildir. CLEAN olmadan milestone kapatılmaz. Bu sonuç kaydı bir checkpoint commit'idir ve bağımsız review edilmiş kod olarak sunulmaz.

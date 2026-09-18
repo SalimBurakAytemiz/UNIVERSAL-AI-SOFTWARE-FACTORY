@@ -1,11 +1,15 @@
 # Next Actions
 
-Milestone 1.1 remains open pending a fresh independent review.
+Milestone 1.1: FOUNDER_ATTENTION_REQUIRED. Milestone 1.2 is not active.
 
-1. Preserve runtime reviewCycle=3, remediationCount=3, contributor history and previous FAILED recovery.
-2. Validate, commit, push and verify the new HEAD before recovery.
-3. Founder explicitly authorizes independent HEALTHY fallback: Codex if independent, otherwise free opencode-nemotron first, then other independent free candidates.
-4. Accept CLEAN only for exact HEAD, empty findings and verified reviewer provenance. On BLOCKED/failure retain FOUNDER_ATTENTION_REQUIRED.
-5. Only after CLEAN, close Milestone 1.1 in canonical checkpoints and advance to Milestone 1.2 without erasing previous counters or contributors.
+1. Restore authorized free reviewer access: opencode-nemotron returns provider HTTP 403 AUTH; other independent free candidates lack credentials. Do not bypass provider restrictions or enable paid routes.
+2. Preserve contributors, reviewCycle=3, remediationCount=3 and both FAILED recovery records. Do not repeat review attempts for consumed targets.
+3. After access is restored, verify the new local and remote HEAD match, then run:
 
-Türkçe: Ücretli modeller, production, Risk-5 ve geri döndürülemez migration kapalıdır. HEALTHY olmayan reviewer ile başarı üretilmez.
+```powershell
+.\scripts\start-full-auto.ps1 -RecoverReview (git rev-parse HEAD) -FounderAuthorized
+```
+
+4. Only authentic independent exact-HEAD CLEAN with empty findings permits closure of 1.1 and transition to 1.2. Before full-auto resumes, checkpoint advancement must preserve historical contributor/cycle records; the legacy ADVANCED branch clears active counters/contributors and must not be used to erase this history. No full-auto readiness is claimed while recovery is FAILED.
+
+Türkçe: Provider erişimi düzelmeden komutu çalıştırmak yeni hedefin tek recovery hakkını da tüketir. Mevcut engel varken normal full-auto devam edemez.

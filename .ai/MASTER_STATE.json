@@ -2,7 +2,7 @@
   "schemaVersion": "1.0.0",
   "factory": "UNIVERSAL-AI-SOFTWARE-FACTORY",
   "owner": "@SalimBurakAytemiz",
-  "state": "CLEAN_SLATE_INITIALIZED",
+  "state": "FOUNDER_ATTENTION_REQUIRED",
   "automationMode": "DAY_ZERO_FULL_AUTO_GIT",
   "currentPhase": 1,
   "currentPhaseName": "Canonical Specification & Architecture Constitution",
@@ -11,9 +11,9 @@
   "lastCompletedMilestone": "0.1",
   "lastVerifiedCommit": null,
   "knownBlockers": [
-    "Milestone 1.1 awaits a fresh exact-HEAD independent recovery review. Prior FAILED recovery and all contributor/cycle history must remain preserved."
+    "Fresh recovery for cd9b08b7788a6980b692157ed5e88a1505beb6da FAILED: opencode-nemotron AUTH (provider 403); other independent free candidates INACTIVE / NO_CREDENTIAL. No independent review verdict exists for this target."
   ],
-  "nextAction": "Validate and push the Founder-authorized independent HEALTHY reviewer fallback change, verify remote SHA, then run one fresh recovery review of the new HEAD. Close 1.1 and advance to 1.2 only on authentic independent CLEAN.",
+  "nextAction": "Restore authorized free reviewer availability. Preserve prior FAILED attempts, contributors and automatic cycles=3. Review only a new committed and remote-verified HEAD; close 1.1 and advance to 1.2 only after independent CLEAN.",
   "sourceOfTruth": "repository+git+.ai",
   "gameStudioActivationAllowed": false
 }

@@ -39,3 +39,5 @@ Executed locally before the fallback commit:
 - Repository.scanSecrets(): PASS.
 
 Tests cover independent Codex, OpenAI exclusion, preferred Nemotron, healthy alternative after Nemotron failure, cross-provider family exclusion, unavailable candidates, BLOCKED, provenance tampering, replay rejection and preserved 3/3 counters. Mock review results are tests only; live review remains separate.
+
+Live recovery follow-up: PASS read-only regression on a copy of actual runtime proves unchanged contributors, prior recovery records, review records and 3/3 counters. Full-auto stops at the exhausted-cycle guard without writes or model calls. Live review did not complete; see REVIEW_STATUS.md.
